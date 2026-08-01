@@ -9,6 +9,7 @@ add_executable(kernellake_gpu_tests
   device_batch_test.cpp
   arrow_bridge_test.cpp
   expression_compiler_test.cpp
+  filter_projection_operator_test.cpp
 )
 
 target_link_libraries(kernellake_gpu_tests PRIVATE

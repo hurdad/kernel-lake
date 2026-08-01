@@ -29,6 +29,12 @@ public:
   [[nodiscard]] std::size_t row_count() const;
   [[nodiscard]] std::size_t column_count() const;
   [[nodiscard]] const Schema& schema() const noexcept { return *schema_; }
+  [[nodiscard]] std::shared_ptr<const Schema> schema_ptr() const noexcept { return schema_; }
+
+  // Releases the owned cudf::table, leaving this batch schema-only (any
+  // further view()/row_count() call is invalid). Operators use this to hand
+  // ownership of a table to a new DeviceBatch without an intermediate copy.
+  [[nodiscard]] std::unique_ptr<cudf::table> release_table() && { return std::move(table_); }
 
 private:
   std::unique_ptr<cudf::table> table_;

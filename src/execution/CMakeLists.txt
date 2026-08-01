@@ -5,6 +5,8 @@ add_library(kernellake_execution STATIC
   arrow_bridge.cpp
   cudf_adapter.cpp
   expression_compiler.cpp
+  filter_operator.cpp
+  projection_operator.cpp
 )
 
 target_include_directories(kernellake_execution PUBLIC
@@ -17,6 +19,7 @@ target_link_libraries(kernellake_execution PUBLIC
   kernellake_common
   kernellake_types
   kernellake_expression
+  kernellake_planner
   CUDA::cudart
   rmm::rmm
   cudf::cudf
