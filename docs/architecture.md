@@ -148,6 +148,27 @@ saying so explicitly.
 Everything else in this document (parsing through physical planning and
 pruning) is CPU-only and builds/tests with the `dev` CMake preset.
 
+### GPU dependency vendoring (no conda)
+
+The `gpu-dev` preset (`KERNELLAKE_WITH_CUDA=ON`) needs libcudf and RMM.
+Rather than requiring conda/mamba, `cmake/ThirdPartyRapids.cmake` vendors
+RAPIDS's self-contained "lib*" wheels from PyPI via `FetchContent` --
+pinned by URL + SHA-256, the same pattern `ThirdPartySqlParser.cmake` uses
+for `hyrise/sql-parser`. Each wheel is a plain zip containing C++ headers,
+a compiled shared library, and a full CMake package config
+(`lib64/cmake/<name>/<name>-config.cmake`), with no Python runtime
+dependency (tagged `py3-none`). This has been verified end-to-end: a
+standalone smoke-test CMake project linking `cudf::cudf` successfully
+allocated and inspected a real GPU-resident `cudf::column`.
+
+Packages vendored this way: `rapids-logger`, `librmm-cu12`,
+`libkvikio-cu12`, `libcudf-cu12`, and `nvidia-libnvcomp-cu12` (the last
+supplies `libnvcomp.so.5`, an undeclared transitive dependency of
+`libcudf.so` not expressed in its own CMake config -- `nvidia-nvcomp-cu12`,
+the similarly-named package, is a trap: it only ships Python extension
+modules, not the plain `.so`). libcudf's own `cudf-config.cmake` requires
+CMake >= 3.30.4, newer than Ubuntu 24.04's apt package (3.28.3).
+
 ## Future architecture (interfaces only, not yet implemented)
 
 These are named as forward-declared types or documented models so later

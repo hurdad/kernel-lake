@@ -29,12 +29,18 @@ and covered by passing tests -- not merely designed or stubbed.
   `PhysicalPlan`)
 - `QueryEngine::explain_logical()` / `QueryEngine::explain()`, wired into
   `kernellake explain` and `kernellake inspect-parquet`
+- GPU dependency vendoring (`cmake/ThirdPartyRapids.cmake`): libcudf, RMM,
+  kvikio, nvcomp, and rapids-logger fetched from pinned PyPI wheels, no
+  conda, verified with a real GPU-resident `cudf::column` allocation
 
-## Blocked on GPU dependencies (libcudf + RMM)
+## GPU dependencies resolved; GPU operators not yet implemented
 
-Not yet started; needs a RAPIDS libcudf/RMM install (realistically via
-conda/mamba -- no solid apt packaging exists) plus the CUDA toolkit, which
-is already installed and verified working in this environment.
+The libcudf/RMM dependency question is solved: vendored via CMake
+`FetchContent` from pinned RAPIDS PyPI wheels (no conda), see
+[docs/architecture.md](docs/architecture.md#gpu-dependency-vendoring-no-conda)
+and `cmake/ThirdPartyRapids.cmake`. Verified end-to-end with a real
+GPU-resident `cudf::column` allocated and inspected on actual hardware via
+the `gpu-dev` CMake preset. What's still not started:
 
 - `ExecutionContext` and the `PhysicalOperator` streaming interface (both
   need `DeviceBatch`, wrapping `cudf::table`, to be a complete type)

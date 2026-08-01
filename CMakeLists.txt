@@ -52,8 +52,7 @@ endif()
 
 if(KERNELLAKE_WITH_CUDA)
   find_package(CUDAToolkit REQUIRED)
-  find_package(rmm CONFIG REQUIRED)
-  find_package(cudf CONFIG REQUIRED)
+  include(ThirdPartyRapids)
 endif()
 
 add_subdirectory(src)
