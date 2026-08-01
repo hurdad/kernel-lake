@@ -26,43 +26,48 @@ and covered by passing tests -- not merely designed or stubbed.
 - Real Parquet metadata inspection (schema, row groups, column statistics)
   and row-group/file pruning against actual min/max statistics
 - Physical plan nodes and the physical planner (`LogicalPlan` + pruning ->
-  `PhysicalPlan`)
-- `QueryEngine::explain_logical()` / `QueryEngine::explain()`, wired into
-  `kernellake explain` and `kernellake inspect-parquet`
+  `PhysicalPlan`), including remapping `ColumnExpression` indices above the
+  scan to the narrowed (projection-pushed-down) physical schema
 - GPU dependency vendoring (`cmake/ThirdPartyRapids.cmake`): libcudf, RMM,
   kvikio, nvcomp, and rapids-logger fetched from pinned PyPI wheels, no
-  conda, verified with a real GPU-resident `cudf::column` allocation
+  conda
+- `ExecutionContext`, `DeviceBatch`, the Arrow<->cudf C-Data-Interface
+  bridge, RAII CUDA device/stream wrappers, and RMM memory-pool/statistics/
+  limit configuration (`kernellake_memory`, `kernellake_execution`)
+- Every GPU operator the MVP query needs: `ParquetScanOperator`,
+  `FilterOperator`, `ProjectionOperator`, `ScalarAggregateOperator`
+  (cross-batch via `cudf::reduce`'s `init` param), `HashAggregateOperator`
+  (cross-batch via `cudf::groupby::streaming_groupby`, bounded by
+  `max_distinct_keys`), `LimitOperator`, `ArrowResultOperator` -- see
+  "GPU operators" in `docs/architecture.md` for the two correctness
+  bugs (STRING columns through `cudf::ast`, and scan column-index
+  remapping) this surfaced and fixed
+- `QueryEngine::execute()`, wired to the real operator pipeline for
+  `gpu-dev` builds (a CPU-only stub throws `ExecutionError` for `dev`
+  builds), and the `kernellake query` CLI command (`--sql`/`--file`,
+  `--format table|csv|jsonl|arrow`, `--output`, `--stats`) -- **the spec's
+  required initial deliverable now runs end-to-end and has been verified
+  on real GPU hardware**
+- `kernellake generate-data`: deterministic synthetic dataset generator
+  (`order_id`/`customer_id`/`region`/`amount`/`event_date`/`event_time`/
+  `category`/`discount`), configurable row/file/row-group count,
+  cardinality, null rate, skew, and seed; CPU-only, no CUDA dependency
+- DuckDB cross-validation tooling (`tools/validate_against_duckdb.py`):
+  runs the same SQL through `kernellake query --format arrow` and DuckDB
+  reading the same Parquet files, compares results. Verified passing for
+  filter/projection, scalar aggregates (SUM/COUNT/AVG/MIN/MAX), grouped
+  aggregates (including high-cardinality `GROUP BY`), and `COUNT` over a
+  nullable column
 
-## GPU dependencies resolved; GPU operators not yet implemented
+## Not yet started
 
-The libcudf/RMM dependency question is solved: vendored via CMake
-`FetchContent` from pinned RAPIDS PyPI wheels (no conda), see
-[docs/architecture.md](docs/architecture.md#gpu-dependency-vendoring-no-conda)
-and `cmake/ThirdPartyRapids.cmake`. Verified end-to-end with a real
-GPU-resident `cudf::column` allocated and inspected on actual hardware via
-the `gpu-dev` CMake preset. What's still not started:
-
-- `ExecutionContext` and the `PhysicalOperator` streaming interface (both
-  need `DeviceBatch`, wrapping `cudf::table`, to be a complete type)
-- RAII CUDA device/stream/event/NVTX wrappers, RMM memory-pool
-  configuration
-- GPU operators: `ParquetScanOperator`, `FilterOperator`,
-  `ProjectionOperator`, `ScalarAggregateOperator`, `HashAggregateOperator`,
-  partial-aggregate merging, `LimitOperator`, `ArrowResultOperator`
-- `QueryEngine::execute()` (currently throws `ExecutionError` explaining
-  why) and the `kernellake query` CLI command
-- Larger-than-GPU-memory batch iteration
-
-## Not yet started (not GPU-blocked)
-
-- `kernellake generate-data`: deterministic sample Parquet dataset generator
-- DuckDB-based correctness validation (needs DuckDB installed; currently
-  missing from this environment) and broader integration tests (multiple
-  files/row-groups, nulls, dictionary-encoded strings)
+- Broader integration-test coverage beyond `tools/validate_against_duckdb.py`
+  (dictionary-encoded strings, multiple files with mismatched row-group
+  layouts, larger-than-single-execution-batch datasets exercised under
+  test rather than only manually)
 - TPC-H tooling: `tools/generate_tpch.py`, `benchmarks/tpch/queries/*.sql`,
   `kernellake validate tpch`, `kernellake benchmark tpch` (Q6 first, then
-  Q1; the query-file management and generator scaffolding don't strictly
-  need GPU execution, but validation/benchmarking do)
+  Q1)
 - Docker images (`docker/Dockerfile.dev`, `docker/Dockerfile.runtime`)
 - GitHub Actions CI (CPU-safe checks split from CUDA compile checks and GPU
   runtime tests)

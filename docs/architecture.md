@@ -16,13 +16,14 @@ SQL text
   -> file discovery          (kernellake::ObjectStore, discover_parquet_files)
   -> Parquet metadata + pruning (kernellake::inspect_parquet_file, evaluate_pruning)
   -> physical plan           (kernellake::PhysicalPlanNode, build_physical_plan)
-  -> GPU execution           (kernellake::PhysicalOperator / DeviceBatch -- pending libcudf/RMM)
+  -> GPU execution           (kernellake::PhysicalOperator / DeviceBatch, kernellake_execution)
   -> Arrow result
 ```
 
-Every stage above physical planning is implemented and covered by unit
-tests (see `tests/unit/`). GPU execution is not: see "CPU/GPU build split"
-below.
+Every stage is implemented and covered by tests: parsing through physical
+planning by `tests/unit/`, GPU execution by `tests/gpu/` (see "CPU/GPU build
+split" below for why GPU execution lives in a separate test binary and
+CMake preset rather than `tests/unit/`).
 
 ## Module layout
 
@@ -36,6 +37,9 @@ below.
 | `optimizer` | Rule-based logical plan rewriting |
 | `storage` | `ObjectStore`/`LocalObjectStore`, file discovery |
 | `io` | Parquet metadata inspection, row-group pruning, the physical planner (ties `planner` + `storage` + `io` together) |
+| `memory` | RAII CUDA device/stream wrappers, RMM memory-pool/statistics/limit configuration (`gpu-dev` preset only) |
+| `execution` | `PhysicalOperator`/`DeviceBatch`/`ExecutionContext`, the Arrow<->cudf bridge, the AST expression compiler, and every concrete GPU operator (`gpu-dev` preset only) |
+| `generator` | `kernellake generate-data`'s deterministic synthetic dataset generator (CPU-only, no CUDA dependency) |
 | `api` | `QueryEngine`, the top-level entry point |
 | `cli` | The `kernellake` executable and its subcommands |
 
@@ -139,14 +143,65 @@ node, since no physical sort operator exists yet.
 `KERNELLAKE_WITH_CUDA` (off by default) gates everything that needs CUDA,
 libcudf, and RMM: `DeviceBatch` (the GPU-resident batch wrapping
 `cudf::table`), `ExecutionContext`, the `PhysicalOperator` streaming
-interface, and the GPU filter/projection/aggregation operator
-implementations. `QueryEngine::execute()` and the `kernellake query` CLI
-command throw a clear `ExecutionError` until that layer exists --
-KernelLake never substitutes a CPU implementation for GPU execution without
-saying so explicitly.
+interface, and the concrete GPU operators (`kernellake_execution`,
+`kernellake_memory`; see `tests/gpu/`). `QueryEngine::execute()` is built
+from one of two mutually exclusive translation units selected by a CMake
+generator expression on `KERNELLAKE_WITH_CUDA`
+(`src/api/query_engine_execute_gpu.cpp` vs. `_stub.cpp`): the GPU build runs
+the real operator pipeline (`kernellake/execution/operator_builder.hpp`
+turns a `PhysicalPlanPtr` into a `PhysicalOperator` tree, pulled to
+exhaustion inside `RmmEnvironment::track_query()` for per-query memory
+accounting, with each resulting `DeviceBatch` converted to an Arrow
+`RecordBatch` via `kernellake/execution/arrow_bridge.hpp`); the CPU-only
+`dev` preset's stub throws a clear `ExecutionError` instead -- KernelLake
+never substitutes a CPU implementation for GPU execution without saying so
+explicitly. The `kernellake query` CLI command (`src/cli/query_command.cpp`)
+is unconditionally built and calls `QueryEngine::execute()`, so its
+behavior likewise depends on which preset built it.
 
 Everything else in this document (parsing through physical planning and
-pruning) is CPU-only and builds/tests with the `dev` CMake preset.
+pruning), plus `kernellake generate-data`, is CPU-only and builds/tests
+with the `dev` CMake preset alone.
+
+### GPU operators
+
+| Operator | Notes |
+| --- | --- |
+| `ParquetScanOperator` | `cudf::io::chunked_parquet_reader`, bounded by `pass_read_limit_bytes` (not row count) |
+| `FilterOperator` | `cudf::compute_column` + `cudf::apply_boolean_mask` over a compiled AST predicate |
+| `ProjectionOperator` | Compiled AST per computed item; a bare column reference is copied directly instead (see below) |
+| `ScalarAggregateOperator` | No `GROUP BY`: `cudf::reduce` with its `init` parameter folds each batch into a running scalar (SUM/MIN/MAX/AVG numerator); COUNT/AVG's denominator is a host-side counter. Empty input produces NULL, not zero, except `COUNT(*)`/`COUNT(x)` which produce 0. |
+| `HashAggregateOperator` | `GROUP BY`: `cudf::groupby::streaming_groupby` accumulates partial groups across batches within `max_distinct_keys` (default 10M), `finalize()`d on last `next()` |
+| `LimitOperator` | `cudf::slice` + the `cudf::table` copy constructor to truncate the final batch |
+| `ArrowResultOperator` | Trivial passthrough; the actual `DeviceBatch` -> `arrow::RecordBatch` conversion happens in `QueryEngine::execute()` via `to_arrow_record_batch()`, since `PhysicalOperator::next()` must return a `DeviceBatch` |
+
+Two correctness details worth knowing if you touch these operators:
+
+- **Plain column references never go through `cudf::ast::compute_column`.**
+  cudf's AST evaluator can only materialize fixed-width output columns, so
+  routing a bare STRING column reference through it (e.g. `GROUP BY region`,
+  or `SELECT region`) aborts with "Invalid, non-fixed-width type" even
+  though no computation was requested. `ProjectionOperator`,
+  `HashAggregateOperator` (group-by keys and `COUNT(*)`'s materialized
+  argument), and `ScalarAggregateOperator` (aggregate arguments) all detect
+  a plain `ColumnExpression` and copy that column directly instead.
+- **The physical planner remaps `ColumnExpression` indices above the scan.**
+  The binder resolves every column reference against the query's one full
+  (unpruned) schema; `build_physical_plan()`'s `convert_scan()` then
+  narrows the *physical* scan to only the columns actually referenced,
+  which shifts column positions whenever a non-trailing column is dropped.
+  `physical_planner.cpp`'s `remap_columns()`/`remap_named()` rewrite every
+  filter predicate, projection item, and aggregate/group-by expression
+  above the scan to the narrowed schema's actual layout -- without this, a
+  query like `SELECT SUM(amount) ...` (where an earlier column got pruned
+  away) would index past the end of the batch the scan operator actually
+  produces.
+- `cudf::groupby`'s COUNT aggregations always produce `INT32` regardless of
+  requested type, but KernelLake's binder declares `COUNT`/`COUNT(*)` as
+  `INT64`; `HashAggregateOperator` casts those result columns after
+  `finalize()` so the output `DeviceBatch`'s actual column types match its
+  declared schema. `ScalarAggregateOperator` doesn't need this -- `cudf::reduce`
+  honors the requested output type for `COUNT`.
 
 ### GPU dependency vendoring (no conda)
 

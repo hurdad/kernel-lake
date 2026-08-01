@@ -10,39 +10,75 @@ execution. KernelLake is a compute and query layer, not a storage database.
 
 ## Status
 
-KernelLake is an early work in progress. The full SQL-to-physical-plan
-compiler is built and tested; **GPU execution is not implemented yet** (see
-[docs/roadmap.md](docs/roadmap.md) for exactly what's done vs. blocked, and
-why). Concretely, this is real, reproducible output against a small local
-Parquet file (10 rows, 2 row groups, columns `id`/`amount`/`region`):
+KernelLake is an early work in progress, but the spec's required initial
+deliverable -- generating sample data and running the MVP query
+end-to-end through real GPU execution -- works today and has been verified
+on real GPU hardware. See [docs/roadmap.md](docs/roadmap.md) for exactly
+what's done vs. not started, and why.
+
+Concretely, this is real, reproducible output:
 
 ```
-$ kernellake explain --sql "SELECT region, SUM(amount) AS total_amount \
-    FROM read_parquet('/tmp/demo.parquet') WHERE region = 'west' GROUP BY region"
+$ kernellake generate-data --output /tmp/kernellake-demo --rows 1000 --files 2 \
+    --row-group-rows 200 --seed 42
+wrote 1000 rows across 2 file(s) to /tmp/kernellake-demo
+
+$ kernellake query --sql "SELECT region, SUM(amount) AS total \
+    FROM read_parquet('/tmp/kernellake-demo/*.parquet') \
+    WHERE event_date >= DATE '2026-01-01' GROUP BY region" --stats
+
+query stats:
+  rows_returned: 10
+  files_considered: 2
+  files_scanned: 2
+  row_groups_considered: 6
+  row_groups_scanned: 6
+  peak_gpu_memory_bytes: 240073275
+  elapsed_wall_seconds: 0.464069
+region    total
+--------  ------------------
+region-8  19889.78518393226
+region-6  19411.167328676154
+...                            # (10 region rows total; truncated here)
+```
+
+That ran the full pipeline against real GPU hardware: SQL parsing,
+binding/type-checking, the rule-based optimizer, file discovery, Parquet
+metadata inspection and row-group pruning, GPU filtering, GPU grouped
+aggregation (`cudf::groupby::streaming_groupby`), and Arrow result
+conversion. `peak_gpu_memory_bytes` and `elapsed_wall_seconds` are measured,
+not estimated -- KernelLake never fabricates a metric it can't measure (see
+`QueryResult` in `include/kernellake/api/query_engine.hpp` for which fields
+still report as unmeasured `std::nullopt`, and why).
+
+Pruning is real too -- read each file's min/max statistics and skip a file
+or row group only when a predicate is *proven* impossible to satisfy
+(against the same generated dataset as above; `order_id` is assigned
+sequentially, so it clusters cleanly by file and row group):
+
+```
+$ kernellake explain --sql "SELECT order_id FROM read_parquet('/tmp/kernellake-demo/*.parquet') \
+    WHERE order_id < 50"
 
 ArrowResult
-    └── HashAggregate
-        group_by: [region]
-        aggregates: [SUM(amount) AS total_amount]
+    └── Projection
+        items: [order_id AS order_id]
         └── Filter
-            predicate: (region = 'west')
+            predicate: (order_id < 50)
             └── ParquetScan
-                files: 1/1
-                row_groups: 1/2
-                columns: [amount, region]
+                files: 1/2
+                row_groups: 1/3
+                columns: [order_id]
 ```
 
-`row_groups: 1/2` is a real pruning decision: KernelLake read the file's
-min/max statistics and proved the other row group couldn't contain any
-`region = 'west'` rows, so it won't be scanned. `columns: [amount, region]`
-is real projection pushdown too -- `id` was never referenced by this query,
-so it's excluded. That plan reflects real SQL parsing, real
-binding/type-checking, a real rule-based optimizer, real file discovery,
-and real Parquet metadata inspection, all against an actual file on disk.
-`kernellake query` (which would actually execute this plan on a GPU) isn't
-implemented yet -- it needs libcudf/RMM, which aren't part of this build.
-See [docs/architecture.md](docs/architecture.md) for the full pipeline and
-the CPU/GPU build split.
+`files: 1/2` and `row_groups: 1/3` mean KernelLake proved the second file
+and two of the first file's three row groups couldn't contain any
+`order_id < 50` rows, and skipped reading them entirely.
+
+See [docs/architecture.md](docs/architecture.md) for the full pipeline, the
+GPU operator set, and the CPU/GPU build split (`kernellake query` throws a
+clear `ExecutionError` when built without CUDA -- it never silently falls
+back to a CPU implementation).
 
 ## Requirements
 
@@ -65,45 +101,87 @@ sudo apt-get install -y libarrow-dev libparquet-dev libarrow-dataset-dev
 ```
 
 GPU execution additionally needs the CUDA Toolkit (12+) and RAPIDS
-libcudf/RMM, neither of which is required to build or test anything in this
-repository today -- see [docs/roadmap.md](docs/roadmap.md) for the current
-GPU-dependency status.
+libcudf/RMM. Only the CUDA Toolkit needs manual installation -- libcudf/RMM
+are vendored automatically via CMake `FetchContent` from pinned RAPIDS PyPI
+wheels the first time you configure the `gpu-dev` preset (no conda/mamba;
+see "GPU dependency vendoring" in [docs/architecture.md](docs/architecture.md)).
+CMake >= 3.30.4 is required for that preset specifically (newer than Ubuntu
+24.04's apt package).
 
 ## Build and test
 
 ```bash
+# CPU-only: SQL parsing through physical planning, pruning, generate-data
 cmake --preset dev
 cmake --build --preset dev
 ctest --preset dev
-```
 
-This builds the CPU-only `dev` preset (SQL parsing through physical
-planning and pruning; no CUDA). All unit tests should pass without a GPU.
+# GPU-enabled: adds real query execution (needs CUDA Toolkit 12+, an
+# NVIDIA GPU, and CMake >= 3.30.4 -- see Requirements above)
+cmake --preset gpu-dev
+cmake --build --preset gpu-dev
+ctest --preset gpu-dev
+```
 
 ## Usage
 
 ```bash
+# Generate a deterministic synthetic dataset (works with either preset)
+./build/dev/src/cli/kernellake generate-data --output /tmp/kernellake-sales \
+  --rows 10000000 --files 16 --row-group-rows 250000 --seed 42
+
 # Inspect a Parquet file's schema, row groups, and column statistics
 ./build/dev/src/cli/kernellake inspect-parquet --path /data/sales.parquet
 ./build/dev/src/cli/kernellake inspect-parquet --path /data/sales.parquet --format json
 
-# See the plan KernelLake would run for a query (no execution yet)
+# See the plan KernelLake would run for a query
 ./build/dev/src/cli/kernellake explain \
   --sql "SELECT region, SUM(amount) FROM read_parquet('/data/sales/*.parquet') GROUP BY region"
 ./build/dev/src/cli/kernellake explain --logical --sql "..."   # pre-physical-planning view
 ./build/dev/src/cli/kernellake explain --format json --sql "..."
+
+# Run a query for real (requires a gpu-dev build; the dev build's binary
+# throws a clear ExecutionError explaining why instead)
+./build/gpu-dev/src/cli/kernellake query \
+  --sql "SELECT region, SUM(amount) FROM read_parquet('/tmp/kernellake-sales/*.parquet') \
+         WHERE event_date >= DATE '2026-01-01' GROUP BY region"
+./build/gpu-dev/src/cli/kernellake query --file query.sql --format csv --output result.csv
+./build/gpu-dev/src/cli/kernellake query --sql "..." --format jsonl
+./build/gpu-dev/src/cli/kernellake query --sql "..." --format arrow --output result.arrow
+./build/gpu-dev/src/cli/kernellake query --sql "..." --stats   # prints measured metrics to stderr
 ```
 
 Supported SQL grammar, the `read_parquet(...)` syntax, and everything
 that's intentionally not yet supported are documented in
 [docs/architecture.md](docs/architecture.md).
 
+## Correctness validation against DuckDB
+
+`tools/validate_against_duckdb.py` runs a set of representative queries
+through both `kernellake query --format arrow` and DuckDB reading the same
+Parquet files, then compares the results (row order and floating-point
+precision-insensitive). It requires a `gpu-dev` build plus the `duckdb` and
+`pyarrow` Python packages:
+
+```bash
+pip install --user duckdb pyarrow   # or a virtualenv, if your system Python is externally managed
+python3 tools/validate_against_duckdb.py \
+  --kernellake build/gpu-dev/src/cli/kernellake --data '/tmp/kernellake-sales/*.parquet'
+```
+
+This has been run against a 500,000-row / 4-file generated dataset,
+covering filtered projection, scalar aggregates (SUM/COUNT/AVG/MIN/MAX),
+grouped aggregates (including a ~40,000-group `GROUP BY customer_id`), and
+`COUNT` over a nullable column -- all matched DuckDB exactly.
+
 ## Project layout
 
 ```
 include/kernellake/<module>/   public headers, one directory per module
 src/<module>/                  implementation, mirrors include/
-tests/unit/                    GoogleTest unit tests
+tests/unit/                    GoogleTest unit tests (CPU-only, both presets)
+tests/gpu/                     GoogleTest GPU tests (gpu-dev preset only)
+tools/                         Python tooling (DuckDB cross-validation, TPC-H generation)
 docs/                          architecture.md, roadmap.md
 config/kernellake.yaml         default engine configuration
 ```
