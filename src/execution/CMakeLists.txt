@@ -7,6 +7,7 @@ add_library(kernellake_execution STATIC
   expression_compiler.cpp
   filter_operator.cpp
   projection_operator.cpp
+  scalar_aggregate_operator.cpp
 )
 
 target_include_directories(kernellake_execution PUBLIC
