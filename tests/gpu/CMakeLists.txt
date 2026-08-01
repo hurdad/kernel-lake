@@ -12,6 +12,7 @@ add_executable(kernellake_gpu_tests
   filter_projection_operator_test.cpp
   scalar_aggregate_operator_test.cpp
   hash_aggregate_operator_test.cpp
+  parquet_scan_operator_test.cpp
 )
 
 target_link_libraries(kernellake_gpu_tests PRIVATE
@@ -19,6 +20,7 @@ target_link_libraries(kernellake_gpu_tests PRIVATE
   kernellake_types
   kernellake_memory
   kernellake_execution
+  Parquet::parquet_static
   GTest::gtest
   GTest::gtest_main
 )

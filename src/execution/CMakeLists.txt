@@ -9,6 +9,8 @@ add_library(kernellake_execution STATIC
   projection_operator.cpp
   scalar_aggregate_operator.cpp
   hash_aggregate_operator.cpp
+  arrow_result_operator.cpp
+  parquet_scan_operator.cpp
 )
 
 target_include_directories(kernellake_execution PUBLIC
