@@ -88,6 +88,15 @@ HashAggregateOperator::CompiledExpr HashAggregateOperator::compile_expr(const Ex
     compiled.case_expr = std::move(compiled_case);
     return compiled;
   }
+  if (const auto* cast_expr = dynamic_cast<const CastExpression*>(&expr);
+      cast_expr != nullptr && cast_expr->result_type().id == TypeId::Decimal) {
+    auto decimal_cast = std::make_shared<CompiledDecimalCast>();
+    decimal_cast->operand = compile_expr(*cast_expr->operand());
+    decimal_cast->target_type = cast_expr->result_type();
+    CompiledExpr compiled;
+    compiled.decimal_cast = std::move(decimal_cast);
+    return compiled;
+  }
   CompiledExpr compiled;
   compiled.expr = &compiler_.compile(expr);
   return compiled;
@@ -97,6 +106,11 @@ std::unique_ptr<cudf::column> HashAggregateOperator::materialize(const CompiledE
                                                                  const DeviceBatch& batch,
                                                                  ExecutionContext& context) {
   if (compiled.case_expr != nullptr) return materialize_case(*compiled.case_expr, batch, context);
+  if (compiled.decimal_cast != nullptr) {
+    const std::unique_ptr<cudf::column> operand = materialize(compiled.decimal_cast->operand, batch, context);
+    return cudf::cast(operand->view(), to_cudf_type(compiled.decimal_cast->target_type), context.stream,
+                      context.memory_resource);
+  }
   if (compiled.source_column_index.has_value()) {
     return std::make_unique<cudf::column>(batch.view().column(*compiled.source_column_index), context.stream,
                                           context.memory_resource);

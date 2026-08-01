@@ -87,6 +87,24 @@ and covered by passing tests -- not merely designed or stubbed.
   together, confirmed present before this session's changes (bisected to
   the last commit), and fixed with a `cudaDeviceSynchronize()` in
   `RmmEnvironment::~RmmEnvironment()` before releasing pool memory.
+- `DECIMAL(p, s)` type support in GPU execution: columns, literals,
+  comparisons, arithmetic, `SUM`/`MIN`/`MAX`, and explicit
+  `CAST(... AS DECIMAL(p, s))` -- see "DECIMAL support" in
+  `docs/ARCHITECTURE.md` for the full scope (implicit promotion only
+  coerces literals, not columns; `AVG` over DECIMAL is not supported; CAST
+  *to* DECIMAL is scoped like `CASE`, materialized outside `cudf::ast`
+  since it has no `CAST_TO_DECIMAL*` operator). Verified against a real
+  DECIMAL128 Parquet column (`tests/gpu/decimal_test.cpp`) and cross-checked
+  against DuckDB. Surfaced and fixed two real bugs found via that testing:
+  (1) `combine_binary`'s comparison path in binder.cpp treated any two
+  DECIMALs as directly comparable by checking only `TypeId` equality, not
+  precision/scale, letting two different DECIMAL types silently skip the
+  mismatch check entirely (the identical bug, already present, was also
+  just fixed in `BETWEEN`'s bound-unification); (2) none of this was
+  DECIMAL-specific, but debugging it surfaced that `ORDER BY <alias>` for a
+  computed expression only resolves after `GROUP BY`, not on a plain query
+  -- already true and documented before this work, not a new limitation,
+  but not obvious until a DECIMAL `CAST` test tripped over it.
 - `QueryEngine::execute()`, wired to the real operator pipeline for
   `gpu-dev` builds (a CPU-only stub throws `ExecutionError` for `dev`
   builds), and the `kernellake query` CLI command (`--sql`/`--file`,

@@ -84,10 +84,13 @@ SELECT <items> FROM read_parquet('path' [, 'path2', ...])
 - `CASE WHEN ... THEN ... [WHEN ...] [ELSE ...] END`, both simple
   (`CASE x WHEN ...`) and searched forms (scoped to the `SELECT` list and
   `GROUP BY` keys -- not `WHERE` or aggregate arguments)
-- `CAST(expr AS type)` (`INT`/`BIGINT`/`DOUBLE`/`VARCHAR(n)`; see
-  "LIKE/IN/CASE/CAST implementation notes" below for the truncate-vs-round
-  caveat on numeric-to-integer casts)
-- Aggregates: `SUM`, `COUNT`, `COUNT(*)`, `MIN`, `MAX`, `AVG`
+- `CAST(expr AS type)` (`INT`/`BIGINT`/`DOUBLE`/`VARCHAR(n)`/`DECIMAL(p, s)`;
+  see "LIKE/IN/CASE/CAST implementation notes" below for the
+  truncate-vs-round caveat on numeric-to-integer casts, and "DECIMAL
+  support" below for `DECIMAL`'s own scope)
+- `DECIMAL(p, s)` columns and literals -- see "DECIMAL support" below
+- Aggregates: `SUM`, `COUNT`, `COUNT(*)`, `MIN`, `MAX`, `AVG` (`AVG` does
+  not support a `DECIMAL` argument; see "DECIMAL support")
 
 Not yet supported (fails clearly rather than being silently reinterpreted):
 `DISTINCT`, `HAVING`, set operations (`UNION`/etc.), `WITH`/CTEs, joins,
@@ -293,6 +296,66 @@ Two correctness details worth knowing if you touch these operators:
   OR (x = c)` (`NOT IN` into the equivalent `AND` chain of `<>`), so it
   needs no new GPU-execution-layer support at all -- it reuses the existing
   `OR`/comparison AST compilation path.
+
+### DECIMAL support
+
+- **cudf's `fixed_point` (DECIMAL32/64/128) types work natively through
+  `cudf::ast`**, including comparisons, arithmetic (`ADD`/`SUB`/`MUL`/`DIV`),
+  and casting *from* DECIMAL to `INT64`/`UINT64`/`FLOAT64` -- verified
+  empirically before committing to this design, since it wasn't obvious
+  going in. The one real gap is casting *to* DECIMAL: `cudf::ast::ast_operator`
+  has no `CAST_TO_DECIMAL*` (only `CAST_TO_INT64`/`UINT64`/`FLOAT64`), so
+  `CAST(expr AS DECIMAL(p, s))` is scoped to the `SELECT` list / `GROUP BY`
+  key position (same scope as `CASE`) and materialized directly via
+  `cudf::cast()`, bypassing `cudf::ast` entirely -- see
+  `ProjectionOperator`/`HashAggregateOperator`'s `decimal_cast` fast path.
+- **Width selection**: `precision <= 9` -> DECIMAL32, `<= 18` -> DECIMAL64,
+  `<= 38` -> DECIMAL128 (the same tiers Spark/Postgres-family engines use).
+  `CAST(... AS DECIMAL)` with no explicit `(p, s)` is rejected (hsql parses
+  it as `precision=scale=0`) -- matching how `CAST(... AS VARCHAR)` requires
+  an explicit length elsewhere in this grammar.
+- **Scale sign convention**: cudf's fixed_point scale is the exponent
+  applied to the stored raw integer (`value = raw * 10^scale`), the
+  *negative* of the "digits after the decimal point" convention
+  `DataType::scale`/Arrow/Parquet use. `to_cudf_type()` negates it; get this
+  backwards and comparisons silently evaluate against the wrong magnitude
+  rather than failing loudly, so it's covered by a real Parquet-file
+  round-trip test (`tests/gpu/decimal_test.cpp`), not just a unit test.
+- **Implicit promotion coerces a numeric literal to a DECIMAL column's exact
+  type; it does not widen or auto-cast a column or computed expression.**
+  `WHERE price > 19.99` retypes the literal `19.99` in place (a compile-time
+  constant can be exactly retargeted with no precision loss); `WHERE price >
+  some_int_column` is rejected at bind time (`cast_if_needed` in
+  binder.cpp), since that would need a genuine runtime CAST to DECIMAL and
+  cudf::ast has none. Two DECIMALs with different precision/scale are
+  likewise rejected rather than auto-widened -- both are real, honest scope
+  limits, not oversights; wrap the non-literal side in an explicit
+  `CAST(... AS DECIMAL(p, s))` instead.
+- **`SUM`/`MIN`/`MAX` over DECIMAL keep the argument's own precision/scale
+  unchanged** (like `MIN`/`MAX` over any type) rather than widening the
+  declared result type -- cudf's own `SUM` aggregation evaluates DECIMAL
+  columns natively and preserves scale. This is a deliberate, documented
+  difference from DuckDB, which widens `SUM(DECIMAL(p, s))`'s result to
+  `DECIMAL(38, s)` to rule out overflow across many rows; KernelLake does
+  not, so summing enough full-precision (`p` already near 38) DECIMAL
+  values could in principle overflow where DuckDB wouldn't. Not a concern
+  at realistic precisions, but worth knowing.
+- **`AVG` over DECIMAL is not supported** (rejected at bind time) --
+  `CAST` the argument to `DOUBLE` first.
+- A DECIMAL literal's value only ever has `double` precision to begin with
+  (hsql parses `19.99` into a C++ `double`; see `LiteralStorage`), so it
+  cannot represent more significant digits than a `double` can -- the same
+  class of documented precision caveat as the CAST-truncates-vs-DuckDB-
+  rounds difference above, not a bug.
+- **Arrow interop**: this Arrow version (25.x) has distinct
+  `Decimal32Type`/`Decimal64Type`/`Decimal128Type`/`Decimal256Type` (not
+  just `Decimal128Type`), and `cudf::to_arrow_host`/`to_arrow_schema` map a
+  cudf DECIMAL32/64/128 column to the matching Arrow width rather than
+  always widening to Decimal128 -- a result column's actual Arrow type
+  depends on its precision. Code reading a KernelLake DECIMAL result via
+  Arrow should use `arrow::Array::GetScalar(...)->ToString()` (as
+  `result_formatter.cpp` already does) rather than assuming a specific
+  `arrow::Decimal128Array`/etc. subtype.
 
 ### GPU dependency vendoring (no conda)
 

@@ -5,6 +5,7 @@
 #include <cudf/copying.hpp>
 #include <cudf/scalar/scalar_factories.hpp>
 #include <cudf/transform.hpp>
+#include <cudf/unary.hpp>
 
 #include "kernellake/execution/cudf_adapter.hpp"
 #include "kernellake/expression/expression.hpp"
@@ -31,12 +32,21 @@ ProjectionOperator::ProjectionOperator(OperatorId id, std::unique_ptr<PhysicalOp
 
 ProjectionOperator::CompiledValue ProjectionOperator::compile_value(const Expression& expr) {
   if (const auto* column_ref = dynamic_cast<const ColumnExpression*>(&expr)) {
-    return CompiledValue{static_cast<cudf::size_type>(column_ref->column_index()), nullptr, nullptr};
+    return CompiledValue{static_cast<cudf::size_type>(column_ref->column_index()), nullptr, nullptr, nullptr};
   }
   if (const auto* literal = dynamic_cast<const LiteralExpression*>(&expr)) {
-    return CompiledValue{std::nullopt, literal_to_scalar(*literal), nullptr};
+    return CompiledValue{std::nullopt, literal_to_scalar(*literal), nullptr, nullptr};
   }
-  return CompiledValue{std::nullopt, nullptr, &compiler_.compile(expr)};
+  if (const auto* cast_expr = dynamic_cast<const CastExpression*>(&expr);
+      cast_expr != nullptr && cast_expr->result_type().id == TypeId::Decimal) {
+    auto decimal_cast = std::make_shared<CompiledDecimalCast>();
+    decimal_cast->operand = compile_value(*cast_expr->operand());
+    decimal_cast->target_type = cast_expr->result_type();
+    CompiledValue value;
+    value.decimal_cast = std::move(decimal_cast);
+    return value;
+  }
+  return CompiledValue{std::nullopt, nullptr, &compiler_.compile(expr), nullptr};
 }
 
 ProjectionOperator::CompiledItem ProjectionOperator::compile_item(const Expression& expr) {
@@ -65,6 +75,12 @@ void ProjectionOperator::open(ExecutionContext& context) {
 std::unique_ptr<cudf::column> ProjectionOperator::materialize_value(const CompiledValue& value,
                                                                     const cudf::table_view& batch,
                                                                     ExecutionContext& context) {
+  if (value.decimal_cast != nullptr) {
+    const std::unique_ptr<cudf::column> operand =
+        materialize_value(value.decimal_cast->operand, batch, context);
+    return cudf::cast(operand->view(), to_cudf_type(value.decimal_cast->target_type), context.stream,
+                      context.memory_resource);
+  }
   if (value.source_column_index.has_value()) {
     return std::make_unique<cudf::column>(batch.column(*value.source_column_index), context.stream,
                                           context.memory_resource);

@@ -44,9 +44,13 @@ class ProjectionOperator final : public PhysicalOperator {
   [[nodiscard]] OperatorId id() const noexcept override { return id_; }
 
  private:
-  // A plain column index to copy, a plain literal to broadcast, or a
-  // compiled AST expression to evaluate -- used both for ordinary
-  // projection items and for a CASE branch's own condition/result.
+  struct CompiledDecimalCast;  // defined below; forward-declared so CompiledValue can hold a shared_ptr to
+                               // it.
+
+  // A plain column index to copy, a plain literal to broadcast, a CAST to
+  // DECIMAL to materialize directly, or a compiled AST expression to
+  // evaluate -- used both for ordinary projection items and for a CASE
+  // branch's own condition/result.
   //
   // The literal case matters beyond CASE branches: cudf::ast can only
   // produce a fixed-width *output* column, so even `SELECT 'foo' FROM ...`
@@ -55,10 +59,25 @@ class ProjectionOperator final : public PhysicalOperator {
   // compute_column -- a string literal is only valid as an *intermediate*
   // AST node (e.g. one side of `region = 'A'`), never as the compiled
   // tree's root when its result type isn't fixed-width.
+  //
+  // `decimal_cast` handles `CAST(... AS DECIMAL(p,s))`: cudf::ast has no
+  // CAST_TO_DECIMAL* operator at all (only CAST_TO_INT64/UINT64/FLOAT64),
+  // so a CAST whose *target* is DECIMAL can't go through compute_column --
+  // it's materialized directly via cudf::cast() instead, exactly like the
+  // literal fast path above bypasses compute_column's fixed-width-output
+  // restriction. Casting *from* DECIMAL still works through the ordinary
+  // AST path (`expr`) since cudf::ast's existing CAST_TO_* operators accept
+  // a DECIMAL operand natively. See docs/ARCHITECTURE.md.
   struct CompiledValue {
     std::optional<cudf::size_type> source_column_index;
     std::shared_ptr<cudf::scalar> literal_scalar;
     const cudf::ast::expression* expr = nullptr;
+    std::shared_ptr<CompiledDecimalCast> decimal_cast;
+  };
+
+  struct CompiledDecimalCast {
+    CompiledValue operand;
+    DataType target_type;
   };
 
   struct CompiledCaseBranch {

@@ -40,7 +40,8 @@ class HashAggregateOperator final : public PhysicalOperator {
   [[nodiscard]] OperatorId id() const noexcept override { return id_; }
 
  private:
-  struct CompiledCase;  // defined below; forward-declared so CompiledExpr can hold a shared_ptr to it.
+  struct CompiledCase;         // defined below; forward-declared so CompiledExpr can hold a shared_ptr to it.
+  struct CompiledDecimalCast;  // ditto.
 
   // A plain column reference (e.g. `GROUP BY region`) is copied directly
   // rather than routed through cudf::ast::compute_column: cudf's AST
@@ -54,11 +55,18 @@ class HashAggregateOperator final : public PhysicalOperator {
   // its own to write directly in GROUP BY. `case_expr` is a shared_ptr, not
   // unique_ptr, so CompiledExpr stays copyable -- CountStar's argument
   // below is a copy of compiled_group_by_.front().
+  //
+  // `decimal_cast` is the same idea for `GROUP BY <alias>` resolving to a
+  // `CAST(... AS DECIMAL(p,s))` in the SELECT list: cudf::ast has no
+  // CAST_TO_DECIMAL* operator, so it's materialized directly via
+  // cudf::cast() instead of through `expr`. See ProjectionOperator's
+  // identical fast path and docs/ARCHITECTURE.md.
   struct CompiledExpr {
     std::optional<cudf::size_type> source_column_index;
     std::shared_ptr<cudf::scalar> literal_scalar;  // plain literal (see cudf_adapter.hpp's literal_to_scalar)
     const cudf::ast::expression* expr = nullptr;
     std::shared_ptr<CompiledCase> case_expr;
+    std::shared_ptr<CompiledDecimalCast> decimal_cast;
   };
 
   struct CompiledCaseBranch {
@@ -70,6 +78,11 @@ class HashAggregateOperator final : public PhysicalOperator {
     std::vector<CompiledCaseBranch> branches;
     std::optional<CompiledExpr> else_value;  // nullopt: NULL when no branch matches
     DataType result_type{TypeId::Boolean};
+  };
+
+  struct CompiledDecimalCast {
+    CompiledExpr operand;
+    DataType target_type;
   };
 
   [[nodiscard]] CompiledExpr compile_expr(const Expression& expr);

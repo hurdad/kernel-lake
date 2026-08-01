@@ -22,8 +22,13 @@ namespace kernellake {
 // ScalarAggregateOperator/HashAggregateOperator via cudf::reduce/
 // cudf::groupby, not as a row-wise AST expression. CastExpression is
 // supported only for the three widening targets cudf::ast itself supports
-// (to INT64/UINT64/FLOAT64); anything else throws ExecutionError naming the
-// unsupported target rather than silently miscompiling.
+// (to INT64/UINT64/FLOAT64) plus casting *from* DECIMAL to any of those
+// (cudf::ast's CAST_TO_* operators accept a DECIMAL operand natively);
+// casting *to* DECIMAL has no cudf::ast operator at all and must be
+// materialized outside the AST tree (see ProjectionOperator/
+// HashAggregateOperator's decimal-cast fast path) -- anything else throws
+// ExecutionError naming the unsupported target rather than silently
+// miscompiling.
 class ExpressionCompiler {
  public:
   [[nodiscard]] const cudf::ast::expression& compile(const Expression& expr);

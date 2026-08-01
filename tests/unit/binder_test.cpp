@@ -15,6 +15,14 @@ Schema sales_schema() {
   });
 }
 
+Schema priced_sales_schema() {
+  return Schema({
+      Field{"region", string_type(false)},
+      Field{"amount", float64_type(false)},
+      Field{"price", decimal_type(10, 2, false)},
+  });
+}
+
 Schema lineitem_schema() {
   return Schema({
       Field{"l_extendedprice", float64_type(false)},
@@ -234,6 +242,77 @@ TEST(Binder, GroupByResolvesSelectListAliasForComputedExpressions) {
   const auto unknown_alias_stmt = sql::parse_sql(
       "SELECT region, COUNT(*) AS n FROM read_parquet('/x.parquet') GROUP BY nonexistent_alias");
   EXPECT_THROW(bind_query(unknown_alias_stmt, sales_schema()), BindingError);
+}
+
+TEST(Binder, CastToDecimalRequiresExplicitPrecisionAndScale) {
+  const auto ok_stmt =
+      sql::parse_sql("SELECT CAST(amount AS DECIMAL(10, 2)) AS x FROM read_parquet('/x.parquet')");
+  const BoundQuery bound = bind_query(ok_stmt, sales_schema());
+  const auto* cast = dynamic_cast<const CastExpression*>(bound.select_list[0].expr.get());
+  ASSERT_NE(cast, nullptr);
+  EXPECT_EQ(cast->result_type().id, TypeId::Decimal);
+  EXPECT_EQ(cast->result_type().precision, 10);
+  EXPECT_EQ(cast->result_type().scale, 2);
+
+  // Precision > 38 (cudf's fixed_point ceiling) is rejected.
+  const auto too_wide_stmt =
+      sql::parse_sql("SELECT CAST(amount AS DECIMAL(39, 2)) AS x FROM read_parquet('/x.parquet')");
+  EXPECT_THROW(bind_query(too_wide_stmt, sales_schema()), BindingError);
+
+  // Scale > precision is nonsensical (more digits after the point than
+  // total digits) and rejected.
+  const auto bad_scale_stmt =
+      sql::parse_sql("SELECT CAST(amount AS DECIMAL(5, 10)) AS x FROM read_parquet('/x.parquet')");
+  EXPECT_THROW(bind_query(bad_scale_stmt, sales_schema()), BindingError);
+}
+
+TEST(Binder, DecimalColumnComparedAgainstLiteralCoercesTheLiteral) {
+  // `price` is DECIMAL(10,2); the literal 19.99 (parsed as a FLOAT64
+  // literal by hsql) must be retyped to match rather than rejected -- see
+  // cast_if_needed in binder.cpp.
+  const auto stmt = sql::parse_sql("SELECT price FROM read_parquet('/x.parquet') WHERE price > 19.99");
+  EXPECT_NO_THROW(bind_query(stmt, priced_sales_schema()));
+}
+
+TEST(Binder, DecimalColumnComparedAgainstNonLiteralColumnIsRejected) {
+  // `amount` is a genuine FLOAT64 column, not a compile-time constant --
+  // implicit DECIMAL promotion only retypes literals (see cast_if_needed),
+  // so this must fail cleanly at bind time rather than silently
+  // misevaluating.
+  const auto stmt = sql::parse_sql("SELECT price FROM read_parquet('/x.parquet') WHERE price > amount");
+  EXPECT_THROW(bind_query(stmt, priced_sales_schema()), BindingError);
+}
+
+TEST(Binder, MixingTwoDifferentDecimalTypesIsRejected) {
+  const auto stmt = sql::parse_sql(
+      "SELECT price FROM read_parquet('/x.parquet') WHERE price > CAST(amount AS DECIMAL(12, 4))");
+  EXPECT_THROW(bind_query(stmt, priced_sales_schema()), BindingError);
+}
+
+TEST(Binder, SumOverDecimalPreservesPrecisionAndScale) {
+  const auto stmt = sql::parse_sql("SELECT SUM(price) AS total FROM read_parquet('/x.parquet')");
+  const BoundQuery bound = bind_query(stmt, priced_sales_schema());
+  ASSERT_EQ(bound.select_list.size(), 1u);
+  const DataType& result_type = bound.select_list[0].expr->result_type();
+  EXPECT_EQ(result_type.id, TypeId::Decimal);
+  EXPECT_EQ(result_type.precision, 10);
+  EXPECT_EQ(result_type.scale, 2);
+}
+
+TEST(Binder, MinMaxOverDecimalPreservePrecisionAndScale) {
+  const auto stmt =
+      sql::parse_sql("SELECT MIN(price) AS lo, MAX(price) AS hi FROM read_parquet('/x.parquet')");
+  const BoundQuery bound = bind_query(stmt, priced_sales_schema());
+  for (const BoundSelectItem& item : bound.select_list) {
+    EXPECT_EQ(item.expr->result_type().id, TypeId::Decimal);
+    EXPECT_EQ(item.expr->result_type().precision, 10);
+    EXPECT_EQ(item.expr->result_type().scale, 2);
+  }
+}
+
+TEST(Binder, AvgOverDecimalIsRejected) {
+  const auto stmt = sql::parse_sql("SELECT AVG(price) AS avg_price FROM read_parquet('/x.parquet')");
+  EXPECT_THROW(bind_query(stmt, priced_sales_schema()), BindingError);
 }
 
 TEST(Binder, GroupByPrefersBaseColumnOverSameNamedAlias) {

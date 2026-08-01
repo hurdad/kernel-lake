@@ -131,6 +131,12 @@ struct AstCase {
 struct AstCast {
   AstExprPtr operand;
   std::string type_name;
+  // Only meaningful for type_name == "DECIMAL" (hsql's own ColumnType
+  // fields; see parser.cpp's kExprCast handling and binder.cpp's
+  // resolve_cast_type_name()). Both are 0 for a bare `CAST(x AS DECIMAL)`
+  // with no explicit precision/scale, which the binder rejects.
+  std::int64_t decimal_precision = 0;
+  std::int64_t decimal_scale = 0;
 };
 
 struct AstExpr {

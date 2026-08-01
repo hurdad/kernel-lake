@@ -49,13 +49,25 @@ bool is_floating(TypeId id) {
 
 // Picks the smallest KernelLake numeric type that can represent both inputs
 // without loss for the common cases KernelLake cares about (int/int and
-// int/float promotion). Decimal-with-decimal and decimal-with-float mixes
-// are rejected rather than guessed at, since choosing a safe precision/scale
-// automatically is not yet implemented.
+// int/float promotion). Two DECIMALs with different precision/scale are
+// rejected rather than guessed at, since choosing a safe widened
+// precision/scale automatically is not yet implemented. Exactly one side
+// being DECIMAL returns that side's exact type unchanged -- cast_if_needed
+// below is what actually enforces that the *other* side can only be a
+// numeric literal (retyped in place, no precision loss) rather than a
+// column or computed expression (which would need a genuine runtime CAST to
+// DECIMAL, and cudf::ast has no such operator -- see docs/ARCHITECTURE.md).
 DataType promote_numeric(const DataType& a, const DataType& b) {
   if (a.id == TypeId::Decimal || b.id == TypeId::Decimal) {
-    if (a.id == b.id && a.precision == b.precision && a.scale == b.scale) return a;
-    throw BindingError("mixing DECIMAL with other numeric types is not yet supported");
+    if (a.id == TypeId::Decimal && b.id == TypeId::Decimal) {
+      if (a.precision == b.precision && a.scale == b.scale) {
+        return DataType{a.id, a.nullable || b.nullable, a.precision, a.scale};
+      }
+      throw BindingError("mixing two DECIMAL types with different precision/scale is not yet supported (" +
+                         a.to_string() + " vs. " + b.to_string() + ")");
+    }
+    const DataType& decimal_side = a.id == TypeId::Decimal ? a : b;
+    return DataType{decimal_side.id, a.nullable || b.nullable, decimal_side.precision, decimal_side.scale};
   }
   const bool nullable = a.nullable || b.nullable;
   if (is_floating(a.id) || is_floating(b.id)) return float64_type(nullable);
@@ -72,7 +84,8 @@ DataType promote_numeric(const DataType& a, const DataType& b) {
 // here and rejecting unsupported targets downstream, with a clear error
 // either way, matches how the rest of the grammar handles "parsed but not
 // executable yet" constructs.
-DataType resolve_cast_type_name(const std::string& name, bool nullable) {
+DataType resolve_cast_type_name(const AstCast& node, bool nullable) {
+  const std::string& name = node.type_name;
   if (name == "BIGINT") return int64_type(nullable);
   if (name == "INT") return int32_type(nullable);
   if (name == "BOOLEAN") return boolean_type(nullable);
@@ -81,12 +94,48 @@ DataType resolve_cast_type_name(const std::string& name, bool nullable) {
   if (name == "DATE") return date32_type(nullable);
   if (name == "DATETIME") return timestamp_type(nullable);
   if (name == "VARCHAR") return string_type(nullable);
-  if (name == "DECIMAL") throw BindingError("CAST to DECIMAL is not yet supported");
+  if (name == "DECIMAL") {
+    // hsql parses a bare `DECIMAL` (no parens) as precision=scale=0; require
+    // an explicit precision/scale rather than guessing a default, matching
+    // how CAST(... AS VARCHAR) requires an explicit length elsewhere in this
+    // grammar.
+    if (node.decimal_precision <= 0) {
+      throw BindingError("CAST to DECIMAL requires explicit precision and scale, e.g. DECIMAL(10, 2)");
+    }
+    if (node.decimal_precision > 38) {
+      throw BindingError("DECIMAL precision must be between 1 and 38, got " +
+                         std::to_string(node.decimal_precision));
+    }
+    if (node.decimal_scale < 0 || node.decimal_scale > node.decimal_precision) {
+      throw BindingError("DECIMAL scale must be between 0 and precision (" +
+                         std::to_string(node.decimal_precision) + "), got " +
+                         std::to_string(node.decimal_scale));
+    }
+    return decimal_type(static_cast<std::int32_t>(node.decimal_precision),
+                        static_cast<std::int32_t>(node.decimal_scale), nullable);
+  }
   throw BindingError("CAST to unknown type '" + name + "'");
 }
 
 ExpressionPtr cast_if_needed(ExpressionPtr expr, const DataType& target) {
-  if (expr->result_type().id == target.id) return expr;
+  const DataType& current = expr->result_type();
+  if (current.id == target.id && current.precision == target.precision && current.scale == target.scale) {
+    return expr;
+  }
+  if (target.id == TypeId::Decimal && current.id != TypeId::Decimal) {
+    // A numeric literal can be retyped to DECIMAL in place with no
+    // precision loss (it's a compile-time constant, not a runtime cast) --
+    // this is what lets `WHERE price > 19.99` bind against a DECIMAL
+    // `price` column. A column or computed expression on the other side
+    // would need a genuine runtime CAST to DECIMAL, which cudf::ast has no
+    // operator for (no CAST_TO_DECIMAL*) -- fails clearly instead of being
+    // silently misevaluated. See docs/ARCHITECTURE.md.
+    if (const auto* literal = dynamic_cast<const LiteralExpression*>(expr.get())) {
+      return std::make_shared<LiteralExpression>(literal->value(), target);
+    }
+    throw BindingError("mixing DECIMAL with a non-literal " + current.to_string() +
+                       " is not yet supported -- wrap it in an explicit CAST(... AS DECIMAL(p, s))");
+  }
   return std::make_shared<CastExpression>(std::move(expr), target);
 }
 
@@ -298,8 +347,11 @@ class Binder {
                                                 boolean_type(result_nullable));
     }
 
-    // Comparison.
-    if (lt.id == rt.id) {
+    // Comparison. DECIMAL additionally needs precision/scale to match, not
+    // just `id` -- two DECIMALs with different precision/scale otherwise
+    // slip past this early-return path without ever reaching
+    // promote_numeric()'s mismatched-DECIMAL rejection below.
+    if (lt.id == rt.id && lt.precision == rt.precision && lt.scale == rt.scale) {
       return std::make_shared<BinaryExpression>(op, std::move(left), std::move(right),
                                                 boolean_type(result_nullable));
     }
@@ -344,7 +396,7 @@ class Binder {
     auto unify = [&](ExpressionPtr bound, const char* side) {
       const DataType& vt = value->result_type();
       const DataType& bt = bound->result_type();
-      if (vt.id == bt.id) return bound;
+      if (vt.id == bt.id && vt.precision == bt.precision && vt.scale == bt.scale) return bound;
       if (is_numeric(vt.id) && is_numeric(bt.id)) {
         return cast_if_needed(std::move(bound), promote_numeric(vt, bt));
       }
@@ -386,6 +438,16 @@ class Binder {
         if (!is_numeric(arg_type.id)) {
           throw BindingError("SUM requires a numeric argument, got " + arg_type.to_string());
         }
+        // DECIMAL keeps its own precision/scale unchanged (like MIN/MAX
+        // below) rather than being cast to a wider type first: cudf's own
+        // SUM aggregation evaluates DECIMAL columns natively and preserves
+        // scale, and casting *to* DECIMAL inside a compiled expression isn't
+        // possible anyway (no CAST_TO_DECIMAL* in cudf::ast).
+        if (arg_type.id == TypeId::Decimal) {
+          const DataType result_type{TypeId::Decimal, true, arg_type.precision, arg_type.scale};
+          return std::make_shared<AggregateExpression>(AggregateFunction::Sum, std::move(argument),
+                                                       result_type);
+        }
         const DataType result_type =
             is_floating(arg_type.id) ? float64_type(true)
                                      : (arg_type.id == TypeId::UInt64 ? uint64_type(true) : int64_type(true));
@@ -396,6 +458,9 @@ class Binder {
       case AstAggregateFunc::Avg: {
         if (!is_numeric(arg_type.id)) {
           throw BindingError("AVG requires a numeric argument, got " + arg_type.to_string());
+        }
+        if (arg_type.id == TypeId::Decimal) {
+          throw BindingError("AVG over DECIMAL is not yet supported -- CAST the argument to DOUBLE first");
         }
         return std::make_shared<AggregateExpression>(AggregateFunction::Avg, std::move(argument),
                                                      float64_type(true));
@@ -488,7 +553,7 @@ class Binder {
 
   ExpressionPtr bind_node(const AstCast& node, bool allow_aggregates) {
     ExpressionPtr operand = bind(node.operand, allow_aggregates);
-    const DataType target = resolve_cast_type_name(node.type_name, operand->result_type().nullable);
+    const DataType target = resolve_cast_type_name(node, operand->result_type().nullable);
     return std::make_shared<CastExpression>(std::move(operand), target);
   }
 

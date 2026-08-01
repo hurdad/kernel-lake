@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cudf/fixed_point/fixed_point.hpp>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/types.hpp>
 
@@ -10,11 +11,17 @@
 
 namespace kernellake {
 
-// Throws PlanningError for TypeId::Decimal (not yet supported for GPU
-// execution -- cudf's fixed_point types need precision/scale plumbing this
-// MVP doesn't do yet).
+// Throws PlanningError for TypeId::Decimal -- picking DECIMAL32/64/128
+// needs the type's precision, which a bare TypeId doesn't carry; use
+// to_cudf_type(DataType) for Decimal instead.
 [[nodiscard]] cudf::type_id to_cudf_type_id(TypeId id);
 
+// For TypeId::Decimal, picks DECIMAL32 (precision <= 9), DECIMAL64 (<= 18),
+// or DECIMAL128 (<= 38), with cudf's scale set to the *negative* of
+// DataType::scale -- cudf's fixed_point scale is the exponent applied to
+// the stored integer (value = raw * 10^scale), so KernelLake's "N digits
+// after the decimal point" convention (matching Arrow/Parquet) is
+// cudf_scale = -N. See docs/ARCHITECTURE.md.
 [[nodiscard]] cudf::data_type to_cudf_type(const DataType& type);
 
 // Converts a literal directly to a cudf::scalar, for operators that need to
@@ -26,5 +33,33 @@ namespace kernellake {
 // valid as an intermediate AST node (e.g. one side of `region = 'A'`). See
 // docs/ARCHITECTURE.md.
 [[nodiscard]] std::unique_ptr<cudf::scalar> literal_to_scalar(const LiteralExpression& expr);
+
+// Builds a cudf::fixed_point_scalar<decimal32/64/128> (width chosen by
+// `type.precision`) from a literal's underlying double/int64 value, shifted
+// to `type.scale` digits after the decimal point. Shared by
+// literal_to_scalar() (materializing a DECIMAL literal directly) and
+// expression_compiler.cpp's make_literal() (wrapping one in a
+// cudf::ast::literal node) -- both need the exact same raw-value/scale
+// construction. The literal's value only ever has double precision to begin
+// with (see LiteralStorage), so this cannot represent more significant
+// digits than a double can; a documented limitation, not a bug.
+[[nodiscard]] std::unique_ptr<cudf::scalar> make_decimal_scalar(const DataType& type,
+                                                                const LiteralStorage& value, bool is_valid);
+
+// The raw (already-shifted) integer representation and cudf type_id
+// (DECIMAL32/64/128) make_decimal_scalar() would build a scalar from --
+// exposed separately because cudf::ast::literal's constructor is templated
+// on the *concrete* fixed_point_scalar<T> type (no type-erased overload
+// exists), so a caller building an AST literal node needs these raw
+// ingredients to construct the concrete scalar itself, unlike
+// make_decimal_scalar()'s type-erased `unique_ptr<cudf::scalar>` (fine for
+// callers like cudf::make_column_from_scalar that only need the base
+// interface).
+struct DecimalRawValue {
+  __int128_t raw;
+  std::int32_t cudf_scale;
+  cudf::type_id type_id;
+};
+[[nodiscard]] DecimalRawValue decimal_raw_value(const DataType& type, const LiteralStorage& value);
 
 }  // namespace kernellake

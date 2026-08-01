@@ -287,7 +287,9 @@ AstExprPtr convert_expr(const hsql::Expr* e) {
       return convert_function(e);
     case hsql::kExprCast: {
       if (e->expr == nullptr) unsupported("malformed CAST expression");
-      return wrap(AstCast{convert_expr(e->expr), to_cast_type_name(e->columnType.data_type)}, alias_of(*e));
+      return wrap(AstCast{convert_expr(e->expr), to_cast_type_name(e->columnType.data_type),
+                          e->columnType.precision, e->columnType.scale},
+                  alias_of(*e));
     }
     default:
       unsupported(

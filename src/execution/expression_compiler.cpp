@@ -4,6 +4,7 @@
 #include <cudf/wrappers/timestamps.hpp>
 
 #include "kernellake/common/errors.hpp"
+#include "kernellake/execution/cudf_adapter.hpp"
 
 namespace kernellake {
 
@@ -115,8 +116,39 @@ const cudf::ast::expression& ExpressionCompiler::make_literal(const DataType& ty
       scalars_.push_back(std::move(scalar));
       return tree_.emplace<cudf::ast::literal>(ref);
     }
-    case TypeId::Decimal:
-      throw ExecutionError("DECIMAL literals are not yet supported for GPU execution");
+    case TypeId::Decimal: {
+      // cudf::ast::literal's constructor is templated on the *concrete*
+      // fixed_point_scalar<T> (no type-erased overload exists), unlike the
+      // rest of this switch's cudf::scalar-based cases -- can't reuse
+      // cudf_adapter's make_decimal_scalar() here since it type-erases too
+      // early; decimal_raw_value() gives the same raw/scale computation
+      // without erasing the concrete type first.
+      const DecimalRawValue raw_value = decimal_raw_value(type, value);
+      const numeric::scale_type scale{raw_value.cudf_scale};
+      switch (raw_value.type_id) {
+        case cudf::type_id::DECIMAL32: {
+          auto scalar = std::make_unique<cudf::fixed_point_scalar<numeric::decimal32>>(
+              static_cast<std::int32_t>(raw_value.raw), scale, is_valid);
+          auto& ref = *scalar;
+          scalars_.push_back(std::move(scalar));
+          return tree_.emplace<cudf::ast::literal>(ref);
+        }
+        case cudf::type_id::DECIMAL64: {
+          auto scalar = std::make_unique<cudf::fixed_point_scalar<numeric::decimal64>>(
+              static_cast<std::int64_t>(raw_value.raw), scale, is_valid);
+          auto& ref = *scalar;
+          scalars_.push_back(std::move(scalar));
+          return tree_.emplace<cudf::ast::literal>(ref);
+        }
+        default: {
+          auto scalar =
+              std::make_unique<cudf::fixed_point_scalar<numeric::decimal128>>(raw_value.raw, scale, is_valid);
+          auto& ref = *scalar;
+          scalars_.push_back(std::move(scalar));
+          return tree_.emplace<cudf::ast::literal>(ref);
+        }
+      }
+    }
   }
   throw ExecutionError("unreachable: unknown KernelLake TypeId in expression compiler");
 }
