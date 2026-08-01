@@ -76,15 +76,18 @@ and covered by passing tests -- not merely designed or stubbed.
   that the CUDA Toolkit and RAPIDS's vendored `nvcomp` component are
   NVIDIA proprietary SDK/EULA dependencies, not open source)
 - `.clang-format` (the whole existing C++ tree has been reformatted to
-  match and is currently clean); `.clang-tidy` config (written, but **not
-  run** -- `clang-tidy` was not available in this development environment,
-  so it is not wired into CI); optional `.pre-commit-config.yaml`
-  (clang-format only)
-- `docker/Dockerfile.dev` and `docker/Dockerfile.runtime` (multi-stage,
-  copying only the built binary plus its actual non-system runtime
-  dependency closure via `ldd`) -- **written but not verified**: Docker
-  was not available in this development environment, so neither image has
-  been through an actual `docker build`/`docker run --gpus all`
+  match and is currently clean); `.clang-tidy` config, spot-checked with a
+  real `clang-tidy-18` run against a compiled source file (one real finding,
+  34,609 non-user-code warnings correctly suppressed by `HeaderFilterRegex`)
+  but not run across the whole tree and not wired into CI yet; optional
+  `.pre-commit-config.yaml` (clang-format only)
+- `docker/Dockerfile` (single file, multi-stage, two named targets:
+  `dev` -- full CUDA devel image with the repo built inside it -- and
+  `runtime` -- only the built binary plus its actual non-system runtime
+  dependency closure, resolved via `ldd` rather than hard-coded vendored
+  paths) -- **written but not verified**: Docker was not available in this
+  development environment, so neither target has been through an actual
+  `docker build`/`docker run --gpus all`
 - `.github/workflows/ci.yml`: formatting check, CPU-only build+test
   (`dev` preset), and a GPU-free TPC-H tooling smoke test (small-scale
   `generate_tpch.py` run plus `kernellake explain` -- not `query` -- against
@@ -110,8 +113,9 @@ and covered by passing tests -- not merely designed or stubbed.
 - A self-hosted GPU CI runner (would enable a `gpu-dev` build/test/
   benchmark/validate workflow to actually run in CI, rather than only
   locally)
-- Actually running `clang-tidy` (config exists, unverified) and an actual
-  `docker build`/`docker run` of both Dockerfiles (written, unverified)
+- Running `clang-tidy` across the whole tree and wiring it into CI (config
+  spot-checked, not exhaustively run); an actual `docker build`/`docker run`
+  of both `docker/Dockerfile` targets (written, unverified)
 
 ## Explicit non-goals for the MVP
 
