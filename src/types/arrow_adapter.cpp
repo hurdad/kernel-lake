@@ -37,7 +37,7 @@ DataType from_arrow_type(const std::shared_ptr<arrow::DataType>& type, bool null
     }
     default:
       throw PlanningError("unsupported Arrow type '" + type->ToString() +
-                           "': KernelLake's type system does not yet cover this type");
+                          "': KernelLake's type system does not yet cover this type");
   }
 }
 
@@ -73,8 +73,8 @@ Schema from_arrow_schema(const std::shared_ptr<arrow::Schema>& schema) {
   std::vector<Field> fields;
   fields.reserve(static_cast<std::size_t>(schema->num_fields()));
   for (const auto& arrow_field : schema->fields()) {
-    fields.push_back(Field{arrow_field->name(), from_arrow_type(arrow_field->type(),
-                                                                  arrow_field->nullable())});
+    fields.push_back(
+        Field{arrow_field->name(), from_arrow_type(arrow_field->type(), arrow_field->nullable())});
   }
   return Schema(std::move(fields));
 }

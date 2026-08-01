@@ -35,15 +35,12 @@ TEST(DeviceBatch, ExposesSchema) {
 }
 
 TEST(DeviceBatch, RejectsColumnSchemaMismatch) {
-  EXPECT_THROW(
-      DeviceBatch(make_table(1, 10), std::make_shared<const Schema>(two_column_schema())),
-      ExecutionError);
+  EXPECT_THROW(DeviceBatch(make_table(1, 10), std::make_shared<const Schema>(two_column_schema())),
+               ExecutionError);
 }
 
 TEST(DeviceBatch, RejectsNullTable) {
-  EXPECT_THROW(
-      DeviceBatch(nullptr, std::make_shared<const Schema>(two_column_schema())),
-      ExecutionError);
+  EXPECT_THROW(DeviceBatch(nullptr, std::make_shared<const Schema>(two_column_schema())), ExecutionError);
 }
 
 TEST(DeviceBatch, IsMoveOnly) {

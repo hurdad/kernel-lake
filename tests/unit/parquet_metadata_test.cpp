@@ -17,11 +17,11 @@ namespace {
 namespace fs = std::filesystem;
 
 class ParquetMetadataTest : public ::testing::Test {
-protected:
+ protected:
   void SetUp() override {
     dir_ = fs::temp_directory_path() /
            fs::path("kernellake_parquet_test_" +
-                     std::string(::testing::UnitTest::GetInstance()->current_test_info()->name()));
+                    std::string(::testing::UnitTest::GetInstance()->current_test_info()->name()));
     fs::create_directories(dir_);
     path_ = (dir_ / "sales.parquet").string();
     write_two_row_group_file(path_);
@@ -46,15 +46,15 @@ protected:
     ASSERT_OK(region_builder.Finish(&region_array));
 
     const auto schema = arrow::schema({arrow::field("id", arrow::int64(), false),
-                                        arrow::field("amount", arrow::float64(), false),
-                                        arrow::field("region", arrow::utf8(), false)});
+                                       arrow::field("amount", arrow::float64(), false),
+                                       arrow::field("region", arrow::utf8(), false)});
     const auto table = arrow::Table::Make(schema, {id_array, amount_array, region_array});
 
     auto sink_result = arrow::io::FileOutputStream::Open(path);
     ASSERT_TRUE(sink_result.ok()) << sink_result.status().ToString();
     const arrow::Status write_status =
         parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), *sink_result,
-                                    /*chunk_size=*/5);
+                                   /*chunk_size=*/5);
     ASSERT_TRUE(write_status.ok()) << write_status.ToString();
   }
 
@@ -100,8 +100,7 @@ TEST_F(ParquetMetadataTest, ReadsMinMaxStatisticsPerRowGroup) {
 }
 
 TEST_F(ParquetMetadataTest, ThrowsOnMissingFile) {
-  EXPECT_THROW(inspect_parquet_file(store_, Uri((dir_ / "missing.parquet").string())),
-               StorageError);
+  EXPECT_THROW(inspect_parquet_file(store_, Uri((dir_ / "missing.parquet").string())), StorageError);
 }
 
 TEST_F(ParquetMetadataTest, ValidateSchemaCompatibilityAcceptsIdenticalSchemas) {
@@ -144,8 +143,7 @@ TEST_F(ParquetMetadataTest, PruningSkipsRowGroupProvenByEquality) {
 TEST_F(ParquetMetadataTest, PruningSkipsRowGroupProvenByRange) {
   const FileMetadata meta = inspect_parquet_file(store_, Uri(path_));
   auto literal = std::make_shared<LiteralExpression>(LiteralExpression::make_int64(5));
-  const std::vector<PushablePredicate> predicates = {
-      PushablePredicate{"id", BinaryOperator::Less, literal}};
+  const std::vector<PushablePredicate> predicates = {PushablePredicate{"id", BinaryOperator::Less, literal}};
 
   const ScanDecision decision = evaluate_pruning(meta, predicates);
   // id < 5: row group 0 (0-4) fully qualifies-or-not but cannot be skipped

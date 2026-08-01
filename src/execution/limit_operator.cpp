@@ -37,6 +37,8 @@ std::optional<DeviceBatch> LimitOperator::next(ExecutionContext& context) {
   return DeviceBatch(std::move(truncated), std::move(schema));
 }
 
-void LimitOperator::close(ExecutionContext& context) { child_->close(context); }
+void LimitOperator::close(ExecutionContext& context) {
+  child_->close(context);
+}
 
 }  // namespace kernellake

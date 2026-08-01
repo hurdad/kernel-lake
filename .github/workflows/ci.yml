@@ -1,0 +1,112 @@
+# CPU-safe CI: formatting, CPU-only compilation, and unit tests that don't
+# require a GPU. Every job's underlying shell commands (apt installs, CMake
+# presets, ctest) mirror commands actually run and verified in this
+# repository's own development environment on Ubuntu 24.04 -- but the
+# GitHub Actions runs themselves have not been executed (no way to trigger
+# an actual Actions run from within this repository's development
+# environment); review the first run before trusting it blindly.
+#
+# GPU-dependent work (the `gpu-dev` preset, `tests/gpu/`, real query
+# execution, DuckDB cross-validation, and TPC-H benchmarks) is
+# intentionally NOT run here: standard GitHub-hosted runners have no GPU,
+# and per the spec's own rule, KernelLake never reports a skipped-GPU test
+# as passing. That work needs a self-hosted GPU runner, which is not
+# configured in this repository -- see docs/ROADMAP.md.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  format-check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install clang-format
+        run: sudo apt-get update && sudo apt-get install -y clang-format-18
+      - name: Check formatting
+        run: |
+          shopt -s globstar
+          files=$(find src include tests -name '*.cpp' -o -name '*.hpp')
+          clang-format-18 --style=file --dry-run --Werror $files
+
+  cpu-build-test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install core toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build git pkg-config \
+            python3 python3-pip \
+            libgtest-dev libbenchmark-dev libspdlog-dev nlohmann-json3-dev libyaml-cpp-dev
+      - name: Install Apache Arrow / Parquet C++
+        run: |
+          wget -O /tmp/arrow-apt-source.deb \
+            "https://packages.apache.org/artifactory/arrow/ubuntu/apache-arrow-apt-source-latest-$(lsb_release --codename --short).deb"
+          sudo apt-get install -y -V /tmp/arrow-apt-source.deb
+          sudo apt-get update
+          sudo apt-get install -y libarrow-dev libparquet-dev libarrow-dataset-dev
+      - name: Configure (dev preset, CPU-only)
+        run: cmake --preset dev
+      - name: Build
+        run: cmake --build --preset dev
+      - name: Test
+        run: ctest --preset dev --output-on-failure
+
+  tpch-tooling-smoke:
+    runs-on: ubuntu-24.04
+    needs: cpu-build-test
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install core toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build git pkg-config \
+            python3 python3-pip \
+            libgtest-dev libbenchmark-dev libspdlog-dev nlohmann-json3-dev libyaml-cpp-dev
+      - name: Install Apache Arrow / Parquet C++
+        run: |
+          wget -O /tmp/arrow-apt-source.deb \
+            "https://packages.apache.org/artifactory/arrow/ubuntu/apache-arrow-apt-source-latest-$(lsb_release --codename --short).deb"
+          sudo apt-get install -y -V /tmp/arrow-apt-source.deb
+          sudo apt-get update
+          sudo apt-get install -y libarrow-dev libparquet-dev libarrow-dataset-dev
+      - name: Install pyarrow (for generate_tpch.py)
+        run: pip install --user --break-system-packages pyarrow
+      - name: Build (dev preset)
+        run: |
+          cmake --preset dev
+          cmake --build --preset dev
+      - name: generate-data smoke test
+        run: |
+          ./build/dev/src/cli/kernellake generate-data --output /tmp/kernellake-sales --rows 10000 --files 2
+
+      # SF1 is the spec's own CI recommendation, but that is a ~6,000,000-row
+      # generation run (see tools/generate_tpch.py); a much smaller scale
+      # factor is used here to keep CI fast and storage-light, per the same
+      # spec section's own allowance ("SF1000 where sufficient storage is
+      # available" implies scale is adjusted to the environment). Run the
+      # real SF1 generation manually or on a runner sized for it.
+      - name: TPC-H data-generation smoke test (small scale factor)
+        run: |
+          python3 tools/generate_tpch.py --scale-factor 0.001 --output /tmp/kernellake-tpch-smoke \
+            --row-group-rows 2000 --files 1
+
+      # No GPU here, so `kernellake query` can't run -- `explain` still
+      # exercises SQL parsing, binding, logical planning, optimization, and
+      # physical planning (including pruning) against the real generated
+      # Parquet files, which is enough to catch a query file that no longer
+      # parses/binds against the schema generate_tpch.py produces.
+      - name: TPC-H query-file validation (parse/bind/plan only, no GPU)
+        run: |
+          for q in benchmarks/tpch/queries/*.sql; do
+            sql=$(grep -v '^--' "$q" | tr '\n' ' ' | sed "s|{data}|/tmp/kernellake-tpch-smoke/*.parquet|")
+            echo "=== $q ==="
+            ./build/dev/src/cli/kernellake explain --sql "$sql"
+          done

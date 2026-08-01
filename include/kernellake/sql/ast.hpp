@@ -40,10 +40,10 @@ enum class AstLiteralKind {
 
 struct AstLiteral {
   AstLiteralKind kind;
-  std::int64_t int_value = 0;     // Integer, and Date (days since 1970-01-01)
-  double float_value = 0.0;       // Float
-  std::string string_value;       // String
-  bool bool_value = false;        // Boolean
+  std::int64_t int_value = 0;  // Integer, and Date (days since 1970-01-01)
+  double float_value = 0.0;    // Float
+  std::string string_value;    // String
+  bool bool_value = false;     // Boolean
 };
 
 enum class AstBinaryOp {
@@ -100,8 +100,7 @@ struct AstAggregate {
 };
 
 struct AstExpr {
-  std::variant<AstColumnRef, AstStar, AstLiteral, AstBinary, AstUnary, AstBetween, AstAggregate>
-      node;
+  std::variant<AstColumnRef, AstStar, AstLiteral, AstBinary, AstUnary, AstBetween, AstAggregate> node;
   std::optional<std::string> alias;
 };
 

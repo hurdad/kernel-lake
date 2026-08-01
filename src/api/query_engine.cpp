@@ -27,7 +27,9 @@ LogicalPlanPtr QueryEngine::plan_logical(std::string_view sql) const {
   return optimize(std::move(logical));
 }
 
-LogicalPlanPtr QueryEngine::explain_logical(std::string_view sql) const { return plan_logical(sql); }
+LogicalPlanPtr QueryEngine::explain_logical(std::string_view sql) const {
+  return plan_logical(sql);
+}
 
 PhysicalPlanPtr QueryEngine::explain(std::string_view sql) const {
   return build_physical_plan(plan_logical(sql), store_);

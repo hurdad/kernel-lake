@@ -18,11 +18,11 @@ namespace {
 namespace fs = std::filesystem;
 
 class SampleDataGeneratorTest : public ::testing::Test {
-protected:
+ protected:
   void SetUp() override {
     dir_ = fs::temp_directory_path() /
            fs::path("kernellake_sample_data_generator_test_" +
-                     std::string(::testing::UnitTest::GetInstance()->current_test_info()->name()));
+                    std::string(::testing::UnitTest::GetInstance()->current_test_info()->name()));
   }
 
   void TearDown() override { fs::remove_all(dir_); }

@@ -27,13 +27,12 @@ std::shared_ptr<arrow::RecordBatch> to_arrow_record_batch(const DeviceBatch& bat
       arrow::ImportRecordBatch(&device_array->array, arrow_schema.get());
   if (!result.ok()) {
     throw ExecutionError("failed to import Arrow record batch from cudf table: " +
-                          result.status().ToString());
+                         result.status().ToString());
   }
   return *result;
 }
 
-DeviceBatch from_arrow_record_batch(const arrow::RecordBatch& batch,
-                                     std::shared_ptr<const Schema> schema) {
+DeviceBatch from_arrow_record_batch(const arrow::RecordBatch& batch, std::shared_ptr<const Schema> schema) {
   ArrowArray c_array{};
   ArrowSchema c_schema{};
   const arrow::Status status = arrow::ExportRecordBatch(batch, &c_array, &c_schema);

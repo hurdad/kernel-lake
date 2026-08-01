@@ -64,8 +64,8 @@ TEST(LogicalPlanner, BuildsGeneralMvpQueryShape) {
 TEST(LogicalPlanner, ReordersAggregateOutputToMatchSelectList) {
   // Aggregate listed before the grouped column, unlike LogicalAggregate's
   // fixed internal [group_by..., aggregates...] output order.
-  const auto stmt = sql::parse_sql(
-      "SELECT SUM(amount) AS total, region FROM read_parquet('/x.parquet') GROUP BY region");
+  const auto stmt =
+      sql::parse_sql("SELECT SUM(amount) AS total, region FROM read_parquet('/x.parquet') GROUP BY region");
   const Schema schema = sales_schema();
   const BoundQuery bound = bind_query(stmt, schema);
   const LogicalPlanPtr plan = build_logical_plan(bound, schema);
@@ -80,8 +80,7 @@ TEST(LogicalPlanner, ReordersAggregateOutputToMatchSelectList) {
   const auto* total_col = dynamic_cast<const ColumnExpression*>(projection->items()[0].expr.get());
   ASSERT_NE(total_col, nullptr);
   EXPECT_EQ(total_col->column_index(), 1u);  // aggregates come after the 1 group-by column
-  const auto* region_col =
-      dynamic_cast<const ColumnExpression*>(projection->items()[1].expr.get());
+  const auto* region_col = dynamic_cast<const ColumnExpression*>(projection->items()[1].expr.get());
   ASSERT_NE(region_col, nullptr);
   EXPECT_EQ(region_col->column_index(), 0u);
 }
@@ -115,8 +114,7 @@ TEST(LogicalPlanner, RejectsOrderByAfterGroupBy) {
 }
 
 TEST(LogicalPlanner, NonAggregateOrderByPlacedBeforeProjection) {
-  const auto stmt =
-      sql::parse_sql("SELECT region FROM read_parquet('/x.parquet') ORDER BY amount DESC");
+  const auto stmt = sql::parse_sql("SELECT region FROM read_parquet('/x.parquet') ORDER BY amount DESC");
   const Schema schema = sales_schema();
   const BoundQuery bound = bind_query(stmt, schema);
   const LogicalPlanPtr plan = build_logical_plan(bound, schema);
@@ -149,8 +147,7 @@ TEST(LogicalPlanner, ExplainTextContainsExpectedNodesAndAttributes) {
 }
 
 TEST(LogicalPlanner, ExplainJsonIsValidAndContainsNodeNames) {
-  const auto stmt =
-      sql::parse_sql("SELECT region FROM read_parquet('/data/sales/*.parquet')");
+  const auto stmt = sql::parse_sql("SELECT region FROM read_parquet('/data/sales/*.parquet')");
   const Schema schema = sales_schema();
   const BoundQuery bound = bind_query(stmt, schema);
   const LogicalPlanPtr plan = build_logical_plan(bound, schema);

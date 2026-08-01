@@ -44,13 +44,10 @@ QueryResult QueryEngine::execute(std::string_view sql) const {
   const CudaDeviceGuard device_guard(config_.engine.device_id);
   const CudaStream stream;
 
-  ExecutionContext context{make_query_id(),
-                            config_.engine.device_id,
-                            stream.get(),
-                            rmm::mr::get_current_device_resource_ref(),
-                            nullptr,
-                            nullptr,
-                            nullptr};
+  ExecutionContext context{make_query_id(), config_.engine.device_id,
+                           stream.get(),    rmm::mr::get_current_device_resource_ref(),
+                           nullptr,         nullptr,
+                           nullptr};
 
   // Half the configured pool ceiling, leaving headroom for filter/
   // projection/aggregation intermediates above the scan itself.
@@ -90,7 +87,8 @@ QueryResult QueryEngine::execute(std::string_view sql) const {
     // null) rather than a guessed value.
   }
 
-  result.elapsed_wall_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - wall_start).count();
+  result.elapsed_wall_seconds =
+      std::chrono::duration<double>(std::chrono::steady_clock::now() - wall_start).count();
   return result;
 }
 

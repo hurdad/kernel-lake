@@ -13,12 +13,12 @@ namespace {
 namespace fs = std::filesystem;
 
 class LocalObjectStoreTest : public ::testing::Test {
-protected:
+ protected:
   void SetUp() override {
-    dir_ = fs::temp_directory_path() / fs::path("kernellake_storage_test_" +
-                                                 std::to_string(::testing::UnitTest::GetInstance()
-                                                                    ->random_seed()) +
-                                                 "_" + test_info_name());
+    dir_ =
+        fs::temp_directory_path() /
+        fs::path("kernellake_storage_test_" +
+                 std::to_string(::testing::UnitTest::GetInstance()->random_seed()) + "_" + test_info_name());
     fs::create_directories(dir_);
     write_file(dir_ / "a.parquet", "a");
     write_file(dir_ / "b.parquet", "b");

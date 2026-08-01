@@ -14,7 +14,7 @@ namespace {
 // Test double: yields a fixed, pre-built sequence of batches, one per call
 // to next(), then reports exhausted.
 class VectorSourceOperator final : public PhysicalOperator {
-public:
+ public:
   explicit VectorSourceOperator(std::vector<DeviceBatch> batches) : batches_(std::move(batches)) {}
 
   void open(ExecutionContext&) override { index_ = 0; }
@@ -26,12 +26,14 @@ public:
   [[nodiscard]] std::string_view name() const noexcept override { return "VectorSource"; }
   [[nodiscard]] OperatorId id() const noexcept override { return 0; }
 
-private:
+ private:
   std::vector<DeviceBatch> batches_;
   std::size_t index_ = 0;
 };
 
-Schema one_int_column_schema() { return Schema({Field{"a", int32_type(false)}}); }
+Schema one_int_column_schema() {
+  return Schema({Field{"a", int32_type(false)}});
+}
 
 DeviceBatch make_filled_batch(int32_t fill_value, cudf::size_type num_rows) {
   std::unique_ptr<cudf::column> column =
@@ -42,12 +44,12 @@ DeviceBatch make_filled_batch(int32_t fill_value, cudf::size_type num_rows) {
   std::vector<std::unique_ptr<cudf::column>> columns;
   columns.push_back(std::move(column));
   return DeviceBatch(std::make_unique<cudf::table>(std::move(columns)),
-                      std::make_shared<const Schema>(one_int_column_schema()));
+                     std::make_shared<const Schema>(one_int_column_schema()));
 }
 
 ExecutionContext make_context() {
-  return ExecutionContext{"test-query", 0, nullptr, rmm::mr::get_current_device_resource_ref(),
-                           nullptr, nullptr, nullptr};
+  return ExecutionContext{"test-query", 0,       nullptr, rmm::mr::get_current_device_resource_ref(),
+                          nullptr,      nullptr, nullptr};
 }
 
 TEST(FilterOperator, PassesMatchingBatchesAndSkipsEmptyOnes) {
@@ -60,8 +62,8 @@ TEST(FilterOperator, PassesMatchingBatchesAndSkipsEmptyOnes) {
   auto a = std::make_shared<ColumnExpression>("a", 0, int32_type(false));
   auto three = std::make_shared<LiteralExpression>(LiteralExpression::make_int64(3));
   auto a_i64 = std::make_shared<CastExpression>(a, int64_type(false));
-  auto predicate = std::make_shared<BinaryExpression>(BinaryOperator::Greater, a_i64, three,
-                                                       boolean_type(false));
+  auto predicate =
+      std::make_shared<BinaryExpression>(BinaryOperator::Greater, a_i64, three, boolean_type(false));
 
   FilterOperator filter(1, std::make_unique<VectorSourceOperator>(std::move(batches)), predicate);
   ExecutionContext context = make_context();
@@ -92,7 +94,7 @@ TEST(ProjectionOperator, EvaluatesArithmeticAcrossMultipleBatches) {
 
   std::vector<NamedExpression> items = {NamedExpression{doubled, "result"}};
   ProjectionOperator projection(1, std::make_unique<VectorSourceOperator>(std::move(batches)),
-                                 std::move(items));
+                                std::move(items));
   ExecutionContext context = make_context();
   projection.open(context);
 

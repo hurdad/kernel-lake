@@ -38,7 +38,9 @@ bool is_numeric(TypeId id) {
   }
 }
 
-bool is_floating(TypeId id) { return id == TypeId::Float32 || id == TypeId::Float64; }
+bool is_floating(TypeId id) {
+  return id == TypeId::Float32 || id == TypeId::Float64;
+}
 
 // Picks the smallest KernelLake numeric type that can represent both inputs
 // without loss for the common cases KernelLake cares about (int/int and
@@ -87,7 +89,7 @@ bool contains_aggregate(const AstExprPtr& expr) {
 // to a source column that is neither wrapped in an aggregate nor listed in
 // GROUP BY.
 bool references_ungrouped_column(const AstExprPtr& expr, const std::vector<std::string>& group_by,
-                                  bool inside_aggregate) {
+                                 bool inside_aggregate) {
   return std::visit(
       [&](const auto& node) -> bool {
         using T = std::decay_t<decltype(node)>;
@@ -114,18 +116,17 @@ bool references_ungrouped_column(const AstExprPtr& expr, const std::vector<std::
 }
 
 class Binder {
-public:
+ public:
   explicit Binder(const Schema& input_schema) : input_schema_(input_schema) {}
 
   // `allow_aggregates` is true only while binding SELECT-list / ORDER BY
   // expressions; WHERE and GROUP BY must not contain aggregate functions.
   ExpressionPtr bind(const AstExprPtr& expr, bool allow_aggregates) {
-    return std::visit(
-        [&](const auto& node) -> ExpressionPtr { return bind_node(node, allow_aggregates); },
-        expr->node);
+    return std::visit([&](const auto& node) -> ExpressionPtr { return bind_node(node, allow_aggregates); },
+                      expr->node);
   }
 
-private:
+ private:
   ExpressionPtr bind_node(const AstColumnRef& node, bool) {
     const auto index = input_schema_.find_field(node.name);
     if (!index) {
@@ -144,11 +145,9 @@ private:
       case AstLiteralKind::Integer:
         return std::make_shared<LiteralExpression>(LiteralExpression::make_int64(node.int_value));
       case AstLiteralKind::Float:
-        return std::make_shared<LiteralExpression>(
-            LiteralExpression::make_float64(node.float_value));
+        return std::make_shared<LiteralExpression>(LiteralExpression::make_float64(node.float_value));
       case AstLiteralKind::String:
-        return std::make_shared<LiteralExpression>(
-            LiteralExpression::make_string(node.string_value));
+        return std::make_shared<LiteralExpression>(LiteralExpression::make_string(node.string_value));
       case AstLiteralKind::Boolean:
         return std::make_shared<LiteralExpression>(LiteralExpression::make_bool(node.bool_value));
       case AstLiteralKind::Date:
@@ -227,37 +226,34 @@ private:
     if (is_arithmetic(op)) {
       if (!is_numeric(lt.id) || !is_numeric(rt.id)) {
         throw BindingError("arithmetic operator '" + std::string(kernellake::to_string(op)) +
-                            "' requires numeric operands, got " + lt.to_string() + " and " +
-                            rt.to_string());
+                           "' requires numeric operands, got " + lt.to_string() + " and " + rt.to_string());
       }
       const DataType result_type = promote_numeric(lt, rt);
       return std::make_shared<BinaryExpression>(op, cast_if_needed(std::move(left), result_type),
-                                                 cast_if_needed(std::move(right), result_type),
-                                                 result_type);
+                                                cast_if_needed(std::move(right), result_type), result_type);
     }
 
     if (is_logical(op)) {
       if (lt.id != TypeId::Boolean || rt.id != TypeId::Boolean) {
         throw BindingError("AND/OR require boolean operands, got " + lt.to_string() + " and " +
-                            rt.to_string());
+                           rt.to_string());
       }
       return std::make_shared<BinaryExpression>(op, std::move(left), std::move(right),
-                                                 boolean_type(result_nullable));
+                                                boolean_type(result_nullable));
     }
 
     // Comparison.
     if (lt.id == rt.id) {
       return std::make_shared<BinaryExpression>(op, std::move(left), std::move(right),
-                                                 boolean_type(result_nullable));
+                                                boolean_type(result_nullable));
     }
     if (is_numeric(lt.id) && is_numeric(rt.id)) {
       const DataType common = promote_numeric(lt, rt);
       return std::make_shared<BinaryExpression>(op, cast_if_needed(std::move(left), common),
-                                                 cast_if_needed(std::move(right), common),
-                                                 boolean_type(result_nullable));
+                                                cast_if_needed(std::move(right), common),
+                                                boolean_type(result_nullable));
     }
-    throw BindingError("incompatible comparison between " + lt.to_string() + " and " +
-                        rt.to_string());
+    throw BindingError("incompatible comparison between " + lt.to_string() + " and " + rt.to_string());
   }
 
   ExpressionPtr bind_node(const AstUnary& node, bool allow_aggregates) {
@@ -268,21 +264,18 @@ private:
         if (operand_type.id != TypeId::Boolean) {
           throw BindingError("NOT requires a boolean operand, got " + operand_type.to_string());
         }
-        return std::make_shared<UnaryExpression>(UnaryOperator::Not, std::move(operand),
-                                                  operand_type);
+        return std::make_shared<UnaryExpression>(UnaryOperator::Not, std::move(operand), operand_type);
       case AstUnaryOp::Negate:
         if (!is_numeric(operand_type.id)) {
-          throw BindingError("unary '-' requires a numeric operand, got " +
-                              operand_type.to_string());
+          throw BindingError("unary '-' requires a numeric operand, got " + operand_type.to_string());
         }
-        return std::make_shared<UnaryExpression>(UnaryOperator::Negate, std::move(operand),
-                                                  operand_type);
+        return std::make_shared<UnaryExpression>(UnaryOperator::Negate, std::move(operand), operand_type);
       case AstUnaryOp::IsNull:
         return std::make_shared<UnaryExpression>(UnaryOperator::IsNull, std::move(operand),
-                                                  boolean_type(false));
+                                                 boolean_type(false));
       case AstUnaryOp::IsNotNull:
         return std::make_shared<UnaryExpression>(UnaryOperator::IsNotNull, std::move(operand),
-                                                  boolean_type(false));
+                                                 boolean_type(false));
     }
     throw BindingError("unreachable unary operator");
   }
@@ -300,20 +293,18 @@ private:
         return cast_if_needed(std::move(bound), promote_numeric(vt, bt));
       }
       throw BindingError(std::string("BETWEEN ") + side + " bound type " + bt.to_string() +
-                          " is incompatible with value type " + vt.to_string());
+                         " is incompatible with value type " + vt.to_string());
     };
     lower = unify(std::move(lower), "lower");
     upper = unify(std::move(upper), "upper");
     if (is_numeric(value->result_type().id)) {
-      const DataType common = promote_numeric(promote_numeric(value->result_type(),
-                                                                lower->result_type()),
-                                               upper->result_type());
+      const DataType common =
+          promote_numeric(promote_numeric(value->result_type(), lower->result_type()), upper->result_type());
       value = cast_if_needed(std::move(value), common);
       lower = cast_if_needed(std::move(lower), common);
       upper = cast_if_needed(std::move(upper), common);
     }
-    return std::make_shared<BetweenExpression>(std::move(value), std::move(lower),
-                                                std::move(upper));
+    return std::make_shared<BetweenExpression>(std::move(value), std::move(lower), std::move(upper));
   }
 
   ExpressionPtr bind_node(const AstAggregate& node, bool allow_aggregates) {
@@ -321,8 +312,7 @@ private:
       throw BindingError("aggregate functions are not allowed here (WHERE/GROUP BY)");
     }
     if (node.function == AstAggregateFunc::CountStar) {
-      return std::make_shared<AggregateExpression>(AggregateFunction::CountStar, nullptr,
-                                                     int64_type(false));
+      return std::make_shared<AggregateExpression>(AggregateFunction::CountStar, nullptr, int64_type(false));
     }
     if (node.argument != nullptr && contains_aggregate(node.argument)) {
       throw BindingError("aggregate functions cannot be nested");
@@ -334,36 +324,34 @@ private:
 
     switch (node.function) {
       case AstAggregateFunc::Count:
-        return std::make_shared<AggregateExpression>(AggregateFunction::Count,
-                                                       std::move(argument), int64_type(false));
+        return std::make_shared<AggregateExpression>(AggregateFunction::Count, std::move(argument),
+                                                     int64_type(false));
       case AstAggregateFunc::Sum: {
         if (!is_numeric(arg_type.id)) {
           throw BindingError("SUM requires a numeric argument, got " + arg_type.to_string());
         }
-        const DataType result_type = is_floating(arg_type.id) ? float64_type(true)
-                                      : (arg_type.id == TypeId::UInt64 ? uint64_type(true)
-                                                                        : int64_type(true));
+        const DataType result_type =
+            is_floating(arg_type.id) ? float64_type(true)
+                                     : (arg_type.id == TypeId::UInt64 ? uint64_type(true) : int64_type(true));
         argument = cast_if_needed(std::move(argument), result_type);
         return std::make_shared<AggregateExpression>(AggregateFunction::Sum, std::move(argument),
-                                                       result_type);
+                                                     result_type);
       }
       case AstAggregateFunc::Avg: {
         if (!is_numeric(arg_type.id)) {
           throw BindingError("AVG requires a numeric argument, got " + arg_type.to_string());
         }
         return std::make_shared<AggregateExpression>(AggregateFunction::Avg, std::move(argument),
-                                                       float64_type(true));
+                                                     float64_type(true));
       }
       case AstAggregateFunc::Min:
-        return std::make_shared<AggregateExpression>(AggregateFunction::Min, std::move(argument),
-                                                       DataType{arg_type.id, true,
-                                                                arg_type.precision,
-                                                                arg_type.scale});
+        return std::make_shared<AggregateExpression>(
+            AggregateFunction::Min, std::move(argument),
+            DataType{arg_type.id, true, arg_type.precision, arg_type.scale});
       case AstAggregateFunc::Max:
-        return std::make_shared<AggregateExpression>(AggregateFunction::Max, std::move(argument),
-                                                       DataType{arg_type.id, true,
-                                                                arg_type.precision,
-                                                                arg_type.scale});
+        return std::make_shared<AggregateExpression>(
+            AggregateFunction::Max, std::move(argument),
+            DataType{arg_type.id, true, arg_type.precision, arg_type.scale});
       case AstAggregateFunc::CountStar:
         break;  // handled above
     }
@@ -413,24 +401,22 @@ BoundQuery bind_query(const sql::AstSelectStatement& stmt, const Schema& input_s
       }
       for (const Field& field : input_schema.fields()) {
         add_select_item(
-            std::make_shared<ColumnExpression>(field.name, *input_schema.find_field(field.name),
-                                                field.type),
+            std::make_shared<ColumnExpression>(field.name, *input_schema.find_field(field.name), field.type),
             field.name);
       }
       continue;
     }
 
-    if (is_aggregate_query &&
-        references_ungrouped_column(item, group_by_names, /*inside_aggregate=*/false)) {
+    if (is_aggregate_query && references_ungrouped_column(item, group_by_names, /*inside_aggregate=*/false)) {
       throw BindingError(
           "column referenced in SELECT list must appear in GROUP BY or be used inside an "
           "aggregate function");
     }
 
     ExpressionPtr bound = binder.bind(item, /*allow_aggregates=*/true);
-    std::string name = item->alias.value_or(
-        std::holds_alternative<AstColumnRef>(item->node) ? std::get<AstColumnRef>(item->node).name
-                                                           : bound->to_string());
+    std::string name = item->alias.value_or(std::holds_alternative<AstColumnRef>(item->node)
+                                                ? std::get<AstColumnRef>(item->node).name
+                                                : bound->to_string());
     add_select_item(std::move(bound), std::move(name));
   }
 
@@ -443,7 +429,7 @@ BoundQuery bind_query(const sql::AstSelectStatement& stmt, const Schema& input_s
     ExpressionPtr where = binder.bind(stmt.where, /*allow_aggregates=*/false);
     if (where->result_type().id != TypeId::Boolean) {
       throw BindingError("WHERE clause must be a boolean expression, got " +
-                          where->result_type().to_string());
+                         where->result_type().to_string());
     }
     result.where = std::move(where);
   }

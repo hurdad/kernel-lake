@@ -14,7 +14,7 @@ namespace kernellake {
 // transfer at the one point where the caller actually needs host data,
 // rather than inside the operator pipeline itself.
 class ArrowResultOperator final : public PhysicalOperator {
-public:
+ public:
   ArrowResultOperator(OperatorId id, std::unique_ptr<PhysicalOperator> child);
 
   void open(ExecutionContext& context) override;
@@ -24,7 +24,7 @@ public:
   [[nodiscard]] std::string_view name() const noexcept override { return "ArrowResult"; }
   [[nodiscard]] OperatorId id() const noexcept override { return id_; }
 
-private:
+ private:
   OperatorId id_;
   std::unique_ptr<PhysicalOperator> child_;
 };

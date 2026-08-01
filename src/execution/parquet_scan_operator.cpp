@@ -5,9 +5,9 @@
 namespace kernellake {
 
 ParquetScanOperator::ParquetScanOperator(OperatorId id, std::vector<PhysicalFileFragment> fragments,
-                                          std::vector<std::string> columns,
-                                          std::shared_ptr<const Schema> schema,
-                                          std::size_t pass_read_limit_bytes)
+                                         std::vector<std::string> columns,
+                                         std::shared_ptr<const Schema> schema,
+                                         std::size_t pass_read_limit_bytes)
     : id_(id),
       fragments_(std::move(fragments)),
       columns_(std::move(columns)),
@@ -55,6 +55,8 @@ std::optional<DeviceBatch> ParquetScanOperator::next(ExecutionContext&) {
   return std::nullopt;
 }
 
-void ParquetScanOperator::close(ExecutionContext&) { reader_.reset(); }
+void ParquetScanOperator::close(ExecutionContext&) {
+  reader_.reset();
+}
 
 }  // namespace kernellake

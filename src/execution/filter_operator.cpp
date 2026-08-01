@@ -6,7 +6,7 @@
 namespace kernellake {
 
 FilterOperator::FilterOperator(OperatorId id, std::unique_ptr<PhysicalOperator> child,
-                                ExpressionPtr predicate)
+                               ExpressionPtr predicate)
     : id_(id), child_(std::move(child)), predicate_(std::move(predicate)) {}
 
 void FilterOperator::open(ExecutionContext& context) {
@@ -16,8 +16,8 @@ void FilterOperator::open(ExecutionContext& context) {
 
 std::optional<DeviceBatch> FilterOperator::next(ExecutionContext& context) {
   while (std::optional<DeviceBatch> batch = child_->next(context)) {
-    std::unique_ptr<cudf::column> mask = cudf::compute_column(
-        batch->view(), *compiled_predicate_, context.stream, context.memory_resource);
+    std::unique_ptr<cudf::column> mask =
+        cudf::compute_column(batch->view(), *compiled_predicate_, context.stream, context.memory_resource);
     std::shared_ptr<const Schema> schema = batch->schema_ptr();
     std::unique_ptr<cudf::table> filtered =
         cudf::apply_boolean_mask(batch->view(), mask->view(), context.stream, context.memory_resource);
@@ -27,6 +27,8 @@ std::optional<DeviceBatch> FilterOperator::next(ExecutionContext& context) {
   return std::nullopt;
 }
 
-void FilterOperator::close(ExecutionContext& context) { child_->close(context); }
+void FilterOperator::close(ExecutionContext& context) {
+  child_->close(context);
+}
 
 }  // namespace kernellake

@@ -39,7 +39,7 @@ and covered by passing tests -- not merely designed or stubbed.
   (cross-batch via `cudf::reduce`'s `init` param), `HashAggregateOperator`
   (cross-batch via `cudf::groupby::streaming_groupby`, bounded by
   `max_distinct_keys`), `LimitOperator`, `ArrowResultOperator` -- see
-  "GPU operators" in `docs/architecture.md` for the two correctness
+  "GPU operators" in `docs/ARCHITECTURE.md` for the two correctness
   bugs (STRING columns through `cudf::ast`, and scan column-index
   remapping) this surfaced and fixed
 - `QueryEngine::execute()`, wired to the real operator pipeline for
@@ -67,8 +67,36 @@ and covered by passing tests -- not merely designed or stubbed.
   as `validate_against_duckdb.py`), and `kernellake benchmark tpch`
   (cold/warm modes with median/mean/min/max/stddev over configurable
   iterations; `execution-only` mode is not implemented -- see
-  `docs/tpch.md`). Verified: Q1 and Q6 both match DuckDB at SF0.01 and
+  `docs/TPCH.md`). Verified: Q1 and Q6 both match DuckDB at SF0.01 and
   SF0.1.
+
+- `LICENSE` (Apache 2.0), `NOTICE`, `THIRD_PARTY_LICENSES.md` (every
+  dependency actually declared in the build, verified against each
+  package's own license metadata rather than assumed -- including flagging
+  that the CUDA Toolkit and RAPIDS's vendored `nvcomp` component are
+  NVIDIA proprietary SDK/EULA dependencies, not open source)
+- `.clang-format` (the whole existing C++ tree has been reformatted to
+  match and is currently clean); `.clang-tidy` config (written, but **not
+  run** -- `clang-tidy` was not available in this development environment,
+  so it is not wired into CI); optional `.pre-commit-config.yaml`
+  (clang-format only)
+- `docker/Dockerfile.dev` and `docker/Dockerfile.runtime` (multi-stage,
+  copying only the built binary plus its actual non-system runtime
+  dependency closure via `ldd`) -- **written but not verified**: Docker
+  was not available in this development environment, so neither image has
+  been through an actual `docker build`/`docker run --gpus all`
+- `.github/workflows/ci.yml`: formatting check, CPU-only build+test
+  (`dev` preset), and a GPU-free TPC-H tooling smoke test (small-scale
+  `generate_tpch.py` run plus `kernellake explain` -- not `query` -- against
+  both query files, to catch a query file that stops parsing/binding/
+  planning). **The workflow's individual shell commands have been run and
+  verified locally**; the GitHub Actions orchestration itself has not
+  (no way to trigger an Actions run from this environment). GPU-dependent
+  work (the `gpu-dev` preset, `tests/gpu/`, real query execution, DuckDB
+  validation, TPC-H benchmarks) is intentionally not in this workflow --
+  standard GitHub-hosted runners have no GPU, and a skipped-GPU job must
+  never be reported as passing; that needs a self-hosted GPU runner, not
+  configured here
 
 ## Not yet started
 
@@ -79,10 +107,11 @@ and covered by passing tests -- not merely designed or stubbed.
 - TPC-H `execution-only` benchmark mode (needs an operator-tree entry point
   that skips `ParquetScanOperator`); TPC-H at real SF1/SF10 scale (only
   tested at SF0.01/SF0.1 so far); Q3/Q12/Q14 (need hash joins)
-- Docker images (`docker/Dockerfile.dev`, `docker/Dockerfile.runtime`)
-- GitHub Actions CI (CPU-safe checks split from CUDA compile checks and GPU
-  runtime tests)
-- `NOTICE` / `THIRD_PARTY_LICENSES.md`, `clang-format`/`clang-tidy` config
+- A self-hosted GPU CI runner (would enable a `gpu-dev` build/test/
+  benchmark/validate workflow to actually run in CI, rather than only
+  locally)
+- Actually running `clang-tidy` (config exists, unverified) and an actual
+  `docker build`/`docker run` of both Dockerfiles (written, unverified)
 
 ## Explicit non-goals for the MVP
 
@@ -92,5 +121,5 @@ operators, full Iceberg catalog integration, Arrow Flight SQL, joins, all
 retries, query spilling, materialized views, transactions, data ingestion
 (`INSERT`/`UPDATE`/`DELETE`), a proprietary storage format, and a web UI.
 Interfaces may exist for some of these (see "Future architecture" in
-`docs/architecture.md`) but none are implemented or exposed as supported
+`docs/ARCHITECTURE.md`) but none are implemented or exposed as supported
 features.

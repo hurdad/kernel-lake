@@ -21,7 +21,7 @@ namespace kernellake {
 
 // Execution and I/O metrics for one query. Every metric KernelLake cannot
 // yet measure (because execution requires GPU/libcudf, not yet built --
-// see docs/architecture.md) stays std::nullopt rather than being guessed at,
+// see docs/ARCHITECTURE.md) stays std::nullopt rather than being guessed at,
 // per the spec's "documented null value, never an invented measurement"
 // rule.
 struct QueryResult {
@@ -63,7 +63,7 @@ struct QueryResult {
 // (query_engine_execute_stub.cpp) -- KernelLake never substitutes a CPU
 // implementation for GPU execution without saying so explicitly.
 class QueryEngine {
-public:
+ public:
   explicit QueryEngine(EngineConfig config);
 
   // Returns the optimized logical plan (i.e. the plan the physical planner
@@ -75,7 +75,7 @@ public:
 
   [[nodiscard]] QueryResult execute(std::string_view sql) const;
 
-private:
+ private:
   [[nodiscard]] LogicalPlanPtr plan_logical(std::string_view sql) const;
 
   EngineConfig config_;

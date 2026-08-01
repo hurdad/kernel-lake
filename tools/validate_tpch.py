@@ -6,7 +6,7 @@ Unofficial TPC-H-derived benchmark. Not a certified TPC result.
 Mirrors the spec's `kernellake validate tpch` CLI surface as a Python tool
 rather than a C++ subcommand, matching the choice already made for
 validate_against_duckdb.py: embedding libduckdb directly into the
-KernelLake binary is a real option (see docs/architecture.md) but hasn't
+KernelLake binary is a real option (see docs/ARCHITECTURE.md) but hasn't
 been done, so DuckDB cross-validation lives here instead.
 
 Usage:

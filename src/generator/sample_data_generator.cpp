@@ -66,15 +66,15 @@ std::shared_ptr<arrow::Schema> sample_schema() {
 }
 
 std::shared_ptr<arrow::Table> generate_batch_table(const SampleDataGeneratorOptions& options,
-                                                    std::int64_t first_order_id, std::int64_t row_count,
-                                                    std::mt19937_64& rng) {
+                                                   std::int64_t first_order_id, std::int64_t row_count,
+                                                   std::mt19937_64& rng) {
   arrow::Int64Builder order_id_builder;
   arrow::Int64Builder customer_id_builder;
   arrow::StringBuilder region_builder;
   arrow::DoubleBuilder amount_builder;
   arrow::Date32Builder event_date_builder;
   arrow::TimestampBuilder event_time_builder(arrow::timestamp(arrow::TimeUnit::MICRO),
-                                              arrow::default_memory_pool());
+                                             arrow::default_memory_pool());
   arrow::StringBuilder category_builder;
   arrow::DoubleBuilder discount_builder;
 
@@ -91,8 +91,8 @@ std::shared_ptr<arrow::Table> generate_batch_table(const SampleDataGeneratorOpti
     if (!status.ok()) throw StorageError("generate-data: " + status.ToString());
     status = customer_id_builder.Append(customer_dist(rng));
     if (!status.ok()) throw StorageError("generate-data: " + status.ToString());
-    status = region_builder.Append("region-" +
-                                    std::to_string(skewed_index(rng, options.region_cardinality, options.skew)));
+    status = region_builder.Append(
+        "region-" + std::to_string(skewed_index(rng, options.region_cardinality, options.skew)));
     if (!status.ok()) throw StorageError("generate-data: " + status.ToString());
     status = amount_builder.Append(amount_dist(rng));
     if (!status.ok()) throw StorageError("generate-data: " + status.ToString());
@@ -100,7 +100,7 @@ std::shared_ptr<arrow::Table> generate_batch_table(const SampleDataGeneratorOpti
     status = event_date_builder.Append(event_date);
     if (!status.ok()) throw StorageError("generate-data: " + status.ToString());
     status = event_time_builder.Append(static_cast<std::int64_t>(event_date) * kMicrosPerDay +
-                                        time_of_day_dist(rng));
+                                       time_of_day_dist(rng));
     if (!status.ok()) throw StorageError("generate-data: " + status.ToString());
     status = category_builder.Append(
         "category-" + std::to_string(skewed_index(rng, options.category_cardinality, options.skew)));
@@ -122,8 +122,8 @@ std::shared_ptr<arrow::Table> generate_batch_table(const SampleDataGeneratorOpti
     throw StorageError("generate-data: failed to finalize generated columns");
   }
 
-  return arrow::Table::Make(sample_schema(), {order_id, customer_id, region, amount, event_date, event_time,
-                                               category, discount});
+  return arrow::Table::Make(
+      sample_schema(), {order_id, customer_id, region, amount, event_date, event_time, category, discount});
 }
 
 }  // namespace
@@ -135,7 +135,7 @@ SampleDataGenerationResult generate_sample_data(const SampleDataGeneratorOptions
   fs::create_directories(options.output_dir, ec);
   if (ec) {
     throw StorageError("generate-data: failed to create output directory '" + options.output_dir +
-                        "': " + ec.message());
+                       "': " + ec.message());
   }
 
   const std::shared_ptr<parquet::WriterProperties> writer_properties = [&] {
@@ -173,11 +173,11 @@ SampleDataGenerationResult generate_sample_data(const SampleDataGeneratorOptions
     arrow::Result<std::shared_ptr<arrow::io::FileOutputStream>> sink =
         arrow::io::FileOutputStream::Open(file_path.string());
     if (!sink.ok()) {
-      throw StorageError("generate-data: failed to open '" + file_path.string() + "': " +
-                          sink.status().ToString());
+      throw StorageError("generate-data: failed to open '" + file_path.string() +
+                         "': " + sink.status().ToString());
     }
     const arrow::Status status = parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), *sink,
-                                                              options.row_group_rows, writer_properties);
+                                                            options.row_group_rows, writer_properties);
     if (!status.ok()) {
       throw StorageError("generate-data: failed to write '" + file_path.string() + "': " + status.ToString());
     }

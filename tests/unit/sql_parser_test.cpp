@@ -22,8 +22,7 @@ TEST(SqlParser, ParsesGeneralMvpQuery) {
   EXPECT_EQ(std::get<AstAggregate>(stmt.select_list[1]->node).function, AstAggregateFunc::Sum);
   EXPECT_EQ(stmt.select_list[1]->alias, "total_amount");
   ASSERT_TRUE(std::holds_alternative<AstAggregate>(stmt.select_list[2]->node));
-  EXPECT_EQ(std::get<AstAggregate>(stmt.select_list[2]->node).function,
-            AstAggregateFunc::CountStar);
+  EXPECT_EQ(std::get<AstAggregate>(stmt.select_list[2]->node).function, AstAggregateFunc::CountStar);
 
   ASSERT_NE(stmt.where, nullptr);
   ASSERT_EQ(stmt.group_by.size(), 1u);
@@ -51,28 +50,24 @@ TEST(SqlParser, ParsesTpchQ6Shape) {
 }
 
 TEST(SqlParser, ParsesMultiplePathArguments) {
-  const auto stmt =
-      parse_sql("SELECT a FROM read_parquet('/data/a.parquet', '/data/b.parquet')");
+  const auto stmt = parse_sql("SELECT a FROM read_parquet('/data/a.parquet', '/data/b.parquet')");
   ASSERT_EQ(stmt.from.paths.size(), 2u);
   EXPECT_EQ(stmt.from.paths[0], "/data/a.parquet");
   EXPECT_EQ(stmt.from.paths[1], "/data/b.parquet");
 }
 
 TEST(SqlParser, ParsesIsNullAndIsNotNull) {
-  const auto is_null =
-      parse_sql("SELECT a FROM read_parquet('/x.parquet') WHERE a IS NULL");
+  const auto is_null = parse_sql("SELECT a FROM read_parquet('/x.parquet') WHERE a IS NULL");
   ASSERT_TRUE(std::holds_alternative<AstUnary>(is_null.where->node));
   EXPECT_EQ(std::get<AstUnary>(is_null.where->node).op, AstUnaryOp::IsNull);
 
-  const auto is_not_null =
-      parse_sql("SELECT a FROM read_parquet('/x.parquet') WHERE a IS NOT NULL");
+  const auto is_not_null = parse_sql("SELECT a FROM read_parquet('/x.parquet') WHERE a IS NOT NULL");
   ASSERT_TRUE(std::holds_alternative<AstUnary>(is_not_null.where->node));
   EXPECT_EQ(std::get<AstUnary>(is_not_null.where->node).op, AstUnaryOp::IsNotNull);
 }
 
 TEST(SqlParser, ParsesOrderByAndStar) {
-  const auto stmt =
-      parse_sql("SELECT * FROM read_parquet('/x.parquet') ORDER BY a DESC, b ASC");
+  const auto stmt = parse_sql("SELECT * FROM read_parquet('/x.parquet') ORDER BY a DESC, b ASC");
   ASSERT_EQ(stmt.select_list.size(), 1u);
   EXPECT_TRUE(std::holds_alternative<AstStar>(stmt.select_list[0]->node));
   ASSERT_EQ(stmt.order_by.size(), 2u);
@@ -95,9 +90,8 @@ TEST(SqlParser, RejectsMissingReadParquetSource) {
 }
 
 TEST(SqlParser, RejectsJoins) {
-  EXPECT_THROW(
-      parse_sql("SELECT a FROM read_parquet('/x.parquet') JOIN read_parquet('/y.parquet') ON true"),
-      SqlError);
+  EXPECT_THROW(parse_sql("SELECT a FROM read_parquet('/x.parquet') JOIN read_parquet('/y.parquet') ON true"),
+               SqlError);
 }
 
 TEST(SqlParser, RejectsUnsupportedFunction) {
@@ -109,8 +103,7 @@ TEST(SqlParser, RejectsMalformedSql) {
 }
 
 TEST(SqlParser, RejectsInvalidDateLiteral) {
-  EXPECT_THROW(parse_sql("SELECT a FROM read_parquet('/x.parquet') WHERE d >= DATE '2026-13-40'"),
-               SqlError);
+  EXPECT_THROW(parse_sql("SELECT a FROM read_parquet('/x.parquet') WHERE d >= DATE '2026-13-40'"), SqlError);
 }
 
 TEST(SqlParser, RejectsOffset) {

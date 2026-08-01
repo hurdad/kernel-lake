@@ -49,7 +49,7 @@ std::string literal_to_string(const LiteralStorage& value) {
 // Returns a reason string if `predicate` can be proven impossible against
 // `stats`, or nullopt if the row group must still be scanned for it.
 std::optional<std::string> predicate_proves_empty(const PushablePredicate& predicate,
-                                                    const ColumnStatistics& stats) {
+                                                  const ColumnStatistics& stats) {
   if (!stats.has_min_max) return std::nullopt;
   const auto* literal_expr = dynamic_cast<const LiteralExpression*>(predicate.literal.get());
   if (literal_expr == nullptr || literal_expr->is_null()) return std::nullopt;
@@ -60,9 +60,9 @@ std::optional<std::string> predicate_proves_empty(const PushablePredicate& predi
   if (!cmp_min.has_value() || !cmp_max.has_value()) return std::nullopt;
 
   std::ostringstream reason;
-  reason << predicate.column_name << " " << to_string(predicate.op) << " "
-         << literal_to_string(literal) << " vs [" << literal_to_string(stats.min_value) << ", "
-         << literal_to_string(stats.max_value) << "]";
+  reason << predicate.column_name << " " << to_string(predicate.op) << " " << literal_to_string(literal)
+         << " vs [" << literal_to_string(stats.min_value) << ", " << literal_to_string(stats.max_value)
+         << "]";
 
   switch (predicate.op) {
     case BinaryOperator::Equal:
@@ -92,8 +92,7 @@ std::optional<std::string> predicate_proves_empty(const PushablePredicate& predi
 
 }  // namespace
 
-ScanDecision evaluate_pruning(const FileMetadata& file,
-                               const std::vector<PushablePredicate>& predicates) {
+ScanDecision evaluate_pruning(const FileMetadata& file, const std::vector<PushablePredicate>& predicates) {
   ScanDecision decision;
   decision.file = file.path;
 

@@ -11,13 +11,13 @@ namespace kernellake {
 
 // GPU-resident batch of columnar data. It internally owns a cudf::table,
 // but the rest of KernelLake depends on this abstraction rather than on
-// every libcudf implementation detail directly (see docs/architecture.md).
+// every libcudf implementation detail directly (see docs/ARCHITECTURE.md).
 // Throws ExecutionError if `table`'s column count doesn't match `schema`'s
 // field count -- this is always a KernelLake bug (a mismatched physical
 // operator), not a runtime data condition, so it fails immediately at
 // construction rather than surfacing confusingly later.
 class DeviceBatch {
-public:
+ public:
   DeviceBatch(std::unique_ptr<cudf::table> table, std::shared_ptr<const Schema> schema);
 
   DeviceBatch(DeviceBatch&&) noexcept = default;
@@ -36,7 +36,7 @@ public:
   // ownership of a table to a new DeviceBatch without an intermediate copy.
   [[nodiscard]] std::unique_ptr<cudf::table> release_table() && { return std::move(table_); }
 
-private:
+ private:
   std::unique_ptr<cudf::table> table_;
   std::shared_ptr<const Schema> schema_;
 };

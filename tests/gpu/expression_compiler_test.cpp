@@ -80,14 +80,13 @@ TEST(ExpressionCompiler, CompilesTpchQ6FilterShapeAndArithmetic) {
   auto quantity = std::make_shared<ColumnExpression>("l_quantity", 2, int32_type(false));
   auto quantity_as_int64 = std::make_shared<CastExpression>(quantity, int64_type(false));
   auto twenty_four = std::make_shared<LiteralExpression>(LiteralExpression::make_int64(24));
-  auto quantity_cmp = std::make_shared<BinaryExpression>(BinaryOperator::Less, quantity_as_int64,
-                                                          twenty_four, boolean_type(false));
+  auto quantity_cmp = std::make_shared<BinaryExpression>(BinaryOperator::Less, quantity_as_int64, twenty_four,
+                                                         boolean_type(false));
 
   BinaryExpression predicate(BinaryOperator::And, between, quantity_cmp, boolean_type(false));
 
   ExpressionCompiler filter_compiler;
-  std::unique_ptr<cudf::column> mask =
-      cudf::compute_column(table.view(), filter_compiler.compile(predicate));
+  std::unique_ptr<cudf::column> mask = cudf::compute_column(table.view(), filter_compiler.compile(predicate));
   EXPECT_EQ(mask->type().id(), cudf::type_id::BOOL8);
   EXPECT_EQ(mask->size(), 10);
 

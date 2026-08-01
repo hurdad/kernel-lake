@@ -73,8 +73,7 @@ int run_query(const std::vector<std::string_view>& args, const EngineConfig& con
 
   const std::optional<ResultFormat> format = parse_result_format(format_name);
   if (!format) {
-    std::fprintf(stderr,
-                 "kernellake query: --format must be one of table|csv|jsonl|arrow, got '%s'\n",
+    std::fprintf(stderr, "kernellake query: --format must be one of table|csv|jsonl|arrow, got '%s'\n",
                  format_name.c_str());
     return 1;
   }

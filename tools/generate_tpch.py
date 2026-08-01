@@ -14,7 +14,7 @@ Deviations from canonical TPC-H, documented per the spec's requirement to
 record every one:
   - Only `lineitem` is generated. `orders`/`customer`/`part`/`supplier`/
     `partsupp`/`nation`/`region` are not, since no currently-supported
-    query joins across tables (see docs/roadmap.md: hash joins are not
+    query joins across tables (see docs/ROADMAP.md: hash joins are not
     implemented yet).
   - l_quantity/l_extendedprice/l_discount/l_tax are DOUBLE, not DECIMAL --
     KernelLake's GPU execution layer does not support the Decimal type yet

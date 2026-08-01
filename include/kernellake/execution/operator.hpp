@@ -15,7 +15,7 @@ namespace kernellake {
 // support cancellation checks via context.cancellation, and use
 // context.stream rather than the default stream so pipelines can overlap.
 class PhysicalOperator {
-public:
+ public:
   virtual ~PhysicalOperator() = default;
 
   virtual void open(ExecutionContext& context) = 0;

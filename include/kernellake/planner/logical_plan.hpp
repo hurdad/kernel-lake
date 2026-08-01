@@ -28,14 +28,13 @@ using LogicalPlanPtr = std::shared_ptr<LogicalPlanNode>;
 // enough node-specific detail (via explain_attributes) to render both the
 // human-readable and JSON EXPLAIN formats generically.
 class LogicalPlanNode {
-public:
+ public:
   virtual ~LogicalPlanNode() = default;
 
   [[nodiscard]] virtual const Schema& output_schema() const = 0;
   [[nodiscard]] virtual std::string_view node_name() const noexcept = 0;
   [[nodiscard]] virtual std::vector<LogicalPlanPtr> children() const = 0;
-  [[nodiscard]] virtual std::vector<std::pair<std::string, std::string>> explain_attributes()
-      const {
+  [[nodiscard]] virtual std::vector<std::pair<std::string, std::string>> explain_attributes() const {
     return {};
   }
 
@@ -56,29 +55,26 @@ struct PushablePredicate {
 };
 
 class LogicalScan final : public LogicalPlanNode {
-public:
+ public:
   LogicalScan(std::vector<std::string> source_paths, Schema schema)
-      : source_paths_(std::move(source_paths)), schema_(schema), required_columns_(all_field_names(schema_)) {}
+      : source_paths_(std::move(source_paths)),
+        schema_(schema),
+        required_columns_(all_field_names(schema_)) {}
 
-  [[nodiscard]] const std::vector<std::string>& source_paths() const noexcept {
-    return source_paths_;
-  }
+  [[nodiscard]] const std::vector<std::string>& source_paths() const noexcept { return source_paths_; }
   [[nodiscard]] const Schema& output_schema() const override { return schema_; }
   [[nodiscard]] std::string_view node_name() const noexcept override { return "LogicalScan"; }
   [[nodiscard]] std::vector<LogicalPlanPtr> children() const override { return {}; }
-  [[nodiscard]] std::vector<std::pair<std::string, std::string>> explain_attributes()
-      const override;
+  [[nodiscard]] std::vector<std::pair<std::string, std::string>> explain_attributes() const override;
 
   // Defaults to every column in the schema until the optimizer's
   // projection-pushdown rule narrows it to what the plan actually
-  // references (see docs/architecture.md for why this narrows the column
+  // references (see docs/ARCHITECTURE.md for why this narrows the column
   // *list* rather than reindexing the scan's schema/expressions).
   [[nodiscard]] const std::vector<std::string>& required_columns() const noexcept {
     return required_columns_;
   }
-  void set_required_columns(std::vector<std::string> columns) {
-    required_columns_ = std::move(columns);
-  }
+  void set_required_columns(std::vector<std::string> columns) { required_columns_ = std::move(columns); }
 
   [[nodiscard]] const std::vector<PushablePredicate>& pushable_predicates() const noexcept {
     return pushable_predicates_;
@@ -87,7 +83,7 @@ public:
     pushable_predicates_ = std::move(predicates);
   }
 
-private:
+ private:
   static std::vector<std::string> all_field_names(const Schema& schema) {
     std::vector<std::string> names;
     names.reserve(schema.field_count());
@@ -104,7 +100,7 @@ private:
 // ---------------------------------------------------------------------------
 
 class LogicalFilter final : public LogicalPlanNode {
-public:
+ public:
   LogicalFilter(LogicalPlanPtr child, ExpressionPtr predicate)
       : child_(std::move(child)), predicate_(std::move(predicate)) {}
 
@@ -113,12 +109,11 @@ public:
   [[nodiscard]] const Schema& output_schema() const override { return child_->output_schema(); }
   [[nodiscard]] std::string_view node_name() const noexcept override { return "LogicalFilter"; }
   [[nodiscard]] std::vector<LogicalPlanPtr> children() const override { return {child_}; }
-  [[nodiscard]] std::vector<std::pair<std::string, std::string>> explain_attributes()
-      const override {
+  [[nodiscard]] std::vector<std::pair<std::string, std::string>> explain_attributes() const override {
     return {{"predicate", predicate_->to_string()}};
   }
 
-private:
+ private:
   LogicalPlanPtr child_;
   ExpressionPtr predicate_;
 };
@@ -126,21 +121,18 @@ private:
 // ---------------------------------------------------------------------------
 
 class LogicalProjection final : public LogicalPlanNode {
-public:
+ public:
   LogicalProjection(LogicalPlanPtr child, std::vector<NamedExpression> items)
       : child_(std::move(child)), items_(std::move(items)), schema_(build_schema(items_)) {}
 
   [[nodiscard]] const LogicalPlanPtr& child() const noexcept { return child_; }
   [[nodiscard]] const std::vector<NamedExpression>& items() const noexcept { return items_; }
   [[nodiscard]] const Schema& output_schema() const override { return schema_; }
-  [[nodiscard]] std::string_view node_name() const noexcept override {
-    return "LogicalProjection";
-  }
+  [[nodiscard]] std::string_view node_name() const noexcept override { return "LogicalProjection"; }
   [[nodiscard]] std::vector<LogicalPlanPtr> children() const override { return {child_}; }
-  [[nodiscard]] std::vector<std::pair<std::string, std::string>> explain_attributes()
-      const override;
+  [[nodiscard]] std::vector<std::pair<std::string, std::string>> explain_attributes() const override;
 
-private:
+ private:
   static Schema build_schema(const std::vector<NamedExpression>& items) {
     std::vector<Field> fields;
     fields.reserve(items.size());
@@ -158,9 +150,9 @@ private:
 // ---------------------------------------------------------------------------
 
 class LogicalAggregate final : public LogicalPlanNode {
-public:
+ public:
   LogicalAggregate(LogicalPlanPtr child, std::vector<NamedExpression> group_by,
-                    std::vector<NamedExpression> aggregates)
+                   std::vector<NamedExpression> aggregates)
       : child_(std::move(child)),
         group_by_(std::move(group_by)),
         aggregates_(std::move(aggregates)),
@@ -168,20 +160,15 @@ public:
 
   [[nodiscard]] const LogicalPlanPtr& child() const noexcept { return child_; }
   [[nodiscard]] const std::vector<NamedExpression>& group_by() const noexcept { return group_by_; }
-  [[nodiscard]] const std::vector<NamedExpression>& aggregates() const noexcept {
-    return aggregates_;
-  }
+  [[nodiscard]] const std::vector<NamedExpression>& aggregates() const noexcept { return aggregates_; }
   [[nodiscard]] const Schema& output_schema() const override { return schema_; }
-  [[nodiscard]] std::string_view node_name() const noexcept override {
-    return "LogicalAggregate";
-  }
+  [[nodiscard]] std::string_view node_name() const noexcept override { return "LogicalAggregate"; }
   [[nodiscard]] std::vector<LogicalPlanPtr> children() const override { return {child_}; }
-  [[nodiscard]] std::vector<std::pair<std::string, std::string>> explain_attributes()
-      const override;
+  [[nodiscard]] std::vector<std::pair<std::string, std::string>> explain_attributes() const override;
 
-private:
+ private:
   static Schema build_schema(const std::vector<NamedExpression>& group_by,
-                              const std::vector<NamedExpression>& aggregates) {
+                             const std::vector<NamedExpression>& aggregates) {
     std::vector<Field> fields;
     fields.reserve(group_by.size() + aggregates.size());
     for (const NamedExpression& item : group_by) {
@@ -202,7 +189,7 @@ private:
 // ---------------------------------------------------------------------------
 
 class LogicalSort final : public LogicalPlanNode {
-public:
+ public:
   struct Key {
     ExpressionPtr expr;
     bool ascending;
@@ -216,10 +203,9 @@ public:
   [[nodiscard]] const Schema& output_schema() const override { return child_->output_schema(); }
   [[nodiscard]] std::string_view node_name() const noexcept override { return "LogicalSort"; }
   [[nodiscard]] std::vector<LogicalPlanPtr> children() const override { return {child_}; }
-  [[nodiscard]] std::vector<std::pair<std::string, std::string>> explain_attributes()
-      const override;
+  [[nodiscard]] std::vector<std::pair<std::string, std::string>> explain_attributes() const override;
 
-private:
+ private:
   LogicalPlanPtr child_;
   std::vector<Key> keys_;
 };
@@ -227,21 +213,19 @@ private:
 // ---------------------------------------------------------------------------
 
 class LogicalLimit final : public LogicalPlanNode {
-public:
-  LogicalLimit(LogicalPlanPtr child, std::int64_t limit)
-      : child_(std::move(child)), limit_(limit) {}
+ public:
+  LogicalLimit(LogicalPlanPtr child, std::int64_t limit) : child_(std::move(child)), limit_(limit) {}
 
   [[nodiscard]] const LogicalPlanPtr& child() const noexcept { return child_; }
   [[nodiscard]] std::int64_t limit() const noexcept { return limit_; }
   [[nodiscard]] const Schema& output_schema() const override { return child_->output_schema(); }
   [[nodiscard]] std::string_view node_name() const noexcept override { return "LogicalLimit"; }
   [[nodiscard]] std::vector<LogicalPlanPtr> children() const override { return {child_}; }
-  [[nodiscard]] std::vector<std::pair<std::string, std::string>> explain_attributes()
-      const override {
+  [[nodiscard]] std::vector<std::pair<std::string, std::string>> explain_attributes() const override {
     return {{"limit", std::to_string(limit_)}};
   }
 
-private:
+ private:
   LogicalPlanPtr child_;
   std::int64_t limit_;
 };

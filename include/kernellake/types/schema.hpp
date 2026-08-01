@@ -49,8 +49,7 @@ struct DataType {
 [[nodiscard]] DataType string_type(bool nullable = true);
 [[nodiscard]] DataType date32_type(bool nullable = true);
 [[nodiscard]] DataType timestamp_type(bool nullable = true);
-[[nodiscard]] DataType decimal_type(std::int32_t precision, std::int32_t scale,
-                                     bool nullable = true);
+[[nodiscard]] DataType decimal_type(std::int32_t precision, std::int32_t scale, bool nullable = true);
 
 struct Field {
   std::string name;
@@ -64,7 +63,7 @@ struct Field {
 // An ordered, immutable list of named, typed fields. Independent of Arrow,
 // Parquet, and libcudf; see arrow_adapter.hpp for conversions to/from Arrow.
 class Schema {
-public:
+ public:
   explicit Schema(std::vector<Field> fields);
 
   [[nodiscard]] const std::vector<Field>& fields() const noexcept { return fields_; }
@@ -80,7 +79,7 @@ public:
   // files that make up one logical dataset.
   [[nodiscard]] bool equals(const Schema& other) const noexcept;
 
-private:
+ private:
   std::vector<Field> fields_;
 };
 

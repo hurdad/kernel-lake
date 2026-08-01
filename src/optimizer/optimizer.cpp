@@ -70,12 +70,12 @@ ExpressionPtr simplify_expression(const ExpressionPtr& expr) {
     ExpressionPtr value = simplify_expression(between->value());
     ExpressionPtr lower = simplify_expression(between->lower());
     ExpressionPtr upper = simplify_expression(between->upper());
-    const bool nullable = value->result_type().nullable || lower->result_type().nullable ||
-                           upper->result_type().nullable;
-    ExpressionPtr ge = std::make_shared<BinaryExpression>(BinaryOperator::GreaterEqual, value,
-                                                           lower, boolean_type(nullable));
-    ExpressionPtr le = std::make_shared<BinaryExpression>(BinaryOperator::LessEqual, value, upper,
-                                                           boolean_type(nullable));
+    const bool nullable =
+        value->result_type().nullable || lower->result_type().nullable || upper->result_type().nullable;
+    ExpressionPtr ge = std::make_shared<BinaryExpression>(BinaryOperator::GreaterEqual, value, lower,
+                                                          boolean_type(nullable));
+    ExpressionPtr le =
+        std::make_shared<BinaryExpression>(BinaryOperator::LessEqual, value, upper, boolean_type(nullable));
     ExpressionPtr conjunction =
         std::make_shared<BinaryExpression>(BinaryOperator::And, ge, le, boolean_type(nullable));
     return simplify_expression(conjunction);
@@ -93,8 +93,7 @@ ExpressionPtr simplify_expression(const ExpressionPtr& expr) {
       }
     }
     if (operand.get() == unary->operand().get()) return expr;
-    return std::make_shared<UnaryExpression>(unary->op(), std::move(operand),
-                                              unary->result_type());
+    return std::make_shared<UnaryExpression>(unary->op(), std::move(operand), unary->result_type());
   }
   if (const auto* binary = dynamic_cast<const BinaryExpression*>(expr.get())) {
     ExpressionPtr left = simplify_expression(binary->left());
@@ -104,17 +103,15 @@ ExpressionPtr simplify_expression(const ExpressionPtr& expr) {
     const BinaryOperator op = binary->op();
 
     if (is_logical(op)) {
-      if (left_lit != nullptr && !left_lit->is_null() &&
-          std::holds_alternative<bool>(left_lit->value())) {
+      if (left_lit != nullptr && !left_lit->is_null() && std::holds_alternative<bool>(left_lit->value())) {
         const bool lv = std::get<bool>(left_lit->value());
         return op == BinaryOperator::And ? (lv ? right : make_bool_literal(false))
-                                          : (lv ? make_bool_literal(true) : right);
+                                         : (lv ? make_bool_literal(true) : right);
       }
-      if (right_lit != nullptr && !right_lit->is_null() &&
-          std::holds_alternative<bool>(right_lit->value())) {
+      if (right_lit != nullptr && !right_lit->is_null() && std::holds_alternative<bool>(right_lit->value())) {
         const bool rv = std::get<bool>(right_lit->value());
         return op == BinaryOperator::And ? (rv ? left : make_bool_literal(false))
-                                          : (rv ? make_bool_literal(true) : left);
+                                         : (rv ? make_bool_literal(true) : left);
       }
     } else if (left_lit != nullptr && right_lit != nullptr) {
       const std::optional<double> lv = literal_as_double(*left_lit);
@@ -122,13 +119,11 @@ ExpressionPtr simplify_expression(const ExpressionPtr& expr) {
       if (lv.has_value() && rv.has_value()) {
         if (is_arithmetic(op)) {
           if (const std::optional<double> result = fold_arithmetic(op, *lv, *rv)) {
-            const bool as_float = binary->result_type().id == TypeId::Float64 ||
-                                   binary->result_type().id == TypeId::Float32;
-            return as_float
-                       ? std::make_shared<LiteralExpression>(
-                             LiteralExpression::make_float64(*result))
-                       : std::make_shared<LiteralExpression>(
-                             LiteralExpression::make_int64(static_cast<std::int64_t>(*result)));
+            const bool as_float =
+                binary->result_type().id == TypeId::Float64 || binary->result_type().id == TypeId::Float32;
+            return as_float ? std::make_shared<LiteralExpression>(LiteralExpression::make_float64(*result))
+                            : std::make_shared<LiteralExpression>(
+                                  LiteralExpression::make_int64(static_cast<std::int64_t>(*result)));
           }
         } else if (is_comparison(op)) {
           if (const std::optional<bool> result = fold_numeric_comparison(op, *lv, *rv)) {
@@ -139,8 +134,7 @@ ExpressionPtr simplify_expression(const ExpressionPtr& expr) {
     }
 
     if (left.get() == binary->left().get() && right.get() == binary->right().get()) return expr;
-    return std::make_shared<BinaryExpression>(op, std::move(left), std::move(right),
-                                               binary->result_type());
+    return std::make_shared<BinaryExpression>(op, std::move(left), std::move(right), binary->result_type());
   }
   if (const auto* cast = dynamic_cast<const CastExpression*>(expr.get())) {
     ExpressionPtr operand = simplify_expression(cast->operand());
@@ -152,7 +146,7 @@ ExpressionPtr simplify_expression(const ExpressionPtr& expr) {
     ExpressionPtr argument = simplify_expression(aggregate->argument());
     if (argument.get() == aggregate->argument().get()) return expr;
     return std::make_shared<AggregateExpression>(aggregate->function(), std::move(argument),
-                                                  aggregate->result_type());
+                                                 aggregate->result_type());
   }
   return expr;  // ColumnExpression, LiteralExpression: nothing to simplify.
 }
@@ -207,8 +201,7 @@ BinaryOperator flip(BinaryOperator op) {
   }
 }
 
-void collect_pushable_predicates(const ExpressionPtr& predicate,
-                                  std::vector<PushablePredicate>& out) {
+void collect_pushable_predicates(const ExpressionPtr& predicate, std::vector<PushablePredicate>& out) {
   const auto* binary = dynamic_cast<const BinaryExpression*>(predicate.get());
   if (binary == nullptr) return;
 
@@ -317,8 +310,7 @@ LogicalPlanPtr rewrite_plan(const LogicalPlanPtr& node) {
     for (const NamedExpression& item : aggregate->aggregates()) {
       aggregates.push_back(NamedExpression{simplify_expression(item.expr), item.name});
     }
-    return std::make_shared<LogicalAggregate>(std::move(child), std::move(group_by),
-                                               std::move(aggregates));
+    return std::make_shared<LogicalAggregate>(std::move(child), std::move(group_by), std::move(aggregates));
   }
 
   if (const auto* sort = dynamic_cast<const LogicalSort*>(node.get())) {
@@ -346,7 +338,7 @@ LogicalPlanPtr rewrite_plan(const LogicalPlanPtr& node) {
 // ---------------------------------------------------------------------------
 
 void annotate_scan(const LogicalPlanPtr& node, std::unordered_set<std::string>& required_columns,
-                    std::vector<PushablePredicate>& pushable_predicates) {
+                   std::vector<PushablePredicate>& pushable_predicates) {
   if (const auto* filter = dynamic_cast<const LogicalFilter*>(node.get())) {
     collect_columns(filter->predicate(), required_columns);
     collect_pushable_predicates(filter->predicate(), pushable_predicates);

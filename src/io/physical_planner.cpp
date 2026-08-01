@@ -13,7 +13,7 @@ namespace {
 
 // LogicalScan's own output_schema() always keeps every original column (the
 // binder resolves every ColumnExpression in the whole query against that one
-// full schema -- see docs/architecture.md and the comment on
+// full schema -- see docs/ARCHITECTURE.md and the comment on
 // LogicalScan::required_columns()). convert_scan() below narrows the
 // *physical* scan to only the columns actually referenced, in doing so
 // reindexing them (a column no longer at its original ordinal position once
@@ -28,38 +28,39 @@ ExpressionPtr remap_columns(const ExpressionPtr& expr, const Schema& scan_schema
     const std::optional<std::size_t> index = scan_schema.find_field(column->name());
     if (!index) {
       throw PlanningError("physical planner: column '" + column->name() +
-                           "' referenced above the scan but missing from its pruned column list "
-                           "(internal error)");
+                          "' referenced above the scan but missing from its pruned column list "
+                          "(internal error)");
     }
     return std::make_shared<ColumnExpression>(column->name(), *index, column->result_type());
   }
   if (const auto* binary = dynamic_cast<const BinaryExpression*>(expr.get())) {
     return std::make_shared<BinaryExpression>(binary->op(), remap_columns(binary->left(), scan_schema),
-                                               remap_columns(binary->right(), scan_schema),
-                                               binary->result_type());
+                                              remap_columns(binary->right(), scan_schema),
+                                              binary->result_type());
   }
   if (const auto* unary = dynamic_cast<const UnaryExpression*>(expr.get())) {
     return std::make_shared<UnaryExpression>(unary->op(), remap_columns(unary->operand(), scan_schema),
-                                              unary->result_type());
+                                             unary->result_type());
   }
   if (const auto* cast = dynamic_cast<const CastExpression*>(expr.get())) {
     return std::make_shared<CastExpression>(remap_columns(cast->operand(), scan_schema), cast->result_type());
   }
   if (const auto* between = dynamic_cast<const BetweenExpression*>(expr.get())) {
     return std::make_shared<BetweenExpression>(remap_columns(between->value(), scan_schema),
-                                                remap_columns(between->lower(), scan_schema),
-                                                remap_columns(between->upper(), scan_schema));
+                                               remap_columns(between->lower(), scan_schema),
+                                               remap_columns(between->upper(), scan_schema));
   }
   if (const auto* aggregate = dynamic_cast<const AggregateExpression*>(expr.get())) {
     ExpressionPtr argument =
         aggregate->argument() ? remap_columns(aggregate->argument(), scan_schema) : nullptr;
     return std::make_shared<AggregateExpression>(aggregate->function(), std::move(argument),
-                                                  aggregate->result_type());
+                                                 aggregate->result_type());
   }
   return expr;  // LiteralExpression: no column reference to remap.
 }
 
-std::vector<NamedExpression> remap_named(const std::vector<NamedExpression>& items, const Schema& scan_schema) {
+std::vector<NamedExpression> remap_named(const std::vector<NamedExpression>& items,
+                                         const Schema& scan_schema) {
   std::vector<NamedExpression> result;
   result.reserve(items.size());
   for (const NamedExpression& item : items) {
@@ -68,7 +69,7 @@ std::vector<NamedExpression> remap_named(const std::vector<NamedExpression>& ite
   return result;
 }
 
-// Single-source queries only (no joins yet -- see docs/roadmap.md), so
+// Single-source queries only (no joins yet -- see docs/ROADMAP.md), so
 // exactly one ParquetScanNode exists per physical plan; find it to recover
 // the narrowed schema every expression above it must be remapped against.
 const Schema* find_scan_schema(const PhysicalPlanNode& node) {
@@ -92,9 +93,9 @@ PhysicalPlanPtr convert_scan(const LogicalScan& scan, ObjectStore& store) {
     if (decision.selected_row_groups.empty() && !meta.row_groups.empty()) {
       continue;  // Every row group was proven unnecessary: skip the file entirely.
     }
-    fragments.push_back(PhysicalFileFragment{
-        meta.path, meta.row_count, static_cast<int>(meta.row_groups.size()),
-        decision.selected_row_groups, decision.skipped_row_groups, decision.reasons});
+    fragments.push_back(
+        PhysicalFileFragment{meta.path, meta.row_count, static_cast<int>(meta.row_groups.size()),
+                             decision.selected_row_groups, decision.skipped_row_groups, decision.reasons});
   }
 
   // Narrow the schema (and the matching column list) to required_columns(),
@@ -111,8 +112,8 @@ PhysicalPlanPtr convert_scan(const LogicalScan& scan, ObjectStore& store) {
   }
 
   return std::make_shared<ParquetScanNode>(std::move(fragments), std::move(narrowed_columns),
-                                            Schema(std::move(narrowed_fields)),
-                                            static_cast<int>(metadata.size()));
+                                           Schema(std::move(narrowed_fields)),
+                                           static_cast<int>(metadata.size()));
 }
 
 PhysicalPlanPtr convert(const LogicalPlanPtr& node, ObjectStore& store) {

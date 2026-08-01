@@ -19,7 +19,7 @@ class Expression;
 using ExpressionPtr = std::shared_ptr<const Expression>;
 
 class Expression {
-public:
+ public:
   virtual ~Expression() = default;
 
   [[nodiscard]] virtual const DataType& result_type() const = 0;
@@ -31,7 +31,7 @@ public:
 // ---------------------------------------------------------------------------
 
 class ColumnExpression final : public Expression {
-public:
+ public:
   ColumnExpression(std::string name, std::size_t column_index, DataType type)
       : name_(std::move(name)), column_index_(column_index), type_(std::move(type)) {}
 
@@ -40,7 +40,7 @@ public:
   [[nodiscard]] const DataType& result_type() const override { return type_; }
   [[nodiscard]] std::string to_string() const override { return name_; }
 
-private:
+ private:
   std::string name_;
   std::size_t column_index_;
   DataType type_;
@@ -56,9 +56,8 @@ private:
 using LiteralStorage = std::variant<std::monostate, bool, std::int64_t, double, std::string>;
 
 class LiteralExpression final : public Expression {
-public:
-  LiteralExpression(LiteralStorage value, DataType type)
-      : value_(std::move(value)), type_(std::move(type)) {}
+ public:
+  LiteralExpression(LiteralStorage value, DataType type) : value_(std::move(value)), type_(std::move(type)) {}
 
   [[nodiscard]] static LiteralExpression make_null(DataType type) {
     return LiteralExpression(std::monostate{}, std::move(type));
@@ -87,7 +86,7 @@ public:
   [[nodiscard]] const DataType& result_type() const override { return type_; }
   [[nodiscard]] std::string to_string() const override;
 
-private:
+ private:
   LiteralStorage value_;
   DataType type_;
 };
@@ -117,7 +116,7 @@ enum class BinaryOperator {
 [[nodiscard]] bool is_logical(BinaryOperator op) noexcept;
 
 class BinaryExpression final : public Expression {
-public:
+ public:
   BinaryExpression(BinaryOperator op, ExpressionPtr left, ExpressionPtr right, DataType result_type)
       : op_(op), left_(std::move(left)), right_(std::move(right)), type_(std::move(result_type)) {}
 
@@ -127,7 +126,7 @@ public:
   [[nodiscard]] const DataType& result_type() const override { return type_; }
   [[nodiscard]] std::string to_string() const override;
 
-private:
+ private:
   BinaryOperator op_;
   ExpressionPtr left_;
   ExpressionPtr right_;
@@ -148,7 +147,7 @@ enum class UnaryOperator {
 [[nodiscard]] std::string_view to_string(UnaryOperator op) noexcept;
 
 class UnaryExpression final : public Expression {
-public:
+ public:
   UnaryExpression(UnaryOperator op, ExpressionPtr operand, DataType result_type)
       : op_(op), operand_(std::move(operand)), type_(std::move(result_type)) {}
 
@@ -157,7 +156,7 @@ public:
   [[nodiscard]] const DataType& result_type() const override { return type_; }
   [[nodiscard]] std::string to_string() const override;
 
-private:
+ private:
   UnaryOperator op_;
   ExpressionPtr operand_;
   DataType type_;
@@ -168,7 +167,7 @@ private:
 // ---------------------------------------------------------------------------
 
 class CastExpression final : public Expression {
-public:
+ public:
   CastExpression(ExpressionPtr operand, DataType target_type)
       : operand_(std::move(operand)), type_(std::move(target_type)) {}
 
@@ -178,7 +177,7 @@ public:
     return "CAST(" + operand_->to_string() + " AS " + type_.to_string() + ")";
   }
 
-private:
+ private:
   ExpressionPtr operand_;
   DataType type_;
 };
@@ -188,7 +187,7 @@ private:
 // ---------------------------------------------------------------------------
 
 class BetweenExpression final : public Expression {
-public:
+ public:
   BetweenExpression(ExpressionPtr value, ExpressionPtr lower, ExpressionPtr upper)
       : value_(std::move(value)),
         lower_(std::move(lower)),
@@ -203,7 +202,7 @@ public:
     return value_->to_string() + " BETWEEN " + lower_->to_string() + " AND " + upper_->to_string();
   }
 
-private:
+ private:
   ExpressionPtr value_;
   ExpressionPtr lower_;
   ExpressionPtr upper_;
@@ -226,7 +225,7 @@ enum class AggregateFunction {
 [[nodiscard]] std::string_view to_string(AggregateFunction function) noexcept;
 
 class AggregateExpression final : public Expression {
-public:
+ public:
   // `argument` is null only for CountStar (COUNT(*) has no operand).
   AggregateExpression(AggregateFunction function, ExpressionPtr argument, DataType result_type)
       : function_(function), argument_(std::move(argument)), type_(std::move(result_type)) {}
@@ -236,7 +235,7 @@ public:
   [[nodiscard]] const DataType& result_type() const override { return type_; }
   [[nodiscard]] std::string to_string() const override;
 
-private:
+ private:
   AggregateFunction function_;
   ExpressionPtr argument_;
   DataType type_;

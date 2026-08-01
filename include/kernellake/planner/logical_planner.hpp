@@ -15,7 +15,6 @@ namespace kernellake {
 // require binding ORDER BY against the post-aggregation output schema
 // (aliases included), which is not yet implemented. ORDER BY on a
 // non-aggregate query works normally.
-[[nodiscard]] LogicalPlanPtr build_logical_plan(const BoundQuery& query,
-                                                 const Schema& source_schema);
+[[nodiscard]] LogicalPlanPtr build_logical_plan(const BoundQuery& query, const Schema& source_schema);
 
 }  // namespace kernellake

@@ -27,11 +27,9 @@ struct RmmEnvironment::Impl {
 
 namespace {
 
-cuda::mr::any_resource<cuda::mr::device_accessible> build_base_resource(
-    const MemorySection& memory) {
+cuda::mr::any_resource<cuda::mr::device_accessible> build_base_resource(const MemorySection& memory) {
   if (memory.use_async_allocator) {
-    return cuda::mr::any_resource<cuda::mr::device_accessible>{
-        rmm::mr::cuda_async_memory_resource{}};
+    return cuda::mr::any_resource<cuda::mr::device_accessible>{rmm::mr::cuda_async_memory_resource{}};
   }
   return cuda::mr::any_resource<cuda::mr::device_accessible>{rmm::mr::pool_memory_resource{
       cuda::mr::any_resource<cuda::mr::device_accessible>{rmm::mr::cuda_memory_resource{}},
@@ -46,8 +44,7 @@ RmmEnvironment::RmmEnvironment(const EngineConfig& config) {
   // be restored on destruction; construct our Impl in two steps since the
   // limiter needs `stats`, which needs `base`, all before we know what the
   // previous global resource was.
-  RmmEnvironment::Impl* raw =
-      new Impl(config, base, cuda::mr::any_resource<cuda::mr::device_accessible>{});
+  RmmEnvironment::Impl* raw = new Impl(config, base, cuda::mr::any_resource<cuda::mr::device_accessible>{});
   impl_.reset(raw);
   impl_->previous_resource = rmm::mr::set_current_device_resource(impl_->limiter);
 }

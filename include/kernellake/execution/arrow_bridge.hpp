@@ -14,13 +14,13 @@ namespace kernellake {
 // Arrow C++'s own bridge (arrow::ImportRecordBatch) then imports into a
 // real arrow::RecordBatch. This is the one unavoidable device-to-host
 // transfer boundary for materializing a query result; see
-// docs/architecture.md.
+// docs/ARCHITECTURE.md.
 [[nodiscard]] std::shared_ptr<arrow::RecordBatch> to_arrow_record_batch(const DeviceBatch& batch);
 
 // Converts a host-resident Arrow RecordBatch to a GPU-resident DeviceBatch
 // (host->device transfer). `schema` must describe the same columns as
 // `batch` (see DeviceBatch's constructor-time validation).
 [[nodiscard]] DeviceBatch from_arrow_record_batch(const arrow::RecordBatch& batch,
-                                                   std::shared_ptr<const Schema> schema);
+                                                  std::shared_ptr<const Schema> schema);
 
 }  // namespace kernellake

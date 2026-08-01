@@ -6,7 +6,9 @@
 namespace kernellake {
 namespace {
 
-TEST(CudaUtils, CheckCudaPassesOnSuccess) { EXPECT_NO_THROW(check_cuda(cudaSuccess, "noop")); }
+TEST(CudaUtils, CheckCudaPassesOnSuccess) {
+  EXPECT_NO_THROW(check_cuda(cudaSuccess, "noop"));
+}
 
 TEST(CudaUtils, CheckCudaThrowsOnFailure) {
   EXPECT_THROW(check_cuda(cudaErrorInvalidValue, "bad_call"), CudaError);

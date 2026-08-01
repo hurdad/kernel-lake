@@ -17,9 +17,8 @@ namespace kernellake {
 //
 // Throws PlanningError for constructs with no physical implementation yet
 // (currently: a LogicalSort anywhere in the plan, since no physical Sort
-// operator exists -- see docs/architecture.md's future-operator list)
+// operator exists -- see docs/ARCHITECTURE.md's future-operator list)
 // rather than silently dropping it and returning unsorted results.
-[[nodiscard]] PhysicalPlanPtr build_physical_plan(const LogicalPlanPtr& logical_plan,
-                                                   ObjectStore& store);
+[[nodiscard]] PhysicalPlanPtr build_physical_plan(const LogicalPlanPtr& logical_plan, ObjectStore& store);
 
 }  // namespace kernellake

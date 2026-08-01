@@ -1,0 +1,14 @@
+# Optional local pre-commit hook (spec: "optional pre-commit configuration").
+# Install with: pip install pre-commit && pre-commit install
+# Only checks formatting -- clang-tidy is not wired in here since it hasn't
+# been run/verified in this repository's own development environment (see
+# docs/roadmap.md) and could produce untriaged false positives across the
+# CUDA/RAPIDS-heavy parts of the codebase.
+repos:
+  - repo: local
+    hooks:
+      - id: clang-format
+        name: clang-format
+        entry: clang-format --style=file -i
+        language: system
+        files: \.(cpp|hpp)$

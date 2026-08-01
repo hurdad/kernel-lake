@@ -14,15 +14,15 @@ namespace kernellake {
 namespace {
 
 std::unique_ptr<PhysicalOperator> build(const PhysicalPlanPtr& node, std::size_t pass_read_limit_bytes,
-                                         OperatorId& next_id) {
+                                        OperatorId& next_id) {
   if (const auto* scan = dynamic_cast<const ParquetScanNode*>(node.get())) {
     return std::make_unique<ParquetScanOperator>(next_id++, scan->fragments(), scan->columns(),
-                                                  std::make_shared<const Schema>(scan->output_schema()),
-                                                  pass_read_limit_bytes);
+                                                 std::make_shared<const Schema>(scan->output_schema()),
+                                                 pass_read_limit_bytes);
   }
   if (const auto* filter = dynamic_cast<const FilterNode*>(node.get())) {
     return std::make_unique<FilterOperator>(next_id++, build(filter->child(), pass_read_limit_bytes, next_id),
-                                             filter->predicate());
+                                            filter->predicate());
   }
   if (const auto* projection = dynamic_cast<const ProjectionNode*>(node.get())) {
     return std::make_unique<ProjectionOperator>(
@@ -40,7 +40,7 @@ std::unique_ptr<PhysicalOperator> build(const PhysicalPlanPtr& node, std::size_t
   }
   if (const auto* limit = dynamic_cast<const LimitNode*>(node.get())) {
     return std::make_unique<LimitOperator>(next_id++, build(limit->child(), pass_read_limit_bytes, next_id),
-                                            limit->limit());
+                                           limit->limit());
   }
   if (const auto* arrow_result = dynamic_cast<const ArrowResultNode*>(node.get())) {
     return std::make_unique<ArrowResultOperator>(
@@ -52,7 +52,7 @@ std::unique_ptr<PhysicalOperator> build(const PhysicalPlanPtr& node, std::size_t
 }  // namespace
 
 std::unique_ptr<PhysicalOperator> build_operator_tree(const PhysicalPlanPtr& plan,
-                                                       std::size_t pass_read_limit_bytes) {
+                                                      std::size_t pass_read_limit_bytes) {
   OperatorId next_id = 1;
   return build(plan, pass_read_limit_bytes, next_id);
 }

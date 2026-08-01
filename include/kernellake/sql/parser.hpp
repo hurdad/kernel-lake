@@ -8,7 +8,7 @@ namespace kernellake::sql {
 
 // Parses one SQL statement into KernelLake's parser-independent AST.
 //
-// Supported grammar (see docs/architecture.md for the authoritative list):
+// Supported grammar (see docs/ARCHITECTURE.md for the authoritative list):
 //   SELECT <items> FROM read_parquet('path' [, 'path2', ...])
 //     [WHERE <expr>] [GROUP BY <cols>] [ORDER BY <cols>] [LIMIT <n>]
 // with column references, aliases, numeric/string/boolean/date literals,

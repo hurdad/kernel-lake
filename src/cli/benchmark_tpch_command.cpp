@@ -128,7 +128,7 @@ int run_benchmark_tpch(const std::vector<std::string_view>& args, const EngineCo
     std::fprintf(stderr,
                  "kernellake benchmark tpch: --mode execution-only is not implemented yet (it needs an "
                  "operator-tree entry point that skips ParquetScanOperator entirely, which does not exist -- "
-                 "see docs/roadmap.md); use cold or warm mode instead\n");
+                 "see docs/ROADMAP.md); use cold or warm mode instead\n");
     return 1;
   }
   if (iterations <= 0) {
@@ -159,7 +159,7 @@ int run_benchmark_tpch(const std::vector<std::string_view>& args, const EngineCo
       }
       const QueryResult result = engine.execute(sql);
       return IterationMetrics{result.elapsed_wall_seconds.value_or(0.0), result.rows_returned.value_or(0),
-                               result.peak_gpu_memory_bytes.value_or(0)};
+                              result.peak_gpu_memory_bytes.value_or(0)};
     };
 
     for (int i = 0; i < warmup_iterations; ++i) run_once();
@@ -196,9 +196,9 @@ int run_benchmark_tpch(const std::vector<std::string_view>& args, const EngineCo
     nlohmann::json iteration_array = nlohmann::json::array();
     for (std::size_t i = 0; i < measurements.size(); ++i) {
       iteration_array.push_back({{"iteration", i},
-                                  {"wall_seconds", measurements[i].wall_seconds},
-                                  {"rows_returned", measurements[i].rows_returned},
-                                  {"peak_gpu_memory_bytes", measurements[i].peak_gpu_memory_bytes}});
+                                 {"wall_seconds", measurements[i].wall_seconds},
+                                 {"rows_returned", measurements[i].rows_returned},
+                                 {"peak_gpu_memory_bytes", measurements[i].peak_gpu_memory_bytes}});
     }
     report["iteration_results"] = iteration_array;
     report["first_iteration_wall_seconds"] = wall_seconds.front();

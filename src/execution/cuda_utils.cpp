@@ -18,9 +18,13 @@ CudaDeviceGuard::CudaDeviceGuard(int device_id) {
   check_cuda(cudaSetDevice(device_id), "cudaSetDevice");
 }
 
-CudaDeviceGuard::~CudaDeviceGuard() { cudaSetDevice(previous_device_id_); }
+CudaDeviceGuard::~CudaDeviceGuard() {
+  cudaSetDevice(previous_device_id_);
+}
 
-CudaStream::CudaStream() { check_cuda(cudaStreamCreate(&stream_), "cudaStreamCreate"); }
+CudaStream::CudaStream() {
+  check_cuda(cudaStreamCreate(&stream_), "cudaStreamCreate");
+}
 
 CudaStream::~CudaStream() {
   if (stream_ != nullptr) cudaStreamDestroy(stream_);

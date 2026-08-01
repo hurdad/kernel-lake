@@ -16,8 +16,7 @@ bool has_parquet_extension(const std::string& path) {
 
 }  // namespace
 
-std::vector<ObjectInfo> discover_parquet_files(ObjectStore& store,
-                                                const std::vector<std::string>& sources) {
+std::vector<ObjectInfo> discover_parquet_files(ObjectStore& store, const std::vector<std::string>& sources) {
   if (sources.empty()) {
     throw StorageError("no data source given (expected FROM read_parquet('path'))");
   }
@@ -36,9 +35,7 @@ std::vector<ObjectInfo> discover_parquet_files(ObjectStore& store,
   std::sort(all_files.begin(), all_files.end(),
             [](const ObjectInfo& a, const ObjectInfo& b) { return a.uri < b.uri; });
   all_files.erase(std::unique(all_files.begin(), all_files.end(),
-                               [](const ObjectInfo& a, const ObjectInfo& b) {
-                                 return a.uri == b.uri;
-                               }),
+                              [](const ObjectInfo& a, const ObjectInfo& b) { return a.uri == b.uri; }),
                   all_files.end());
   return all_files;
 }

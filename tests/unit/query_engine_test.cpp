@@ -15,11 +15,11 @@ namespace {
 namespace fs = std::filesystem;
 
 class QueryEngineTest : public ::testing::Test {
-protected:
+ protected:
   void SetUp() override {
     dir_ = fs::temp_directory_path() /
            fs::path("kernellake_query_engine_test_" +
-                     std::string(::testing::UnitTest::GetInstance()->current_test_info()->name()));
+                    std::string(::testing::UnitTest::GetInstance()->current_test_info()->name()));
     fs::create_directories(dir_);
     path_ = (dir_ / "sales.parquet").string();
 
@@ -36,8 +36,8 @@ protected:
     ASSERT_TRUE(amount_builder.Finish(&amount_array).ok());
     ASSERT_TRUE(region_builder.Finish(&region_array).ok());
     const auto schema = arrow::schema({arrow::field("id", arrow::int64(), false),
-                                        arrow::field("amount", arrow::float64(), false),
-                                        arrow::field("region", arrow::utf8(), false)});
+                                       arrow::field("amount", arrow::float64(), false),
+                                       arrow::field("region", arrow::utf8(), false)});
     const auto table = arrow::Table::Make(schema, {id_array, amount_array, region_array});
     auto sink = arrow::io::FileOutputStream::Open(path_).ValueOrDie();
     const arrow::Status status =

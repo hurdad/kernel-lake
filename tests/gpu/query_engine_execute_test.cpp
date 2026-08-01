@@ -26,11 +26,11 @@ constexpr std::int32_t kJan02_2026 = 20455;
 constexpr std::int32_t kJan03_2026 = 20456;
 
 class QueryEngineExecuteTest : public ::testing::Test {
-protected:
+ protected:
   void SetUp() override {
     dir_ = fs::temp_directory_path() /
            fs::path("kernellake_query_engine_execute_test_" +
-                     std::string(::testing::UnitTest::GetInstance()->current_test_info()->name()));
+                    std::string(::testing::UnitTest::GetInstance()->current_test_info()->name()));
     fs::create_directories(dir_);
     path_ = (dir_ / "sales.parquet").string();
 
@@ -43,7 +43,7 @@ protected:
     const std::vector<std::string> regions = {"A", "A", "A", "B", "B", "B"};
     const std::vector<double> amounts = {10.0, 20.0, 5.0, 100.0, 7.0, 3.0};
     const std::vector<std::int32_t> dates = {kDec30_2025, kJan01_2026, kJan02_2026,
-                                              kDec31_2025, kJan01_2026, kJan03_2026};
+                                             kDec31_2025, kJan01_2026, kJan03_2026};
     for (std::size_t i = 0; i < regions.size(); ++i) {
       ASSERT_TRUE(region_builder.Append(regions[i]).ok());
       ASSERT_TRUE(amount_builder.Append(amounts[i]).ok());
@@ -55,8 +55,8 @@ protected:
     ASSERT_TRUE(date_builder.Finish(&date_array).ok());
 
     const auto schema = arrow::schema({arrow::field("region", arrow::utf8(), false),
-                                        arrow::field("amount", arrow::float64(), false),
-                                        arrow::field("event_date", arrow::date32(), false)});
+                                       arrow::field("amount", arrow::float64(), false),
+                                       arrow::field("event_date", arrow::date32(), false)});
     const auto table = arrow::Table::Make(schema, {region_array, amount_array, date_array});
     auto sink = arrow::io::FileOutputStream::Open(path_).ValueOrDie();
     const arrow::Status status =
@@ -74,7 +74,7 @@ protected:
 TEST_F(QueryEngineExecuteTest, FilterAndGroupedAggregateMatchesExpectedTotals) {
   const QueryResult result =
       engine_.execute("SELECT region, SUM(amount) AS total FROM read_parquet('" + path_ +
-                       "') WHERE event_date >= DATE '2026-01-01' GROUP BY region");
+                      "') WHERE event_date >= DATE '2026-01-01' GROUP BY region");
 
   ASSERT_EQ(result.rows_returned, 2);
   ASSERT_EQ(result.batches.size(), 1u);

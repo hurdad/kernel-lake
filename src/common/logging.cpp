@@ -15,8 +15,7 @@ void init_logging(const LoggingSection& config) {
   spdlog::set_level(level);
 
   if (config.json) {
-    spdlog::set_pattern(
-        R"({"time":"%Y-%m-%dT%H:%M:%S.%fZ","level":"%l","logger":"%n","message":"%v"})");
+    spdlog::set_pattern(R"({"time":"%Y-%m-%dT%H:%M:%S.%fZ","level":"%l","logger":"%n","message":"%v"})");
   } else {
     spdlog::set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%^%l%$] [%n] %v");
   }

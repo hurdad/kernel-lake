@@ -82,8 +82,8 @@ std::vector<std::pair<std::string, std::string>> LogicalSort::explain_attributes
 
 namespace {
 
-void explain_text_recursive(const LogicalPlanNode& node, const std::string& prefix,
-                             bool is_root, std::ostringstream& out) {
+void explain_text_recursive(const LogicalPlanNode& node, const std::string& prefix, bool is_root,
+                            std::ostringstream& out) {
   out << node.node_name() << "\n";
   const std::string attr_prefix = prefix + (is_root ? "    " : "    ");
   for (const auto& [key, value] : node.explain_attributes()) {

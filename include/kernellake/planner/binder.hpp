@@ -38,7 +38,7 @@ struct BoundQuery {
 //
 // `input_schema` is supplied by the caller rather than looked up here, so
 // the binder stays decoupled from file discovery and Parquet metadata
-// inspection (see docs/architecture.md); in the full engine it comes from
+// inspection (see docs/ARCHITECTURE.md); in the full engine it comes from
 // inspecting the FROM read_parquet(...) source's Parquet schema.
 //
 // Throws BindingError, identifying the problem, on: unknown or ambiguous

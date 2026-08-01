@@ -15,7 +15,7 @@ namespace kernellake {
 // can share the same type without every caller needing to know which
 // backend is in play.
 class Uri {
-public:
+ public:
   Uri() = default;
   explicit Uri(std::string value) : value_(std::move(value)) {}
 
@@ -23,14 +23,13 @@ public:
 
   [[nodiscard]] std::string_view scheme() const noexcept {
     const std::size_t pos = value_.find("://");
-    return pos == std::string::npos ? std::string_view("file")
-                                     : std::string_view(value_).substr(0, pos);
+    return pos == std::string::npos ? std::string_view("file") : std::string_view(value_).substr(0, pos);
   }
 
   [[nodiscard]] bool operator==(const Uri& other) const noexcept { return value_ == other.value_; }
   [[nodiscard]] bool operator<(const Uri& other) const noexcept { return value_ < other.value_; }
 
-private:
+ private:
   std::string value_;
 };
 
@@ -44,7 +43,7 @@ struct ObjectInfo {
 // Parquet reading needs) so the Parquet-scanning code never has to know
 // which ObjectStore backend produced the bytes.
 class RandomAccessObject {
-public:
+ public:
   virtual ~RandomAccessObject() = default;
 
   [[nodiscard]] virtual std::uint64_t size() const = 0;
@@ -52,7 +51,7 @@ public:
 };
 
 class ObjectStore {
-public:
+ public:
   virtual ~ObjectStore() = default;
 
   // Lists objects addressed by `prefix`, which may be a single object path,

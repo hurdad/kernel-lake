@@ -7,8 +7,8 @@ namespace kernellake {
 namespace {
 
 TEST(ArrowAdapter, RoundTripsPrimitiveTypes) {
-  for (const DataType& type : {int32_type(), int64_type(), float64_type(), string_type(),
-                                date32_type(), timestamp_type(), boolean_type()}) {
+  for (const DataType& type : {int32_type(), int64_type(), float64_type(), string_type(), date32_type(),
+                               timestamp_type(), boolean_type()}) {
     const auto arrow_type = to_arrow_type(type);
     const DataType round_tripped = from_arrow_type(arrow_type, type.nullable);
     EXPECT_EQ(round_tripped.id, type.id);

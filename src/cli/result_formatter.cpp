@@ -25,7 +25,8 @@ namespace {
 [[nodiscard]] std::string scalar_text(const arrow::Array& column, std::int64_t row) {
   if (column.IsNull(row)) return "NULL";
   arrow::Result<std::shared_ptr<arrow::Scalar>> scalar = column.GetScalar(row);
-  if (!scalar.ok()) throw ExecutionError(arrow_status_message(scalar.status(), "failed to read result value"));
+  if (!scalar.ok())
+    throw ExecutionError(arrow_status_message(scalar.status(), "failed to read result value"));
   return (*scalar)->ToString();
 }
 
@@ -79,7 +80,8 @@ void write_table_format(const QueryResult& result, std::FILE* out) {
   const std::vector<std::string> headers = [&] {
     std::vector<std::string> names;
     if (result.schema) {
-      for (const std::shared_ptr<arrow::Field>& field : result.schema->fields()) names.push_back(field->name());
+      for (const std::shared_ptr<arrow::Field>& field : result.schema->fields())
+        names.push_back(field->name());
     }
     return names;
   }();
@@ -154,11 +156,14 @@ void write_csv_format(const QueryResult& result, const std::optional<std::string
   const std::shared_ptr<arrow::io::OutputStream> sink = open_binary_sink(output_path);
   arrow::Result<std::shared_ptr<arrow::Table>> table =
       arrow::Table::FromRecordBatches(result.schema, result.batches);
-  if (!table.ok()) throw ExecutionError(arrow_status_message(table.status(), "failed to assemble CSV output"));
-  const arrow::Status status = arrow::csv::WriteCSV(**table, arrow::csv::WriteOptions::Defaults(), sink.get());
+  if (!table.ok())
+    throw ExecutionError(arrow_status_message(table.status(), "failed to assemble CSV output"));
+  const arrow::Status status =
+      arrow::csv::WriteCSV(**table, arrow::csv::WriteOptions::Defaults(), sink.get());
   if (!status.ok()) throw ExecutionError(arrow_status_message(status, "failed to write CSV output"));
   const arrow::Status close_status = sink->Close();
-  if (!close_status.ok()) throw ExecutionError(arrow_status_message(close_status, "failed to close CSV output"));
+  if (!close_status.ok())
+    throw ExecutionError(arrow_status_message(close_status, "failed to close CSV output"));
 }
 
 void write_arrow_ipc_format(const QueryResult& result, const std::optional<std::string>& output_path) {
@@ -193,7 +198,7 @@ std::optional<ResultFormat> parse_result_format(std::string_view name) {
 }
 
 void write_query_result(const QueryResult& result, ResultFormat format,
-                         const std::optional<std::string>& output_path) {
+                        const std::optional<std::string>& output_path) {
   switch (format) {
     case ResultFormat::Table: {
       std::FILE* out = output_path ? std::fopen(output_path->c_str(), "w") : stdout;

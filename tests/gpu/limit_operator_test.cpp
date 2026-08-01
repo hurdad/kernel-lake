@@ -11,7 +11,7 @@ namespace kernellake {
 namespace {
 
 class VectorSourceOperator final : public PhysicalOperator {
-public:
+ public:
   explicit VectorSourceOperator(std::vector<DeviceBatch> batches) : batches_(std::move(batches)) {}
   void open(ExecutionContext&) override { index_ = 0; }
   std::optional<DeviceBatch> next(ExecutionContext&) override {
@@ -22,17 +22,19 @@ public:
   [[nodiscard]] std::string_view name() const noexcept override { return "VectorSource"; }
   [[nodiscard]] OperatorId id() const noexcept override { return 0; }
 
-private:
+ private:
   std::vector<DeviceBatch> batches_;
   std::size_t index_ = 0;
 };
 
 ExecutionContext make_context() {
-  return ExecutionContext{"test-query", 0, nullptr, rmm::mr::get_current_device_resource_ref(),
-                           nullptr, nullptr, nullptr};
+  return ExecutionContext{"test-query", 0,       nullptr, rmm::mr::get_current_device_resource_ref(),
+                          nullptr,      nullptr, nullptr};
 }
 
-Schema one_int_column_schema() { return Schema({Field{"a", int32_type(false)}}); }
+Schema one_int_column_schema() {
+  return Schema({Field{"a", int32_type(false)}});
+}
 
 DeviceBatch make_filled_batch(int32_t fill_value, cudf::size_type num_rows) {
   std::unique_ptr<cudf::column> column =
@@ -43,7 +45,7 @@ DeviceBatch make_filled_batch(int32_t fill_value, cudf::size_type num_rows) {
   std::vector<std::unique_ptr<cudf::column>> columns;
   columns.push_back(std::move(column));
   return DeviceBatch(std::make_unique<cudf::table>(std::move(columns)),
-                      std::make_shared<const Schema>(one_int_column_schema()));
+                     std::make_shared<const Schema>(one_int_column_schema()));
 }
 
 TEST(LimitOperator, PassesBatchesUnchangedUntilLimitReached) {

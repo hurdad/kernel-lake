@@ -12,7 +12,7 @@ namespace kernellake {
 // ordering. Throws StorageError (naming the offending path) when a
 // component does not exist or a glob/directory matches nothing.
 class LocalObjectStore final : public ObjectStore {
-public:
+ public:
   [[nodiscard]] std::vector<ObjectInfo> list(const Uri& prefix) override;
   [[nodiscard]] std::unique_ptr<RandomAccessObject> open(const Uri& uri) override;
 };

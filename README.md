@@ -13,7 +13,7 @@ execution. KernelLake is a compute and query layer, not a storage database.
 KernelLake is an early work in progress, but the spec's required initial
 deliverable -- generating sample data and running the MVP query
 end-to-end through real GPU execution -- works today and has been verified
-on real GPU hardware. See [docs/roadmap.md](docs/roadmap.md) for exactly
+on real GPU hardware. See [docs/ROADMAP.md](docs/ROADMAP.md) for exactly
 what's done vs. not started, and why.
 
 Concretely, this is real, reproducible output:
@@ -75,7 +75,7 @@ ArrowResult
 and two of the first file's three row groups couldn't contain any
 `order_id < 50` rows, and skipped reading them entirely.
 
-See [docs/architecture.md](docs/architecture.md) for the full pipeline, the
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full pipeline, the
 GPU operator set, and the CPU/GPU build split (`kernellake query` throws a
 clear `ExecutionError` when built without CUDA -- it never silently falls
 back to a CPU implementation).
@@ -104,7 +104,7 @@ GPU execution additionally needs the CUDA Toolkit (12+) and RAPIDS
 libcudf/RMM. Only the CUDA Toolkit needs manual installation -- libcudf/RMM
 are vendored automatically via CMake `FetchContent` from pinned RAPIDS PyPI
 wheels the first time you configure the `gpu-dev` preset (no conda/mamba;
-see "GPU dependency vendoring" in [docs/architecture.md](docs/architecture.md)).
+see "GPU dependency vendoring" in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)).
 CMake >= 3.30.4 is required for that preset specifically (newer than Ubuntu
 24.04's apt package).
 
@@ -153,7 +153,7 @@ ctest --preset gpu-dev
 
 Supported SQL grammar, the `read_parquet(...)` syntax, and everything
 that's intentionally not yet supported are documented in
-[docs/architecture.md](docs/architecture.md).
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Correctness validation against DuckDB
 
@@ -178,7 +178,7 @@ grouped aggregates (including a ~40,000-group `GROUP BY customer_id`), and
 
 **Unofficial TPC-H-derived benchmark. Not a certified TPC result.** Q6 and
 Q1 (both `lineitem`-only, no joins) are supported; see
-[docs/tpch.md](docs/tpch.md) for the full generate -> query -> validate ->
+[docs/TPCH.md](docs/TPCH.md) for the full generate -> query -> validate ->
 benchmark workflow, including `tools/generate_tpch.py` (a synthetic
 generator, not the official `dbgen`) and `kernellake benchmark tpch`'s
 cold/warm timing modes.
@@ -192,15 +192,19 @@ tests/unit/                    GoogleTest unit tests (CPU-only, both presets)
 tests/gpu/                     GoogleTest GPU tests (gpu-dev preset only)
 tools/                         Python tooling (DuckDB cross-validation, TPC-H generation)
 benchmarks/tpch/queries/       Version-controlled TPC-H-derived SQL (q01.sql, q06.sql)
-docs/                          architecture.md, roadmap.md, tpch.md
+docs/                          ARCHITECTURE.md, ROADMAP.md, TPCH.md
 config/kernellake.yaml         default engine configuration
 ```
 
-See [docs/architecture.md](docs/architecture.md) for what each module owns
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for what each module owns
 and how they depend on each other.
 
 ## License
 
-Apache License 2.0 (see `LICENSE`). TPC-H-derived benchmarking in this
-project, once implemented, will be clearly labeled as an unofficial,
+Apache License 2.0 (see `LICENSE` and `NOTICE`). See
+`THIRD_PARTY_LICENSES.md` for every dependency actually linked into the
+build and its license -- including two NVIDIA components (the CUDA
+Toolkit and RAPIDS's vendored `nvcomp`) distributed under NVIDIA's own
+proprietary SDK terms rather than an open-source license. TPC-H-derived
+benchmarking in this project is clearly labeled as an unofficial,
 uncertified derivative -- never presented as an official TPC-H result.

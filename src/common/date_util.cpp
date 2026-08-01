@@ -32,8 +32,7 @@ std::int32_t parse_iso_date(std::string_view text) {
     if (!std::isdigit(static_cast<unsigned char>(text[i]))) fail(text);
   }
 
-  const int year = (text[0] - '0') * 1000 + (text[1] - '0') * 100 + (text[2] - '0') * 10 +
-                    (text[3] - '0');
+  const int year = (text[0] - '0') * 1000 + (text[1] - '0') * 100 + (text[2] - '0') * 10 + (text[3] - '0');
   const int month = (text[5] - '0') * 10 + (text[6] - '0');
   const int day = (text[8] - '0') * 10 + (text[9] - '0');
 

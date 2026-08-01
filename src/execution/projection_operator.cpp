@@ -19,7 +19,7 @@ std::shared_ptr<const Schema> build_output_schema(const std::vector<NamedExpress
 }  // namespace
 
 ProjectionOperator::ProjectionOperator(OperatorId id, std::unique_ptr<PhysicalOperator> child,
-                                        std::vector<NamedExpression> items)
+                                       std::vector<NamedExpression> items)
     : id_(id),
       child_(std::move(child)),
       items_(std::move(items)),
@@ -46,14 +46,17 @@ std::optional<DeviceBatch> ProjectionOperator::next(ExecutionContext& context) {
   for (const CompiledItem& item : compiled_items_) {
     if (item.source_column_index.has_value()) {
       columns.push_back(std::make_unique<cudf::column>(batch->view().column(*item.source_column_index),
-                                                         context.stream, context.memory_resource));
+                                                       context.stream, context.memory_resource));
     } else {
-      columns.push_back(cudf::compute_column(batch->view(), *item.expr, context.stream, context.memory_resource));
+      columns.push_back(
+          cudf::compute_column(batch->view(), *item.expr, context.stream, context.memory_resource));
     }
   }
   return DeviceBatch(std::make_unique<cudf::table>(std::move(columns)), output_schema_);
 }
 
-void ProjectionOperator::close(ExecutionContext& context) { child_->close(context); }
+void ProjectionOperator::close(ExecutionContext& context) {
+  child_->close(context);
+}
 
 }  // namespace kernellake

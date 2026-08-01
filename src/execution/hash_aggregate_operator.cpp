@@ -16,7 +16,7 @@ namespace kernellake {
 namespace {
 
 std::shared_ptr<const Schema> build_output_schema(const std::vector<NamedExpression>& group_by,
-                                                    const std::vector<NamedExpression>& aggregates) {
+                                                  const std::vector<NamedExpression>& aggregates) {
   std::vector<Field> fields;
   fields.reserve(group_by.size() + aggregates.size());
   for (const NamedExpression& item : group_by) fields.push_back(Field{item.name, item.expr->result_type()});
@@ -45,9 +45,9 @@ std::unique_ptr<cudf::groupby_aggregation> to_streaming_aggregation(AggregateFun
 }  // namespace
 
 HashAggregateOperator::HashAggregateOperator(OperatorId id, std::unique_ptr<PhysicalOperator> child,
-                                              std::vector<NamedExpression> group_by,
-                                              std::vector<NamedExpression> aggregates,
-                                              cudf::size_type max_distinct_keys)
+                                             std::vector<NamedExpression> group_by,
+                                             std::vector<NamedExpression> aggregates,
+                                             cudf::size_type max_distinct_keys)
     : id_(id),
       child_(std::move(child)),
       group_by_(std::move(group_by)),
@@ -67,11 +67,11 @@ HashAggregateOperator::CompiledExpr HashAggregateOperator::compile_expr(const Ex
 }
 
 std::unique_ptr<cudf::column> HashAggregateOperator::materialize(const CompiledExpr& compiled,
-                                                                   const DeviceBatch& batch,
-                                                                   ExecutionContext& context) {
+                                                                 const DeviceBatch& batch,
+                                                                 ExecutionContext& context) {
   if (compiled.source_column_index.has_value()) {
     return std::make_unique<cudf::column>(batch.view().column(*compiled.source_column_index), context.stream,
-                                           context.memory_resource);
+                                          context.memory_resource);
   }
   return cudf::compute_column(batch.view(), *compiled.expr, context.stream, context.memory_resource);
 }
@@ -100,27 +100,27 @@ void HashAggregateOperator::open(ExecutionContext& context) {
     // produced all-zero counts in testing -- streaming_groupby apparently
     // doesn't support a value column index that aliases a key index.
     const CompiledExpr compiled_argument = aggregate->function() == AggregateFunction::CountStar
-                                                ? compiled_group_by_.front()
-                                                : compile_expr(*aggregate->argument());
+                                               ? compiled_group_by_.front()
+                                               : compile_expr(*aggregate->argument());
     compiled_aggregate_args_.push_back(compiled_argument);
     result_is_count_.push_back(aggregate->function() == AggregateFunction::Count ||
-                                aggregate->function() == AggregateFunction::CountStar);
-    requests.push_back(
-        cudf::groupby::streaming_aggregation_request{next_index, to_streaming_aggregation(aggregate->function())});
+                               aggregate->function() == AggregateFunction::CountStar);
+    requests.push_back(cudf::groupby::streaming_aggregation_request{
+        next_index, to_streaming_aggregation(aggregate->function())});
     ++next_index;
   }
 
   std::vector<cudf::size_type> key_indices(group_by_.size());
   std::iota(key_indices.begin(), key_indices.end(), 0);
-  streaming_ =
-      std::make_unique<cudf::groupby::streaming_groupby>(key_indices, requests, max_distinct_keys_);
+  streaming_ = std::make_unique<cudf::groupby::streaming_groupby>(key_indices, requests, max_distinct_keys_);
 }
 
 std::unique_ptr<cudf::table> HashAggregateOperator::build_combined_columns(const DeviceBatch& batch,
-                                                                            ExecutionContext& context) {
+                                                                           ExecutionContext& context) {
   std::vector<std::unique_ptr<cudf::column>> columns;
   columns.reserve(compiled_group_by_.size() + compiled_aggregate_args_.size());
-  for (const CompiledExpr& compiled : compiled_group_by_) columns.push_back(materialize(compiled, batch, context));
+  for (const CompiledExpr& compiled : compiled_group_by_)
+    columns.push_back(materialize(compiled, batch, context));
   for (const CompiledExpr& compiled : compiled_aggregate_args_) {
     columns.push_back(materialize(compiled, batch, context));
   }
@@ -157,13 +157,15 @@ std::optional<DeviceBatch> HashAggregateOperator::next(ExecutionContext& context
     std::unique_ptr<cudf::column> column = std::move(results[i].results.front());
     if (result_is_count_[i]) {
       column = cudf::cast(column->view(), cudf::data_type{cudf::type_id::INT64}, context.stream,
-                           context.memory_resource);
+                          context.memory_resource);
     }
     final_columns.push_back(std::move(column));
   }
   return DeviceBatch(std::make_unique<cudf::table>(std::move(final_columns)), output_schema_);
 }
 
-void HashAggregateOperator::close(ExecutionContext& context) { child_->close(context); }
+void HashAggregateOperator::close(ExecutionContext& context) {
+  child_->close(context);
+}
 
 }  // namespace kernellake

@@ -7,7 +7,7 @@
 namespace kernellake {
 
 // Configures kernellake generate-data's deterministic synthetic "sales"
-// dataset (see docs/architecture.md for the schema this produces:
+// dataset (see docs/ARCHITECTURE.md for the schema this produces:
 // order_id/customer_id/region/amount/event_date/event_time/category/
 // discount). The same options always produce byte-identical Parquet output,
 // so benchmark and correctness runs stay reproducible across machines.

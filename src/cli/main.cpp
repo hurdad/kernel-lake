@@ -87,7 +87,7 @@ int main(int argc, char** argv) {
 
   const std::string_view command = args[command_index];
   const std::vector<std::string_view> command_args(args.begin() + static_cast<long>(command_index) + 1,
-                                                     args.end());
+                                                   args.end());
 
   spdlog::info("kernellake starting: command='{}' config='{}'", command, config_path);
 

@@ -16,6 +16,6 @@ namespace kernellake {
 // itself) or if any listed object is not a ".parquet" file -- KernelLake
 // does not silently skip or reinterpret non-Parquet input.
 [[nodiscard]] std::vector<ObjectInfo> discover_parquet_files(ObjectStore& store,
-                                                              const std::vector<std::string>& sources);
+                                                             const std::vector<std::string>& sources);
 
 }  // namespace kernellake

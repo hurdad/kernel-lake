@@ -27,6 +27,6 @@ struct ScanDecision {
 // incomparable statistics always fall back to "must scan" for that
 // predicate. Correctness takes priority over aggressive pruning.
 [[nodiscard]] ScanDecision evaluate_pruning(const FileMetadata& file,
-                                             const std::vector<PushablePredicate>& predicates);
+                                            const std::vector<PushablePredicate>& predicates);
 
 }  // namespace kernellake

@@ -9,7 +9,7 @@ result -- see the Licensing section of the spec and `LICENSE`/`NOTICE`.
 Only `lineitem`-only queries are supported today: **Q6** (scan, filter,
 arithmetic expression, scalar aggregation) and **Q1** (grouped aggregation).
 Q3/Q12/Q14 and the rest of the 22-query suite need hash joins, which
-KernelLake does not implement yet (see `docs/roadmap.md`).
+KernelLake does not implement yet (see `docs/ROADMAP.md`).
 
 ## 1. Generate data
 
@@ -92,6 +92,6 @@ Three modes are named in the spec; two are implemented:
 The report's `result_validation_performed` is always `false` -- the
 benchmark command does not call DuckDB in-process (no `libduckdb`
 dependency has been added to the C++ build; see
-`docs/architecture.md`). Run `tools/validate_tpch.py` separately before
+`docs/ARCHITECTURE.md`). Run `tools/validate_tpch.py` separately before
 trusting a benchmark number, per the spec's "do not treat benchmark timing
 as valid when correctness validation fails."

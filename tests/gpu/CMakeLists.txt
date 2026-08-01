@@ -1,7 +1,7 @@
 # GPU-specific tests, clearly separated from tests/unit (which must never
 # require a GPU). Only built when KERNELLAKE_WITH_CUDA is ON; see
-# docs/architecture.md for the CPU/GPU build split and
-# docs/roadmap.md for why "skip cleanly when no GPU" handling matters even
+# docs/ARCHITECTURE.md for the CPU/GPU build split and
+# docs/ROADMAP.md for why "skip cleanly when no GPU" handling matters even
 # though this build already requires CUDA to configure at all.
 add_executable(kernellake_gpu_tests
   rmm_environment_test.cpp

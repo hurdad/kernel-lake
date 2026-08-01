@@ -40,8 +40,7 @@ std::optional<LiteralStorage> decode_statistic(const parquet::Statistics& stats,
     case parquet::Type::BYTE_ARRAY: {
       const auto& typed = static_cast<const parquet::ByteArrayStatistics&>(stats);
       const parquet::ByteArray& value = want_min ? typed.min() : typed.max();
-      return LiteralStorage{
-          std::string(reinterpret_cast<const char*>(value.ptr), value.len)};
+      return LiteralStorage{std::string(reinterpret_cast<const char*>(value.ptr), value.len)};
     }
     default:
       // INT96 and FIXED_LEN_BYTE_ARRAY (decimal) are not yet decoded here;
@@ -91,8 +90,7 @@ FileMetadata inspect_parquet_file(ObjectStore& store, const Uri& path) {
   std::shared_ptr<arrow::Schema> arrow_schema;
   const arrow::Status status = parquet::arrow::FromParquetSchema(file_meta->schema(), &arrow_schema);
   if (!status.ok()) {
-    throw StorageError("failed to convert Parquet schema for '" + path.value() +
-                        "': " + status.ToString());
+    throw StorageError("failed to convert Parquet schema for '" + path.value() + "': " + status.ToString());
   }
 
   FileMetadata result;
@@ -131,16 +129,15 @@ void validate_schema_compatibility(const std::vector<FileMetadata>& files) {
     for (std::size_t f = 0; f < common; ++f) {
       if (!(reference.field(f) == candidate.field(f))) {
         throw StorageError("schema mismatch between '" + files.front().path.value() + "' and '" +
-                            files[i].path.value() + "': field " + std::to_string(f) + " is " +
-                            reference.field(f).name + " " + reference.field(f).type.to_string() +
-                            " vs " + candidate.field(f).name + " " +
-                            candidate.field(f).type.to_string());
+                           files[i].path.value() + "': field " + std::to_string(f) + " is " +
+                           reference.field(f).name + " " + reference.field(f).type.to_string() + " vs " +
+                           candidate.field(f).name + " " + candidate.field(f).type.to_string());
       }
     }
     throw StorageError("schema mismatch between '" + files.front().path.value() + "' and '" +
-                        files[i].path.value() + "': different column counts (" +
-                        std::to_string(reference.field_count()) + " vs " +
-                        std::to_string(candidate.field_count()) + ")");
+                       files[i].path.value() + "': different column counts (" +
+                       std::to_string(reference.field_count()) + " vs " +
+                       std::to_string(candidate.field_count()) + ")");
   }
 }
 

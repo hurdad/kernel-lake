@@ -18,8 +18,7 @@ namespace kernellake {
 
 // Throws PlanningError if the Arrow type has no KernelLake equivalent
 // (e.g. nested/list/struct/map types, which are not yet supported).
-[[nodiscard]] DataType from_arrow_type(const std::shared_ptr<arrow::DataType>& type,
-                                        bool nullable);
+[[nodiscard]] DataType from_arrow_type(const std::shared_ptr<arrow::DataType>& type, bool nullable);
 
 [[nodiscard]] std::shared_ptr<arrow::DataType> to_arrow_type(const DataType& type);
 

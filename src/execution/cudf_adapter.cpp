@@ -32,6 +32,8 @@ cudf::type_id to_cudf_type_id(TypeId id) {
   throw PlanningError("unreachable: unknown KernelLake TypeId");
 }
 
-cudf::data_type to_cudf_type(const DataType& type) { return cudf::data_type{to_cudf_type_id(type.id)}; }
+cudf::data_type to_cudf_type(const DataType& type) {
+  return cudf::data_type{to_cudf_type_id(type.id)};
+}
 
 }  // namespace kernellake

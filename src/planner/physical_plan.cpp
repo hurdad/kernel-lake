@@ -72,7 +72,7 @@ std::vector<std::pair<std::string, std::string>> ScalarAggregateNode::explain_at
 namespace {
 
 void explain_text_recursive(const PhysicalPlanNode& node, const std::string& prefix,
-                             std::ostringstream& out) {
+                            std::ostringstream& out) {
   out << node.node_name() << "\n";
   const std::string attr_prefix = prefix + "    ";
   for (const auto& [key, value] : node.explain_attributes()) {
@@ -106,6 +106,8 @@ std::string explain_text(const PhysicalPlanNode& root) {
   return out.str();
 }
 
-std::string explain_json(const PhysicalPlanNode& root) { return explain_json_recursive(root).dump(2); }
+std::string explain_json(const PhysicalPlanNode& root) {
+  return explain_json_recursive(root).dump(2);
+}
 
 }  // namespace kernellake

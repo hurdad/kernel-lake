@@ -9,7 +9,7 @@ namespace kernellake {
 namespace {
 
 class VectorSourceOperator final : public PhysicalOperator {
-public:
+ public:
   explicit VectorSourceOperator(std::vector<DeviceBatch> batches) : batches_(std::move(batches)) {}
   void open(ExecutionContext&) override { index_ = 0; }
   std::optional<DeviceBatch> next(ExecutionContext&) override {
@@ -20,14 +20,14 @@ public:
   [[nodiscard]] std::string_view name() const noexcept override { return "VectorSource"; }
   [[nodiscard]] OperatorId id() const noexcept override { return 0; }
 
-private:
+ private:
   std::vector<DeviceBatch> batches_;
   std::size_t index_ = 0;
 };
 
 ExecutionContext make_context() {
-  return ExecutionContext{"test-query", 0, nullptr, rmm::mr::get_current_device_resource_ref(),
-                           nullptr, nullptr, nullptr};
+  return ExecutionContext{"test-query", 0,       nullptr, rmm::mr::get_current_device_resource_ref(),
+                          nullptr,      nullptr, nullptr};
 }
 
 template <typename T>
@@ -35,7 +35,7 @@ std::unique_ptr<cudf::column> column_from_host(const std::vector<T>& values, cud
   rmm::device_buffer data(values.size() * sizeof(T), cudf::get_default_stream());
   cudaMemcpy(data.data(), values.data(), values.size() * sizeof(T), cudaMemcpyHostToDevice);
   return std::make_unique<cudf::column>(cudf::data_type{type}, static_cast<cudf::size_type>(values.size()),
-                                         std::move(data), rmm::device_buffer{}, 0);
+                                        std::move(data), rmm::device_buffer{}, 0);
 }
 
 template <typename T>
@@ -54,7 +54,7 @@ DeviceBatch make_batch(const std::vector<int32_t>& regions, const std::vector<do
   columns.push_back(column_from_host(regions, cudf::type_id::INT32));
   columns.push_back(column_from_host(amounts, cudf::type_id::FLOAT64));
   return DeviceBatch(std::make_unique<cudf::table>(std::move(columns)),
-                      std::make_shared<const Schema>(region_amount_schema()));
+                     std::make_shared<const Schema>(region_amount_schema()));
 }
 
 TEST(HashAggregateOperator, MergesPartialGroupsAcrossBatches) {
@@ -72,10 +72,10 @@ TEST(HashAggregateOperator, MergesPartialGroupsAcrossBatches) {
   auto count_expr =
       std::make_shared<AggregateExpression>(AggregateFunction::CountStar, nullptr, int64_type(false));
   std::vector<NamedExpression> aggregates = {NamedExpression{sum_expr, "total"},
-                                              NamedExpression{count_expr, "n"}};
+                                             NamedExpression{count_expr, "n"}};
 
-  HashAggregateOperator op(1, std::make_unique<VectorSourceOperator>(std::move(batches)),
-                            std::move(group_by), std::move(aggregates));
+  HashAggregateOperator op(1, std::make_unique<VectorSourceOperator>(std::move(batches)), std::move(group_by),
+                           std::move(aggregates));
   ExecutionContext context = make_context();
   op.open(context);
 
@@ -113,7 +113,7 @@ TEST(HashAggregateOperator, EmptyInputProducesZeroRowResult) {
   std::vector<NamedExpression> aggregates = {NamedExpression{sum_expr, "total"}};
 
   HashAggregateOperator op(1, std::make_unique<VectorSourceOperator>(std::vector<DeviceBatch>{}),
-                            std::move(group_by), std::move(aggregates));
+                           std::move(group_by), std::move(aggregates));
   ExecutionContext context = make_context();
   op.open(context);
   std::optional<DeviceBatch> result = op.next(context);

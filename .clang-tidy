@@ -1,0 +1,19 @@
+---
+Checks: >
+  -*,
+  bugprone-*,
+  -bugprone-easily-swappable-parameters,
+  performance-*,
+  modernize-use-override,
+  modernize-use-nullptr,
+  modernize-use-default-member-init,
+  modernize-use-emplace,
+  readability-braces-around-statements,
+  readability-container-size-empty,
+  readability-redundant-*,
+  readability-simplify-boolean-expr,
+  cppcoreguidelines-slicing,
+  cppcoreguidelines-pro-type-static-cast-downcast
+WarningsAsErrors: ''
+HeaderFilterRegex: '^.*/include/kernellake/.*'
+FormatStyle: file

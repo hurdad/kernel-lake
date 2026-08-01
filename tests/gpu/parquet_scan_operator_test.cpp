@@ -16,8 +16,8 @@ namespace {
 namespace fs = std::filesystem;
 
 ExecutionContext make_context() {
-  return ExecutionContext{"test-query", 0, nullptr, rmm::mr::get_current_device_resource_ref(),
-                           nullptr, nullptr, nullptr};
+  return ExecutionContext{"test-query", 0,       nullptr, rmm::mr::get_current_device_resource_ref(),
+                          nullptr,      nullptr, nullptr};
 }
 
 template <typename T>
@@ -28,11 +28,11 @@ std::vector<T> copy_to_host(const cudf::column_view& view) {
 }
 
 class ParquetScanOperatorTest : public ::testing::Test {
-protected:
+ protected:
   void SetUp() override {
     dir_ = fs::temp_directory_path() /
            fs::path("kernellake_parquet_scan_test_" +
-                     std::string(::testing::UnitTest::GetInstance()->current_test_info()->name()));
+                    std::string(::testing::UnitTest::GetInstance()->current_test_info()->name()));
     fs::create_directories(dir_);
     path_ = (dir_ / "sales.parquet").string();
 
@@ -50,8 +50,8 @@ protected:
     ASSERT_TRUE(amount_builder.Finish(&amount_array).ok());
     ASSERT_TRUE(region_builder.Finish(&region_array).ok());
     const auto schema = arrow::schema({arrow::field("id", arrow::int64(), false),
-                                        arrow::field("amount", arrow::float64(), false),
-                                        arrow::field("region", arrow::utf8(), false)});
+                                       arrow::field("amount", arrow::float64(), false),
+                                       arrow::field("region", arrow::utf8(), false)});
     const auto table = arrow::Table::Make(schema, {id_array, amount_array, region_array});
     auto sink = arrow::io::FileOutputStream::Open(path_).ValueOrDie();
     const arrow::Status status =
@@ -67,8 +67,7 @@ protected:
 
 TEST_F(ParquetScanOperatorTest, ReadsAllSelectedColumnsAndRowGroups) {
   RmmEnvironment env(default_config());
-  std::vector<PhysicalFileFragment> fragments = {
-      PhysicalFileFragment{Uri(path_), 10, 2, {0, 1}, {}, {}}};
+  std::vector<PhysicalFileFragment> fragments = {PhysicalFileFragment{Uri(path_), 10, 2, {0, 1}, {}, {}}};
   Schema schema({Field{"id", int64_type(false)}, Field{"amount", float64_type(false)}});
 
   ParquetScanOperator scan(1, fragments, {"id", "amount"}, std::make_shared<const Schema>(schema));

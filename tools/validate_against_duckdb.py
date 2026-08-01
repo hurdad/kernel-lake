@@ -14,7 +14,7 @@ Usage:
 
 Requires the `duckdb` and `pyarrow` Python packages and a GPU-enabled
 `kernellake` build (query execution has no CPU fallback -- see
-docs/architecture.md). See validate_tpch.py for the TPC-H-derived variant
+docs/ARCHITECTURE.md). See validate_tpch.py for the TPC-H-derived variant
 of this same check.
 """
 

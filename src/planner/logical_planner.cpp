@@ -27,8 +27,7 @@ LogicalPlanPtr build_logical_plan(const BoundQuery& query, const Schema& source_
   }
 
   if (!query.order_by.empty() && query.is_aggregate_query) {
-    throw PlanningError(
-        "ORDER BY after GROUP BY is not yet supported in this version of KernelLake");
+    throw PlanningError("ORDER BY after GROUP BY is not yet supported in this version of KernelLake");
   }
   if (!query.order_by.empty()) {
     // Placed before the (aggregate-free) projection: projection only
@@ -74,7 +73,7 @@ LogicalPlanPtr build_logical_plan(const BoundQuery& query, const Schema& source_
         const auto pos_it = group_by_positions.find(item.expr->to_string());
         if (pos_it == group_by_positions.end()) {
           throw PlanningError("SELECT item '" + item.output_name +
-                               "' is neither an aggregate nor a GROUP BY column");
+                              "' is neither an aggregate nor a GROUP BY column");
         }
         absolute_index = pos_it->second;
       }

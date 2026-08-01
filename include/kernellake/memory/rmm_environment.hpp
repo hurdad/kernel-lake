@@ -31,11 +31,11 @@ struct MemoryUsage {
 //
 // Avoids global mutable execution state beyond what CUDA/RMM themselves
 // require (a single current-device-resource slot per process) -- see
-// docs/architecture.md's "Concurrency" notes for why a single shared
+// docs/ARCHITECTURE.md's "Concurrency" notes for why a single shared
 // statistics/limiting stack is an acceptable MVP simplification given
 // KernelLake executes one query at a time.
 class RmmEnvironment {
-public:
+ public:
   explicit RmmEnvironment(const EngineConfig& config);
   ~RmmEnvironment();
 
@@ -50,7 +50,7 @@ public:
 
   [[nodiscard]] MemoryUsage current_usage() const;
 
-private:
+ private:
   struct Impl;
   std::unique_ptr<Impl> impl_;
 };

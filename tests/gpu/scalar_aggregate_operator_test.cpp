@@ -13,7 +13,7 @@ namespace kernellake {
 namespace {
 
 class VectorSourceOperator final : public PhysicalOperator {
-public:
+ public:
   explicit VectorSourceOperator(std::vector<DeviceBatch> batches) : batches_(std::move(batches)) {}
   void open(ExecutionContext&) override { index_ = 0; }
   std::optional<DeviceBatch> next(ExecutionContext&) override {
@@ -24,14 +24,14 @@ public:
   [[nodiscard]] std::string_view name() const noexcept override { return "VectorSource"; }
   [[nodiscard]] OperatorId id() const noexcept override { return 0; }
 
-private:
+ private:
   std::vector<DeviceBatch> batches_;
   std::size_t index_ = 0;
 };
 
 ExecutionContext make_context() {
-  return ExecutionContext{"test-query", 0, nullptr, rmm::mr::get_current_device_resource_ref(),
-                           nullptr, nullptr, nullptr};
+  return ExecutionContext{"test-query", 0,       nullptr, rmm::mr::get_current_device_resource_ref(),
+                          nullptr,      nullptr, nullptr};
 }
 
 std::unique_ptr<cudf::column> filled_column(cudf::type_id type, double value, cudf::size_type num_rows) {
@@ -65,8 +65,8 @@ TEST(ScalarAggregateOperator, SumAccumulatesAcrossMultipleBatches) {
   for (double value : {10.0, 20.0, 30.0}) {
     std::vector<std::unique_ptr<cudf::column>> columns;
     columns.push_back(filled_column(cudf::type_id::FLOAT64, value, 5));
-    batches.push_back(
-        DeviceBatch(std::make_unique<cudf::table>(std::move(columns)), std::make_shared<const Schema>(schema)));
+    batches.push_back(DeviceBatch(std::make_unique<cudf::table>(std::move(columns)),
+                                  std::make_shared<const Schema>(schema)));
   }
 
   auto amount = std::make_shared<ColumnExpression>("amount", 0, float64_type(false));
@@ -74,7 +74,7 @@ TEST(ScalarAggregateOperator, SumAccumulatesAcrossMultipleBatches) {
   std::vector<NamedExpression> aggregates = {NamedExpression{sum_expr, "total"}};
 
   ScalarAggregateOperator op(1, std::make_unique<VectorSourceOperator>(std::move(batches)),
-                              std::move(aggregates));
+                             std::move(aggregates));
   ExecutionContext context = make_context();
   op.open(context);
 
@@ -99,15 +99,15 @@ TEST(ScalarAggregateOperator, CountStarCountsRowsAcrossBatchesIncludingZero) {
     std::vector<DeviceBatch> batches;
     std::vector<std::unique_ptr<cudf::column>> columns;
     columns.push_back(filled_column(cudf::type_id::INT32, 1, 7));
-    batches.push_back(
-        DeviceBatch(std::make_unique<cudf::table>(std::move(columns)), std::make_shared<const Schema>(schema)));
+    batches.push_back(DeviceBatch(std::make_unique<cudf::table>(std::move(columns)),
+                                  std::make_shared<const Schema>(schema)));
     std::vector<std::unique_ptr<cudf::column>> columns2;
     columns2.push_back(filled_column(cudf::type_id::INT32, 1, 3));
-    batches.push_back(
-        DeviceBatch(std::make_unique<cudf::table>(std::move(columns2)), std::make_shared<const Schema>(schema)));
+    batches.push_back(DeviceBatch(std::make_unique<cudf::table>(std::move(columns2)),
+                                  std::make_shared<const Schema>(schema)));
 
     ScalarAggregateOperator op(1, std::make_unique<VectorSourceOperator>(std::move(batches)),
-                                std::vector<NamedExpression>{aggregates});
+                               std::vector<NamedExpression>{aggregates});
     ExecutionContext context = make_context();
     op.open(context);
     std::optional<DeviceBatch> result = op.next(context);
@@ -118,7 +118,7 @@ TEST(ScalarAggregateOperator, CountStarCountsRowsAcrossBatchesIncludingZero) {
   {
     // Empty case: COUNT(*) of zero rows is 0, not NULL.
     ScalarAggregateOperator op(1, std::make_unique<VectorSourceOperator>(std::vector<DeviceBatch>{}),
-                                std::vector<NamedExpression>{aggregates});
+                               std::vector<NamedExpression>{aggregates});
     ExecutionContext context = make_context();
     op.open(context);
     std::optional<DeviceBatch> result = op.next(context);
@@ -136,7 +136,7 @@ TEST(ScalarAggregateOperator, SumOfEmptyInputIsNullNotZero) {
   std::vector<NamedExpression> aggregates = {NamedExpression{sum_expr, "total"}};
 
   ScalarAggregateOperator op(1, std::make_unique<VectorSourceOperator>(std::vector<DeviceBatch>{}),
-                              std::move(aggregates));
+                             std::move(aggregates));
   ExecutionContext context = make_context();
   op.open(context);
   std::optional<DeviceBatch> result = op.next(context);
@@ -152,8 +152,8 @@ TEST(ScalarAggregateOperator, AvgComputesMeanAcrossBatches) {
   for (double value : {2.0, 4.0, 6.0}) {
     std::vector<std::unique_ptr<cudf::column>> columns;
     columns.push_back(filled_column(cudf::type_id::FLOAT64, value, 2));
-    batches.push_back(
-        DeviceBatch(std::make_unique<cudf::table>(std::move(columns)), std::make_shared<const Schema>(schema)));
+    batches.push_back(DeviceBatch(std::make_unique<cudf::table>(std::move(columns)),
+                                  std::make_shared<const Schema>(schema)));
   }
 
   auto amount = std::make_shared<ColumnExpression>("amount", 0, float64_type(false));
@@ -161,7 +161,7 @@ TEST(ScalarAggregateOperator, AvgComputesMeanAcrossBatches) {
   std::vector<NamedExpression> aggregates = {NamedExpression{avg_expr, "avg"}};
 
   ScalarAggregateOperator op(1, std::make_unique<VectorSourceOperator>(std::move(batches)),
-                              std::move(aggregates));
+                             std::move(aggregates));
   ExecutionContext context = make_context();
   op.open(context);
   std::optional<DeviceBatch> result = op.next(context);
@@ -183,8 +183,8 @@ TEST(ScalarAggregateOperator, FullTpchQ6ShapedPipeline) {
     columns.push_back(filled_column(cudf::type_id::FLOAT64, 100.0, 4));
     columns.push_back(filled_column(cudf::type_id::FLOAT64, 0.06, 4));
     columns.push_back(filled_column(cudf::type_id::INT32, 10, 4));
-    batches.push_back(
-        DeviceBatch(std::make_unique<cudf::table>(std::move(columns)), std::make_shared<const Schema>(schema)));
+    batches.push_back(DeviceBatch(std::make_unique<cudf::table>(std::move(columns)),
+                                  std::make_shared<const Schema>(schema)));
   }
   // Batch 2: 3 rows that fail quantity < 24 (quantity = 30), should be excluded.
   {
@@ -192,8 +192,8 @@ TEST(ScalarAggregateOperator, FullTpchQ6ShapedPipeline) {
     columns.push_back(filled_column(cudf::type_id::FLOAT64, 200.0, 3));
     columns.push_back(filled_column(cudf::type_id::FLOAT64, 0.06, 3));
     columns.push_back(filled_column(cudf::type_id::INT32, 30, 3));
-    batches.push_back(
-        DeviceBatch(std::make_unique<cudf::table>(std::move(columns)), std::make_shared<const Schema>(schema)));
+    batches.push_back(DeviceBatch(std::make_unique<cudf::table>(std::move(columns)),
+                                  std::make_shared<const Schema>(schema)));
   }
   // Batch 3: 2 rows that pass (discount 0.05, quantity 5), price 50.
   {
@@ -201,8 +201,8 @@ TEST(ScalarAggregateOperator, FullTpchQ6ShapedPipeline) {
     columns.push_back(filled_column(cudf::type_id::FLOAT64, 50.0, 2));
     columns.push_back(filled_column(cudf::type_id::FLOAT64, 0.05, 2));
     columns.push_back(filled_column(cudf::type_id::INT32, 5, 2));
-    batches.push_back(
-        DeviceBatch(std::make_unique<cudf::table>(std::move(columns)), std::make_shared<const Schema>(schema)));
+    batches.push_back(DeviceBatch(std::make_unique<cudf::table>(std::move(columns)),
+                                  std::make_shared<const Schema>(schema)));
   }
 
   auto discount = std::make_shared<ColumnExpression>("l_discount", 1, float64_type(false));
@@ -214,13 +214,13 @@ TEST(ScalarAggregateOperator, FullTpchQ6ShapedPipeline) {
   auto quantity_i64 = std::make_shared<CastExpression>(quantity, int64_type(false));
   auto twenty_four = std::make_shared<LiteralExpression>(LiteralExpression::make_int64(24));
   auto quantity_cmp = std::make_shared<BinaryExpression>(BinaryOperator::Less, quantity_i64, twenty_four,
-                                                          boolean_type(false));
+                                                         boolean_type(false));
   auto predicate =
       std::make_shared<BinaryExpression>(BinaryOperator::And, between, quantity_cmp, boolean_type(false));
 
   auto extendedprice = std::make_shared<ColumnExpression>("l_extendedprice", 0, float64_type(false));
   auto revenue_expr = std::make_shared<BinaryExpression>(BinaryOperator::Multiply, extendedprice, discount,
-                                                          float64_type(false));
+                                                         float64_type(false));
   std::vector<NamedExpression> projection_items = {NamedExpression{revenue_expr, "revenue"}};
 
   auto revenue_col = std::make_shared<ColumnExpression>("revenue", 0, float64_type(false));

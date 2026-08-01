@@ -14,20 +14,20 @@ void check_cuda(cudaError_t status, std::string_view operation);
 // RAII CUDA device selection: sets the device on construction, restores
 // whatever device was current beforehand on destruction.
 class CudaDeviceGuard {
-public:
+ public:
   explicit CudaDeviceGuard(int device_id);
   ~CudaDeviceGuard();
 
   CudaDeviceGuard(const CudaDeviceGuard&) = delete;
   CudaDeviceGuard& operator=(const CudaDeviceGuard&) = delete;
 
-private:
+ private:
   int previous_device_id_;
 };
 
 // RAII non-blocking CUDA stream.
 class CudaStream {
-public:
+ public:
   CudaStream();
   ~CudaStream();
 
@@ -38,7 +38,7 @@ public:
 
   [[nodiscard]] cudaStream_t get() const noexcept { return stream_; }
 
-private:
+ private:
   cudaStream_t stream_ = nullptr;
 };
 

@@ -24,12 +24,12 @@ namespace kernellake {
 // explicitly out of MVP scope), so this defaults to a generous fixed value
 // -- see kDefaultMaxDistinctKeys.
 class HashAggregateOperator final : public PhysicalOperator {
-public:
+ public:
   static constexpr cudf::size_type kDefaultMaxDistinctKeys = 10'000'000;
 
   HashAggregateOperator(OperatorId id, std::unique_ptr<PhysicalOperator> child,
-                         std::vector<NamedExpression> group_by, std::vector<NamedExpression> aggregates,
-                         cudf::size_type max_distinct_keys = kDefaultMaxDistinctKeys);
+                        std::vector<NamedExpression> group_by, std::vector<NamedExpression> aggregates,
+                        cudf::size_type max_distinct_keys = kDefaultMaxDistinctKeys);
 
   void open(ExecutionContext& context) override;
   std::optional<DeviceBatch> next(ExecutionContext& context) override;
@@ -38,7 +38,7 @@ public:
   [[nodiscard]] std::string_view name() const noexcept override { return "HashAggregate"; }
   [[nodiscard]] OperatorId id() const noexcept override { return id_; }
 
-private:
+ private:
   // A plain column reference (e.g. `GROUP BY region`) is copied directly
   // rather than routed through cudf::ast::compute_column: cudf's AST
   // evaluator can only materialize fixed-width output columns, so a STRING
@@ -50,11 +50,12 @@ private:
   };
 
   [[nodiscard]] CompiledExpr compile_expr(const Expression& expr);
-  [[nodiscard]] std::unique_ptr<cudf::column> materialize(const CompiledExpr& compiled, const DeviceBatch& batch,
-                                                           ExecutionContext& context);
+  [[nodiscard]] std::unique_ptr<cudf::column> materialize(const CompiledExpr& compiled,
+                                                          const DeviceBatch& batch,
+                                                          ExecutionContext& context);
   void process_batch(const DeviceBatch& batch, ExecutionContext& context);
   [[nodiscard]] std::unique_ptr<cudf::table> build_combined_columns(const DeviceBatch& batch,
-                                                                     ExecutionContext& context);
+                                                                    ExecutionContext& context);
 
   OperatorId id_;
   std::unique_ptr<PhysicalOperator> child_;

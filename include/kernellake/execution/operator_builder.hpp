@@ -16,6 +16,6 @@ namespace kernellake {
 // operator's own docs for why this is a byte budget rather than an exact
 // row count.
 [[nodiscard]] std::unique_ptr<PhysicalOperator> build_operator_tree(const PhysicalPlanPtr& plan,
-                                                                     std::size_t pass_read_limit_bytes);
+                                                                    std::size_t pass_read_limit_bytes);
 
 }  // namespace kernellake

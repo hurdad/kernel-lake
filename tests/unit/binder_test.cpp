@@ -69,20 +69,19 @@ TEST(Binder, RejectsUnknownColumn) {
 }
 
 TEST(Binder, RejectsUngroupedColumnInAggregateQuery) {
-  const auto stmt = sql::parse_sql(
-      "SELECT region, amount, SUM(amount) FROM read_parquet('/x.parquet') GROUP BY region");
+  const auto stmt =
+      sql::parse_sql("SELECT region, amount, SUM(amount) FROM read_parquet('/x.parquet') GROUP BY region");
   EXPECT_THROW(bind_query(stmt, sales_schema()), BindingError);
 }
 
 TEST(Binder, AllowsGroupedColumnInAggregateQuery) {
-  const auto stmt = sql::parse_sql(
-      "SELECT region, SUM(amount) FROM read_parquet('/x.parquet') GROUP BY region");
+  const auto stmt =
+      sql::parse_sql("SELECT region, SUM(amount) FROM read_parquet('/x.parquet') GROUP BY region");
   EXPECT_NO_THROW(bind_query(stmt, sales_schema()));
 }
 
 TEST(Binder, RejectsIncompatibleComparison) {
-  const auto stmt =
-      sql::parse_sql("SELECT region FROM read_parquet('/x.parquet') WHERE region > 5");
+  const auto stmt = sql::parse_sql("SELECT region FROM read_parquet('/x.parquet') WHERE region > 5");
   EXPECT_THROW(bind_query(stmt, sales_schema()), BindingError);
 }
 
@@ -92,14 +91,12 @@ TEST(Binder, RejectsNonBooleanWhere) {
 }
 
 TEST(Binder, RejectsDuplicateOutputNames) {
-  const auto stmt = sql::parse_sql(
-      "SELECT region AS x, amount AS x FROM read_parquet('/x.parquet')");
+  const auto stmt = sql::parse_sql("SELECT region AS x, amount AS x FROM read_parquet('/x.parquet')");
   EXPECT_THROW(bind_query(stmt, sales_schema()), BindingError);
 }
 
 TEST(Binder, RejectsAggregateInWhere) {
-  const auto stmt =
-      sql::parse_sql("SELECT region FROM read_parquet('/x.parquet') WHERE SUM(amount) > 0");
+  const auto stmt = sql::parse_sql("SELECT region FROM read_parquet('/x.parquet') WHERE SUM(amount) > 0");
   EXPECT_THROW(bind_query(stmt, sales_schema()), BindingError);
 }
 
@@ -113,16 +110,14 @@ TEST(Binder, ExpandsStar) {
 
 TEST(Binder, InsertsSafeNumericCastForComparison) {
   Schema schema({Field{"a", int32_type(false)}});
-  const auto stmt =
-      sql::parse_sql("SELECT a FROM read_parquet('/x.parquet') WHERE a > 1.5");
+  const auto stmt = sql::parse_sql("SELECT a FROM read_parquet('/x.parquet') WHERE a > 1.5");
   const BoundQuery bound = bind_query(stmt, schema);
   ASSERT_NE(bound.where, nullptr);
   EXPECT_EQ(bound.where->result_type().id, TypeId::Boolean);
 }
 
 TEST(Binder, NullLiteralComparisonBindsWithoutError) {
-  const auto stmt =
-      sql::parse_sql("SELECT region FROM read_parquet('/x.parquet') WHERE amount = NULL");
+  const auto stmt = sql::parse_sql("SELECT region FROM read_parquet('/x.parquet') WHERE amount = NULL");
   EXPECT_NO_THROW(bind_query(stmt, sales_schema()));
 }
 

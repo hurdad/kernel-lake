@@ -13,7 +13,7 @@ namespace kernellake {
 // that filter down to zero rows are skipped rather than returned, so
 // downstream operators only ever see non-empty batches.
 class FilterOperator final : public PhysicalOperator {
-public:
+ public:
   FilterOperator(OperatorId id, std::unique_ptr<PhysicalOperator> child, ExpressionPtr predicate);
 
   void open(ExecutionContext& context) override;
@@ -23,7 +23,7 @@ public:
   [[nodiscard]] std::string_view name() const noexcept override { return "Filter"; }
   [[nodiscard]] OperatorId id() const noexcept override { return id_; }
 
-private:
+ private:
   OperatorId id_;
   std::unique_ptr<PhysicalOperator> child_;
   ExpressionPtr predicate_;

@@ -22,9 +22,9 @@ namespace kernellake {
 // computation was requested. Genuinely computed expressions still go
 // through compute_column as before.
 class ProjectionOperator final : public PhysicalOperator {
-public:
+ public:
   ProjectionOperator(OperatorId id, std::unique_ptr<PhysicalOperator> child,
-                      std::vector<NamedExpression> items);
+                     std::vector<NamedExpression> items);
 
   void open(ExecutionContext& context) override;
   std::optional<DeviceBatch> next(ExecutionContext& context) override;
@@ -33,7 +33,7 @@ public:
   [[nodiscard]] std::string_view name() const noexcept override { return "Projection"; }
   [[nodiscard]] OperatorId id() const noexcept override { return id_; }
 
-private:
+ private:
   // One entry per output item: either a source column index to copy
   // directly (plain column reference) or a compiled AST expression to
   // evaluate (anything else).

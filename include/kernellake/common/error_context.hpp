@@ -12,7 +12,7 @@ namespace kernellake {
 // Every KernelLake error thrown from a non-trivial call site should be built
 // through this rather than an ad hoc string, so messages stay uniform.
 class ErrorContextBuilder {
-public:
+ public:
   explicit ErrorContextBuilder(std::string operation) : operation_(std::move(operation)) {}
 
   ErrorContextBuilder& uri(std::string value) {
@@ -61,7 +61,7 @@ public:
     return out.str();
   }
 
-private:
+ private:
   std::string operation_;
   std::optional<std::string> uri_;
   std::optional<int> cuda_device_;

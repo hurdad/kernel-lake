@@ -19,11 +19,11 @@ namespace {
 namespace fs = std::filesystem;
 
 class PhysicalPlannerTest : public ::testing::Test {
-protected:
+ protected:
   void SetUp() override {
     dir_ = fs::temp_directory_path() /
            fs::path("kernellake_physical_planner_test_" +
-                     std::string(::testing::UnitTest::GetInstance()->current_test_info()->name()));
+                    std::string(::testing::UnitTest::GetInstance()->current_test_info()->name()));
     fs::create_directories(dir_);
     path_ = (dir_ / "sales.parquet").string();
     write_two_row_group_file(path_);
@@ -46,8 +46,8 @@ protected:
     ASSERT_TRUE(amount_builder.Finish(&amount_array).ok());
     ASSERT_TRUE(region_builder.Finish(&region_array).ok());
     const auto schema = arrow::schema({arrow::field("id", arrow::int64(), false),
-                                        arrow::field("amount", arrow::float64(), false),
-                                        arrow::field("region", arrow::utf8(), false)});
+                                       arrow::field("amount", arrow::float64(), false),
+                                       arrow::field("region", arrow::utf8(), false)});
     const auto table = arrow::Table::Make(schema, {id_array, amount_array, region_array});
     auto sink = arrow::io::FileOutputStream::Open(path).ValueOrDie();
     const arrow::Status status =
@@ -57,7 +57,7 @@ protected:
 
   Schema sales_schema() {
     return Schema({Field{"id", int64_type(false)}, Field{"amount", float64_type(false)},
-                    Field{"region", string_type(false)}});
+                   Field{"region", string_type(false)}});
   }
 
   PhysicalPlanPtr plan_for(const std::string& sql) {
@@ -144,8 +144,7 @@ TEST_F(PhysicalPlannerTest, AggregateArgumentUsesNarrowedColumnIndexWhenEarlierC
 }
 
 TEST_F(PhysicalPlannerTest, PruningSkipsWholeRowGroupAtPhysicalLevel) {
-  const PhysicalPlanPtr plan =
-      plan_for("SELECT id FROM read_parquet('" + path_ + "') WHERE region = 'B'");
+  const PhysicalPlanPtr plan = plan_for("SELECT id FROM read_parquet('" + path_ + "') WHERE region = 'B'");
   const auto* scan = dynamic_cast<const ParquetScanNode*>(find_leaf(plan.get()));
   ASSERT_NE(scan, nullptr);
   ASSERT_EQ(scan->files_scanned(), 1u);
@@ -173,8 +172,8 @@ TEST_F(PhysicalPlannerTest, ScalarAggregateForNoGroupBy) {
 }
 
 TEST_F(PhysicalPlannerTest, HashAggregateForGroupBy) {
-  const PhysicalPlanPtr plan = plan_for(
-      "SELECT region, SUM(amount) AS total FROM read_parquet('" + path_ + "') GROUP BY region");
+  const PhysicalPlanPtr plan =
+      plan_for("SELECT region, SUM(amount) AS total FROM read_parquet('" + path_ + "') GROUP BY region");
   const PhysicalPlanNode* node = plan.get();
   while (dynamic_cast<const HashAggregateNode*>(node) == nullptr && !node->children().empty()) {
     node = node->children()[0].get();
@@ -186,16 +185,14 @@ TEST_F(PhysicalPlannerTest, HashAggregateForGroupBy) {
 }
 
 TEST_F(PhysicalPlannerTest, RejectsOrderByWithClearError) {
-  const auto stmt =
-      sql::parse_sql("SELECT id FROM read_parquet('" + path_ + "') ORDER BY id");
+  const auto stmt = sql::parse_sql("SELECT id FROM read_parquet('" + path_ + "') ORDER BY id");
   const BoundQuery bound = bind_query(stmt, sales_schema());
   LogicalPlanPtr logical = optimize(build_logical_plan(bound, sales_schema()));
   EXPECT_THROW(build_physical_plan(logical, store_), PlanningError);
 }
 
 TEST_F(PhysicalPlannerTest, ExplainShowsFilesAndRowGroupCounts) {
-  const PhysicalPlanPtr plan =
-      plan_for("SELECT id FROM read_parquet('" + path_ + "') WHERE region = 'B'");
+  const PhysicalPlanPtr plan = plan_for("SELECT id FROM read_parquet('" + path_ + "') WHERE region = 'B'");
   const std::string text = explain_text(*plan);
   EXPECT_NE(text.find("ArrowResult"), std::string::npos);
   EXPECT_NE(text.find("ParquetScan"), std::string::npos);

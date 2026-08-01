@@ -24,7 +24,9 @@ T read_or(const YAML::Node& node, const char* key, T fallback) {
 
 }  // namespace
 
-EngineConfig default_config() { return EngineConfig{}; }
+EngineConfig default_config() {
+  return EngineConfig{};
+}
 
 EngineConfig parse_config(const std::string& yaml_text) {
   YAML::Node root;
@@ -39,14 +41,12 @@ EngineConfig parse_config(const std::string& yaml_text) {
   const YAML::Node engine = root["engine"];
   config.engine.device_id = read_or(engine, "device_id", config.engine.device_id);
   config.engine.batch_rows = read_or(engine, "batch_rows", config.engine.batch_rows);
-  config.engine.result_batch_rows =
-      read_or(engine, "result_batch_rows", config.engine.result_batch_rows);
+  config.engine.result_batch_rows = read_or(engine, "result_batch_rows", config.engine.result_batch_rows);
   config.engine.query_memory_limit_bytes =
       read_or(engine, "query_memory_limit_bytes", config.engine.query_memory_limit_bytes);
 
   const YAML::Node memory = root["memory"];
-  config.memory.pool_initial_bytes =
-      read_or(memory, "pool_initial_bytes", config.memory.pool_initial_bytes);
+  config.memory.pool_initial_bytes = read_or(memory, "pool_initial_bytes", config.memory.pool_initial_bytes);
   config.memory.pool_max_bytes = read_or(memory, "pool_max_bytes", config.memory.pool_max_bytes);
   config.memory.use_async_allocator =
       read_or(memory, "use_async_allocator", config.memory.use_async_allocator);
@@ -69,10 +69,8 @@ EngineConfig parse_config(const std::string& yaml_text) {
       read_or(benchmark, "default_iterations", config.benchmark.default_iterations);
   config.benchmark.warmup_iterations =
       read_or(benchmark, "warmup_iterations", config.benchmark.warmup_iterations);
-  config.benchmark.output_format =
-      read_or(benchmark, "output_format", config.benchmark.output_format);
-  config.benchmark.verify_results =
-      read_or(benchmark, "verify_results", config.benchmark.verify_results);
+  config.benchmark.output_format = read_or(benchmark, "output_format", config.benchmark.output_format);
+  config.benchmark.verify_results = read_or(benchmark, "verify_results", config.benchmark.verify_results);
   config.benchmark.baseline = read_or(benchmark, "baseline", config.benchmark.baseline);
 
   return config;
@@ -82,7 +80,7 @@ EngineConfig load_config_file(const std::string& path) {
   std::ifstream file(path);
   if (!file) {
     throw ConfigurationError("cannot open configuration file '" + path +
-                              "': check that the path exists and is readable");
+                             "': check that the path exists and is readable");
   }
   std::ostringstream buffer;
   buffer << file.rdbuf();
@@ -91,8 +89,7 @@ EngineConfig load_config_file(const std::string& path) {
 
 void validate_config(const EngineConfig& config) {
   if (config.engine.device_id < 0) {
-    throw ConfigurationError("engine.device_id must be >= 0, got " +
-                              std::to_string(config.engine.device_id));
+    throw ConfigurationError("engine.device_id must be >= 0, got " + std::to_string(config.engine.device_id));
   }
   if (config.engine.batch_rows == 0) {
     throw ConfigurationError("engine.batch_rows must be > 0");
@@ -108,14 +105,13 @@ void validate_config(const EngineConfig& config) {
     throw ConfigurationError("memory.pool_initial_bytes must be > 0");
   }
   if (config.memory.pool_max_bytes < config.memory.pool_initial_bytes) {
-    throw ConfigurationError(
-        "memory.pool_max_bytes (" + std::to_string(config.memory.pool_max_bytes) +
-        ") must be >= memory.pool_initial_bytes (" +
-        std::to_string(config.memory.pool_initial_bytes) + ")");
+    throw ConfigurationError("memory.pool_max_bytes (" + std::to_string(config.memory.pool_max_bytes) +
+                             ") must be >= memory.pool_initial_bytes (" +
+                             std::to_string(config.memory.pool_initial_bytes) + ")");
   }
 
-  static constexpr std::array<const char*, 7> kLogLevels = {
-      "trace", "debug", "info", "warn", "warning", "error", "critical"};
+  static constexpr std::array<const char*, 7> kLogLevels = {"trace",   "debug", "info",    "warn",
+                                                            "warning", "error", "critical"};
   bool level_ok = false;
   for (const char* level : kLogLevels) {
     if (config.logging.level == level) {
@@ -125,17 +121,17 @@ void validate_config(const EngineConfig& config) {
   }
   if (!level_ok) {
     throw ConfigurationError("logging.level '" + config.logging.level +
-                              "' is not a recognized level "
-                              "(expected one of trace/debug/info/warn/error/critical)");
+                             "' is not a recognized level "
+                             "(expected one of trace/debug/info/warn/error/critical)");
   }
 
   if (config.benchmark.output_format != "json" && config.benchmark.output_format != "csv") {
     throw ConfigurationError("benchmark.output_format '" + config.benchmark.output_format +
-                              "' is unsupported (expected 'json' or 'csv')");
+                             "' is unsupported (expected 'json' or 'csv')");
   }
   if (config.benchmark.baseline != "duckdb" && config.benchmark.baseline != "none") {
     throw ConfigurationError("benchmark.baseline '" + config.benchmark.baseline +
-                              "' is unsupported (expected 'duckdb' or 'none')");
+                             "' is unsupported (expected 'duckdb' or 'none')");
   }
   if (config.benchmark.default_iterations <= 0) {
     throw ConfigurationError("benchmark.default_iterations must be > 0");

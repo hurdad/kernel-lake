@@ -25,10 +25,10 @@ namespace kernellake {
 // (to INT64/UINT64/FLOAT64); anything else throws ExecutionError naming the
 // unsupported target rather than silently miscompiling.
 class ExpressionCompiler {
-public:
+ public:
   [[nodiscard]] const cudf::ast::expression& compile(const Expression& expr);
 
-private:
+ private:
   const cudf::ast::expression& compile_column(const ColumnExpression& expr);
   const cudf::ast::expression& compile_literal(const LiteralExpression& expr);
   const cudf::ast::expression& compile_binary(const BinaryExpression& expr);
@@ -36,8 +36,7 @@ private:
   const cudf::ast::expression& compile_between(const BetweenExpression& expr);
   const cudf::ast::expression& compile_cast(const CastExpression& expr);
 
-  const cudf::ast::expression& make_literal(const DataType& type, const LiteralStorage& value,
-                                             bool is_valid);
+  const cudf::ast::expression& make_literal(const DataType& type, const LiteralStorage& value, bool is_valid);
 
   cudf::ast::tree tree_;
   std::vector<std::unique_ptr<cudf::scalar>> scalars_;

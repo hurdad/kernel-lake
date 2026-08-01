@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.26)
 
 # CUDA is an optional language: it is only enabled when KERNELLAKE_WITH_CUDA is
 # turned on, which additionally requires libcudf/RMM to build the GPU
-# execution layer. See docs/architecture.md for the CPU/GPU build split.
+# execution layer. See docs/ARCHITECTURE.md for the CPU/GPU build split.
 option(KERNELLAKE_WITH_CUDA "Enable CUDA and GPU execution (requires CUDA toolkit, libcudf, RMM)" OFF)
 option(KERNELLAKE_BUILD_TESTS "Build unit and integration tests" ON)
 option(KERNELLAKE_BUILD_BENCHMARKS "Build microbenchmarks and TPC-H benchmarks" ON)

@@ -29,8 +29,7 @@ int run_explain(const std::vector<std::string_view>& args, const EngineConfig& c
     return 1;
   }
   if (format != "text" && format != "json") {
-    std::fprintf(stderr, "kernellake explain: --format must be 'text' or 'json', got '%s'\n",
-                 format.c_str());
+    std::fprintf(stderr, "kernellake explain: --format must be 'text' or 'json', got '%s'\n", format.c_str());
     return 1;
   }
 

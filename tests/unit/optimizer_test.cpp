@@ -50,8 +50,7 @@ Schema two_column_schema() {
 }
 
 TEST(Optimizer, ConstantFoldsArithmetic) {
-  auto plan =
-      plan_for("SELECT a FROM read_parquet('/x.parquet') WHERE a > 1 + 2", two_column_schema());
+  auto plan = plan_for("SELECT a FROM read_parquet('/x.parquet') WHERE a > 1 + 2", two_column_schema());
   plan = optimize(std::move(plan));
 
   // Plan shape: Projection -> Filter -> Scan.
@@ -63,8 +62,7 @@ TEST(Optimizer, ConstantFoldsArithmetic) {
 }
 
 TEST(Optimizer, RemovesFilterThatFoldsToTrue) {
-  auto plan =
-      plan_for("SELECT a FROM read_parquet('/x.parquet') WHERE 1 = 1", two_column_schema());
+  auto plan = plan_for("SELECT a FROM read_parquet('/x.parquet') WHERE 1 = 1", two_column_schema());
   plan = optimize(std::move(plan));
 
   const auto* projection = dynamic_cast<const LogicalProjection*>(plan.get());
@@ -74,8 +72,7 @@ TEST(Optimizer, RemovesFilterThatFoldsToTrue) {
 }
 
 TEST(Optimizer, AnnotatesAlwaysFalseFilterWithZeroRows) {
-  auto plan =
-      plan_for("SELECT a FROM read_parquet('/x.parquet') WHERE 1 = 2", two_column_schema());
+  auto plan = plan_for("SELECT a FROM read_parquet('/x.parquet') WHERE 1 = 2", two_column_schema());
   plan = optimize(std::move(plan));
 
   const auto* projection = dynamic_cast<const LogicalProjection*>(plan.get());
@@ -100,8 +97,7 @@ TEST(Optimizer, CombinesAdjacentFilters) {
 
   auto b_col = std::make_shared<ColumnExpression>("b", 1, int64_type(false));
   auto two = std::make_shared<LiteralExpression>(LiteralExpression::make_int64(2));
-  auto outer_pred =
-      std::make_shared<BinaryExpression>(BinaryOperator::Less, b_col, two, boolean_type(false));
+  auto outer_pred = std::make_shared<BinaryExpression>(BinaryOperator::Less, b_col, two, boolean_type(false));
   auto outer_filter = std::make_shared<LogicalFilter>(inner_filter, outer_pred);
 
   LogicalPlanPtr optimized = optimize(outer_filter);
@@ -112,9 +108,9 @@ TEST(Optimizer, CombinesAdjacentFilters) {
 }
 
 TEST(Optimizer, SimplifiesBetweenIntoComparisons) {
-  auto plan = plan_for(
-      "SELECT l_discount FROM read_parquet('/x.parquet') WHERE l_discount BETWEEN 0.05 AND 0.07",
-      lineitem_schema());
+  auto plan =
+      plan_for("SELECT l_discount FROM read_parquet('/x.parquet') WHERE l_discount BETWEEN 0.05 AND 0.07",
+               lineitem_schema());
   plan = optimize(std::move(plan));
 
   const auto* projection = dynamic_cast<const LogicalProjection*>(plan.get());
@@ -130,8 +126,7 @@ TEST(Optimizer, RemovesRedundantIdentityProjection) {
   Schema schema({Field{"a", int64_type(false)}});
   auto scan = std::make_shared<LogicalScan>(std::vector<std::string>{"/x.parquet"}, schema);
   auto column = std::make_shared<ColumnExpression>("a", 0, int64_type(false));
-  auto projection =
-      std::make_shared<LogicalProjection>(scan, std::vector<NamedExpression>{{column, "a"}});
+  auto projection = std::make_shared<LogicalProjection>(scan, std::vector<NamedExpression>{{column, "a"}});
 
   LogicalPlanPtr optimized = optimize(projection);
   EXPECT_NE(dynamic_cast<const LogicalScan*>(optimized.get()), nullptr);
@@ -150,8 +145,8 @@ TEST(Optimizer, PushesLimitThroughProjectionToScan) {
 }
 
 TEST(Optimizer, DoesNotPushLimitPastFilter) {
-  auto plan = plan_for(
-      "SELECT region FROM read_parquet('/x.parquet') WHERE amount > 0 LIMIT 10", sales_schema());
+  auto plan =
+      plan_for("SELECT region FROM read_parquet('/x.parquet') WHERE amount > 0 LIMIT 10", sales_schema());
   plan = optimize(std::move(plan));
 
   const auto* projection = dynamic_cast<const LogicalProjection*>(plan.get());
@@ -195,8 +190,7 @@ TEST(Optimizer, DoesNotTreatAggregateReprojectionColumnsAsScanColumns) {
   // Must be {region, amount}, never "total_amount" (that name only exists in
   // the aggregate's output schema, not the scan's).
   EXPECT_EQ(scan->required_columns().size(), 2u);
-  EXPECT_EQ(std::find(scan->required_columns().begin(), scan->required_columns().end(),
-                       "total_amount"),
+  EXPECT_EQ(std::find(scan->required_columns().begin(), scan->required_columns().end(), "total_amount"),
             scan->required_columns().end());
 }
 

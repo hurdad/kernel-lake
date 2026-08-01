@@ -45,8 +45,7 @@ const cudf::ast::expression& ExpressionCompiler::compile_column(const ColumnExpr
 }
 
 const cudf::ast::expression& ExpressionCompiler::make_literal(const DataType& type,
-                                                                const LiteralStorage& value,
-                                                                bool is_valid) {
+                                                              const LiteralStorage& value, bool is_valid) {
   switch (type.id) {
     case TypeId::Boolean: {
       auto scalar = std::make_unique<cudf::numeric_scalar<bool>>(
@@ -209,8 +208,8 @@ const cudf::ast::expression& ExpressionCompiler::compile_cast(const CastExpressi
       return tree_.emplace<cudf::ast::operation>(cudf::ast::ast_operator::CAST_TO_FLOAT64, operand);
     default:
       throw ExecutionError("CAST to " + expr.result_type().to_string() +
-                            " is not supported for GPU row-wise expressions (cudf::ast only "
-                            "supports widening casts to INT64/UINT64/FLOAT64)");
+                           " is not supported for GPU row-wise expressions (cudf::ast only "
+                           "supports widening casts to INT64/UINT64/FLOAT64)");
   }
 }
 

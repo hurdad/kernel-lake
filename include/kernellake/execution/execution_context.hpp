@@ -13,7 +13,7 @@ class QueryMemoryTracker;
 
 // Explicit execution context, passed by reference through every operator
 // rather than relying on any process-wide "current query" state (see
-// docs/architecture.md's Concurrency notes).
+// docs/ARCHITECTURE.md's Concurrency notes).
 //
 // `memory_resource` is an `rmm::device_async_resource_ref` (a small,
 // type-erased reference value) rather than the raw

@@ -44,7 +44,7 @@ bool has_glob_chars(std::string_view text) {
 
 [[noreturn]] void fail_missing(const std::string& path) {
   throw StorageError("path does not exist: '" + path +
-                      "' (check the path and that KernelLake has read access)");
+                     "' (check the path and that KernelLake has read access)");
 }
 
 std::vector<ObjectInfo> list_directory_matching(const fs::path& dir, std::string_view pattern) {
@@ -53,8 +53,7 @@ std::vector<ObjectInfo> list_directory_matching(const fs::path& dir, std::string
     if (!entry.is_regular_file()) continue;
     const std::string filename = entry.path().filename().string();
     if (!glob_match(pattern, filename)) continue;
-    results.push_back(ObjectInfo{Uri(entry.path().string()),
-                                  static_cast<std::uint64_t>(entry.file_size())});
+    results.push_back(ObjectInfo{Uri(entry.path().string()), static_cast<std::uint64_t>(entry.file_size())});
   }
   std::sort(results.begin(), results.end(),
             [](const ObjectInfo& a, const ObjectInfo& b) { return a.uri < b.uri; });
@@ -62,9 +61,8 @@ std::vector<ObjectInfo> list_directory_matching(const fs::path& dir, std::string
 }
 
 class LocalRandomAccessObject final : public RandomAccessObject {
-public:
-  explicit LocalRandomAccessObject(std::shared_ptr<arrow::io::ReadableFile> file)
-      : file_(std::move(file)) {}
+ public:
+  explicit LocalRandomAccessObject(std::shared_ptr<arrow::io::ReadableFile> file) : file_(std::move(file)) {}
 
   [[nodiscard]] std::uint64_t size() const override {
     const arrow::Result<std::int64_t> result = file_->GetSize();
@@ -74,11 +72,9 @@ public:
     return static_cast<std::uint64_t>(*result);
   }
 
-  [[nodiscard]] std::shared_ptr<arrow::io::RandomAccessFile> as_arrow_file() const override {
-    return file_;
-  }
+  [[nodiscard]] std::shared_ptr<arrow::io::RandomAccessFile> as_arrow_file() const override { return file_; }
 
-private:
+ private:
   std::shared_ptr<arrow::io::ReadableFile> file_;
 };
 
@@ -109,13 +105,11 @@ std::vector<ObjectInfo> LocalObjectStore::list(const Uri& prefix) {
     return results;
   }
 
-  return {ObjectInfo{Uri(fs::absolute(path).string()),
-                      static_cast<std::uint64_t>(fs::file_size(path))}};
+  return {ObjectInfo{Uri(fs::absolute(path).string()), static_cast<std::uint64_t>(fs::file_size(path))}};
 }
 
 std::unique_ptr<RandomAccessObject> LocalObjectStore::open(const Uri& uri) {
-  arrow::Result<std::shared_ptr<arrow::io::ReadableFile>> result =
-      arrow::io::ReadableFile::Open(uri.value());
+  arrow::Result<std::shared_ptr<arrow::io::ReadableFile>> result = arrow::io::ReadableFile::Open(uri.value());
   if (!result.ok()) {
     throw StorageError("failed to open '" + uri.value() + "': " + result.status().ToString());
   }
