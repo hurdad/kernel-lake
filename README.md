@@ -196,9 +196,11 @@ docker run --rm --gpus all -v /tmp/kernellake-sales:/data:ro \
   kernellake/kernellake:runtime query --sql "SELECT region, SUM(amount) FROM read_parquet('/data/*.parquet') GROUP BY region"
 ```
 
-`.github/workflows/docker-publish.yml` builds and pushes both targets to
-`ghcr.io/<owner>/<repo>:dev` and `:runtime`/`:latest` on every push to
-`main`. Neither the Dockerfile nor that workflow has been exercised by an
+`.github/workflows/ci.yml`'s `docker-publish` job builds and pushes both
+targets to `ghcr.io/<owner>/<repo>:dev` and `:runtime`/`:latest` on every
+push to `main` -- but only after `format-check`, `cpu-build-test`, and
+`tpch-tooling-smoke` all succeed, so a broken build is never shipped as an
+image. Neither the Dockerfile nor that workflow has been exercised by an
 actual `docker build`/Actions run in this repository's own development
 environment (Docker wasn't available there) -- see
 [docs/ROADMAP.md](docs/ROADMAP.md).

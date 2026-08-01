@@ -88,26 +88,30 @@ and covered by passing tests -- not merely designed or stubbed.
   paths) -- **written but not verified**: Docker was not available in this
   development environment, so neither target has been through an actual
   `docker build`/`docker run --gpus all`
-- `.github/workflows/ci.yml`: formatting check, CPU-only build+test
-  (`dev` preset), and a GPU-free TPC-H tooling smoke test (small-scale
-  `generate_tpch.py` run plus `kernellake explain` -- not `query` -- against
-  both query files, to catch a query file that stops parsing/binding/
-  planning). **The workflow's individual shell commands have been run and
-  verified locally**; the GitHub Actions orchestration itself has not
-  (no way to trigger an Actions run from this environment). GPU-dependent
-  work (the `gpu-dev` preset, `tests/gpu/`, real query execution, DuckDB
+- `.github/workflows/ci.yml`, one workflow with four jobs in dependency
+  order: `format-check` and `cpu-build-test` (parallel, CPU-only build+test
+  on the `dev` preset) -> `tpch-tooling-smoke` (`needs: cpu-build-test`;
+  small-scale `generate_tpch.py` run plus `kernellake explain` -- not
+  `query` -- against both query files, to catch a query file that stops
+  parsing/binding/planning) -> `docker-publish` (`needs:` all three,
+  `if: github.event_name != 'pull_request'`; builds both `docker/Dockerfile`
+  targets and pushes them to `ghcr.io/<owner>/<repo>:dev` and `:runtime`/
+  `:latest` using `GITHUB_TOKEN`, no extra secrets). A broken build or a
+  query file that stops parsing is never shipped as an image, since
+  `docker-publish` can't start until the jobs ahead of it succeed.
+  Cross-workflow `needs:` isn't a GitHub Actions feature, which is why this
+  is one file rather than a separate docker-publish.yml gated some other
+  way. **Every job's individual shell commands have been run and verified
+  locally**; the GitHub Actions orchestration itself has not (no way to
+  trigger an Actions run from this environment) -- and `docker-publish`
+  specifically builds a CUDA devel image, large enough that hosted
+  runners' default disk may be tight (the job frees some runner disk
+  first and notes the fallback if that's not enough). GPU-dependent work
+  (the `gpu-dev` preset, `tests/gpu/`, real query execution, DuckDB
   validation, TPC-H benchmarks) is intentionally not in this workflow --
   standard GitHub-hosted runners have no GPU, and a skipped-GPU job must
   never be reported as passing; that needs a self-hosted GPU runner, not
   configured here
-- `.github/workflows/docker-publish.yml`: builds both `docker/Dockerfile`
-  targets and pushes them to `ghcr.io/<owner>/<repo>:dev` and `:runtime`/
-  `:latest` on push to `main`, using `GITHUB_TOKEN` (no extra registry
-  secrets). Building doesn't need a GPU, so this runs on a standard
-  hosted runner -- but it has not been exercised by an actual Actions run,
-  and CUDA devel images are large enough that hosted runners' default
-  disk may be tight (the workflow frees some runner disk first and notes
-  the fallback if that's not enough)
 
 - `tests/gpu/multi_batch_integration_test.cpp`: dictionary-encoded vs. plain
   string columns, two files with deliberately mismatched row-group layouts
