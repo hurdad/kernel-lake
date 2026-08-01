@@ -2,7 +2,7 @@
 
 **Unofficial TPC-H-derived benchmark. Not a certified TPC result.** Nothing
 in this document or its tooling may be published as an official TPC-H
-result -- see the Licensing section of the spec and `LICENSE`/`NOTICE`.
+result -- see `NOTICE`.
 
 ## Scope
 

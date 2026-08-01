@@ -22,7 +22,9 @@ namespace kernellake {
 // SUM/MIN/MAX use cudf::reduce's `init` parameter to fold each new batch
 // directly into the running scalar; COUNT/AVG's denominator is accumulated
 // as a plain host-side counter (cudf::reduce has no init-based COUNT/MEAN).
-// A COUNT(*)/SUM/etc. over zero input rows produces NULL, not zero.
+// SUM/MIN/MAX/AVG over zero input rows produce NULL, not zero; COUNT(*)
+// and COUNT(x) produce 0 -- see CountStarCountsRowsAcrossBatchesIncludingZero
+// and SumOfEmptyInputIsNullNotZero in the corresponding test file.
 class ScalarAggregateOperator final : public PhysicalOperator {
  public:
   ScalarAggregateOperator(OperatorId id, std::unique_ptr<PhysicalOperator> child,
