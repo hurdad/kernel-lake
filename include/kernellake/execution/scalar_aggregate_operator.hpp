@@ -3,6 +3,7 @@
 #include <cudf/scalar/scalar.hpp>
 
 #include <memory>
+#include <optional>
 #include <vector>
 
 #include "kernellake/execution/expression_compiler.hpp"
@@ -39,11 +40,19 @@ private:
     AggregateFunction function;
     ExpressionPtr argument;  // null only for CountStar
     DataType result_type;
+    // A plain column reference (e.g. `MIN(region)`) is copied directly
+    // instead of routed through cudf::ast::compute_column: cudf's AST
+    // evaluator can only materialize fixed-width output columns, so a
+    // STRING argument column would abort with "Invalid, non-fixed-width
+    // type" even though no actual computation was requested.
+    std::optional<cudf::size_type> argument_column_index;
     const cudf::ast::expression* compiled_argument = nullptr;
     std::unique_ptr<cudf::scalar> running_value;  // Sum/Min/Max/Avg's running sum
     std::int64_t running_count = 0;               // Count/CountStar/Avg's denominator
   };
 
+  [[nodiscard]] std::unique_ptr<cudf::column> materialize_argument(Accumulator& state, const DeviceBatch& batch,
+                                                                     ExecutionContext& context);
   void process_batch(Accumulator& state, const DeviceBatch& batch, ExecutionContext& context);
   [[nodiscard]] std::unique_ptr<cudf::column> finalize(Accumulator& state, ExecutionContext& context);
 

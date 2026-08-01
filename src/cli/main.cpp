@@ -24,9 +24,11 @@ void print_usage() {
       "Commands:\n"
       "  inspect-parquet --path <path> [--format text|json]\n"
       "  explain --sql <sql> [--format text|json] [--logical]\n"
+      "  query (--sql <sql> | --file <path>) [--format table|csv|jsonl|arrow]\n"
+      "         [--output <path>] [--stats]\n"
       "\n"
       "Commands not yet implemented (added incrementally as their execution path lands):\n"
-      "  query, generate-data, benchmark, validate\n");
+      "  generate-data, benchmark, validate\n");
 }
 
 }  // namespace
@@ -87,6 +89,9 @@ int main(int argc, char** argv) {
   }
   if (command == "explain") {
     return kernellake::cli::run_explain(command_args, config);
+  }
+  if (command == "query") {
+    return kernellake::cli::run_query(command_args, config);
   }
 
   std::fprintf(stderr, "kernellake: command '%.*s' is not yet implemented\n",

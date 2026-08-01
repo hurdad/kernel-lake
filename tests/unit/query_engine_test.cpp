@@ -80,9 +80,21 @@ TEST_F(QueryEngineTest, ExplainRejectsUnknownColumnWithBindingError) {
                BindingError);
 }
 
+#ifdef KERNELLAKE_WITH_CUDA
+// GPU-enabled build: execute() actually runs the query -- correctness is
+// covered in depth by tests/gpu/query_engine_execute_test.cpp, but a smoke
+// test belongs here too since this suite runs on every build.
+TEST_F(QueryEngineTest, ExecuteReturnsRowsOnGpuBuild) {
+  const QueryResult result = engine_.execute("SELECT id FROM read_parquet('" + path_ + "')");
+  EXPECT_EQ(result.rows_returned, 10);
+}
+#else
+// CPU-only build: no GPU execution layer is linked in, so execute() must
+// say so clearly rather than silently doing nothing or crashing.
 TEST_F(QueryEngineTest, ExecuteThrowsClearExecutionError) {
   EXPECT_THROW(engine_.execute("SELECT id FROM read_parquet('" + path_ + "')"), ExecutionError);
 }
+#endif
 
 }  // namespace
 }  // namespace kernellake

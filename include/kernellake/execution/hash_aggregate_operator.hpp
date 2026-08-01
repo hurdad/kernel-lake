@@ -3,6 +3,7 @@
 #include <cudf/groupby.hpp>
 
 #include <memory>
+#include <optional>
 #include <vector>
 
 #include "kernellake/execution/expression_compiler.hpp"
@@ -38,6 +39,19 @@ public:
   [[nodiscard]] OperatorId id() const noexcept override { return id_; }
 
 private:
+  // A plain column reference (e.g. `GROUP BY region`) is copied directly
+  // rather than routed through cudf::ast::compute_column: cudf's AST
+  // evaluator can only materialize fixed-width output columns, so a STRING
+  // (or other variable-width) key column would abort with "Invalid,
+  // non-fixed-width type" even though no actual computation was requested.
+  struct CompiledExpr {
+    std::optional<cudf::size_type> source_column_index;
+    const cudf::ast::expression* expr = nullptr;
+  };
+
+  [[nodiscard]] CompiledExpr compile_expr(const Expression& expr);
+  [[nodiscard]] std::unique_ptr<cudf::column> materialize(const CompiledExpr& compiled, const DeviceBatch& batch,
+                                                           ExecutionContext& context);
   void process_batch(const DeviceBatch& batch, ExecutionContext& context);
   [[nodiscard]] std::unique_ptr<cudf::table> build_combined_columns(const DeviceBatch& batch,
                                                                      ExecutionContext& context);
@@ -50,11 +64,11 @@ private:
   std::shared_ptr<const Schema> output_schema_;
 
   ExpressionCompiler compiler_;
-  std::vector<const cudf::ast::expression*> compiled_group_by_;
-  // CountStar entries point at compiled_group_by_.front() (reused, not
-  // shared via nullptr) so every aggregate still gets its own materialized
-  // column at its own table slot -- see the comment in open().
-  std::vector<const cudf::ast::expression*> compiled_aggregate_args_;
+  std::vector<CompiledExpr> compiled_group_by_;
+  // CountStar entries are a copy of compiled_group_by_.front() (reused, not
+  // aliased) so every aggregate still gets its own materialized column at
+  // its own table slot -- see the comment in open().
+  std::vector<CompiledExpr> compiled_aggregate_args_;
 
   // cudf::groupby's COUNT aggregations always produce cudf::size_type
   // (INT32) output regardless of requested type, but KernelLake's binder

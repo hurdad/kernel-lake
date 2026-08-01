@@ -14,6 +14,7 @@ add_executable(kernellake_gpu_tests
   hash_aggregate_operator_test.cpp
   parquet_scan_operator_test.cpp
   limit_operator_test.cpp
+  query_engine_execute_test.cpp
 )
 
 target_link_libraries(kernellake_gpu_tests PRIVATE
@@ -21,6 +22,7 @@ target_link_libraries(kernellake_gpu_tests PRIVATE
   kernellake_types
   kernellake_memory
   kernellake_execution
+  kernellake_api
   Parquet::parquet_static
   GTest::gtest
   GTest::gtest_main

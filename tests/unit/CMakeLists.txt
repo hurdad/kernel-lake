@@ -28,5 +28,13 @@ target_link_libraries(kernellake_unit_tests PRIVATE
   GTest::gtest_main
 )
 
+# kernellake_unit_tests is built (and run) under both the CPU-only `dev`
+# preset and the GPU-enabled `gpu-dev` preset. QueryEngine::execute()'s
+# actual behavior differs between the two (see query_engine_test.cpp), so
+# tests need to know which one they were compiled against.
+target_compile_definitions(kernellake_unit_tests PRIVATE
+  $<$<BOOL:${KERNELLAKE_WITH_CUDA}>:KERNELLAKE_WITH_CUDA>
+)
+
 include(GoogleTest)
 gtest_discover_tests(kernellake_unit_tests)

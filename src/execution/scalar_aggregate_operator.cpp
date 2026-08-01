@@ -1,6 +1,7 @@
 #include "kernellake/execution/scalar_aggregate_operator.hpp"
 
 #include <cudf/aggregation.hpp>
+#include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/reduction.hpp>
 #include <cudf/scalar/scalar_factories.hpp>
@@ -8,6 +9,7 @@
 
 #include "kernellake/common/errors.hpp"
 #include "kernellake/execution/cudf_adapter.hpp"
+#include "kernellake/expression/expression.hpp"
 
 namespace kernellake {
 
@@ -42,9 +44,25 @@ void ScalarAggregateOperator::open(ExecutionContext& context) {
     state.function = aggregate->function();
     state.argument = aggregate->argument();
     state.result_type = aggregate->result_type();
-    if (state.argument != nullptr) state.compiled_argument = &compiler_.compile(*state.argument);
+    if (state.argument != nullptr) {
+      if (const auto* column_ref = dynamic_cast<const ColumnExpression*>(state.argument.get())) {
+        state.argument_column_index = static_cast<cudf::size_type>(column_ref->column_index());
+      } else {
+        state.compiled_argument = &compiler_.compile(*state.argument);
+      }
+    }
     states_.push_back(std::move(state));
   }
+}
+
+std::unique_ptr<cudf::column> ScalarAggregateOperator::materialize_argument(Accumulator& state,
+                                                                             const DeviceBatch& batch,
+                                                                             ExecutionContext& context) {
+  if (state.argument_column_index.has_value()) {
+    return std::make_unique<cudf::column>(batch.view().column(*state.argument_column_index), context.stream,
+                                           context.memory_resource);
+  }
+  return cudf::compute_column(batch.view(), *state.compiled_argument, context.stream, context.memory_resource);
 }
 
 void ScalarAggregateOperator::process_batch(Accumulator& state, const DeviceBatch& batch,
@@ -54,8 +72,7 @@ void ScalarAggregateOperator::process_batch(Accumulator& state, const DeviceBatc
       state.running_count += static_cast<std::int64_t>(batch.row_count());
       return;
     case AggregateFunction::Count: {
-      std::unique_ptr<cudf::column> column = cudf::compute_column(
-          batch.view(), *state.compiled_argument, context.stream, context.memory_resource);
+      std::unique_ptr<cudf::column> column = materialize_argument(state, batch, context);
       auto agg = cudf::make_count_aggregation<cudf::reduce_aggregation>(cudf::null_policy::EXCLUDE);
       std::unique_ptr<cudf::scalar> count = cudf::reduce(
           column->view(), *agg, cudf::data_type{cudf::type_id::INT64}, context.stream, context.memory_resource);
@@ -66,8 +83,7 @@ void ScalarAggregateOperator::process_batch(Accumulator& state, const DeviceBatc
     case AggregateFunction::Sum:
     case AggregateFunction::Min:
     case AggregateFunction::Max: {
-      std::unique_ptr<cudf::column> column = cudf::compute_column(
-          batch.view(), *state.compiled_argument, context.stream, context.memory_resource);
+      std::unique_ptr<cudf::column> column = materialize_argument(state, batch, context);
       std::unique_ptr<cudf::reduce_aggregation> agg =
           state.function == AggregateFunction::Sum
               ? cudf::make_sum_aggregation<cudf::reduce_aggregation>()
@@ -83,8 +99,7 @@ void ScalarAggregateOperator::process_batch(Accumulator& state, const DeviceBatc
       return;
     }
     case AggregateFunction::Avg: {
-      std::unique_ptr<cudf::column> column = cudf::compute_column(
-          batch.view(), *state.compiled_argument, context.stream, context.memory_resource);
+      std::unique_ptr<cudf::column> column = materialize_argument(state, batch, context);
       auto sum_agg = cudf::make_sum_aggregation<cudf::reduce_aggregation>();
       const std::optional<std::reference_wrapper<cudf::scalar const>> init =
           state.running_value ? std::optional<std::reference_wrapper<cudf::scalar const>>(*state.running_value)

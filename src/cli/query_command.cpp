@@ -1,0 +1,95 @@
+#include "commands.hpp"
+
+#include <cstdio>
+#include <fstream>
+#include <sstream>
+
+#include "kernellake/api/query_engine.hpp"
+#include "kernellake/common/errors.hpp"
+#include "result_formatter.hpp"
+
+namespace kernellake::cli {
+
+namespace {
+
+[[nodiscard]] std::string read_file_or_throw(const std::string& path) {
+  std::ifstream stream(path);
+  if (!stream) throw ExecutionError("failed to open SQL file '" + path + "'");
+  std::ostringstream contents;
+  contents << stream.rdbuf();
+  return contents.str();
+}
+
+void print_optional(const char* label, const std::optional<std::int64_t>& value) {
+  if (value) std::fprintf(stderr, "  %s: %lld\n", label, static_cast<long long>(*value));
+}
+
+void print_optional(const char* label, const std::optional<double>& value) {
+  if (value) std::fprintf(stderr, "  %s: %.6f\n", label, *value);
+}
+
+void print_stats(const QueryResult& result) {
+  std::fprintf(stderr, "query stats:\n");
+  print_optional("rows_returned", result.rows_returned);
+  print_optional("files_considered", result.files_considered);
+  print_optional("files_scanned", result.files_scanned);
+  print_optional("row_groups_considered", result.row_groups_considered);
+  print_optional("row_groups_scanned", result.row_groups_scanned);
+  print_optional("peak_gpu_memory_bytes", result.peak_gpu_memory_bytes);
+  print_optional("elapsed_wall_seconds", result.elapsed_wall_seconds);
+}
+
+}  // namespace
+
+int run_query(const std::vector<std::string_view>& args, const EngineConfig& config) {
+  std::string sql;
+  std::string file;
+  std::string format_name = "table";
+  std::optional<std::string> output_path;
+  bool show_stats = false;
+
+  for (std::size_t i = 0; i < args.size(); ++i) {
+    if (args[i] == "--sql" && i + 1 < args.size()) {
+      sql = args[++i];
+    } else if (args[i] == "--file" && i + 1 < args.size()) {
+      file = args[++i];
+    } else if (args[i] == "--format" && i + 1 < args.size()) {
+      format_name = args[++i];
+    } else if (args[i] == "--output" && i + 1 < args.size()) {
+      output_path = std::string(args[++i]);
+    } else if (args[i] == "--stats") {
+      show_stats = true;
+    }
+  }
+
+  if (sql.empty() && file.empty()) {
+    std::fprintf(stderr, "kernellake query: one of --sql or --file is required\n");
+    return 1;
+  }
+  if (!sql.empty() && !file.empty()) {
+    std::fprintf(stderr, "kernellake query: --sql and --file are mutually exclusive\n");
+    return 1;
+  }
+
+  const std::optional<ResultFormat> format = parse_result_format(format_name);
+  if (!format) {
+    std::fprintf(stderr,
+                 "kernellake query: --format must be one of table|csv|jsonl|arrow, got '%s'\n",
+                 format_name.c_str());
+    return 1;
+  }
+
+  try {
+    const std::string query_sql = file.empty() ? sql : read_file_or_throw(file);
+    QueryEngine engine(config);
+    const QueryResult result = engine.execute(query_sql);
+    write_query_result(result, *format, output_path);
+    if (show_stats) print_stats(result);
+  } catch (const KernelLakeError& e) {
+    std::fprintf(stderr, "kernellake query: %s\n", e.what());
+    return 1;
+  }
+  return 0;
+}
+
+}  // namespace kernellake::cli

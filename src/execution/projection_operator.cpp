@@ -1,6 +1,9 @@
 #include "kernellake/execution/projection_operator.hpp"
 
+#include <cudf/column/column.hpp>
 #include <cudf/transform.hpp>
+
+#include "kernellake/expression/expression.hpp"
 
 namespace kernellake {
 
@@ -26,7 +29,11 @@ void ProjectionOperator::open(ExecutionContext& context) {
   child_->open(context);
   compiled_items_.reserve(items_.size());
   for (const NamedExpression& item : items_) {
-    compiled_items_.push_back(&compiler_.compile(*item.expr));
+    if (const auto* column_ref = dynamic_cast<const ColumnExpression*>(item.expr.get())) {
+      compiled_items_.push_back(CompiledItem{column_ref->column_index(), nullptr});
+    } else {
+      compiled_items_.push_back(CompiledItem{std::nullopt, &compiler_.compile(*item.expr)});
+    }
   }
 }
 
@@ -36,8 +43,13 @@ std::optional<DeviceBatch> ProjectionOperator::next(ExecutionContext& context) {
 
   std::vector<std::unique_ptr<cudf::column>> columns;
   columns.reserve(compiled_items_.size());
-  for (const cudf::ast::expression* expr : compiled_items_) {
-    columns.push_back(cudf::compute_column(batch->view(), *expr, context.stream, context.memory_resource));
+  for (const CompiledItem& item : compiled_items_) {
+    if (item.source_column_index.has_value()) {
+      columns.push_back(std::make_unique<cudf::column>(batch->view().column(*item.source_column_index),
+                                                         context.stream, context.memory_resource));
+    } else {
+      columns.push_back(cudf::compute_column(batch->view(), *item.expr, context.stream, context.memory_resource));
+    }
   }
   return DeviceBatch(std::make_unique<cudf::table>(std::move(columns)), output_schema_);
 }

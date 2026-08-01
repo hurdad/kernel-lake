@@ -15,4 +15,6 @@ int run_inspect_parquet(const std::vector<std::string_view>& args);
 
 int run_explain(const std::vector<std::string_view>& args, const EngineConfig& config);
 
+int run_query(const std::vector<std::string_view>& args, const EngineConfig& config);
+
 }  // namespace kernellake::cli

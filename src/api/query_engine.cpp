@@ -33,11 +33,4 @@ PhysicalPlanPtr QueryEngine::explain(std::string_view sql) const {
   return build_physical_plan(plan_logical(sql), store_);
 }
 
-QueryResult QueryEngine::execute(std::string_view /*sql*/) const {
-  throw ExecutionError(
-      "query execution requires GPU operators (libcudf/RMM), which are not part of this build; "
-      "use `kernellake explain --sql ...` to see the plan KernelLake would run, or build with "
-      "-DKERNELLAKE_WITH_CUDA=ON once libcudf/RMM are installed");
-}
-
 }  // namespace kernellake

@@ -1,6 +1,7 @@
 #include "kernellake/execution/hash_aggregate_operator.hpp"
 
 #include <cudf/aggregation.hpp>
+#include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/transform.hpp>
 #include <cudf/unary.hpp>
@@ -58,11 +59,28 @@ HashAggregateOperator::HashAggregateOperator(OperatorId id, std::unique_ptr<Phys
   }
 }
 
+HashAggregateOperator::CompiledExpr HashAggregateOperator::compile_expr(const Expression& expr) {
+  if (const auto* column_ref = dynamic_cast<const ColumnExpression*>(&expr)) {
+    return CompiledExpr{static_cast<cudf::size_type>(column_ref->column_index()), nullptr};
+  }
+  return CompiledExpr{std::nullopt, &compiler_.compile(expr)};
+}
+
+std::unique_ptr<cudf::column> HashAggregateOperator::materialize(const CompiledExpr& compiled,
+                                                                   const DeviceBatch& batch,
+                                                                   ExecutionContext& context) {
+  if (compiled.source_column_index.has_value()) {
+    return std::make_unique<cudf::column>(batch.view().column(*compiled.source_column_index), context.stream,
+                                           context.memory_resource);
+  }
+  return cudf::compute_column(batch.view(), *compiled.expr, context.stream, context.memory_resource);
+}
+
 void HashAggregateOperator::open(ExecutionContext& context) {
   child_->open(context);
 
   compiled_group_by_.reserve(group_by_.size());
-  for (const NamedExpression& item : group_by_) compiled_group_by_.push_back(&compiler_.compile(*item.expr));
+  for (const NamedExpression& item : group_by_) compiled_group_by_.push_back(compile_expr(*item.expr));
 
   std::vector<cudf::groupby::streaming_aggregation_request> requests;
   requests.reserve(aggregates_.size());
@@ -75,15 +93,15 @@ void HashAggregateOperator::open(ExecutionContext& context) {
       throw ExecutionError("HashAggregateOperator item '" + item.name + "' is not an AggregateExpression");
     }
     // COUNT(*) has no natural argument column; reuse group_by[0]'s compiled
-    // expression (materialized at its own dedicated table slot below, via
+    // form (materialized at its own dedicated table slot below, via
     // null_policy::INCLUDE so nulls in that column don't suppress the
     // count). Note: referencing an *existing* key column's index directly,
     // instead of materializing a fresh copy at its own index, silently
     // produced all-zero counts in testing -- streaming_groupby apparently
     // doesn't support a value column index that aliases a key index.
-    const cudf::ast::expression* compiled_argument = aggregate->function() == AggregateFunction::CountStar
-                                                          ? compiled_group_by_.front()
-                                                          : &compiler_.compile(*aggregate->argument());
+    const CompiledExpr compiled_argument = aggregate->function() == AggregateFunction::CountStar
+                                                ? compiled_group_by_.front()
+                                                : compile_expr(*aggregate->argument());
     compiled_aggregate_args_.push_back(compiled_argument);
     result_is_count_.push_back(aggregate->function() == AggregateFunction::Count ||
                                 aggregate->function() == AggregateFunction::CountStar);
@@ -102,11 +120,9 @@ std::unique_ptr<cudf::table> HashAggregateOperator::build_combined_columns(const
                                                                             ExecutionContext& context) {
   std::vector<std::unique_ptr<cudf::column>> columns;
   columns.reserve(compiled_group_by_.size() + compiled_aggregate_args_.size());
-  for (const cudf::ast::expression* expr : compiled_group_by_) {
-    columns.push_back(cudf::compute_column(batch.view(), *expr, context.stream, context.memory_resource));
-  }
-  for (const cudf::ast::expression* expr : compiled_aggregate_args_) {
-    columns.push_back(cudf::compute_column(batch.view(), *expr, context.stream, context.memory_resource));
+  for (const CompiledExpr& compiled : compiled_group_by_) columns.push_back(materialize(compiled, batch, context));
+  for (const CompiledExpr& compiled : compiled_aggregate_args_) {
+    columns.push_back(materialize(compiled, batch, context));
   }
   return std::make_unique<cudf::table>(std::move(columns));
 }

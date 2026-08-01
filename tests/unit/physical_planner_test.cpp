@@ -97,6 +97,52 @@ TEST_F(PhysicalPlannerTest, BuildsScanWithNarrowedColumnsAndSchema) {
   EXPECT_EQ(scan->output_schema().field(0).name, "region");
 }
 
+TEST_F(PhysicalPlannerTest, ExpressionsAboveScanUseNarrowedColumnIndicesNotOriginalOnes) {
+  // "region" is field index 2 in sales_schema(), but column pruning narrows
+  // the physical scan to just this one column, putting it at index 0 in the
+  // batches the scan operator will actually produce. Every ColumnExpression
+  // above the scan (here, the filter predicate and the projection item) must
+  // be rewritten to that narrowed index -- otherwise the execution layer
+  // would index into a column that doesn't exist in the pruned batch.
+  const PhysicalPlanPtr plan =
+      plan_for("SELECT region FROM read_parquet('" + path_ + "') WHERE region = 'B'");
+  const auto* result = dynamic_cast<const ArrowResultNode*>(plan.get());
+  ASSERT_NE(result, nullptr);
+  const auto* projection = dynamic_cast<const ProjectionNode*>(result->child().get());
+  ASSERT_NE(projection, nullptr);
+  const auto* filter = dynamic_cast<const FilterNode*>(projection->child().get());
+  ASSERT_NE(filter, nullptr);
+
+  const auto* comparison = dynamic_cast<const BinaryExpression*>(filter->predicate().get());
+  ASSERT_NE(comparison, nullptr);
+  const auto* predicate_column = dynamic_cast<const ColumnExpression*>(comparison->left().get());
+  ASSERT_NE(predicate_column, nullptr);
+  EXPECT_EQ(predicate_column->column_index(), 0u);
+
+  ASSERT_EQ(projection->items().size(), 1u);
+  const auto* projection_column = dynamic_cast<const ColumnExpression*>(projection->items()[0].expr.get());
+  ASSERT_NE(projection_column, nullptr);
+  EXPECT_EQ(projection_column->column_index(), 0u);
+}
+
+TEST_F(PhysicalPlannerTest, AggregateArgumentUsesNarrowedColumnIndexWhenEarlierColumnsAreDropped) {
+  // "amount" is field index 1 in sales_schema(); selecting only SUM(amount)
+  // drops "id" (index 0), so the narrowed scan schema puts "amount" at
+  // index 0 -- while the binder-assigned index on the AggregateExpression's
+  // argument is still 1 until the physical planner remaps it.
+  const PhysicalPlanPtr plan = plan_for("SELECT SUM(amount) AS total FROM read_parquet('" + path_ + "')");
+  const auto* result = dynamic_cast<const ArrowResultNode*>(plan.get());
+  ASSERT_NE(result, nullptr);
+  const auto* scalar = dynamic_cast<const ScalarAggregateNode*>(result->child().get());
+  ASSERT_NE(scalar, nullptr);
+  ASSERT_EQ(scalar->aggregates().size(), 1u);
+  const auto* aggregate = dynamic_cast<const AggregateExpression*>(scalar->aggregates()[0].expr.get());
+  ASSERT_NE(aggregate, nullptr);
+  const auto* argument_column = dynamic_cast<const ColumnExpression*>(aggregate->argument().get());
+  ASSERT_NE(argument_column, nullptr);
+  EXPECT_EQ(argument_column->column_index(), 0u);
+}
+
 TEST_F(PhysicalPlannerTest, PruningSkipsWholeRowGroupAtPhysicalLevel) {
   const PhysicalPlanPtr plan =
       plan_for("SELECT id FROM read_parquet('" + path_ + "') WHERE region = 'B'");

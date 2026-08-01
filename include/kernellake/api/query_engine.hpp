@@ -54,11 +54,14 @@ struct QueryResult {
 // planning, optimization, file discovery, and pruning -- everything short
 // of actually decoding column data and running GPU operators.
 //
-// execute() throws ExecutionError: GPU execution (DeviceBatch, the
-// PhysicalOperator implementations) requires libcudf/RMM, which are not yet
-// part of this build (see task 13 in project memory / docs/roadmap.md).
-// KernelLake never substitutes a CPU implementation for this without saying
-// so explicitly, so execute() fails loudly rather than silently.
+// execute() actually runs the query on the GPU when built with
+// KERNELLAKE_WITH_CUDA=ON (see query_engine_execute_gpu.cpp): it builds the
+// physical-plan operator tree (kernellake/execution/operator_builder.hpp),
+// pulls DeviceBatch results through it, and converts each to a host-side
+// Arrow RecordBatch. In a CPU-only build (KERNELLAKE_WITH_CUDA=OFF, the
+// `dev` preset), execute() throws ExecutionError instead
+// (query_engine_execute_stub.cpp) -- KernelLake never substitutes a CPU
+// implementation for GPU execution without saying so explicitly.
 class QueryEngine {
 public:
   explicit QueryEngine(EngineConfig config);
