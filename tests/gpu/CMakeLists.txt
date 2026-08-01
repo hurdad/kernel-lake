@@ -13,6 +13,7 @@ add_executable(kernellake_gpu_tests
   scalar_aggregate_operator_test.cpp
   hash_aggregate_operator_test.cpp
   parquet_scan_operator_test.cpp
+  limit_operator_test.cpp
 )
 
 target_link_libraries(kernellake_gpu_tests PRIVATE

@@ -11,6 +11,7 @@ add_library(kernellake_execution STATIC
   hash_aggregate_operator.cpp
   arrow_result_operator.cpp
   parquet_scan_operator.cpp
+  limit_operator.cpp
 )
 
 target_include_directories(kernellake_execution PUBLIC
