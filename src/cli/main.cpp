@@ -91,21 +91,33 @@ int main(int argc, char** argv) {
 
   spdlog::info("kernellake starting: command='{}' config='{}'", command, config_path);
 
-  if (command == "inspect-parquet") {
-    return kernellake::cli::run_inspect_parquet(command_args);
-  }
-  if (command == "explain") {
-    return kernellake::cli::run_explain(command_args, config);
-  }
-  if (command == "query") {
-    return kernellake::cli::run_query(command_args, config);
-  }
-  if (command == "generate-data") {
-    return kernellake::cli::run_generate_data(command_args);
-  }
-  if (command == "benchmark" && !command_args.empty() && command_args[0] == "tpch") {
-    return kernellake::cli::run_benchmark_tpch(
-        std::vector<std::string_view>(command_args.begin() + 1, command_args.end()), config);
+  // Every run_*() command already catches KernelLakeError for a clean,
+  // targeted message. This is the last line of defense against anything
+  // else escaping uncaught -- most notably cudf/rmm/Arrow's own exception
+  // types, which do not derive from KernelLakeError, would otherwise call
+  // std::terminate and crash the whole process instead of reporting a
+  // normal CLI error.
+  try {
+    if (command == "inspect-parquet") {
+      return kernellake::cli::run_inspect_parquet(command_args);
+    }
+    if (command == "explain") {
+      return kernellake::cli::run_explain(command_args, config);
+    }
+    if (command == "query") {
+      return kernellake::cli::run_query(command_args, config);
+    }
+    if (command == "generate-data") {
+      return kernellake::cli::run_generate_data(command_args);
+    }
+    if (command == "benchmark" && !command_args.empty() && command_args[0] == "tpch") {
+      return kernellake::cli::run_benchmark_tpch(
+          std::vector<std::string_view>(command_args.begin() + 1, command_args.end()), config);
+    }
+  } catch (const std::exception& e) {
+    std::fprintf(stderr, "kernellake %.*s: unexpected error: %s\n", static_cast<int>(command.size()),
+                 command.data(), e.what());
+    return 1;
   }
 
   std::fprintf(stderr, "kernellake: command '%.*s' is not yet implemented\n",

@@ -56,6 +56,22 @@ ExpressionPtr remap_columns(const ExpressionPtr& expr, const Schema& scan_schema
     return std::make_shared<AggregateExpression>(aggregate->function(), std::move(argument),
                                                  aggregate->result_type());
   }
+  if (const auto* like = dynamic_cast<const LikeExpression*>(expr.get())) {
+    return std::make_shared<LikeExpression>(remap_columns(like->value(), scan_schema), like->pattern(),
+                                            like->negated());
+  }
+  if (const auto* case_expr = dynamic_cast<const CaseExpression*>(expr.get())) {
+    std::vector<CaseExpression::WhenThen> branches;
+    branches.reserve(case_expr->when_then().size());
+    for (const CaseExpression::WhenThen& branch : case_expr->when_then()) {
+      branches.push_back(CaseExpression::WhenThen{remap_columns(branch.condition, scan_schema),
+                                                  remap_columns(branch.result, scan_schema)});
+    }
+    ExpressionPtr else_branch =
+        case_expr->else_branch() ? remap_columns(case_expr->else_branch(), scan_schema) : nullptr;
+    return std::make_shared<CaseExpression>(std::move(branches), std::move(else_branch),
+                                            case_expr->result_type());
+  }
   return expr;  // LiteralExpression: no column reference to remap.
 }
 

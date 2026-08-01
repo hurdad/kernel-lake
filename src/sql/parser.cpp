@@ -58,9 +58,10 @@ Preprocessed preprocess_from_read_parquet(const std::string& sql) {
   throw SqlError("unsupported SQL construct: " + std::string(what));
 }
 
-AstExprPtr wrap(
-    std::variant<AstColumnRef, AstStar, AstLiteral, AstBinary, AstUnary, AstBetween, AstAggregate> node,
-    std::optional<std::string> alias = std::nullopt) {
+AstExprPtr wrap(std::variant<AstColumnRef, AstStar, AstLiteral, AstBinary, AstUnary, AstBetween, AstAggregate,
+                             AstLike, AstIn, AstCase, AstCast>
+                    node,
+                std::optional<std::string> alias = std::nullopt) {
   auto expr = std::make_shared<AstExpr>();
   expr->node = std::move(node);
   expr->alias = std::move(alias);
@@ -105,6 +106,40 @@ AstBinaryOp to_binary_op(hsql::OperatorType op) {
   }
 }
 
+AstIn convert_in(const hsql::Expr* e) {
+  if (e->select != nullptr) unsupported("IN with a subquery (only a literal list is supported)");
+  if (e->expr == nullptr || e->exprList == nullptr) unsupported("malformed IN expression");
+  AstIn in;
+  in.value = convert_expr(e->expr);
+  in.list.reserve(e->exprList->size());
+  for (const hsql::Expr* item : *e->exprList) in.list.push_back(convert_expr(item));
+  return in;
+}
+
+AstCase convert_case(const hsql::Expr* e) {
+  if (e->exprList == nullptr || e->exprList->empty()) unsupported("CASE with no WHEN branches");
+  AstCase result;
+  result.when_then.reserve(e->exprList->size());
+  for (const hsql::Expr* element : *e->exprList) {
+    if (element->opType != hsql::kOpCaseListElement || element->expr == nullptr ||
+        element->expr2 == nullptr) {
+      unsupported("malformed CASE WHEN branch");
+    }
+    AstExprPtr when = convert_expr(element->expr);
+    // Simple CASE ("CASE x WHEN v THEN ... END") compares each WHEN value
+    // against the CASE operand; searched CASE ("CASE WHEN cond THEN ...
+    // END", e->expr == nullptr) uses each WHEN as a boolean condition
+    // directly. Desugar the simple form into the searched form here so
+    // the binder/executor only ever need to handle one shape.
+    AstExprPtr condition = e->expr != nullptr
+                               ? wrap(AstBinary{AstBinaryOp::Eq, convert_expr(e->expr), std::move(when)})
+                               : std::move(when);
+    result.when_then.emplace_back(std::move(condition), convert_expr(element->expr2));
+  }
+  if (e->expr2 != nullptr) result.else_branch = convert_expr(e->expr2);
+  return result;
+}
+
 AstExprPtr convert_operator(const hsql::Expr* e) {
   switch (e->opType) {
     case hsql::kOpBetween: {
@@ -120,13 +155,31 @@ AstExprPtr convert_operator(const hsql::Expr* e) {
     case hsql::kOpIsNull:
       return wrap(AstUnary{AstUnaryOp::IsNull, convert_expr(e->expr)}, alias_of(*e));
     case hsql::kOpNot: {
-      // hsql represents "x IS NOT NULL" as NOT(IS NULL(x)); recover the
-      // cleaner IsNotNull node instead of double-negating.
+      // hsql represents "x IS NOT NULL" as NOT(IS NULL(x)) and "x NOT IN
+      // (...)" as NOT(IN(x, ...)); recover the cleaner negated node
+      // instead of double-negating.
       if (e->expr != nullptr && e->expr->type == hsql::kExprOperator && e->expr->opType == hsql::kOpIsNull) {
         return wrap(AstUnary{AstUnaryOp::IsNotNull, convert_expr(e->expr->expr)}, alias_of(*e));
       }
+      if (e->expr != nullptr && e->expr->type == hsql::kExprOperator && e->expr->opType == hsql::kOpIn) {
+        AstIn in = convert_in(e->expr);
+        in.negated = true;
+        return wrap(std::move(in), alias_of(*e));
+      }
       return wrap(AstUnary{AstUnaryOp::Not, convert_expr(e->expr)}, alias_of(*e));
     }
+    case hsql::kOpLike:
+    case hsql::kOpNotLike: {
+      if (e->expr == nullptr || e->expr2 == nullptr) unsupported("malformed LIKE expression");
+      return wrap(AstLike{convert_expr(e->expr), convert_expr(e->expr2), e->opType == hsql::kOpNotLike},
+                  alias_of(*e));
+    }
+    case hsql::kOpILike:
+      unsupported("ILIKE (case-insensitive LIKE) -- use LIKE");
+    case hsql::kOpIn:
+      return wrap(convert_in(e), alias_of(*e));
+    case hsql::kOpCase:
+      return wrap(convert_case(e), alias_of(*e));
     default:
       break;
   }
@@ -168,6 +221,41 @@ AstExprPtr convert_function(const hsql::Expr* e) {
   unsupported("function '" + name + "' (only SUM/COUNT/MIN/MAX/AVG are supported)");
 }
 
+// Names deliberately match SQL keywords, not KernelLake's own TypeId names
+// -- this keeps the AST (and this mapping) independent of both hsql and
+// KernelLake's type system; binder.cpp owns the actual mapping to
+// DataType/TypeId.
+std::string to_cast_type_name(hsql::DataType type) {
+  switch (type) {
+    case hsql::DataType::BIGINT:
+    case hsql::DataType::LONG:
+      return "BIGINT";
+    case hsql::DataType::INT:
+    case hsql::DataType::SMALLINT:
+      return "INT";
+    case hsql::DataType::BOOLEAN:
+      return "BOOLEAN";
+    case hsql::DataType::DOUBLE:
+    case hsql::DataType::REAL:
+      return "DOUBLE";
+    case hsql::DataType::FLOAT:
+      return "FLOAT";
+    case hsql::DataType::DATE:
+      return "DATE";
+    case hsql::DataType::DATETIME:
+      return "DATETIME";
+    case hsql::DataType::VARCHAR:
+    case hsql::DataType::TEXT:
+    case hsql::DataType::CHAR:
+      return "VARCHAR";
+    case hsql::DataType::DECIMAL:
+      return "DECIMAL";
+    case hsql::DataType::UNKNOWN:
+      unsupported("CAST to an unrecognized type");
+  }
+  unsupported("CAST to an unrecognized type");
+}
+
 AstExprPtr convert_expr(const hsql::Expr* e) {
   if (e == nullptr) unsupported("null expression");
   switch (e->type) {
@@ -197,10 +285,14 @@ AstExprPtr convert_expr(const hsql::Expr* e) {
       return convert_operator(e);
     case hsql::kExprFunctionRef:
       return convert_function(e);
+    case hsql::kExprCast: {
+      if (e->expr == nullptr) unsupported("malformed CAST expression");
+      return wrap(AstCast{convert_expr(e->expr), to_cast_type_name(e->columnType.data_type)}, alias_of(*e));
+    }
     default:
       unsupported(
-          "expression type not in the supported grammar (subqueries, CASE, LIKE, IN, "
-          "CAST, EXTRACT, and arrays are not yet supported)");
+          "expression type not in the supported grammar (subqueries, EXTRACT, and arrays are not "
+          "yet supported)");
   }
 }
 

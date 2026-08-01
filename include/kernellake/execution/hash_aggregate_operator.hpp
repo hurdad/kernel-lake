@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cudf/groupby.hpp>
+#include <cudf/scalar/scalar.hpp>
 
 #include <memory>
 #include <optional>
@@ -39,20 +40,45 @@ class HashAggregateOperator final : public PhysicalOperator {
   [[nodiscard]] OperatorId id() const noexcept override { return id_; }
 
  private:
+  struct CompiledCase;  // defined below; forward-declared so CompiledExpr can hold a shared_ptr to it.
+
   // A plain column reference (e.g. `GROUP BY region`) is copied directly
   // rather than routed through cudf::ast::compute_column: cudf's AST
   // evaluator can only materialize fixed-width output columns, so a STRING
   // (or other variable-width) key column would abort with "Invalid,
   // non-fixed-width type" even though no actual computation was requested.
+  //
+  // `case_expr` is engaged instead of the above for a CASE expression --
+  // reachable as a group-by key via `GROUP BY <alias>` resolving to a CASE
+  // in the SELECT list (see binder.cpp), since a CASE has no column name of
+  // its own to write directly in GROUP BY. `case_expr` is a shared_ptr, not
+  // unique_ptr, so CompiledExpr stays copyable -- CountStar's argument
+  // below is a copy of compiled_group_by_.front().
   struct CompiledExpr {
     std::optional<cudf::size_type> source_column_index;
+    std::shared_ptr<cudf::scalar> literal_scalar;  // plain literal (see cudf_adapter.hpp's literal_to_scalar)
     const cudf::ast::expression* expr = nullptr;
+    std::shared_ptr<CompiledCase> case_expr;
+  };
+
+  struct CompiledCaseBranch {
+    CompiledExpr condition;
+    CompiledExpr result;
+  };
+
+  struct CompiledCase {
+    std::vector<CompiledCaseBranch> branches;
+    std::optional<CompiledExpr> else_value;  // nullopt: NULL when no branch matches
+    DataType result_type{TypeId::Boolean};
   };
 
   [[nodiscard]] CompiledExpr compile_expr(const Expression& expr);
   [[nodiscard]] std::unique_ptr<cudf::column> materialize(const CompiledExpr& compiled,
                                                           const DeviceBatch& batch,
                                                           ExecutionContext& context);
+  [[nodiscard]] std::unique_ptr<cudf::column> materialize_case(const CompiledCase& case_expr,
+                                                               const DeviceBatch& batch,
+                                                               ExecutionContext& context);
   void process_batch(const DeviceBatch& batch, ExecutionContext& context);
   [[nodiscard]] std::unique_ptr<cudf::table> build_combined_columns(const DeviceBatch& batch,
                                                                     ExecutionContext& context);

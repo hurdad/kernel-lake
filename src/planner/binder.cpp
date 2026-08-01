@@ -1,6 +1,7 @@
 #include "kernellake/planner/binder.hpp"
 
 #include <algorithm>
+#include <unordered_map>
 #include <unordered_set>
 
 #include "kernellake/common/errors.hpp"
@@ -14,9 +15,13 @@ using sql::AstAggregateFunc;
 using sql::AstBetween;
 using sql::AstBinary;
 using sql::AstBinaryOp;
+using sql::AstCase;
+using sql::AstCast;
 using sql::AstColumnRef;
 using sql::AstExpr;
 using sql::AstExprPtr;
+using sql::AstIn;
+using sql::AstLike;
 using sql::AstLiteral;
 using sql::AstLiteralKind;
 using sql::AstStar;
@@ -60,6 +65,26 @@ DataType promote_numeric(const DataType& a, const DataType& b) {
   return int32_type(nullable);
 }
 
+// Names match parser.cpp's to_cast_type_name() (SQL keyword spelling, not
+// KernelLake's own TypeId names). GPU support for a given target type is
+// enforced later, at GPU-compile time (expression_compiler.cpp only
+// supports widening CASTs to INT64/UINT64/FLOAT64) -- accepting the syntax
+// here and rejecting unsupported targets downstream, with a clear error
+// either way, matches how the rest of the grammar handles "parsed but not
+// executable yet" constructs.
+DataType resolve_cast_type_name(const std::string& name, bool nullable) {
+  if (name == "BIGINT") return int64_type(nullable);
+  if (name == "INT") return int32_type(nullable);
+  if (name == "BOOLEAN") return boolean_type(nullable);
+  if (name == "DOUBLE") return float64_type(nullable);
+  if (name == "FLOAT") return float32_type(nullable);
+  if (name == "DATE") return date32_type(nullable);
+  if (name == "DATETIME") return timestamp_type(nullable);
+  if (name == "VARCHAR") return string_type(nullable);
+  if (name == "DECIMAL") throw BindingError("CAST to DECIMAL is not yet supported");
+  throw BindingError("CAST to unknown type '" + name + "'");
+}
+
 ExpressionPtr cast_if_needed(ExpressionPtr expr, const DataType& target) {
   if (expr->result_type().id == target.id) return expr;
   return std::make_shared<CastExpression>(std::move(expr), target);
@@ -78,6 +103,18 @@ bool contains_aggregate(const AstExprPtr& expr) {
         } else if constexpr (std::is_same_v<T, AstBetween>) {
           return contains_aggregate(node.value) || contains_aggregate(node.lower) ||
                  contains_aggregate(node.upper);
+        } else if constexpr (std::is_same_v<T, AstLike>) {
+          return contains_aggregate(node.value) || contains_aggregate(node.pattern);
+        } else if constexpr (std::is_same_v<T, AstIn>) {
+          if (contains_aggregate(node.value)) return true;
+          return std::any_of(node.list.begin(), node.list.end(), contains_aggregate);
+        } else if constexpr (std::is_same_v<T, AstCase>) {
+          for (const auto& [condition, result] : node.when_then) {
+            if (contains_aggregate(condition) || contains_aggregate(result)) return true;
+          }
+          return node.else_branch != nullptr && contains_aggregate(node.else_branch);
+        } else if constexpr (std::is_same_v<T, AstCast>) {
+          return contains_aggregate(node.operand);
         } else {
           return false;
         }
@@ -108,6 +145,25 @@ bool references_ungrouped_column(const AstExprPtr& expr, const std::vector<std::
         } else if constexpr (std::is_same_v<T, AstAggregate>) {
           if (node.argument == nullptr) return false;
           return references_ungrouped_column(node.argument, group_by, true);
+        } else if constexpr (std::is_same_v<T, AstLike>) {
+          return references_ungrouped_column(node.value, group_by, inside_aggregate) ||
+                 references_ungrouped_column(node.pattern, group_by, inside_aggregate);
+        } else if constexpr (std::is_same_v<T, AstIn>) {
+          if (references_ungrouped_column(node.value, group_by, inside_aggregate)) return true;
+          return std::any_of(node.list.begin(), node.list.end(), [&](const AstExprPtr& item) {
+            return references_ungrouped_column(item, group_by, inside_aggregate);
+          });
+        } else if constexpr (std::is_same_v<T, AstCase>) {
+          for (const auto& [condition, result] : node.when_then) {
+            if (references_ungrouped_column(condition, group_by, inside_aggregate) ||
+                references_ungrouped_column(result, group_by, inside_aggregate)) {
+              return true;
+            }
+          }
+          return node.else_branch != nullptr &&
+                 references_ungrouped_column(node.else_branch, group_by, inside_aggregate);
+        } else if constexpr (std::is_same_v<T, AstCast>) {
+          return references_ungrouped_column(node.operand, group_by, inside_aggregate);
         } else {
           return false;
         }
@@ -358,17 +414,92 @@ class Binder {
     throw BindingError("unreachable aggregate function");
   }
 
+  ExpressionPtr bind_node(const AstLike& node, bool allow_aggregates) {
+    ExpressionPtr value = bind(node.value, allow_aggregates);
+    if (value->result_type().id != TypeId::String) {
+      throw BindingError("LIKE requires a STRING operand, got " + value->result_type().to_string());
+    }
+    // The pattern must be a compile-time string constant -- a per-row
+    // pattern column would need cudf::strings::like's column-of-patterns
+    // overload, which is not wired up here (see kernellake/execution's
+    // LIKE handling).
+    const auto* pattern_literal = std::get_if<AstLiteral>(&node.pattern->node);
+    if (pattern_literal == nullptr || pattern_literal->kind != AstLiteralKind::String) {
+      throw BindingError("LIKE pattern must be a string literal");
+    }
+    return std::make_shared<LikeExpression>(std::move(value), pattern_literal->string_value, node.negated);
+  }
+
+  ExpressionPtr bind_node(const AstIn& node, bool allow_aggregates) {
+    if (node.list.empty()) throw BindingError("IN requires at least one value");
+    ExpressionPtr value = bind(node.value, allow_aggregates);
+    ExpressionPtr result;
+    for (const AstExprPtr& item : node.list) {
+      ExpressionPtr comparison = combine_binary(AstBinaryOp::Eq, value, bind(item, allow_aggregates));
+      result = result == nullptr ? std::move(comparison)
+                                 : combine_binary(AstBinaryOp::Or, std::move(result), std::move(comparison));
+    }
+    if (!node.negated) return result;
+    return std::make_shared<UnaryExpression>(UnaryOperator::Not, std::move(result), boolean_type(false));
+  }
+
+  ExpressionPtr bind_node(const AstCase& node, bool allow_aggregates) {
+    std::vector<std::pair<ExpressionPtr, ExpressionPtr>> branches;
+    branches.reserve(node.when_then.size());
+    for (const auto& [condition, then_result] : node.when_then) {
+      ExpressionPtr bound_condition = bind(condition, allow_aggregates);
+      if (bound_condition->result_type().id != TypeId::Boolean) {
+        throw BindingError("CASE WHEN condition must be boolean, got " +
+                           bound_condition->result_type().to_string());
+      }
+      branches.emplace_back(std::move(bound_condition), bind(then_result, allow_aggregates));
+    }
+    ExpressionPtr bound_else =
+        node.else_branch != nullptr ? bind(node.else_branch, allow_aggregates) : nullptr;
+
+    // A CASE with no ELSE evaluates to NULL when no WHEN matches, so the
+    // result is nullable even if every branch itself is not.
+    DataType common = branches.front().second->result_type();
+    bool any_nullable = common.nullable || bound_else == nullptr;
+    auto unify = [&](const DataType& branch_type) {
+      any_nullable = any_nullable || branch_type.nullable;
+      if (branch_type.id == common.id) return;
+      if (is_numeric(common.id) && is_numeric(branch_type.id)) {
+        common = promote_numeric(common, branch_type);
+        return;
+      }
+      throw BindingError("CASE branches have incompatible result types: " + common.to_string() + " and " +
+                         branch_type.to_string());
+    };
+    for (std::size_t i = 1; i < branches.size(); ++i) unify(branches[i].second->result_type());
+    if (bound_else != nullptr) unify(bound_else->result_type());
+    common.nullable = any_nullable;
+
+    std::vector<CaseExpression::WhenThen> final_branches;
+    final_branches.reserve(branches.size());
+    for (auto& [condition, then_result] : branches) {
+      final_branches.push_back(
+          CaseExpression::WhenThen{std::move(condition), cast_if_needed(std::move(then_result), common)});
+    }
+    ExpressionPtr final_else =
+        bound_else != nullptr ? cast_if_needed(std::move(bound_else), common) : nullptr;
+    return std::make_shared<CaseExpression>(std::move(final_branches), std::move(final_else), common);
+  }
+
+  ExpressionPtr bind_node(const AstCast& node, bool allow_aggregates) {
+    ExpressionPtr operand = bind(node.operand, allow_aggregates);
+    const DataType target = resolve_cast_type_name(node.type_name, operand->result_type().nullable);
+    return std::make_shared<CastExpression>(std::move(operand), target);
+  }
+
   const Schema& input_schema_;
 };
 
 }  // namespace
 
 BoundQuery bind_query(const sql::AstSelectStatement& stmt, const Schema& input_schema) {
-  std::vector<std::string> group_by_names;
   for (const AstExprPtr& item : stmt.group_by) {
-    if (const auto* column = std::get_if<AstColumnRef>(&item->node)) {
-      group_by_names.push_back(column->name);
-    } else {
+    if (!std::holds_alternative<AstColumnRef>(item->node)) {
       throw BindingError("GROUP BY expressions must be plain column references in this version");
     }
   }
@@ -385,15 +516,27 @@ BoundQuery bind_query(const sql::AstSelectStatement& stmt, const Schema& input_s
 
   std::vector<Field> output_fields;
   std::unordered_set<std::string> seen_names;
+  // Maps a SELECT-list output name to its position, so GROUP BY can
+  // reference a computed expression by its alias (e.g. `SELECT CASE ... END
+  // AS bucket ... GROUP BY bucket`) -- there is no other way to name a
+  // computed, non-column GROUP BY key. Resolved below, once every SELECT
+  // item is bound.
+  std::unordered_map<std::string, std::size_t> alias_to_select_index;
 
   auto add_select_item = [&](ExpressionPtr expr, std::string name) {
     if (!seen_names.insert(name).second) {
       throw BindingError("duplicate output column name '" + name + "'");
     }
+    alias_to_select_index[name] = result.select_list.size();
     output_fields.push_back(Field{name, expr->result_type()});
     result.select_list.push_back(BoundSelectItem{expr, std::move(name)});
   };
 
+  // The "referenced in SELECT list must appear in GROUP BY" check is
+  // deferred to a second pass below (once GROUP BY's alias references are
+  // resolved against this SELECT list) rather than interleaved here, since
+  // it needs the *final* set of grouped names, not just the raw column
+  // references written directly in the GROUP BY clause.
   for (const AstExprPtr& item : stmt.select_list) {
     if (std::holds_alternative<AstStar>(item->node)) {
       if (stmt.select_list.size() != 1) {
@@ -405,12 +548,6 @@ BoundQuery bind_query(const sql::AstSelectStatement& stmt, const Schema& input_s
             field.name);
       }
       continue;
-    }
-
-    if (is_aggregate_query && references_ungrouped_column(item, group_by_names, /*inside_aggregate=*/false)) {
-      throw BindingError(
-          "column referenced in SELECT list must appear in GROUP BY or be used inside an "
-          "aggregate function");
     }
 
     ExpressionPtr bound = binder.bind(item, /*allow_aggregates=*/true);
@@ -434,8 +571,43 @@ BoundQuery bind_query(const sql::AstSelectStatement& stmt, const Schema& input_s
     result.where = std::move(where);
   }
 
+  // A GROUP BY name is resolved against the base table first (matching a
+  // real column takes priority over a same-named alias, consistent with
+  // how most SQL engines resolve this ambiguity) and falls back to a
+  // SELECT-list alias -- the only way to GROUP BY a computed expression
+  // like a CASE, since it has no column name of its own to repeat.
+  std::vector<std::string> group_by_names;
+  // The SELECT item that *defines* an alias-referenced GROUP BY key (e.g.
+  // the CASE itself in `... AS bucket ... GROUP BY bucket`) is exempt from
+  // the ungrouped-column check below: it likely references raw columns
+  // (e.g. `amount` inside the CASE) that aren't individually listed in
+  // group_by_names, but the expression *as a whole* is exactly what's
+  // being grouped on, which is what actually matters.
+  std::unordered_set<std::size_t> select_indices_used_as_group_by_alias;
   for (const AstExprPtr& item : stmt.group_by) {
-    result.group_by.push_back(binder.bind(item, /*allow_aggregates=*/false));
+    const std::string& name = std::get<AstColumnRef>(item->node).name;
+    if (input_schema.find_field(name)) {
+      result.group_by.push_back(binder.bind(item, /*allow_aggregates=*/false));
+    } else if (const auto alias = alias_to_select_index.find(name); alias != alias_to_select_index.end()) {
+      result.group_by.push_back(result.select_list[alias->second].expr);
+      select_indices_used_as_group_by_alias.insert(alias->second);
+    } else {
+      throw BindingError("unknown column '" + name + "' in GROUP BY");
+    }
+    group_by_names.push_back(name);
+  }
+
+  if (is_aggregate_query) {
+    for (std::size_t i = 0; i < stmt.select_list.size(); ++i) {
+      const AstExprPtr& item = stmt.select_list[i];
+      if (std::holds_alternative<AstStar>(item->node)) continue;  // handled during expansion above
+      if (select_indices_used_as_group_by_alias.count(i) != 0) continue;
+      if (references_ungrouped_column(item, group_by_names, /*inside_aggregate=*/false)) {
+        throw BindingError(
+            "column referenced in SELECT list must appear in GROUP BY or be used inside an "
+            "aggregate function");
+      }
+    }
   }
 
   for (const sql::AstOrderByItem& item : stmt.order_by) {

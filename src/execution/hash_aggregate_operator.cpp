@@ -3,6 +3,8 @@
 #include <cudf/aggregation.hpp>
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
+#include <cudf/copying.hpp>
+#include <cudf/scalar/scalar_factories.hpp>
 #include <cudf/transform.hpp>
 #include <cudf/unary.hpp>
 
@@ -10,6 +12,7 @@
 
 #include "kernellake/common/errors.hpp"
 #include "kernellake/execution/cudf_adapter.hpp"
+#include "kernellake/expression/expression.hpp"
 
 namespace kernellake {
 
@@ -61,19 +64,72 @@ HashAggregateOperator::HashAggregateOperator(OperatorId id, std::unique_ptr<Phys
 
 HashAggregateOperator::CompiledExpr HashAggregateOperator::compile_expr(const Expression& expr) {
   if (const auto* column_ref = dynamic_cast<const ColumnExpression*>(&expr)) {
-    return CompiledExpr{static_cast<cudf::size_type>(column_ref->column_index()), nullptr};
+    CompiledExpr compiled;
+    compiled.source_column_index = static_cast<cudf::size_type>(column_ref->column_index());
+    return compiled;
   }
-  return CompiledExpr{std::nullopt, &compiler_.compile(expr)};
+  if (const auto* literal = dynamic_cast<const LiteralExpression*>(&expr)) {
+    CompiledExpr compiled;
+    compiled.literal_scalar = literal_to_scalar(*literal);
+    return compiled;
+  }
+  if (const auto* case_expr = dynamic_cast<const CaseExpression*>(&expr)) {
+    auto compiled_case = std::make_shared<CompiledCase>();
+    compiled_case->result_type = case_expr->result_type();
+    compiled_case->branches.reserve(case_expr->when_then().size());
+    for (const CaseExpression::WhenThen& branch : case_expr->when_then()) {
+      compiled_case->branches.push_back(
+          CompiledCaseBranch{compile_expr(*branch.condition), compile_expr(*branch.result)});
+    }
+    if (case_expr->else_branch() != nullptr) {
+      compiled_case->else_value = compile_expr(*case_expr->else_branch());
+    }
+    CompiledExpr compiled;
+    compiled.case_expr = std::move(compiled_case);
+    return compiled;
+  }
+  CompiledExpr compiled;
+  compiled.expr = &compiler_.compile(expr);
+  return compiled;
 }
 
 std::unique_ptr<cudf::column> HashAggregateOperator::materialize(const CompiledExpr& compiled,
                                                                  const DeviceBatch& batch,
                                                                  ExecutionContext& context) {
+  if (compiled.case_expr != nullptr) return materialize_case(*compiled.case_expr, batch, context);
   if (compiled.source_column_index.has_value()) {
     return std::make_unique<cudf::column>(batch.view().column(*compiled.source_column_index), context.stream,
                                           context.memory_resource);
   }
+  if (compiled.literal_scalar != nullptr) {
+    return cudf::make_column_from_scalar(*compiled.literal_scalar,
+                                         static_cast<cudf::size_type>(batch.row_count()), context.stream,
+                                         context.memory_resource);
+  }
   return cudf::compute_column(batch.view(), *compiled.expr, context.stream, context.memory_resource);
+}
+
+std::unique_ptr<cudf::column> HashAggregateOperator::materialize_case(const CompiledCase& case_expr,
+                                                                      const DeviceBatch& batch,
+                                                                      ExecutionContext& context) {
+  // Folds from the last branch backward -- see the identical algorithm and
+  // comment in ProjectionOperator::materialize_case.
+  std::unique_ptr<cudf::column> result;
+  if (case_expr.else_value.has_value()) {
+    result = materialize(*case_expr.else_value, batch, context);
+  } else {
+    const std::unique_ptr<cudf::scalar> null_scalar = cudf::make_default_constructed_scalar(
+        to_cudf_type(case_expr.result_type), context.stream, context.memory_resource);
+    result = cudf::make_column_from_scalar(*null_scalar, static_cast<cudf::size_type>(batch.row_count()),
+                                           context.stream, context.memory_resource);
+  }
+  for (auto it = case_expr.branches.rbegin(); it != case_expr.branches.rend(); ++it) {
+    std::unique_ptr<cudf::column> condition = materialize(it->condition, batch, context);
+    std::unique_ptr<cudf::column> branch_result = materialize(it->result, batch, context);
+    result = cudf::copy_if_else(branch_result->view(), result->view(), condition->view(), context.stream,
+                                context.memory_resource);
+  }
+  return result;
 }
 
 void HashAggregateOperator::open(ExecutionContext& context) {

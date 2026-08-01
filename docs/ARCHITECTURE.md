@@ -75,12 +75,35 @@ SELECT <items> FROM read_parquet('path' [, 'path2', ...])
 - Numeric, string, boolean, date (`DATE 'YYYY-MM-DD'`), and `NULL` literals
 - Arithmetic (`+ - * /`), comparisons, `AND`/`OR`/`NOT`, `BETWEEN`,
   `IS [NOT] NULL`
+- `LIKE`/`NOT LIKE` (SQL `%`/`_` wildcards; scoped to top-level `WHERE`
+  AND-conjuncts -- not inside `OR`, the `SELECT` list, or aggregate
+  arguments)
+- `IN (literal, ...)`/`NOT IN (...)` (desugared at bind time into an
+  equivalent `OR`/`AND` chain of equality comparisons -- no new GPU
+  execution support needed, and no scalar-subquery form `IN (SELECT ...)`)
+- `CASE WHEN ... THEN ... [WHEN ...] [ELSE ...] END`, both simple
+  (`CASE x WHEN ...`) and searched forms (scoped to the `SELECT` list and
+  `GROUP BY` keys -- not `WHERE` or aggregate arguments)
+- `CAST(expr AS type)` (`INT`/`BIGINT`/`DOUBLE`/`VARCHAR(n)`; see
+  "LIKE/IN/CASE/CAST implementation notes" below for the truncate-vs-round
+  caveat on numeric-to-integer casts)
 - Aggregates: `SUM`, `COUNT`, `COUNT(*)`, `MIN`, `MAX`, `AVG`
 
 Not yet supported (fails clearly rather than being silently reinterpreted):
 `DISTINCT`, `HAVING`, set operations (`UNION`/etc.), `WITH`/CTEs, joins,
-subqueries, `OFFSET`, `LIKE`/`IN`/`CASE`/`CAST` expressions, window
-functions, and any function other than the five aggregates above.
+subqueries, `OFFSET`, window functions, `LIKE` outside a top-level `WHERE`
+AND-conjunct, `CASE` in `WHERE`/aggregate arguments, and any function other
+than the five aggregates above.
+
+`GROUP BY <name>` resolves `<name>` against the base-table schema first,
+then falls back to matching a `SELECT`-list output alias -- this is what
+lets you `GROUP BY` a computed expression like `CASE ... AS bucket` (which
+has no column name of its own): `SELECT CASE ... AS bucket, COUNT(*) FROM
+... GROUP BY bucket` groups by the alias, not a base column named `bucket`.
+If both exist, the base column wins (standard SQL alias-shadowing
+behavior). The alias-defining `SELECT` item is exempted from the
+ungrouped-column check that normally rejects non-aggregated,
+non-grouped-by expressions in an aggregate query's `SELECT` list.
 
 `ORDER BY` executes for real via `SortOperator` (`cudf::stable_sorted_order`
 + `cudf::gather`, blocking -- it consumes the whole input before producing
@@ -140,9 +163,9 @@ human-readable explanation of every skip.
 `LogicalScan`'s source-path specs into concrete files via `ObjectStore`,
 inspects and prunes each one, and maps every other logical node onto its
 physical equivalent (`LogicalAggregate` becomes `HashAggregate` when it has
-a `GROUP BY`, or `ScalarAggregate` when it does not), always wrapping the
-result in `ArrowResultNode`. It throws `PlanningError` for a `LogicalSort`
-node, since no physical sort operator exists yet.
+a `GROUP BY`, or `ScalarAggregate` when it does not; `LogicalSort` becomes
+`SortNode`, see `SortOperator` below), always wrapping the result in
+`ArrowResultNode`.
 
 ## CPU/GPU build split
 
@@ -230,6 +253,47 @@ Two correctness details worth knowing if you touch these operators:
   wrongly treat a `Sort` sitting directly on `LogicalAggregate` as if it
   needed scan-schema remapping.
 
+### LIKE/IN/CASE/CAST implementation notes
+
+- **`cudf::ast::compute_column` cannot produce a STRING (or other
+  non-fixed-width) output column at all, even from a pure literal
+  expression.** A string literal is only valid as an *intermediate* AST
+  node (e.g. one side of a comparison); it can never be the compiled tree's
+  root/output. This surfaces most visibly with `CASE` branches that are
+  string literals (e.g. `CASE WHEN ... THEN 'high' ELSE 'low' END`):
+  routing that through the AST compiler aborts with cudf's "Invalid,
+  non-fixed-width type" error. `ProjectionOperator` and
+  `HashAggregateOperator` both detect a plain `LiteralExpression` and
+  materialize it directly via `cudf::make_column_from_scalar`
+  (`cudf_adapter.hpp`'s `literal_to_scalar()`), bypassing the AST compiler
+  entirely, mirroring the existing plain-column-reference fast path
+  described above.
+- **`CASE` is implemented by folding branches from last to first** with
+  `cudf::copy_if_else(branch_result, accumulated_result, condition, ...)`,
+  where `accumulated_result` starts as the `ELSE` value (or an all-NULL
+  column of the result type, if there is no `ELSE`).
+- **`LIKE`/`NOT LIKE` cannot go through `cudf::ast` at all** --
+  `ast_operator` has no LIKE-equivalent. `FilterOperator` splits its
+  predicate into top-level AND-conjuncts, evaluates any `LIKE`/`NOT LIKE`
+  conjuncts separately via `cudf::strings::like()` (negated with
+  `cudf::unary_operation(..., unary_operator::NOT, ...)`), evaluates the
+  remaining AST-expressible conjuncts as one compiled expression, and
+  combines the two boolean masks with `cudf::binary_operation(...,
+  binary_operator::LOGICAL_AND, ...)`.
+- **`CAST(DOUBLE AS BIGINT)` truncates, matching `cudf::ast::CAST_TO_INT64`'s
+  direct `static_cast<int64_t>`.** This is a real, deliberate semantic
+  difference from DuckDB, which rounds to the nearest integer on the same
+  cast (confirmed by cross-validating identical queries against both
+  engines: e.g. `996.604` casts to `996` here vs. `997` in DuckDB). There is
+  no rounding step before the cast; this is documented rather than "fixed"
+  because truncation is what `cudf::ast`'s cast operator natively does, and
+  changing it would mean adding a rounding pass that most callers casting a
+  DOUBLE to an integer type don't actually want.
+- `IN (a, b, c)` is desugared entirely at bind time into `(x = a) OR (x = b)
+  OR (x = c)` (`NOT IN` into the equivalent `AND` chain of `<>`), so it
+  needs no new GPU-execution-layer support at all -- it reuses the existing
+  `OR`/comparison AST compilation path.
+
 ### GPU dependency vendoring (no conda)
 
 The `gpu-dev` preset (`KERNELLAKE_WITH_CUDA=ON`) needs libcudf and RMM.
@@ -257,7 +321,7 @@ These are named as forward-declared types or documented models so later
 work has a clean seam to build against; none of them have implementations
 yet, and none are exposed as supported CLI features.
 
-**Future physical operators**: `HashJoin`, `Sort`, `Exchange`, `Spill`,
+**Future physical operators**: `HashJoin`, `Exchange`, `Spill`,
 `Repartition`, `MergeAggregate`, `Broadcast`.
 
 **Future distributed model**:

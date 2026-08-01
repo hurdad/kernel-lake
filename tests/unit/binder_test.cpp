@@ -121,5 +121,133 @@ TEST(Binder, NullLiteralComparisonBindsWithoutError) {
   EXPECT_NO_THROW(bind_query(stmt, sales_schema()));
 }
 
+TEST(Binder, LikeRequiresStringOperandAndLiteralPattern) {
+  const auto stmt = sql::parse_sql("SELECT region FROM read_parquet('/x.parquet') WHERE region LIKE 'A%'");
+  const BoundQuery bound = bind_query(stmt, sales_schema());
+  ASSERT_NE(bound.where, nullptr);
+  const auto* like = dynamic_cast<const LikeExpression*>(bound.where.get());
+  ASSERT_NE(like, nullptr);
+  EXPECT_EQ(like->pattern(), "A%");
+  EXPECT_FALSE(like->negated());
+
+  const auto not_stmt =
+      sql::parse_sql("SELECT region FROM read_parquet('/x.parquet') WHERE region NOT LIKE 'A%'");
+  const BoundQuery not_bound = bind_query(not_stmt, sales_schema());
+  const auto* not_like = dynamic_cast<const LikeExpression*>(not_bound.where.get());
+  ASSERT_NE(not_like, nullptr);
+  EXPECT_TRUE(not_like->negated());
+
+  const auto numeric_stmt =
+      sql::parse_sql("SELECT region FROM read_parquet('/x.parquet') WHERE amount LIKE 'A%'");
+  EXPECT_THROW(bind_query(numeric_stmt, sales_schema()), BindingError);
+}
+
+TEST(Binder, InDesugarsIntoOrChainOfEqualityComparisons) {
+  const auto stmt =
+      sql::parse_sql("SELECT region FROM read_parquet('/x.parquet') WHERE region IN ('A', 'B', 'C')");
+  const BoundQuery bound = bind_query(stmt, sales_schema());
+  ASSERT_NE(bound.where, nullptr);
+  // (region = 'A') OR (region = 'B') OR (region = 'C'), left-associated.
+  const auto* outer_or = dynamic_cast<const BinaryExpression*>(bound.where.get());
+  ASSERT_NE(outer_or, nullptr);
+  EXPECT_EQ(outer_or->op(), BinaryOperator::Or);
+  const auto* inner_or = dynamic_cast<const BinaryExpression*>(outer_or->left().get());
+  ASSERT_NE(inner_or, nullptr);
+  EXPECT_EQ(inner_or->op(), BinaryOperator::Or);
+  const auto* first_eq = dynamic_cast<const BinaryExpression*>(inner_or->left().get());
+  ASSERT_NE(first_eq, nullptr);
+  EXPECT_EQ(first_eq->op(), BinaryOperator::Equal);
+}
+
+TEST(Binder, NotInNegatesTheDesugaredOrChain) {
+  const auto stmt =
+      sql::parse_sql("SELECT region FROM read_parquet('/x.parquet') WHERE region NOT IN ('A', 'B')");
+  const BoundQuery bound = bind_query(stmt, sales_schema());
+  const auto* not_expr = dynamic_cast<const UnaryExpression*>(bound.where.get());
+  ASSERT_NE(not_expr, nullptr);
+  EXPECT_EQ(not_expr->op(), UnaryOperator::Not);
+}
+
+TEST(Binder, CaseRequiresBooleanConditionsAndUnifiesResultTypes) {
+  const auto stmt = sql::parse_sql(
+      "SELECT CASE WHEN amount > 500 THEN 1 WHEN amount > 100 THEN 2 ELSE 0 END AS bucket "
+      "FROM read_parquet('/x.parquet')");
+  const BoundQuery bound = bind_query(stmt, sales_schema());
+  ASSERT_EQ(bound.select_list.size(), 1u);
+  const auto* case_expr = dynamic_cast<const CaseExpression*>(bound.select_list[0].expr.get());
+  ASSERT_NE(case_expr, nullptr);
+  EXPECT_EQ(case_expr->when_then().size(), 2u);
+  EXPECT_NE(case_expr->else_branch(), nullptr);
+  EXPECT_EQ(case_expr->result_type().id, TypeId::Int64);
+  EXPECT_FALSE(case_expr->result_type().nullable);  // ELSE present, all branches non-null
+
+  const auto no_else_stmt =
+      sql::parse_sql("SELECT CASE WHEN amount > 500 THEN 1 END AS bucket FROM read_parquet('/x.parquet')");
+  const BoundQuery no_else_bound = bind_query(no_else_stmt, sales_schema());
+  const auto* no_else_case = dynamic_cast<const CaseExpression*>(no_else_bound.select_list[0].expr.get());
+  ASSERT_NE(no_else_case, nullptr);
+  EXPECT_TRUE(no_else_case->result_type().nullable);  // no ELSE -> NULL is possible
+
+  const auto non_boolean_condition_stmt =
+      sql::parse_sql("SELECT CASE WHEN amount THEN 1 ELSE 0 END AS bucket FROM read_parquet('/x.parquet')");
+  EXPECT_THROW(bind_query(non_boolean_condition_stmt, sales_schema()), BindingError);
+
+  const auto incompatible_branches_stmt = sql::parse_sql(
+      "SELECT CASE WHEN amount > 500 THEN 'high' ELSE 0 END AS bucket FROM read_parquet('/x.parquet')");
+  EXPECT_THROW(bind_query(incompatible_branches_stmt, sales_schema()), BindingError);
+}
+
+TEST(Binder, CastMapsSqlTypeNamesToDataTypes) {
+  const auto stmt = sql::parse_sql("SELECT CAST(amount AS BIGINT) AS x FROM read_parquet('/x.parquet')");
+  const BoundQuery bound = bind_query(stmt, sales_schema());
+  const auto* cast = dynamic_cast<const CastExpression*>(bound.select_list[0].expr.get());
+  ASSERT_NE(cast, nullptr);
+  EXPECT_EQ(cast->result_type().id, TypeId::Int64);
+
+  // hsql's grammar requires an explicit length for VARCHAR (bare VARCHAR
+  // with no length is a parse error, unlike BIGINT/INT/etc.); the length
+  // itself is unused by KernelLake's binder, which only has one unbounded
+  // String type.
+  const auto varchar_stmt =
+      sql::parse_sql("SELECT CAST(amount AS VARCHAR(255)) AS x FROM read_parquet('/x.parquet')");
+  const BoundQuery varchar_bound = bind_query(varchar_stmt, sales_schema());
+  const auto* varchar_cast = dynamic_cast<const CastExpression*>(varchar_bound.select_list[0].expr.get());
+  ASSERT_NE(varchar_cast, nullptr);
+  EXPECT_EQ(varchar_cast->result_type().id, TypeId::String);
+
+  const auto decimal_stmt =
+      sql::parse_sql("SELECT CAST(amount AS DECIMAL) AS x FROM read_parquet('/x.parquet')");
+  EXPECT_THROW(bind_query(decimal_stmt, sales_schema()), BindingError);
+}
+
+TEST(Binder, GroupByResolvesSelectListAliasForComputedExpressions) {
+  // "bucket" is not a base-table column -- it can only resolve against the
+  // SELECT-list alias, since that's the only way to name a computed GROUP
+  // BY key like a CASE expression.
+  const auto stmt = sql::parse_sql(
+      "SELECT CASE WHEN amount > 500 THEN 'high' ELSE 'low' END AS bucket, COUNT(*) AS n "
+      "FROM read_parquet('/x.parquet') GROUP BY bucket");
+  const BoundQuery bound = bind_query(stmt, sales_schema());
+  ASSERT_EQ(bound.group_by.size(), 1u);
+  EXPECT_NE(dynamic_cast<const CaseExpression*>(bound.group_by[0].get()), nullptr);
+
+  const auto unknown_alias_stmt = sql::parse_sql(
+      "SELECT region, COUNT(*) AS n FROM read_parquet('/x.parquet') GROUP BY nonexistent_alias");
+  EXPECT_THROW(bind_query(unknown_alias_stmt, sales_schema()), BindingError);
+}
+
+TEST(Binder, GroupByPrefersBaseColumnOverSameNamedAlias) {
+  // "region" is both a real base-table column and this query's own alias
+  // for it -- resolving against the base column either way gives the same
+  // answer, but this pins down that base-table resolution is tried first.
+  const auto stmt = sql::parse_sql(
+      "SELECT region AS region, COUNT(*) AS n FROM read_parquet('/x.parquet') GROUP BY region");
+  const BoundQuery bound = bind_query(stmt, sales_schema());
+  ASSERT_EQ(bound.group_by.size(), 1u);
+  const auto* column = dynamic_cast<const ColumnExpression*>(bound.group_by[0].get());
+  ASSERT_NE(column, nullptr);
+  EXPECT_EQ(column->name(), "region");
+}
+
 }  // namespace
 }  // namespace kernellake

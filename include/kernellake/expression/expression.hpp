@@ -210,6 +210,75 @@ class BetweenExpression final : public Expression {
 };
 
 // ---------------------------------------------------------------------------
+// LIKE
+// ---------------------------------------------------------------------------
+
+// `value LIKE 'pattern'` ('%'/'_' wildcards, SQL LIKE semantics). The
+// pattern is always a compile-time string constant (the binder rejects a
+// per-row pattern column -- see binder.cpp), so it is captured directly
+// rather than as a nested Expression.
+class LikeExpression final : public Expression {
+ public:
+  LikeExpression(ExpressionPtr value, std::string pattern, bool negated)
+      : value_(std::move(value)),
+        pattern_(std::move(pattern)),
+        negated_(negated),
+        type_(boolean_type(false)) {}
+
+  [[nodiscard]] const ExpressionPtr& value() const noexcept { return value_; }
+  [[nodiscard]] const std::string& pattern() const noexcept { return pattern_; }
+  [[nodiscard]] bool negated() const noexcept { return negated_; }
+  [[nodiscard]] const DataType& result_type() const override { return type_; }
+  [[nodiscard]] std::string to_string() const override {
+    return value_->to_string() + (negated_ ? " NOT LIKE '" : " LIKE '") + pattern_ + "'";
+  }
+
+ private:
+  ExpressionPtr value_;
+  std::string pattern_;
+  bool negated_;
+  DataType type_;
+};
+
+// ---------------------------------------------------------------------------
+// CASE
+// ---------------------------------------------------------------------------
+
+// `CASE WHEN c1 THEN r1 [WHEN c2 THEN r2 ...] [ELSE re] END`. Every
+// condition is already boolean and every result already shares a common
+// result_type (both enforced by the binder). `else_branch` is null for a
+// CASE with no ELSE clause -- evaluates to NULL when no WHEN matches.
+class CaseExpression final : public Expression {
+ public:
+  struct WhenThen {
+    ExpressionPtr condition;
+    ExpressionPtr result;
+  };
+
+  CaseExpression(std::vector<WhenThen> when_then, ExpressionPtr else_branch, DataType result_type)
+      : when_then_(std::move(when_then)),
+        else_branch_(std::move(else_branch)),
+        type_(std::move(result_type)) {}
+
+  [[nodiscard]] const std::vector<WhenThen>& when_then() const noexcept { return when_then_; }
+  [[nodiscard]] const ExpressionPtr& else_branch() const noexcept { return else_branch_; }  // may be null
+  [[nodiscard]] const DataType& result_type() const override { return type_; }
+  [[nodiscard]] std::string to_string() const override {
+    std::string text = "CASE";
+    for (const WhenThen& branch : when_then_) {
+      text += " WHEN " + branch.condition->to_string() + " THEN " + branch.result->to_string();
+    }
+    if (else_branch_ != nullptr) text += " ELSE " + else_branch_->to_string();
+    return text + " END";
+  }
+
+ private:
+  std::vector<WhenThen> when_then_;
+  ExpressionPtr else_branch_;
+  DataType type_;
+};
+
+// ---------------------------------------------------------------------------
 // Aggregates
 // ---------------------------------------------------------------------------
 

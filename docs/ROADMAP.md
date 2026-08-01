@@ -53,6 +53,40 @@ and covered by passing tests -- not merely designed or stubbed.
   masked because every prior test happened to hit the case where the
   optimizer removes the redundant reprojection entirely. Verified against
   DuckDB for the surviving-reprojection case.
+- `LIKE`/`NOT LIKE`, `IN`/`NOT IN` (desugared to `OR`/`AND` chains at bind
+  time), `CASE WHEN ... END` (simple and searched, `SELECT` list and
+  `GROUP BY` keys), and explicit `CAST` -- see "LIKE/IN/CASE/CAST
+  implementation notes" in `docs/ARCHITECTURE.md` for scope limits, the
+  discovery that `cudf::ast::compute_column` cannot produce STRING output
+  even for a pure literal (worked around for `CASE`'s literal branches via
+  a direct-scalar fast path), and the documented CAST-truncates-vs-DuckDB-
+  rounds semantic difference. Also added `GROUP BY <alias>` resolution
+  (base-table column first, `SELECT`-list alias fallback), needed to group
+  by a computed `CASE` expression. All four surfaced and fixed real bugs:
+  a `LikeExpression`-only `WHERE` column was silently dropped by the
+  optimizer's required-columns pass, `GROUP BY <alias>` didn't work at all
+  (pre-existing, not CASE-specific), `HashAggregateOperator` couldn't
+  materialize a `CASE` group-by key, and a STRING `CASE` branch crashed the
+  process (`std::terminate`) rather than failing cleanly. Verified against
+  DuckDB. Also found and fixed, while debugging the STRING-CASE crash: no
+  uncaught non-`KernelLakeError` exception (cudf/rmm/Arrow's own types)
+  handler existed in the CLI, so such an exception crashed the whole
+  process instead of printing a clean error -- fixed with a single
+  top-level `try/catch` around command dispatch in `src/cli/main.cpp`.
+- Fixed a real, latent GPU-memory-teardown race found while running the
+  full `gpu-dev` test suite (not the task above's SQL work): `RmmEnvironment`'s
+  destructor restored the previous CUDA device memory resource and freed
+  its own pool without first synchronizing the device, so GPU work still
+  in flight when one test's `RmmEnvironment` went out of scope could read
+  or write memory that got freed and reissued to a *later*, unrelated
+  test's pool -- manifesting as a driver-level segfault deep inside a much
+  later test rather than a failure at the source. Every test passed
+  individually or in most small combinations, since there was no
+  still-in-flight work left to race against; reproduced deterministically
+  with `ParquetScanOperatorTest` + `LimitOperator` + `SortOperator` run
+  together, confirmed present before this session's changes (bisected to
+  the last commit), and fixed with a `cudaDeviceSynchronize()` in
+  `RmmEnvironment::~RmmEnvironment()` before releasing pool memory.
 - `QueryEngine::execute()`, wired to the real operator pipeline for
   `gpu-dev` builds (a CPU-only stub throws `ExecutionError` for `dev`
   builds), and the `kernellake query` CLI command (`--sql`/`--file`,

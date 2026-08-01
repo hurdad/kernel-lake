@@ -8,6 +8,7 @@
 #include <rmm/mr/statistics_resource_adaptor.hpp>
 
 #include "kernellake/common/errors.hpp"
+#include "kernellake/execution/cuda_utils.hpp"
 
 namespace kernellake {
 
@@ -51,6 +52,17 @@ RmmEnvironment::RmmEnvironment(const EngineConfig& config) {
 
 RmmEnvironment::~RmmEnvironment() {
   if (impl_) {
+    // impl_'s pool (or async-allocator) resource is about to be torn down
+    // and its underlying device memory returned to the driver. Without this
+    // sync, any GPU work still in flight on the device (e.g. a kernel
+    // launched via cudf against a batch that hasn't been awaited yet) can
+    // read or write into memory that gets freed and reissued to a *later*
+    // RmmEnvironment's pool -- corrupting unrelated, much later work instead
+    // of failing at the source. Caught via a full-suite run that crashed
+    // deep inside an unrelated later test with a driver-level GPF; every
+    // test passes individually or in small combinations because there is no
+    // still-in-flight work left to race against.
+    check_cuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize before tearing down RmmEnvironment");
     rmm::mr::set_current_device_resource(impl_->previous_resource);
   }
 }

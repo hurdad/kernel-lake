@@ -8,6 +8,7 @@
 #include <arrow/io/file.h>
 #include <parquet/arrow/writer.h>
 
+#include <algorithm>
 #include <filesystem>
 #include <map>
 
@@ -139,6 +140,85 @@ TEST_F(QueryEngineExecuteTest, AggregateOrderByProducesDescendingTotals) {
   EXPECT_DOUBLE_EQ(total_column->Value(0), 110.0);
   EXPECT_EQ(region_column->GetString(1), "A");
   EXPECT_DOUBLE_EQ(total_column->Value(1), 35.0);
+}
+
+TEST_F(QueryEngineExecuteTest, LikeFiltersToMatchingRegionRows) {
+  // region A rows: 10+20+5=35 (see SetUp's regions/amounts).
+  const QueryResult result = engine_.execute("SELECT SUM(amount) AS total FROM read_parquet('" + path_ +
+                                             "') WHERE region LIKE 'A%'");
+  ASSERT_EQ(result.batches.size(), 1u);
+  const auto total_column =
+      std::static_pointer_cast<arrow::DoubleArray>(result.batches.front()->GetColumnByName("total"));
+  ASSERT_NE(total_column, nullptr);
+  EXPECT_DOUBLE_EQ(total_column->Value(0), 35.0);
+}
+
+TEST_F(QueryEngineExecuteTest, NotLikeFiltersToNonMatchingRegionRows) {
+  // This specific shape (a scalar aggregate with no GROUP BY to also
+  // reference "region") is what originally surfaced the missing
+  // LikeExpression case in the optimizer's required-columns collector --
+  // without it, "region" would be silently pruned from the scan entirely.
+  const QueryResult result = engine_.execute("SELECT SUM(amount) AS total FROM read_parquet('" + path_ +
+                                             "') WHERE region NOT LIKE 'A%'");
+  ASSERT_EQ(result.batches.size(), 1u);
+  const auto total_column =
+      std::static_pointer_cast<arrow::DoubleArray>(result.batches.front()->GetColumnByName("total"));
+  ASSERT_NE(total_column, nullptr);
+  EXPECT_DOUBLE_EQ(total_column->Value(0), 110.0);
+}
+
+TEST_F(QueryEngineExecuteTest, InDesugarsToEquivalentOrChain) {
+  const QueryResult result =
+      engine_.execute("SELECT COUNT(*) AS n FROM read_parquet('" + path_ + "') WHERE region IN ('A')");
+  ASSERT_EQ(result.batches.size(), 1u);
+  const auto n_column =
+      std::static_pointer_cast<arrow::Int64Array>(result.batches.front()->GetColumnByName("n"));
+  ASSERT_NE(n_column, nullptr);
+  EXPECT_EQ(n_column->Value(0), 3);
+}
+
+TEST_F(QueryEngineExecuteTest, CaseWithGroupByAliasBucketsRows) {
+  // amounts > 15: 20, 100 (2 rows); <= 15: 10, 5, 7, 3 (4 rows). "bucket"
+  // is not a base-table column -- GROUP BY only resolves it by matching
+  // this query's own SELECT-list alias for the CASE expression, and the
+  // CASE's own STRING literal branches ('high'/'low') must not be routed
+  // through cudf::ast::compute_column (it cannot produce STRING output at
+  // all, even for a pure literal) -- see docs/ARCHITECTURE.md.
+  const QueryResult result = engine_.execute(
+      "SELECT CASE WHEN amount > 15 THEN 'high' ELSE 'low' END AS bucket, COUNT(*) AS n FROM read_parquet('" +
+      path_ + "') GROUP BY bucket ORDER BY bucket");
+
+  ASSERT_EQ(result.rows_returned, 2);
+  ASSERT_EQ(result.batches.size(), 1u);
+  const std::shared_ptr<arrow::RecordBatch>& batch = result.batches.front();
+  const auto bucket_column = std::static_pointer_cast<arrow::StringArray>(batch->GetColumnByName("bucket"));
+  const auto n_column = std::static_pointer_cast<arrow::Int64Array>(batch->GetColumnByName("n"));
+  ASSERT_NE(bucket_column, nullptr);
+  ASSERT_NE(n_column, nullptr);
+
+  std::map<std::string, std::int64_t> counts_by_bucket;
+  for (std::int64_t i = 0; i < batch->num_rows(); ++i) {
+    counts_by_bucket[bucket_column->GetString(i)] = n_column->Value(i);
+  }
+  ASSERT_EQ(counts_by_bucket.size(), 2u);
+  EXPECT_EQ(counts_by_bucket.at("high"), 2);
+  EXPECT_EQ(counts_by_bucket.at("low"), 4);
+}
+
+TEST_F(QueryEngineExecuteTest, CastConvertsAmountToInteger) {
+  // Every amount in SetUp is already a whole number, so truncate-vs-round
+  // ambiguity (our CAST truncates; see docs/ARCHITECTURE.md for why this
+  // differs from DuckDB's rounding behavior) doesn't affect this result.
+  const QueryResult result = engine_.execute(
+      "SELECT CAST(amount AS BIGINT) AS amount_int FROM read_parquet('" + path_ + "') WHERE region = 'B'");
+  ASSERT_EQ(result.batches.size(), 1u);
+  const auto column =
+      std::static_pointer_cast<arrow::Int64Array>(result.batches.front()->GetColumnByName("amount_int"));
+  ASSERT_NE(column, nullptr);
+  std::vector<std::int64_t> values;
+  for (std::int64_t i = 0; i < result.batches.front()->num_rows(); ++i) values.push_back(column->Value(i));
+  std::sort(values.begin(), values.end());
+  EXPECT_EQ(values, (std::vector<std::int64_t>{3, 7, 100}));
 }
 
 }  // namespace

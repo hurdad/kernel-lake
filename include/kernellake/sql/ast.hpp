@@ -99,8 +99,44 @@ struct AstAggregate {
   AstExprPtr argument;  // null only for CountStar
 };
 
+// `value LIKE 'pattern'` ('%'/'_' wildcards) or `value NOT LIKE 'pattern'`.
+// `pattern` must bind to a string literal (see binder.cpp) -- a per-row
+// pattern column is not supported.
+struct AstLike {
+  AstExprPtr value;
+  AstExprPtr pattern;
+  bool negated = false;
+};
+
+// `value IN (list...)` or `value NOT IN (list...)`. Desugars at bind time
+// into a chain of `=`/`<>` comparisons combined with OR/AND -- see
+// binder.cpp -- rather than needing its own Expression/GPU-operator
+// support.
+struct AstIn {
+  AstExprPtr value;
+  std::vector<AstExprPtr> list;
+  bool negated = false;
+};
+
+// `CASE WHEN c1 THEN r1 [WHEN c2 THEN r2 ...] [ELSE re] END`.
+// `else_branch` is null for a CASE with no ELSE (result is NULL when no
+// WHEN condition matches).
+struct AstCase {
+  std::vector<std::pair<AstExprPtr, AstExprPtr>> when_then;
+  AstExprPtr else_branch;
+};
+
+// `CAST(operand AS type_name)`. `type_name` is resolved against
+// KernelLake's DataType names by the binder, not here.
+struct AstCast {
+  AstExprPtr operand;
+  std::string type_name;
+};
+
 struct AstExpr {
-  std::variant<AstColumnRef, AstStar, AstLiteral, AstBinary, AstUnary, AstBetween, AstAggregate> node;
+  std::variant<AstColumnRef, AstStar, AstLiteral, AstBinary, AstUnary, AstBetween, AstAggregate, AstLike,
+               AstIn, AstCase, AstCast>
+      node;
   std::optional<std::string> alias;
 };
 

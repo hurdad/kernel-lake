@@ -172,8 +172,18 @@ void collect_columns(const ExpressionPtr& expr, std::unordered_set<std::string>&
     collect_columns(cast->operand(), out);
   } else if (const auto* aggregate = dynamic_cast<const AggregateExpression*>(expr.get())) {
     collect_columns(aggregate->argument(), out);
+  } else if (const auto* like = dynamic_cast<const LikeExpression*>(expr.get())) {
+    collect_columns(like->value(), out);
+  } else if (const auto* case_expr = dynamic_cast<const CaseExpression*>(expr.get())) {
+    for (const CaseExpression::WhenThen& branch : case_expr->when_then()) {
+      collect_columns(branch.condition, out);
+      collect_columns(branch.result, out);
+    }
+    collect_columns(case_expr->else_branch(), out);
   }
-  // LiteralExpression: nothing to collect.
+  // LiteralExpression: nothing to collect. AstIn desugars into
+  // BinaryExpression at bind time (see binder.cpp), so it needs no case
+  // here.
 }
 
 // Unwraps CastExpression to find the underlying column/literal, for
