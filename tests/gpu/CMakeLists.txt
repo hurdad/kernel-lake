@@ -15,6 +15,7 @@ add_executable(kernellake_gpu_tests
   parquet_scan_operator_test.cpp
   limit_operator_test.cpp
   query_engine_execute_test.cpp
+  multi_batch_integration_test.cpp
 )
 
 target_link_libraries(kernellake_gpu_tests PRIVATE

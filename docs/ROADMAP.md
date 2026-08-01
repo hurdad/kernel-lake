@@ -109,12 +109,18 @@ and covered by passing tests -- not merely designed or stubbed.
   disk may be tight (the workflow frees some runner disk first and notes
   the fallback if that's not enough)
 
+- `tests/gpu/multi_batch_integration_test.cpp`: dictionary-encoded vs. plain
+  string columns, two files with deliberately mismatched row-group layouts
+  (3 row groups of 100 rows vs. 1 row group of 250 rows), and a forced
+  multi-pass `ParquetScanOperator` (a 256-byte `pass_read_limit_bytes`
+  against ~550 rows' worth of data) -- one test proves the scan genuinely
+  emits more than 2 batches under these settings (not just 1-per-file),
+  another runs the real `build_physical_plan` + `build_operator_tree`
+  pipeline (the same one `QueryEngine::execute()` uses) end-to-end across
+  those same conditions and checks the grouped sums/counts by hand
+
 ## Not yet started
 
-- Broader integration-test coverage beyond `tools/validate_against_duckdb.py`
-  (dictionary-encoded strings, multiple files with mismatched row-group
-  layouts, larger-than-single-execution-batch datasets exercised under
-  test rather than only manually)
 - TPC-H `execution-only` benchmark mode (needs an operator-tree entry point
   that skips `ParquetScanOperator`); TPC-H at real SF1/SF10 scale (only
   tested at SF0.01/SF0.1 so far); Q3/Q12/Q14 (need hash joins)
