@@ -1,0 +1,90 @@
+#!/usr/bin/env python3
+"""Validate KernelLake's TPC-H-derived queries (benchmarks/tpch/queries/) against DuckDB.
+
+Unofficial TPC-H-derived benchmark. Not a certified TPC result.
+
+Mirrors the spec's `kernellake validate tpch` CLI surface as a Python tool
+rather than a C++ subcommand, matching the choice already made for
+validate_against_duckdb.py: embedding libduckdb directly into the
+KernelLake binary is a real option (see docs/architecture.md) but hasn't
+been done, so DuckDB cross-validation lives here instead.
+
+Usage:
+    python3 tools/validate_tpch.py \
+        --kernellake build/gpu-dev/src/cli/kernellake \
+        --data '/tmp/kernellake-tpch-sf1/*.parquet' \
+        --query 6
+    python3 tools/validate_tpch.py --kernellake ... --data ... --query all
+"""
+
+import argparse
+import re
+import sys
+from pathlib import Path
+
+from duckdb_compare import normalize, rows_match, run_duckdb, run_kernellake
+
+QUERIES_DIR = Path(__file__).resolve().parent.parent / "benchmarks" / "tpch" / "queries"
+
+
+def load_query(query_number: int, data_glob: str) -> str:
+    path = QUERIES_DIR / f"q{query_number:02d}.sql"
+    if not path.exists():
+        raise FileNotFoundError(f"no query file for Q{query_number}: {path}")
+    text = path.read_text()
+    text = re.sub(r"--[^\n]*\n", "\n", text)  # strip line comments
+    return text.replace("{data}", data_glob).strip()
+
+
+def validate_one(kernellake_bin: str, query_number: int, data_glob: str) -> bool:
+    sql = load_query(query_number, data_glob)
+    print(f"--- Q{query_number}: {sql.splitlines()[0]}...")
+    try:
+        kernellake_rows = normalize(run_kernellake(kernellake_bin, sql))
+        duckdb_rows = normalize(run_duckdb(sql))
+    except Exception as exc:  # noqa: BLE001 -- report and let the caller count it as a failure
+        print(f"    ERROR: {exc}")
+        return False
+
+    if rows_match(kernellake_rows, duckdb_rows):
+        print(f"    PASS ({len(kernellake_rows)} rows)")
+        return True
+
+    print(f"    FAIL: kernellake={len(kernellake_rows)} rows, duckdb={len(duckdb_rows)} rows")
+    print(f"    kernellake sample: {kernellake_rows[:3]}")
+    print(f"    duckdb sample:     {duckdb_rows[:3]}")
+    return False
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--kernellake", required=True, help="Path to the kernellake CLI binary")
+    parser.add_argument("--data", required=True, help="Parquet glob passed to read_parquet(...)")
+    parser.add_argument("--scale-factor", type=float, default=None, help="Informational only, for the report")
+    parser.add_argument("--query", required=True, help="Query number (e.g. 6) or 'all'")
+    parser.add_argument("--baseline", default="duckdb", choices=["duckdb"])
+    args = parser.parse_args()
+
+    available = sorted(int(p.stem[1:]) for p in QUERIES_DIR.glob("q*.sql"))
+    query_numbers = available if args.query == "all" else [int(args.query)]
+
+    print("Unofficial TPC-H-derived benchmark. Not a certified TPC result.")
+    if args.scale_factor is not None:
+        print(f"scale_factor={args.scale_factor}")
+    print()
+
+    failures = 0
+    for query_number in query_numbers:
+        if not validate_one(args.kernellake, query_number, args.data):
+            failures += 1
+
+    print()
+    if failures:
+        print(f"{failures}/{len(query_numbers)} TPC-H queries FAILED to match {args.baseline}")
+        return 1
+    print(f"all {len(query_numbers)} TPC-H queries matched {args.baseline}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -30,9 +30,12 @@ void print_usage() {
       "         [--region-cardinality <n>] [--category-cardinality <n>]\n"
       "         [--customer-cardinality <n>] [--null-rate <0..1>] [--skew <n>]\n"
       "         [--seed <n>] [--no-dictionary-encoding]\n"
+      "  benchmark tpch --data <glob> --query <n> --mode cold|warm\n"
+      "         [--scale-factor <n>] [--iterations <n>] [--warmup-iterations <n>]\n"
+      "         [--query-file <path>] [--output <path.json>]\n"
       "\n"
-      "Commands not yet implemented (added incrementally as their execution path lands):\n"
-      "  benchmark, validate\n");
+      "TPC-H validation (`kernellake validate tpch` in the spec) is a Python tool, not a\n"
+      "CLI subcommand -- see tools/validate_tpch.py.\n");
 }
 
 }  // namespace
@@ -99,6 +102,10 @@ int main(int argc, char** argv) {
   }
   if (command == "generate-data") {
     return kernellake::cli::run_generate_data(command_args);
+  }
+  if (command == "benchmark" && !command_args.empty() && command_args[0] == "tpch") {
+    return kernellake::cli::run_benchmark_tpch(
+        std::vector<std::string_view>(command_args.begin() + 1, command_args.end()), config);
   }
 
   std::fprintf(stderr, "kernellake: command '%.*s' is not yet implemented\n",

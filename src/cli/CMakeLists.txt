@@ -5,6 +5,7 @@ add_executable(kernellake
   query_command.cpp
   result_formatter.cpp
   generate_data_command.cpp
+  benchmark_tpch_command.cpp
 )
 
 target_link_libraries(kernellake PRIVATE
@@ -14,4 +15,5 @@ target_link_libraries(kernellake PRIVATE
   kernellake_api
   kernellake_generator
   Arrow::arrow_static
+  nlohmann_json::nlohmann_json
 )

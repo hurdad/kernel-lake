@@ -174,6 +174,15 @@ covering filtered projection, scalar aggregates (SUM/COUNT/AVG/MIN/MAX),
 grouped aggregates (including a ~40,000-group `GROUP BY customer_id`), and
 `COUNT` over a nullable column -- all matched DuckDB exactly.
 
+## TPC-H-derived benchmarking (unofficial)
+
+**Unofficial TPC-H-derived benchmark. Not a certified TPC result.** Q6 and
+Q1 (both `lineitem`-only, no joins) are supported; see
+[docs/tpch.md](docs/tpch.md) for the full generate -> query -> validate ->
+benchmark workflow, including `tools/generate_tpch.py` (a synthetic
+generator, not the official `dbgen`) and `kernellake benchmark tpch`'s
+cold/warm timing modes.
+
 ## Project layout
 
 ```
@@ -182,7 +191,8 @@ src/<module>/                  implementation, mirrors include/
 tests/unit/                    GoogleTest unit tests (CPU-only, both presets)
 tests/gpu/                     GoogleTest GPU tests (gpu-dev preset only)
 tools/                         Python tooling (DuckDB cross-validation, TPC-H generation)
-docs/                          architecture.md, roadmap.md
+benchmarks/tpch/queries/       Version-controlled TPC-H-derived SQL (q01.sql, q06.sql)
+docs/                          architecture.md, roadmap.md, tpch.md
 config/kernellake.yaml         default engine configuration
 ```
 

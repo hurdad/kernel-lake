@@ -19,4 +19,6 @@ int run_query(const std::vector<std::string_view>& args, const EngineConfig& con
 
 int run_generate_data(const std::vector<std::string_view>& args);
 
+int run_benchmark_tpch(const std::vector<std::string_view>& args, const EngineConfig& config);
+
 }  // namespace kernellake::cli

@@ -59,15 +59,26 @@ and covered by passing tests -- not merely designed or stubbed.
   aggregates (including high-cardinality `GROUP BY`), and `COUNT` over a
   nullable column
 
+- TPC-H tooling (`lineitem`-only -- Q6 and Q1, both single-table; Q3/Q12/Q14
+  need hash joins, not implemented yet): `tools/generate_tpch.py` (synthetic
+  generator, not real `dbgen`), `benchmarks/tpch/queries/{q01,q06}.sql`,
+  `tools/validate_tpch.py` (DuckDB cross-validation; the spec's `kernellake
+  validate tpch` as a Python tool rather than a CLI subcommand, same choice
+  as `validate_against_duckdb.py`), and `kernellake benchmark tpch`
+  (cold/warm modes with median/mean/min/max/stddev over configurable
+  iterations; `execution-only` mode is not implemented -- see
+  `docs/tpch.md`). Verified: Q1 and Q6 both match DuckDB at SF0.01 and
+  SF0.1.
+
 ## Not yet started
 
 - Broader integration-test coverage beyond `tools/validate_against_duckdb.py`
   (dictionary-encoded strings, multiple files with mismatched row-group
   layouts, larger-than-single-execution-batch datasets exercised under
   test rather than only manually)
-- TPC-H tooling: `tools/generate_tpch.py`, `benchmarks/tpch/queries/*.sql`,
-  `kernellake validate tpch`, `kernellake benchmark tpch` (Q6 first, then
-  Q1)
+- TPC-H `execution-only` benchmark mode (needs an operator-tree entry point
+  that skips `ParquetScanOperator`); TPC-H at real SF1/SF10 scale (only
+  tested at SF0.01/SF0.1 so far); Q3/Q12/Q14 (need hash joins)
 - Docker images (`docker/Dockerfile.dev`, `docker/Dockerfile.runtime`)
 - GitHub Actions CI (CPU-safe checks split from CUDA compile checks and GPU
   runtime tests)
