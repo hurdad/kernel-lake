@@ -183,6 +183,26 @@ benchmark workflow, including `tools/generate_tpch.py` (a synthetic
 generator, not the official `dbgen`) and `kernellake benchmark tpch`'s
 cold/warm timing modes.
 
+## Docker
+
+`docker/Dockerfile` is a single multi-stage file with two named targets:
+`dev` (full CUDA devel image, repo built inside it) and `runtime` (only the
+built binary plus its actual runtime dependency closure).
+
+```bash
+docker build --target dev     -f docker/Dockerfile -t kernellake/kernellake:dev .
+docker build --target runtime -f docker/Dockerfile -t kernellake/kernellake:runtime .
+docker run --rm --gpus all -v /tmp/kernellake-sales:/data:ro \
+  kernellake/kernellake:runtime query --sql "SELECT region, SUM(amount) FROM read_parquet('/data/*.parquet') GROUP BY region"
+```
+
+`.github/workflows/docker-publish.yml` builds and pushes both targets to
+`ghcr.io/<owner>/<repo>:dev` and `:runtime`/`:latest` on every push to
+`main`. Neither the Dockerfile nor that workflow has been exercised by an
+actual `docker build`/Actions run in this repository's own development
+environment (Docker wasn't available there) -- see
+[docs/ROADMAP.md](docs/ROADMAP.md).
+
 ## Project layout
 
 ```

@@ -1,0 +1,80 @@
+# Builds docker/Dockerfile's `dev` and `runtime` targets and publishes
+# both to the GitHub Container Registry (ghcr.io) using the repository's
+# own GITHUB_TOKEN -- no extra registry secrets needed.
+#
+# Building does NOT need a GPU (nvcc compiles without one; only `docker run
+# --gpus all` at use time does), so this runs on a standard GitHub-hosted
+# runner. It has NOT been exercised by an actual Actions run in this
+# repository's development environment (no way to trigger one from there --
+# see docs/ROADMAP.md), and CUDA devel-based images are large: hosted
+# runners' default ~14 GB free disk may be tight once the base image,
+# Arrow/Parquet, and the RAPIDS wheels vendored by
+# cmake/ThirdPartyRapids.cmake are all pulled in. If this run fails on
+# disk space, free more of it before the build step (removing the
+# runner's pre-installed .NET/Android SDKs is the usual fix) or switch to
+# a larger runner.
+#
+# Only runs on push to main (not pull_request -- forked PRs can't get
+# packages:write on GITHUB_TOKEN anyway, and untrusted PR builds shouldn't
+# publish images), plus manual triggering.
+name: Docker publish
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+jobs:
+  docker-publish:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free up runner disk space
+        run: |
+          # CUDA devel images plus vendored RAPIDS wheels are large;
+          # reclaim space from pre-installed toolchains this build never
+          # touches (a common workaround for GitHub-hosted runners' fixed
+          # disk size).
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache
+          docker system prune -af
+
+      - name: Compute lowercase image name
+        id: image
+        run: echo "name=ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push dev image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          target: dev
+          push: true
+          tags: ${{ steps.image.outputs.name }}:dev
+          cache-from: type=gha,scope=dev
+          cache-to: type=gha,mode=max,scope=dev
+
+      - name: Build and push runtime image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          target: runtime
+          push: true
+          tags: |
+            ${{ steps.image.outputs.name }}:runtime
+            ${{ steps.image.outputs.name }}:latest
+          cache-from: type=gha,scope=runtime
+          cache-to: type=gha,mode=max,scope=runtime

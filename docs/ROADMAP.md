@@ -100,6 +100,14 @@ and covered by passing tests -- not merely designed or stubbed.
   standard GitHub-hosted runners have no GPU, and a skipped-GPU job must
   never be reported as passing; that needs a self-hosted GPU runner, not
   configured here
+- `.github/workflows/docker-publish.yml`: builds both `docker/Dockerfile`
+  targets and pushes them to `ghcr.io/<owner>/<repo>:dev` and `:runtime`/
+  `:latest` on push to `main`, using `GITHUB_TOKEN` (no extra registry
+  secrets). Building doesn't need a GPU, so this runs on a standard
+  hosted runner -- but it has not been exercised by an actual Actions run,
+  and CUDA devel images are large enough that hosted runners' default
+  disk may be tight (the workflow frees some runner disk first and notes
+  the fallback if that's not enough)
 
 ## Not yet started
 
