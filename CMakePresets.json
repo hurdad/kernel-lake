@@ -1,0 +1,69 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": { "major": 3, "minor": 26, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+      }
+    },
+    {
+      "name": "dev",
+      "displayName": "Development (CPU, debug)",
+      "inherits": "base",
+      "description": "CPU-only debug build: SQL/planner/optimizer/storage/Parquet metadata path without CUDA/libcudf.",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "KERNELLAKE_WITH_CUDA": "OFF",
+        "KERNELLAKE_BUILD_TESTS": "ON",
+        "KERNELLAKE_BUILD_BENCHMARKS": "ON"
+      }
+    },
+    {
+      "name": "release",
+      "displayName": "Release (CPU)",
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "KERNELLAKE_WITH_CUDA": "OFF",
+        "KERNELLAKE_BUILD_TESTS": "ON",
+        "KERNELLAKE_BUILD_BENCHMARKS": "ON"
+      }
+    },
+    {
+      "name": "gpu-dev",
+      "displayName": "Development (GPU, debug)",
+      "inherits": "base",
+      "description": "Enables CUDA + libcudf + RMM. Requires the CUDA toolkit and a RAPIDS libcudf/RMM install.",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "KERNELLAKE_WITH_CUDA": "ON",
+        "KERNELLAKE_BUILD_TESTS": "ON",
+        "KERNELLAKE_BUILD_BENCHMARKS": "ON",
+        "CMAKE_CUDA_COMPILER": "/usr/local/cuda/bin/nvcc"
+      }
+    }
+  ],
+  "buildPresets": [
+    { "name": "dev", "configurePreset": "dev" },
+    { "name": "release", "configurePreset": "release" },
+    { "name": "gpu-dev", "configurePreset": "gpu-dev" }
+  ],
+  "testPresets": [
+    {
+      "name": "dev",
+      "configurePreset": "dev",
+      "output": { "outputOnFailure": true },
+      "execution": { "noTestsAction": "error", "stopOnFailure": false }
+    },
+    {
+      "name": "release",
+      "configurePreset": "release",
+      "output": { "outputOnFailure": true }
+    }
+  ]
+}

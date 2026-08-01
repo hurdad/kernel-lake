@@ -1,0 +1,29 @@
+engine:
+  device_id: 0
+  batch_rows: 1000000
+  result_batch_rows: 65536
+  query_memory_limit_bytes: 8589934592
+
+memory:
+  pool_initial_bytes: 1073741824
+  pool_max_bytes: 8589934592
+  use_async_allocator: true
+
+storage:
+  local_root: /
+  enable_s3: false
+
+logging:
+  level: info
+  json: false
+
+profiling:
+  nvtx: true
+  operator_metrics: true
+
+benchmark:
+  default_iterations: 5
+  warmup_iterations: 1
+  output_format: json
+  verify_results: true
+  baseline: duckdb
