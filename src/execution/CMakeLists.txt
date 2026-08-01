@@ -2,6 +2,7 @@
 add_library(kernellake_execution STATIC
   cuda_utils.cpp
   device_batch.cpp
+  arrow_bridge.cpp
 )
 
 target_include_directories(kernellake_execution PUBLIC
@@ -16,4 +17,5 @@ target_link_libraries(kernellake_execution PUBLIC
   CUDA::cudart
   rmm::rmm
   cudf::cudf
+  Arrow::arrow_static
 )

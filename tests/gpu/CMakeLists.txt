@@ -7,6 +7,7 @@ add_executable(kernellake_gpu_tests
   rmm_environment_test.cpp
   cuda_utils_test.cpp
   device_batch_test.cpp
+  arrow_bridge_test.cpp
 )
 
 target_link_libraries(kernellake_gpu_tests PRIVATE
