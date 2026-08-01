@@ -8,6 +8,7 @@ add_library(kernellake_execution STATIC
   filter_operator.cpp
   projection_operator.cpp
   scalar_aggregate_operator.cpp
+  hash_aggregate_operator.cpp
 )
 
 target_include_directories(kernellake_execution PUBLIC
