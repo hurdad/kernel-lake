@@ -12,6 +12,7 @@ add_executable(kernellake_unit_tests
   parquet_metadata_test.cpp
   physical_planner_test.cpp
   query_engine_test.cpp
+  sample_data_generator_test.cpp
 )
 
 target_link_libraries(kernellake_unit_tests PRIVATE
@@ -24,6 +25,7 @@ target_link_libraries(kernellake_unit_tests PRIVATE
   kernellake_storage
   kernellake_io
   kernellake_api
+  kernellake_generator
   GTest::gtest
   GTest::gtest_main
 )

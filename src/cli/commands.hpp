@@ -17,4 +17,6 @@ int run_explain(const std::vector<std::string_view>& args, const EngineConfig& c
 
 int run_query(const std::vector<std::string_view>& args, const EngineConfig& config);
 
+int run_generate_data(const std::vector<std::string_view>& args);
+
 }  // namespace kernellake::cli

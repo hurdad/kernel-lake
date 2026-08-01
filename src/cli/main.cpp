@@ -26,9 +26,13 @@ void print_usage() {
       "  explain --sql <sql> [--format text|json] [--logical]\n"
       "  query (--sql <sql> | --file <path>) [--format table|csv|jsonl|arrow]\n"
       "         [--output <path>] [--stats]\n"
+      "  generate-data --output <dir> --rows <n> [--files <n>] [--row-group-rows <n>]\n"
+      "         [--region-cardinality <n>] [--category-cardinality <n>]\n"
+      "         [--customer-cardinality <n>] [--null-rate <0..1>] [--skew <n>]\n"
+      "         [--seed <n>] [--no-dictionary-encoding]\n"
       "\n"
       "Commands not yet implemented (added incrementally as their execution path lands):\n"
-      "  generate-data, benchmark, validate\n");
+      "  benchmark, validate\n");
 }
 
 }  // namespace
@@ -92,6 +96,9 @@ int main(int argc, char** argv) {
   }
   if (command == "query") {
     return kernellake::cli::run_query(command_args, config);
+  }
+  if (command == "generate-data") {
+    return kernellake::cli::run_generate_data(command_args);
   }
 
   std::fprintf(stderr, "kernellake: command '%.*s' is not yet implemented\n",
