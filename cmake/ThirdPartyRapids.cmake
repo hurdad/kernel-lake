@@ -100,13 +100,30 @@ find_package(rmm CONFIG REQUIRED)
 find_package(kvikio CONFIG REQUIRED)
 find_package(cudf CONFIG REQUIRED)
 
-# libnvcomp.so.5 has no CMake package of its own; append its directory to
-# cudf::cudf's own link/runtime search path so every target that links
-# cudf::cudf resolves and finds it automatically, without each of
-# KernelLake's own targets having to repeat this workaround.
-set(_kernellake_nvcomp_lib_dir
-    "${nvidia_libnvcomp_cu12_SOURCE_DIR}/nvidia/libnvcomp/lib64")
-set_property(TARGET cudf::cudf APPEND PROPERTY
-             INTERFACE_LINK_DIRECTORIES "${_kernellake_nvcomp_lib_dir}")
-set_property(TARGET cudf::cudf APPEND PROPERTY
-             INTERFACE_LINK_OPTIONS "-Wl,-rpath,${_kernellake_nvcomp_lib_dir}")
+# libcudf.so has two undeclared transitive shared-library dependencies,
+# libnvcomp.so.5 and libkvikio.so, that are awkward to resolve from the
+# consuming executable's side: libcudf.so carries its own DT_RUNPATH
+# ("$ORIGIN", i.e. only its own directory), and per ELF/ld.so semantics an
+# object with its own DT_RUNPATH resolves *its* NEEDED entries using that
+# runpath (plus LD_LIBRARY_PATH / ld.so.cache / default paths) -- never the
+# loading executable's rpath. Making them direct link dependencies of a
+# consumer doesn't reliably help either: the linker's --as-needed
+# optimization (default on this toolchain) drops libkvikio.so again since
+# nothing in KernelLake calls its symbols directly.
+#
+# The robust fix, independent of any consumer's link flags: symlink both
+# libraries directly into libcudf.so's own directory, so its "$ORIGIN"
+# runpath finds them without any help from whoever links cudf::cudf.
+# (librmm.so and librapids_logger.so don't need this treatment -- our own
+# targets link them directly and unconditionally use their symbols, so
+# --as-needed keeps them and they're already loaded by the time libcudf.so
+# needs them.)
+set(_kernellake_cudf_lib_dir "${libcudf_cu12_SOURCE_DIR}/libcudf/lib64")
+file(CREATE_LINK
+     "${nvidia_libnvcomp_cu12_SOURCE_DIR}/nvidia/libnvcomp/lib64/libnvcomp.so.5"
+     "${_kernellake_cudf_lib_dir}/libnvcomp.so.5"
+     SYMBOLIC)
+file(CREATE_LINK
+     "${libkvikio_cu12_SOURCE_DIR}/libkvikio/lib64/libkvikio.so"
+     "${_kernellake_cudf_lib_dir}/libkvikio.so"
+     SYMBOLIC)

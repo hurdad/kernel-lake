@@ -6,10 +6,12 @@
 add_executable(kernellake_gpu_tests
   rmm_environment_test.cpp
   cuda_utils_test.cpp
+  device_batch_test.cpp
 )
 
 target_link_libraries(kernellake_gpu_tests PRIVATE
   kernellake_common
+  kernellake_types
   kernellake_memory
   kernellake_execution
   GTest::gtest
