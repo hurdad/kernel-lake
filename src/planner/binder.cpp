@@ -439,8 +439,33 @@ BoundQuery bind_query(const sql::AstSelectStatement& stmt, const Schema& input_s
   }
 
   for (const sql::AstOrderByItem& item : stmt.order_by) {
-    result.order_by.push_back(
-        BoundOrderByItem{binder.bind(item.expr, /*allow_aggregates=*/true), item.ascending});
+    if (is_aggregate_query) {
+      // Binding against the base-table schema (like the non-aggregate case
+      // below) can't work here: GROUP BY/aggregate queries can ORDER BY an
+      // aggregate alias ("ORDER BY total") that doesn't exist as a column
+      // until after aggregation. Scoped deliberately to plain references to
+      // an existing SELECT-list output name (by far the common case, and
+      // exactly what the physical Sort operator receives, since it runs
+      // after the final projection) rather than arbitrary re-derived
+      // expressions -- see docs/ARCHITECTURE.md.
+      const auto* column = std::get_if<AstColumnRef>(&item.expr->node);
+      if (column == nullptr) {
+        throw BindingError(
+            "ORDER BY after GROUP BY only supports a plain SELECT-list output name in this "
+            "version of KernelLake");
+      }
+      const std::optional<std::size_t> index = result.output_schema.find_field(column->name);
+      if (!index) {
+        throw BindingError("ORDER BY after GROUP BY: '" + column->name +
+                           "' is not one of this query's output columns");
+      }
+      const Field& field = result.output_schema.field(*index);
+      result.order_by.push_back(BoundOrderByItem{
+          std::make_shared<ColumnExpression>(field.name, *index, field.type), item.ascending});
+    } else {
+      result.order_by.push_back(
+          BoundOrderByItem{binder.bind(item.expr, /*allow_aggregates=*/true), item.ascending});
+    }
   }
 
   result.limit = stmt.limit;

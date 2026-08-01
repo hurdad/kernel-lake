@@ -129,9 +129,25 @@ PhysicalPlanPtr convert(const LogicalPlanPtr& node, ObjectStore& store) {
   }
   if (const auto* projection = dynamic_cast<const LogicalProjection*>(node.get())) {
     PhysicalPlanPtr child = convert(projection->child(), store);
-    const Schema* scan_schema = find_scan_schema(*child);
-    std::vector<NamedExpression> items =
-        scan_schema ? remap_named(projection->items(), *scan_schema) : projection->items();
+    // A LogicalProjection is the one node with two structurally different
+    // roles: the non-aggregate path's final projection, sitting directly
+    // on LogicalFilter/LogicalScan with items that reference the
+    // base-table schema (needs remapping, same as a Filter predicate); and
+    // the aggregate path's reprojection, sitting directly on
+    // LogicalAggregate with items that already reference *that* node's
+    // own output schema one-for-one (e.g. an AggregateExpression alias
+    // like "total" -- remapping that against the scan would fail, since
+    // "total" was never a scanned column). Only the first case needs
+    // remapping -- see the near-identical LogicalSort discriminator below
+    // for why this checks positively for Filter/Scan rather than
+    // negatively for "not Aggregate".
+    const bool items_reference_scan_schema =
+        dynamic_cast<const LogicalFilter*>(projection->child().get()) != nullptr ||
+        dynamic_cast<const LogicalScan*>(projection->child().get()) != nullptr;
+    std::vector<NamedExpression> items = projection->items();
+    if (items_reference_scan_schema) {
+      if (const Schema* scan_schema = find_scan_schema(*child)) items = remap_named(items, *scan_schema);
+    }
     return std::make_shared<ProjectionNode>(std::move(child), std::move(items));
   }
   if (const auto* aggregate = dynamic_cast<const LogicalAggregate*>(node.get())) {
@@ -146,10 +162,35 @@ PhysicalPlanPtr convert(const LogicalPlanPtr& node, ObjectStore& store) {
         scan_schema ? remap_named(aggregate->group_by(), *scan_schema) : aggregate->group_by();
     return std::make_shared<HashAggregateNode>(std::move(child), std::move(group_by), std::move(aggregates));
   }
-  if (dynamic_cast<const LogicalSort*>(node.get()) != nullptr) {
-    throw PlanningError(
-        "ORDER BY has no physical execution path yet (Sort is a prepared interface only "
-        "pending a physical sort operator)");
+  if (const auto* sort = dynamic_cast<const LogicalSort*>(node.get())) {
+    PhysicalPlanPtr child = convert(sort->child(), store);
+    std::vector<LogicalSort::Key> keys = sort->keys();
+    // logical_planner.cpp places a non-aggregate ORDER BY's Sort directly
+    // on the scan/filter chain -- its child is *always* exactly a
+    // LogicalFilter or LogicalScan, by construction -- with keys that
+    // reference the base-table schema, same as a Filter predicate. An
+    // aggregate query's Sort sits above the aggregate's output instead,
+    // with keys already referencing that output schema one-for-one (see
+    // binder.cpp's ORDER BY handling), needing no remap.
+    //
+    // Checking for "child is LogicalFilter/LogicalScan" (a positive match
+    // on the one case that needs remapping) rather than "child is not
+    // LogicalProjection" (a negative match on the other case) matters: the
+    // optimizer's redundant-projection-removal rule can delete the
+    // aggregate-path's LogicalProjection when the SELECT list already
+    // matches the aggregate's natural column order, leaving Sort sitting
+    // directly on LogicalAggregate -- a LogicalProjection child is not a
+    // reliable "aggregate path" signal, but LogicalFilter/LogicalScan *is*
+    // a reliable "non-aggregate path" signal.
+    const bool keys_reference_scan_schema =
+        dynamic_cast<const LogicalFilter*>(sort->child().get()) != nullptr ||
+        dynamic_cast<const LogicalScan*>(sort->child().get()) != nullptr;
+    if (keys_reference_scan_schema) {
+      if (const Schema* scan_schema = find_scan_schema(*child)) {
+        for (LogicalSort::Key& key : keys) key.expr = remap_columns(key.expr, *scan_schema);
+      }
+    }
+    return std::make_shared<SortNode>(std::move(child), std::move(keys));
   }
   if (const auto* limit = dynamic_cast<const LogicalLimit*>(node.get())) {
     return std::make_shared<LimitNode>(convert(limit->child(), store), limit->limit());

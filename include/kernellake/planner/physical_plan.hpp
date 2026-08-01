@@ -169,6 +169,30 @@ class ScalarAggregateNode final : public PhysicalPlanNode {
   Schema schema_;
 };
 
+class SortNode final : public PhysicalPlanNode {
+ public:
+  SortNode(PhysicalPlanPtr child, std::vector<LogicalSort::Key> keys)
+      : child_(std::move(child)), keys_(std::move(keys)) {}
+
+  [[nodiscard]] const PhysicalPlanPtr& child() const noexcept { return child_; }
+  [[nodiscard]] const std::vector<LogicalSort::Key>& keys() const noexcept { return keys_; }
+  [[nodiscard]] const Schema& output_schema() const override { return child_->output_schema(); }
+  [[nodiscard]] std::string_view node_name() const noexcept override { return "Sort"; }
+  [[nodiscard]] std::vector<PhysicalPlanPtr> children() const override { return {child_}; }
+  [[nodiscard]] std::vector<std::pair<std::string, std::string>> explain_attributes() const override {
+    std::string rendered;
+    for (std::size_t i = 0; i < keys_.size(); ++i) {
+      if (i > 0) rendered += ", ";
+      rendered += keys_[i].expr->to_string() + (keys_[i].ascending ? " ASC" : " DESC");
+    }
+    return {{"order_by", rendered}};
+  }
+
+ private:
+  PhysicalPlanPtr child_;
+  std::vector<LogicalSort::Key> keys_;
+};
+
 class LimitNode final : public PhysicalPlanNode {
  public:
   LimitNode(PhysicalPlanPtr child, std::int64_t limit) : child_(std::move(child)), limit_(limit) {}

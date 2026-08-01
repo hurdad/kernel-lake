@@ -82,11 +82,17 @@ Not yet supported (fails clearly rather than being silently reinterpreted):
 subqueries, `OFFSET`, `LIKE`/`IN`/`CASE`/`CAST` expressions, window
 functions, and any function other than the five aggregates above.
 
-`ORDER BY` after `GROUP BY` is parsed and bound but rejected at physical
-planning time (`PlanningError`): sorting the grouped output would require
-binding `ORDER BY` against the post-aggregation schema (including SELECT
-aliases), which is not yet implemented. `ORDER BY` on a non-aggregate query
-works normally.
+`ORDER BY` executes for real via `SortOperator` (`cudf::stable_sorted_order`
++ `cudf::gather`, blocking -- it consumes the whole input before producing
+its one output batch, so its memory footprint is the whole result set, not
+bounded like the streaming operators). On a non-aggregate query it can
+reference any column, bound against the base-table schema. After `GROUP
+BY` it is scoped to a plain SELECT-list output name (e.g. `ORDER BY total`)
+-- resolved against the query's final output schema rather than the base
+table, since an aggregate alias doesn't exist as a column until after
+aggregation -- not an arbitrary re-derived expression; `ORDER BY
+<expression not in the SELECT list>` after `GROUP BY` fails with a clear
+`BindingError` rather than being silently reinterpreted.
 
 ## Logical plan and the optimizer
 
@@ -173,6 +179,7 @@ with the `dev` CMake preset alone.
 | `ScalarAggregateOperator` | No `GROUP BY`: `cudf::reduce` with its `init` parameter folds each batch into a running scalar (SUM/MIN/MAX/AVG numerator); COUNT/AVG's denominator is a host-side counter. Empty input produces NULL, not zero, except `COUNT(*)`/`COUNT(x)` which produce 0. |
 | `HashAggregateOperator` | `GROUP BY`: `cudf::groupby::streaming_groupby` accumulates partial groups across batches within `max_distinct_keys` (default 10M), `finalize()`d on last `next()` |
 | `LimitOperator` | `cudf::slice` + the `cudf::table` copy constructor to truncate the final batch |
+| `SortOperator` | `ORDER BY`: **blocking**, unlike every operator above -- consumes `child` to exhaustion, concatenates every batch (`cudf::concatenate`) into one table, then `cudf::stable_sorted_order` + `cudf::gather`. Memory footprint is the whole result set, not bounded like the streaming operators. |
 | `ArrowResultOperator` | Trivial passthrough; the actual `DeviceBatch` -> `arrow::RecordBatch` conversion happens in `QueryEngine::execute()` via `to_arrow_record_batch()`, since `PhysicalOperator::next()` must return a `DeviceBatch` |
 
 Two correctness details worth knowing if you touch these operators:
@@ -202,6 +209,26 @@ Two correctness details worth knowing if you touch these operators:
   `finalize()` so the output `DeviceBatch`'s actual column types match its
   declared schema. `ScalarAggregateOperator` doesn't need this -- `cudf::reduce`
   honors the requested output type for `COUNT`.
+- **`LogicalProjection`/`LogicalSort` conversion must not always remap
+  against the scan.** Most physical nodes (`Filter`, `Aggregate`) sit at a
+  fixed structural position, always directly above the scan, so their
+  expressions always reference the base-table schema and always need
+  `remap_columns()`. `Projection` and `Sort` are different: each can sit
+  either directly on `Filter`/`Scan` (references the base-table schema,
+  needs remapping) *or* directly on `Aggregate` (its reprojection's/sort
+  key's expressions already reference the aggregate's own output schema
+  one-for-one, and remapping them against the scan fails outright, since
+  an aggregate alias like `total` was never a real scanned column).
+  `physical_planner.cpp`'s `convert()` discriminates by checking whether
+  the node's child is specifically `LogicalFilter`/`LogicalScan` (a
+  positive match on the case that needs remapping) rather than checking
+  "child is not `LogicalAggregate`" -- the latter looked equivalent but
+  isn't: the optimizer's redundant-projection-removal rule can delete an
+  aggregate query's reprojection when the SELECT list already matches the
+  aggregate's natural column order, which made an earlier, negative-check
+  version of this discriminator (checking only for `LogicalProjection`)
+  wrongly treat a `Sort` sitting directly on `LogicalAggregate` as if it
+  needed scan-schema remapping.
 
 ### GPU dependency vendoring (no conda)
 

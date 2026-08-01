@@ -104,13 +104,38 @@ TEST(LogicalPlanner, BuildsTpchQ6ScalarAggregateShape) {
   EXPECT_EQ(aggregate->aggregates()[0].name, "revenue");
 }
 
-TEST(LogicalPlanner, RejectsOrderByAfterGroupBy) {
+TEST(LogicalPlanner, AggregateOrderByReferencesSelectListOutputName) {
+  // "region" here means the SELECT-list output column (also happens to be
+  // the GROUP BY key's own name in this case), not a base-table column --
+  // see binder.cpp's ORDER BY handling for why that distinction matters.
   const auto stmt = sql::parse_sql(
-      "SELECT region, SUM(amount) FROM read_parquet('/x.parquet') GROUP BY region "
-      "ORDER BY region");
+      "SELECT region, SUM(amount) AS total FROM read_parquet('/x.parquet') GROUP BY region "
+      "ORDER BY region DESC");
   const Schema schema = sales_schema();
   const BoundQuery bound = bind_query(stmt, schema);
-  EXPECT_THROW(build_logical_plan(bound, schema), PlanningError);
+  const LogicalPlanPtr plan = build_logical_plan(bound, schema);
+
+  const auto* sort = dynamic_cast<const LogicalSort*>(plan.get());
+  ASSERT_NE(sort, nullptr);
+  ASSERT_EQ(sort->keys().size(), 1u);
+  EXPECT_FALSE(sort->keys()[0].ascending);
+  // Sort sits directly on the final LogicalProjection, whose output schema
+  // the sort key's column index must match -- see the physical planner's
+  // "keys_reference_scan_schema" discriminator, which relies on exactly
+  // this structural shape.
+  const auto* projection = dynamic_cast<const LogicalProjection*>(sort->children()[0].get());
+  ASSERT_NE(projection, nullptr);
+}
+
+TEST(LogicalPlanner, RejectsAggregateOrderByOnNonOutputExpression) {
+  const auto stmt = sql::parse_sql(
+      "SELECT region, SUM(amount) AS total FROM read_parquet('/x.parquet') GROUP BY region "
+      "ORDER BY amount");
+  const Schema schema = sales_schema();
+  // "amount" is not a SELECT-list output name (only "region" and "total"
+  // are) -- ORDER BY after GROUP BY is scoped to output names, not
+  // arbitrary re-derived expressions (see binder.cpp).
+  EXPECT_THROW(bind_query(stmt, schema), BindingError);
 }
 
 TEST(LogicalPlanner, NonAggregateOrderByPlacedBeforeProjection) {

@@ -42,6 +42,17 @@ and covered by passing tests -- not merely designed or stubbed.
   "GPU operators" in `docs/ARCHITECTURE.md` for the two correctness
   bugs (STRING columns through `cudf::ast`, and scan column-index
   remapping) this surfaced and fixed
+- `ORDER BY` execution: `SortOperator` (`cudf::stable_sorted_order` +
+  `cudf::gather`, blocking), on both plain queries and after `GROUP BY`
+  (scoped to a SELECT-list output name -- see `docs/ARCHITECTURE.md`).
+  Surfaced and fixed two more latent physical-planner bugs in the process:
+  `LogicalProjection`'s and `LogicalSort`'s conversion both unconditionally
+  remapped their expressions against the scan schema, which is wrong for
+  the aggregate-reprojection/post-aggregation-sort case (their expressions
+  already reference the aggregate's own output schema) -- previously
+  masked because every prior test happened to hit the case where the
+  optimizer removes the redundant reprojection entirely. Verified against
+  DuckDB for the surviving-reprojection case.
 - `QueryEngine::execute()`, wired to the real operator pipeline for
   `gpu-dev` builds (a CPU-only stub throws `ExecutionError` for `dev`
   builds), and the `kernellake query` CLI command (`--sql`/`--file`,

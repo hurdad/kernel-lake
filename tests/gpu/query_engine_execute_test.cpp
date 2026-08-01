@@ -115,5 +115,31 @@ TEST_F(QueryEngineExecuteTest, PlainProjectionReturnsAllRows) {
   EXPECT_EQ(result.rows_returned, 6);
 }
 
+TEST_F(QueryEngineExecuteTest, AggregateOrderByProducesDescendingTotals) {
+  // region A: 10+20+5=35, region B: 100+7+3=110 (see SetUp's regions/
+  // amounts). SELECT order [total, region] differs from HashAggregate's
+  // natural [region, total] output, so the reprojection survives the
+  // optimizer's redundant-projection removal -- exercising the exact
+  // shape that surfaced the LogicalProjection/Sort remap bugs fixed in
+  // physical_planner.cpp (see PhysicalPlannerTest in
+  // tests/unit/physical_planner_test.cpp for the structural version of
+  // this same check).
+  const QueryResult result = engine_.execute("SELECT SUM(amount) AS total, region FROM read_parquet('" +
+                                             path_ + "') GROUP BY region ORDER BY total DESC");
+
+  ASSERT_EQ(result.rows_returned, 2);
+  ASSERT_EQ(result.batches.size(), 1u);
+  const std::shared_ptr<arrow::RecordBatch>& batch = result.batches.front();
+  const auto total_column = std::static_pointer_cast<arrow::DoubleArray>(batch->GetColumnByName("total"));
+  const auto region_column = std::static_pointer_cast<arrow::StringArray>(batch->GetColumnByName("region"));
+  ASSERT_NE(total_column, nullptr);
+  ASSERT_NE(region_column, nullptr);
+
+  EXPECT_EQ(region_column->GetString(0), "B");
+  EXPECT_DOUBLE_EQ(total_column->Value(0), 110.0);
+  EXPECT_EQ(region_column->GetString(1), "A");
+  EXPECT_DOUBLE_EQ(total_column->Value(1), 35.0);
+}
+
 }  // namespace
 }  // namespace kernellake

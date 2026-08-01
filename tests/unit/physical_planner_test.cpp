@@ -184,11 +184,104 @@ TEST_F(PhysicalPlannerTest, HashAggregateForGroupBy) {
   ASSERT_EQ(hash_agg->aggregates().size(), 1u);
 }
 
-TEST_F(PhysicalPlannerTest, RejectsOrderByWithClearError) {
-  const auto stmt = sql::parse_sql("SELECT id FROM read_parquet('" + path_ + "') ORDER BY id");
+TEST_F(PhysicalPlannerTest, BuildsSortNodeForOrderBy) {
+  const auto stmt = sql::parse_sql("SELECT amount FROM read_parquet('" + path_ + "') ORDER BY amount DESC");
   const BoundQuery bound = bind_query(stmt, sales_schema());
   LogicalPlanPtr logical = optimize(build_logical_plan(bound, sales_schema()));
-  EXPECT_THROW(build_physical_plan(logical, store_), PlanningError);
+  const PhysicalPlanPtr plan = build_physical_plan(logical, store_);
+
+  const auto* result = dynamic_cast<const ArrowResultNode*>(plan.get());
+  ASSERT_NE(result, nullptr);
+  const PhysicalPlanNode* node = result->child().get();
+  while (dynamic_cast<const SortNode*>(node) == nullptr && !node->children().empty()) {
+    node = node->children()[0].get();
+  }
+  const auto* sort = dynamic_cast<const SortNode*>(node);
+  ASSERT_NE(sort, nullptr);
+  ASSERT_EQ(sort->keys().size(), 1u);
+  EXPECT_FALSE(sort->keys()[0].ascending);
+  const auto* key_column = dynamic_cast<const ColumnExpression*>(sort->keys()[0].expr.get());
+  ASSERT_NE(key_column, nullptr);
+  // "amount" is field index 1 in sales_schema(), but it's the only column
+  // selected/ordered by, so column pruning narrows the scan to just it,
+  // putting it at index 0 in the batches the scan actually produces -- the
+  // sort key's index must have been remapped to match, not left at 1.
+  EXPECT_EQ(key_column->column_index(), 0u);
+}
+
+TEST_F(PhysicalPlannerTest, SurvivingAggregateReprojectionIsNotRemappedAgainstTheScan) {
+  // SELECT order [total, region] differs from HashAggregate's natural
+  // [group_by..., aggregates...] = [region, total] output order, so the
+  // optimizer's redundant-projection-removal rule can't remove the
+  // reprojection here (unlike most other tests in this file, where it
+  // happens to). This is the exact shape that exposed a real bug: the
+  // reprojection's items reference the *aggregate's* output schema
+  // (region@0, total@1) already correctly, by construction in
+  // logical_planner.cpp -- remapping them against the scan (which has no
+  // "total" column at all) must NOT happen.
+  const PhysicalPlanPtr plan =
+      plan_for("SELECT SUM(amount) AS total, region FROM read_parquet('" + path_ + "') GROUP BY region");
+  const auto* result = dynamic_cast<const ArrowResultNode*>(plan.get());
+  ASSERT_NE(result, nullptr);
+  const auto* projection = dynamic_cast<const ProjectionNode*>(result->child().get());
+  ASSERT_NE(projection, nullptr);
+  ASSERT_EQ(projection->items().size(), 2u);
+
+  // logical_planner.cpp's reprojection always builds a plain
+  // ColumnExpression referencing the aggregate's output position, even for
+  // an aggregate-derived column like "total" -- never re-wraps the
+  // original AggregateExpression. HashAggregate's own output order is
+  // [group_by..., aggregates...] = [region@0, total@1].
+  const auto* total_column = dynamic_cast<const ColumnExpression*>(projection->items()[0].expr.get());
+  ASSERT_NE(total_column, nullptr);
+  EXPECT_EQ(total_column->column_index(), 1u);
+
+  const auto* region_column = dynamic_cast<const ColumnExpression*>(projection->items()[1].expr.get());
+  ASSERT_NE(region_column, nullptr);
+  EXPECT_EQ(region_column->column_index(), 0u);
+}
+
+TEST_F(PhysicalPlannerTest, SurvivingPlainProjectionRemapsAgainstTheNarrowedScanSchema) {
+  // amount/region reordered relative to sales_schema()'s id/amount/region,
+  // so the (non-aggregate) redundant-projection-removal rule doesn't apply
+  // and this reprojection survives too -- but unlike the aggregate case
+  // above, its child is the scan (via Filter), so it DOES need remapping.
+  const PhysicalPlanPtr plan =
+      plan_for("SELECT amount, region FROM read_parquet('" + path_ + "') WHERE amount > 0");
+  const auto* result = dynamic_cast<const ArrowResultNode*>(plan.get());
+  ASSERT_NE(result, nullptr);
+  const auto* projection = dynamic_cast<const ProjectionNode*>(result->child().get());
+  ASSERT_NE(projection, nullptr);
+  ASSERT_EQ(projection->items().size(), 2u);
+
+  // Scan is narrowed to [amount, region] (id is never referenced),
+  // preserving original relative order -- amount@0, region@1.
+  const auto* amount_column = dynamic_cast<const ColumnExpression*>(projection->items()[0].expr.get());
+  ASSERT_NE(amount_column, nullptr);
+  EXPECT_EQ(amount_column->column_index(), 0u);
+  const auto* region_column = dynamic_cast<const ColumnExpression*>(projection->items()[1].expr.get());
+  ASSERT_NE(region_column, nullptr);
+  EXPECT_EQ(region_column->column_index(), 1u);
+}
+
+TEST_F(PhysicalPlannerTest, AggregateOrderBySurvivesWhenReprojectionIsNotRemoved) {
+  // Combines both fixes: a surviving aggregate reprojection AND a Sort
+  // directly above it (not above LogicalAggregate), which is the shape
+  // that broke before the LogicalProjection discriminator fix in
+  // physical_planner.cpp.
+  const PhysicalPlanPtr plan = plan_for("SELECT SUM(amount) AS total, region FROM read_parquet('" + path_ +
+                                        "') GROUP BY region ORDER BY total");
+  const auto* result = dynamic_cast<const ArrowResultNode*>(plan.get());
+  ASSERT_NE(result, nullptr);
+  const auto* sort = dynamic_cast<const SortNode*>(result->child().get());
+  ASSERT_NE(sort, nullptr);
+  ASSERT_EQ(sort->keys().size(), 1u);
+  const auto* key_column = dynamic_cast<const ColumnExpression*>(sort->keys()[0].expr.get());
+  ASSERT_NE(key_column, nullptr);
+  // "total" is the reprojection's output position 0.
+  EXPECT_EQ(key_column->column_index(), 0u);
+  const auto* projection = dynamic_cast<const ProjectionNode*>(sort->child().get());
+  ASSERT_NE(projection, nullptr);
 }
 
 TEST_F(PhysicalPlannerTest, ExplainShowsFilesAndRowGroupCounts) {

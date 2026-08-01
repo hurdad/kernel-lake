@@ -8,6 +8,7 @@
 #include "kernellake/execution/parquet_scan_operator.hpp"
 #include "kernellake/execution/projection_operator.hpp"
 #include "kernellake/execution/scalar_aggregate_operator.hpp"
+#include "kernellake/execution/sort_operator.hpp"
 
 namespace kernellake {
 
@@ -37,6 +38,10 @@ std::unique_ptr<PhysicalOperator> build(const PhysicalPlanPtr& node, std::size_t
     return std::make_unique<ScalarAggregateOperator>(
         next_id++, build(scalar_aggregate->child(), pass_read_limit_bytes, next_id),
         scalar_aggregate->aggregates());
+  }
+  if (const auto* sort = dynamic_cast<const SortNode*>(node.get())) {
+    return std::make_unique<SortOperator>(next_id++, build(sort->child(), pass_read_limit_bytes, next_id),
+                                          sort->keys());
   }
   if (const auto* limit = dynamic_cast<const LimitNode*>(node.get())) {
     return std::make_unique<LimitOperator>(next_id++, build(limit->child(), pass_read_limit_bytes, next_id),

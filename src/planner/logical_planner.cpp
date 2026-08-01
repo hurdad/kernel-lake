@@ -26,10 +26,7 @@ LogicalPlanPtr build_logical_plan(const BoundQuery& query, const Schema& source_
     plan = std::make_shared<LogicalFilter>(plan, query.where);
   }
 
-  if (!query.order_by.empty() && query.is_aggregate_query) {
-    throw PlanningError("ORDER BY after GROUP BY is not yet supported in this version of KernelLake");
-  }
-  if (!query.order_by.empty()) {
+  if (!query.order_by.empty() && !query.is_aggregate_query) {
     // Placed before the (aggregate-free) projection: projection only
     // reshapes columns and never changes row count or order, so sorting
     // here is equivalent to sorting the final output, while still allowing
@@ -82,6 +79,12 @@ LogicalPlanPtr build_logical_plan(const BoundQuery& query, const Schema& source_
       projection_items.push_back(NamedExpression{column, item.output_name});
     }
     plan = std::make_shared<LogicalProjection>(plan, std::move(projection_items));
+
+    if (!query.order_by.empty()) {
+      // Bound against the final output schema (see binder.cpp), which this
+      // projection now exactly matches column-for-column.
+      plan = std::make_shared<LogicalSort>(plan, to_sort_keys(query.order_by));
+    }
   } else {
     std::vector<NamedExpression> projection_items;
     projection_items.reserve(query.select_list.size());

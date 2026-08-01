@@ -12,6 +12,7 @@ add_library(kernellake_execution STATIC
   arrow_result_operator.cpp
   parquet_scan_operator.cpp
   limit_operator.cpp
+  sort_operator.cpp
   operator_builder.cpp
 )
 
