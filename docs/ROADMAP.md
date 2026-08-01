@@ -85,33 +85,26 @@ and covered by passing tests -- not merely designed or stubbed.
   `dev` -- full CUDA devel image with the repo built inside it -- and
   `runtime` -- only the built binary plus its actual non-system runtime
   dependency closure, resolved via `ldd` rather than hard-coded vendored
-  paths) -- **written but not verified**: Docker was not available in this
-  development environment, so neither target has been through an actual
-  `docker build`/`docker run --gpus all`
-- `.github/workflows/ci.yml`, one workflow with four jobs in dependency
-  order: `format-check` and `cpu-build-test` (parallel, CPU-only build+test
-  on the `dev` preset) -> `tpch-tooling-smoke` (`needs: cpu-build-test`;
-  small-scale `generate_tpch.py` run plus `kernellake explain` -- not
-  `query` -- against both query files, to catch a query file that stops
-  parsing/binding/planning) -> `docker-publish` (`needs:` all three,
-  `if: github.event_name != 'pull_request'`; builds both `docker/Dockerfile`
-  targets and pushes them to `ghcr.io/<owner>/<repo>:dev` and `:runtime`/
-  `:latest` using `GITHUB_TOKEN`, no extra secrets). A broken build or a
-  query file that stops parsing is never shipped as an image, since
-  `docker-publish` can't start until the jobs ahead of it succeed.
-  Cross-workflow `needs:` isn't a GitHub Actions feature, which is why this
-  is one file rather than a separate docker-publish.yml gated some other
-  way. **Every job's individual shell commands have been run and verified
-  locally**; the GitHub Actions orchestration itself has not (no way to
-  trigger an Actions run from this environment) -- and `docker-publish`
-  specifically builds a CUDA devel image, large enough that hosted
-  runners' default disk may be tight (the job frees some runner disk
-  first and notes the fallback if that's not enough). GPU-dependent work
-  (the `gpu-dev` preset, `tests/gpu/`, real query execution, DuckDB
-  validation, TPC-H benchmarks) is intentionally not in this workflow --
-  standard GitHub-hosted runners have no GPU, and a skipped-GPU job must
-  never be reported as passing; that needs a self-hosted GPU runner, not
-  configured here
+  paths) and `.github/workflows/ci.yml`, one workflow with four jobs in
+  dependency order: `format-check` and `cpu-build-test` (parallel,
+  CPU-only build+test on the `dev` preset) -> `tpch-tooling-smoke`
+  (`needs: cpu-build-test`; small-scale `generate_tpch.py` run plus
+  `kernellake explain` -- not `query` -- against both query files) ->
+  `docker-publish` (`needs:` all three, `if: github.event_name !=
+  'pull_request'`; builds both `docker/Dockerfile` targets and pushes
+  them to `ghcr.io/<owner>/<repo>:dev` and `:runtime`/`:latest` using
+  `GITHUB_TOKEN`). **Confirmed on real GitHub Actions infrastructure**
+  (run `30718829266`, 2026-08-01): all four jobs succeeded end to end,
+  including `docker-publish` (~10 minutes, no runner-disk issues) --
+  both images are live at `ghcr.io/hurdad/kernel-lake:dev`/`:runtime`/
+  `:latest`. Cross-workflow `needs:` isn't a GitHub Actions feature, which
+  is why this is one file rather than a separate docker-publish.yml
+  gated some other way. GPU-dependent work (the `gpu-dev` preset,
+  `tests/gpu/`, real query execution, DuckDB validation, TPC-H
+  benchmarks) is intentionally not in this workflow -- standard
+  GitHub-hosted runners have no GPU, and a skipped-GPU job must never be
+  reported as passing; that needs a self-hosted GPU runner, not
+  configured here (see "Not yet started")
 
 - `tests/gpu/multi_batch_integration_test.cpp`: dictionary-encoded vs. plain
   string columns, two files with deliberately mismatched row-group layouts
@@ -130,10 +123,15 @@ and covered by passing tests -- not merely designed or stubbed.
   tested at SF0.01/SF0.1 so far); Q3/Q12/Q14 (need hash joins)
 - A self-hosted GPU CI runner (would enable a `gpu-dev` build/test/
   benchmark/validate workflow to actually run in CI, rather than only
-  locally)
+  locally) -- explicitly deferred; `hurdad/kernel-lake` is a public repo,
+  and a self-hosted runner must never be reachable from `pull_request`
+  events (only `push` to `main`, after review) or an outside contributor
+  gets code execution on the runner's owner's hardware
 - Running `clang-tidy` across the whole tree and wiring it into CI (config
-  spot-checked, not exhaustively run); an actual `docker build`/`docker run`
-  of both `docker/Dockerfile` targets (written, unverified)
+  spot-checked, not exhaustively run)
+- `docker run --gpus all` of the published `runtime` image against a real
+  GPU (the image builds and pushes successfully in CI; actually running it
+  hasn't been checked yet)
 
 ## Explicit non-goals for the MVP
 

@@ -197,12 +197,13 @@ docker run --rm --gpus all -v /tmp/kernellake-sales:/data:ro \
 ```
 
 `.github/workflows/ci.yml`'s `docker-publish` job builds and pushes both
-targets to `ghcr.io/<owner>/<repo>:dev` and `:runtime`/`:latest` on every
-push to `main` -- but only after `format-check`, `cpu-build-test`, and
-`tpch-tooling-smoke` all succeed, so a broken build is never shipped as an
-image. Neither the Dockerfile nor that workflow has been exercised by an
-actual `docker build`/Actions run in this repository's own development
-environment (Docker wasn't available there) -- see
+targets to `ghcr.io/hurdad/kernel-lake:dev` and `:runtime`/`:latest` on
+every push to `main` -- but only after `format-check`, `cpu-build-test`,
+and `tpch-tooling-smoke` all succeed, so a broken build is never shipped as
+an image. **Confirmed working on real GitHub Actions**: all four jobs have
+succeeded end to end, including the image build/push (~10 minutes, no
+runner-disk issues) -- both images are live. `docker run --gpus all`
+against the published image hasn't been checked yet -- see
 [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## Project layout
