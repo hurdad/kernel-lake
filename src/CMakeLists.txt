@@ -7,4 +7,10 @@ add_subdirectory(optimizer)
 add_subdirectory(storage)
 add_subdirectory(io)
 add_subdirectory(api)
+
+if(KERNELLAKE_WITH_CUDA)
+  add_subdirectory(memory)
+  add_subdirectory(execution)
+endif()
+
 add_subdirectory(cli)
