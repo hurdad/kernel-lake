@@ -99,6 +99,58 @@ class LogicalScan final : public LogicalPlanNode {
 
 // ---------------------------------------------------------------------------
 
+// A two-table INNER JOIN on a single equality key (see BoundJoin in
+// binder.hpp -- this is the only shape currently supported). Its output
+// schema is the plain concatenation of `left`'s and `right`'s output
+// fields, in that order: every ColumnExpression above this node in the
+// bound query already indexes into that combined row (see binder.cpp's
+// two-schema bind_query() overload), so nothing downstream (optimizer
+// column collection, the physical planner's remapping, GPU operators) needs
+// to know a join happened at all except the physical planner's own
+// HashJoinNode conversion. `left_key_index`/`right_key_index` are each into
+// that side's *own* schema (pre-concatenation), matching what
+// HashJoinOperator needs to extract the key column from each side's
+// (already pruned/remapped) physical scan.
+class LogicalJoin final : public LogicalPlanNode {
+ public:
+  LogicalJoin(LogicalPlanPtr left, LogicalPlanPtr right, std::size_t left_key_index,
+              std::size_t right_key_index)
+      : left_(std::move(left)),
+        right_(std::move(right)),
+        left_key_index_(left_key_index),
+        right_key_index_(right_key_index),
+        schema_(build_schema(left_->output_schema(), right_->output_schema())) {}
+
+  [[nodiscard]] const LogicalPlanPtr& left() const noexcept { return left_; }
+  [[nodiscard]] const LogicalPlanPtr& right() const noexcept { return right_; }
+  [[nodiscard]] std::size_t left_key_index() const noexcept { return left_key_index_; }
+  [[nodiscard]] std::size_t right_key_index() const noexcept { return right_key_index_; }
+  [[nodiscard]] const Schema& output_schema() const override { return schema_; }
+  [[nodiscard]] std::string_view node_name() const noexcept override { return "LogicalJoin"; }
+  [[nodiscard]] std::vector<LogicalPlanPtr> children() const override { return {left_, right_}; }
+  [[nodiscard]] std::vector<std::pair<std::string, std::string>> explain_attributes() const override {
+    return {{"type", "INNER"},
+            {"left_key", left_->output_schema().field(left_key_index_).name},
+            {"right_key", right_->output_schema().field(right_key_index_).name}};
+  }
+
+ private:
+  static Schema build_schema(const Schema& left, const Schema& right) {
+    std::vector<Field> fields = left.fields();
+    const std::vector<Field>& right_fields = right.fields();
+    fields.insert(fields.end(), right_fields.begin(), right_fields.end());
+    return Schema(std::move(fields));
+  }
+
+  LogicalPlanPtr left_;
+  LogicalPlanPtr right_;
+  std::size_t left_key_index_;
+  std::size_t right_key_index_;
+  Schema schema_;
+};
+
+// ---------------------------------------------------------------------------
+
 class LogicalFilter final : public LogicalPlanNode {
  public:
   LogicalFilter(LogicalPlanPtr child, ExpressionPtr predicate)

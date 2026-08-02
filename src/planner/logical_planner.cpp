@@ -19,8 +19,20 @@ std::vector<LogicalSort::Key> to_sort_keys(const std::vector<BoundOrderByItem>& 
 
 }  // namespace
 
-LogicalPlanPtr build_logical_plan(const BoundQuery& query, const Schema& source_schema) {
-  LogicalPlanPtr plan = std::make_shared<LogicalScan>(query.source_paths, source_schema);
+LogicalPlanPtr build_logical_plan(const BoundQuery& query, const Schema& source_schema,
+                                  const Schema* right_schema) {
+  LogicalPlanPtr plan;
+  if (query.join.has_value()) {
+    if (right_schema == nullptr) {
+      throw PlanningError("unreachable: a JOIN query requires a right_schema");
+    }
+    auto left_scan = std::make_shared<LogicalScan>(query.join->left_source_paths, source_schema);
+    auto right_scan = std::make_shared<LogicalScan>(query.join->right_source_paths, *right_schema);
+    plan = std::make_shared<LogicalJoin>(std::move(left_scan), std::move(right_scan),
+                                         query.join->left_key_index, query.join->right_key_index);
+  } else {
+    plan = std::make_shared<LogicalScan>(query.source_paths, source_schema);
+  }
 
   if (query.where != nullptr) {
     plan = std::make_shared<LogicalFilter>(plan, query.where);

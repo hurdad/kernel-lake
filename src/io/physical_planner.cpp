@@ -85,11 +85,25 @@ std::vector<NamedExpression> remap_named(const std::vector<NamedExpression>& ite
   return result;
 }
 
-// Single-source queries only (no joins yet -- see docs/ROADMAP.md), so
-// exactly one ParquetScanNode exists per physical plan; find it to recover
-// the narrowed schema every expression above it must be remapped against.
+// Finds the schema every expression sitting directly above a scan (or, for
+// a JOIN query, directly above the HashJoinNode) must be remapped against.
+// A HashJoinNode is a schema boundary exactly like a ParquetScanNode is --
+// its own already-narrowed, already-concatenated output_schema() is what a
+// Filter/Projection/Aggregate/Sort sitting on top of a join needs, so the
+// search stops there rather than continuing into the join's two children
+// (which have two separate, incompatible narrowed schemas).
+//
+// Known limitation: remapping above a join matches by column *name* against
+// this combined schema (same as the single-table case always has), so if
+// both JOIN sides happen to have a column with the same name, an unqualified
+// reference to it above the join could resolve to the wrong side. Not a
+// concern for the join *condition* itself (bound with each side's own
+// index, see binder.cpp), only for additional WHERE/SELECT/GROUP BY
+// references after the join -- avoid colliding column names across joined
+// tables, or select/rename them distinctly, until this is tightened.
 const Schema* find_scan_schema(const PhysicalPlanNode& node) {
   if (const auto* scan = dynamic_cast<const ParquetScanNode*>(&node)) return &scan->output_schema();
+  if (const auto* join = dynamic_cast<const HashJoinNode*>(&node)) return &join->output_schema();
   for (const PhysicalPlanPtr& child : node.children()) {
     if (const Schema* found = find_scan_schema(*child)) return found;
   }
@@ -136,6 +150,27 @@ PhysicalPlanPtr convert(const LogicalPlanPtr& node, ObjectStore& store) {
   if (const auto* scan = dynamic_cast<const LogicalScan*>(node.get())) {
     return convert_scan(*scan, store);
   }
+  if (const auto* join = dynamic_cast<const LogicalJoin*>(node.get())) {
+    PhysicalPlanPtr left_child = convert(join->left(), store);
+    PhysicalPlanPtr right_child = convert(join->right(), store);
+    // The join key's index was assigned against each side's *original*
+    // (pre-narrowing) schema; translate by name to that side's actual
+    // narrowed physical schema, exactly like remap_columns does for any
+    // other column reference above a scan.
+    const std::string& left_key_name = join->left()->output_schema().field(join->left_key_index()).name;
+    const std::string& right_key_name = join->right()->output_schema().field(join->right_key_index()).name;
+    const std::optional<std::size_t> left_key_narrowed =
+        left_child->output_schema().find_field(left_key_name);
+    const std::optional<std::size_t> right_key_narrowed =
+        right_child->output_schema().find_field(right_key_name);
+    if (!left_key_narrowed || !right_key_narrowed) {
+      throw PlanningError(
+          "physical planner: JOIN key column missing from its pruned column list (internal "
+          "error)");
+    }
+    return std::make_shared<HashJoinNode>(std::move(left_child), std::move(right_child), *left_key_narrowed,
+                                          *right_key_narrowed);
+  }
   if (const auto* filter = dynamic_cast<const LogicalFilter*>(node.get())) {
     PhysicalPlanPtr child = convert(filter->child(), store);
     const Schema* scan_schema = find_scan_schema(*child);
@@ -157,9 +192,15 @@ PhysicalPlanPtr convert(const LogicalPlanPtr& node, ObjectStore& store) {
     // remapping -- see the near-identical LogicalSort discriminator below
     // for why this checks positively for Filter/Scan rather than
     // negatively for "not Aggregate".
+    // LogicalJoin joins this list alongside Filter/Scan: a Projection can
+    // sit directly on a JOIN with no intervening WHERE clause beyond the ON
+    // condition (e.g. `SELECT a.x, b.y FROM ... JOIN ... ON ...`), and its
+    // items then reference the join's combined pre-narrowing schema just
+    // like they'd reference a bare scan's.
     const bool items_reference_scan_schema =
         dynamic_cast<const LogicalFilter*>(projection->child().get()) != nullptr ||
-        dynamic_cast<const LogicalScan*>(projection->child().get()) != nullptr;
+        dynamic_cast<const LogicalScan*>(projection->child().get()) != nullptr ||
+        dynamic_cast<const LogicalJoin*>(projection->child().get()) != nullptr;
     std::vector<NamedExpression> items = projection->items();
     if (items_reference_scan_schema) {
       if (const Schema* scan_schema = find_scan_schema(*child)) items = remap_named(items, *scan_schema);
@@ -200,7 +241,8 @@ PhysicalPlanPtr convert(const LogicalPlanPtr& node, ObjectStore& store) {
     // a reliable "non-aggregate path" signal.
     const bool keys_reference_scan_schema =
         dynamic_cast<const LogicalFilter*>(sort->child().get()) != nullptr ||
-        dynamic_cast<const LogicalScan*>(sort->child().get()) != nullptr;
+        dynamic_cast<const LogicalScan*>(sort->child().get()) != nullptr ||
+        dynamic_cast<const LogicalJoin*>(sort->child().get()) != nullptr;
     if (keys_reference_scan_schema) {
       if (const Schema* scan_schema = find_scan_schema(*child)) {
         for (LogicalSort::Key& key : keys) key.expr = remap_columns(key.expr, *scan_schema);

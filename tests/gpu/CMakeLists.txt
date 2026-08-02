@@ -18,6 +18,7 @@ add_executable(kernellake_gpu_tests
   query_engine_execute_test.cpp
   multi_batch_integration_test.cpp
   decimal_test.cpp
+  hash_join_test.cpp
 )
 
 target_link_libraries(kernellake_gpu_tests PRIVATE

@@ -13,45 +13,66 @@ namespace kernellake::sql {
 
 namespace {
 
-constexpr std::string_view kPlaceholderTable = "kernellake_parquet_source";
+struct PlaceholderSource {
+  std::string placeholder;
+  std::vector<std::string> paths;
+};
 
 struct Preprocessed {
   std::string sql;
-  std::vector<std::string> paths;
+  std::vector<PlaceholderSource> sources;  // in order of appearance
 };
 
 // hyrise/sql-parser's FROM-clause grammar only accepts table names, joins,
 // and subqueries -- it has no notion of a table-valued function call like
-// `read_parquet('...')`. We recognize that one specific shape ourselves,
-// extract its string-literal path arguments, and substitute a plain
-// placeholder identifier before handing the query to the parser. This is a
-// deliberate, narrow, documented preprocessing step -- not general
-// SQL-string rewriting -- and any FROM clause that does not match it fails
-// clearly rather than being silently reinterpreted.
+// `read_parquet('...')`. We find every occurrence of that one specific
+// shape ourselves, extract its string-literal path arguments, and
+// substitute a distinct placeholder identifier for each occurrence before
+// handing the query to the parser -- this leaves the surrounding syntax
+// (JOIN/ON/aliases/commas) completely untouched, so hsql's own grammar
+// still does the real work of parsing table references and join structure.
+// This is a deliberate, narrow, documented preprocessing step -- not
+// general SQL-string rewriting -- and any FROM clause whose shape isn't
+// recognized after this substitution fails clearly in parse_sql() below
+// rather than being silently reinterpreted.
 Preprocessed preprocess_from_read_parquet(const std::string& sql) {
-  static const std::regex kFromPattern(
-      R"(FROM\s+read_parquet\s*\(\s*((?:'(?:[^'\\]|\\.)*'\s*,\s*)*'(?:[^'\\]|\\.)*')\s*\))",
-      std::regex::icase);
-
-  std::smatch match;
-  if (!std::regex_search(sql, match, kFromPattern)) {
-    throw SqlError(
-        "KernelLake requires a single data source of the form "
-        "FROM read_parquet('path' [, 'path2', ...]); no such clause was found in the query");
-  }
-
-  const std::string args = match[1].str();
+  static const std::regex kReadParquetPattern(
+      R"(read_parquet\s*\(\s*((?:'(?:[^'\\]|\\.)*'\s*,\s*)*'(?:[^'\\]|\\.)*')\s*\))", std::regex::icase);
   static const std::regex kStringLiteralPattern(R"('((?:[^'\\]|\\.)*)')");
-  std::vector<std::string> paths;
-  for (auto it = std::sregex_iterator(args.begin(), args.end(), kStringLiteralPattern);
-       it != std::sregex_iterator(); ++it) {
-    paths.push_back((*it)[1].str());
-  }
 
-  std::string rewritten = sql;
-  rewritten.replace(static_cast<std::size_t>(match.position(0)), static_cast<std::size_t>(match.length(0)),
-                    "FROM " + std::string(kPlaceholderTable));
-  return Preprocessed{std::move(rewritten), std::move(paths)};
+  std::string rewritten;
+  std::vector<PlaceholderSource> sources;
+  std::size_t last_pos = 0;
+  for (auto it = std::sregex_iterator(sql.begin(), sql.end(), kReadParquetPattern);
+       it != std::sregex_iterator(); ++it) {
+    const std::smatch& match = *it;
+    const auto match_pos = static_cast<std::size_t>(match.position(0));
+    rewritten.append(sql, last_pos, match_pos - last_pos);
+
+    std::string placeholder = "kernellake_parquet_source_" + std::to_string(sources.size());
+    const std::string args = match[1].str();
+    std::vector<std::string> paths;
+    for (auto path_it = std::sregex_iterator(args.begin(), args.end(), kStringLiteralPattern);
+         path_it != std::sregex_iterator(); ++path_it) {
+      paths.push_back((*path_it)[1].str());
+    }
+    rewritten += placeholder;
+    sources.push_back(PlaceholderSource{std::move(placeholder), std::move(paths)});
+
+    last_pos = match_pos + static_cast<std::size_t>(match.length(0));
+  }
+  rewritten.append(sql, last_pos, sql.size() - last_pos);
+
+  if (sources.empty()) {
+    throw SqlError(
+        "KernelLake requires at least one data source of the form "
+        "read_parquet('path' [, 'path2', ...]); no such clause was found in the query");
+  }
+  if (sources.size() > 2) {
+    throw SqlError("KernelLake supports at most two read_parquet(...) sources (for a two-table JOIN), got " +
+                   std::to_string(sources.size()));
+  }
+  return Preprocessed{std::move(rewritten), std::move(sources)};
 }
 
 [[noreturn]] void unsupported(std::string_view what) {
@@ -261,7 +282,9 @@ AstExprPtr convert_expr(const hsql::Expr* e) {
   switch (e->type) {
     case hsql::kExprColumnRef:
       if (e->name == nullptr) unsupported("column reference with no name");
-      return wrap(AstColumnRef{std::string(e->name)}, alias_of(*e));
+      return wrap(AstColumnRef{std::string(e->name),
+                               e->table != nullptr ? std::optional<std::string>(e->table) : std::nullopt},
+                  alias_of(*e));
     case hsql::kExprStar:
       return wrap(AstStar{}, alias_of(*e));
     case hsql::kExprLiteralInt:
@@ -332,13 +355,52 @@ AstSelectStatement parse_sql(std::string_view sql_view) {
   if (stmt->groupBy != nullptr && stmt->groupBy->having != nullptr) {
     unsupported("HAVING");
   }
-  if (stmt->fromTable == nullptr || stmt->fromTable->type != hsql::kTableName ||
-      stmt->fromTable->name == nullptr || stmt->fromTable->name != kPlaceholderTable) {
-    unsupported("joins and subqueries (only a single FROM read_parquet(...) source is supported)");
-  }
-
   AstSelectStatement out;
-  out.from.paths = preprocessed.paths;
+
+  if (stmt->fromTable != nullptr && stmt->fromTable->type == hsql::kTableName &&
+      stmt->fromTable->name != nullptr) {
+    if (preprocessed.sources.size() != 1 || stmt->fromTable->name != preprocessed.sources[0].placeholder) {
+      unsupported(
+          "joins and subqueries (only a single FROM read_parquet(...) source, or a two-table JOIN, "
+          "is supported)");
+    }
+    out.from.paths = preprocessed.sources[0].paths;
+    if (stmt->fromTable->alias != nullptr && stmt->fromTable->alias->name != nullptr) {
+      out.from.alias = std::string(stmt->fromTable->alias->name);
+    }
+  } else if (stmt->fromTable != nullptr && stmt->fromTable->type == hsql::kTableJoin) {
+    const hsql::JoinDefinition* join = stmt->fromTable->join;
+    if (join == nullptr || join->left == nullptr || join->right == nullptr) unsupported("malformed JOIN");
+    if (join->type != hsql::kJoinInner) unsupported("JOIN types other than INNER JOIN");
+    if (join->left->type != hsql::kTableName || join->right->type != hsql::kTableName ||
+        join->left->name == nullptr || join->right->name == nullptr) {
+      unsupported("JOIN sides must each be a single read_parquet(...) source, not a subquery or nested join");
+    }
+    if (join->left->alias == nullptr || join->left->alias->name == nullptr || join->right->alias == nullptr ||
+        join->right->alias->name == nullptr) {
+      unsupported("both sides of a JOIN must be aliased, e.g. read_parquet('a.parquet') AS a");
+    }
+    if (preprocessed.sources.size() != 2)
+      unsupported("a JOIN requires exactly two read_parquet(...) sources");
+    if (join->condition == nullptr) unsupported("JOIN with no ON condition");
+
+    auto find_source = [&](const char* placeholder) -> const std::vector<std::string>& {
+      for (const PlaceholderSource& source : preprocessed.sources) {
+        if (source.placeholder == placeholder) return source.paths;
+      }
+      unsupported("JOIN source does not reference a read_parquet(...) call");
+    };
+
+    AstJoinClause clause;
+    clause.left = AstParquetSource{find_source(join->left->name), std::string(join->left->alias->name)};
+    clause.right = AstParquetSource{find_source(join->right->name), std::string(join->right->alias->name)};
+    clause.condition = convert_expr(join->condition);
+    out.join = std::move(clause);
+  } else {
+    unsupported(
+        "joins and subqueries (only a single FROM read_parquet(...) source, or a two-table JOIN, is "
+        "supported)");
+  }
 
   if (stmt->selectList == nullptr || stmt->selectList->empty()) {
     throw SqlError("SELECT list must not be empty");

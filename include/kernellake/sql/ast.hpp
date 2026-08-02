@@ -22,8 +22,13 @@ namespace kernellake::sql {
 struct AstExpr;
 using AstExprPtr = std::shared_ptr<AstExpr>;
 
+// `table` is the optional qualifier on a qualified column reference (e.g.
+// `a` in `a.key`) -- only meaningful for a two-table JOIN query, where it
+// disambiguates which side's schema to resolve `name` against. Null for an
+// unqualified reference.
 struct AstColumnRef {
   std::string name;
+  std::optional<std::string> table;
 };
 
 // SELECT * — expanded against the FROM schema during binding.
@@ -151,15 +156,30 @@ struct AstOrderByItem {
   bool ascending = true;
 };
 
-// The MVP's only supported data source: FROM read_parquet('path' [, 'path2', ...]).
+// A single `read_parquet('path' [, 'path2', ...])` source, optionally
+// aliased (`AS a`). An alias is required when this source participates in
+// a JOIN (it's how a qualified column reference like `a.key` picks a side)
+// but optional for the single-table MVP shape.
 struct AstParquetSource {
   std::vector<std::string> paths;
+  std::optional<std::string> alias;
+};
+
+// `FROM read_parquet(...) AS a JOIN read_parquet(...) AS b ON <condition>`.
+// Only a two-table INNER JOIN is supported -- see docs/ARCHITECTURE.md for
+// the full scope (single equality key, both sides must be aliased
+// `read_parquet(...)` sources, no comma-style joins or 3+ tables).
+struct AstJoinClause {
+  AstParquetSource left;
+  AstParquetSource right;
+  AstExprPtr condition;
 };
 
 struct AstSelectStatement {
   std::vector<AstExprPtr> select_list;
-  AstParquetSource from;
-  AstExprPtr where;  // null if no WHERE clause
+  AstParquetSource from;              // single-table FROM; unused when `join` is set
+  std::optional<AstJoinClause> join;  // two-table FROM ... JOIN ... ON ...
+  AstExprPtr where;                   // null if no WHERE clause
   std::vector<AstExprPtr> group_by;
   std::vector<AstOrderByItem> order_by;
   std::optional<std::int64_t> limit;

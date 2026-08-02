@@ -13,6 +13,7 @@ add_library(kernellake_execution STATIC
   parquet_scan_operator.cpp
   limit_operator.cpp
   sort_operator.cpp
+  hash_join_operator.cpp
   operator_builder.cpp
 )
 

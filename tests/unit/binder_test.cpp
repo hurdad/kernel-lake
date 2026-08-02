@@ -23,6 +23,21 @@ Schema priced_sales_schema() {
   });
 }
 
+Schema orders_schema() {
+  return Schema({
+      Field{"order_id", int64_type(false)},
+      Field{"customer_id", int64_type(false)},
+      Field{"amount", float64_type(false)},
+  });
+}
+
+Schema customers_schema() {
+  return Schema({
+      Field{"customer_id", int64_type(false)},
+      Field{"name", string_type(false)},
+  });
+}
+
 Schema lineitem_schema() {
   return Schema({
       Field{"l_extendedprice", float64_type(false)},
@@ -326,6 +341,99 @@ TEST(Binder, GroupByPrefersBaseColumnOverSameNamedAlias) {
   const auto* column = dynamic_cast<const ColumnExpression*>(bound.group_by[0].get());
   ASSERT_NE(column, nullptr);
   EXPECT_EQ(column->name(), "region");
+}
+
+TEST(Binder, JoinResolvesQualifiedAndUnambiguousUnqualifiedColumns) {
+  const auto stmt = sql::parse_sql(
+      "SELECT o.order_id, name, amount FROM read_parquet('/o.parquet') AS o "
+      "JOIN read_parquet('/c.parquet') AS c ON o.customer_id = c.customer_id");
+  const BoundQuery bound = bind_query(stmt, orders_schema(), customers_schema());
+  ASSERT_TRUE(bound.join.has_value());
+  // customer_id is orders_schema()'s index 1, customers_schema()'s index 0.
+  EXPECT_EQ(bound.join->left_key_index, 1u);
+  EXPECT_EQ(bound.join->right_key_index, 0u);
+
+  ASSERT_EQ(bound.select_list.size(), 3u);
+  // o.order_id -> orders_schema() index 0 (left side, no offset).
+  const auto* order_id = dynamic_cast<const ColumnExpression*>(bound.select_list[0].expr.get());
+  ASSERT_NE(order_id, nullptr);
+  EXPECT_EQ(order_id->column_index(), 0u);
+  // unqualified `name` only exists on the right (customers) side -> combined
+  // index = orders_schema().field_count() (3) + 1 (name's local index).
+  const auto* name = dynamic_cast<const ColumnExpression*>(bound.select_list[1].expr.get());
+  ASSERT_NE(name, nullptr);
+  EXPECT_EQ(name->column_index(), 4u);
+  // unqualified `amount` only exists on the left (orders) side.
+  const auto* amount = dynamic_cast<const ColumnExpression*>(bound.select_list[2].expr.get());
+  ASSERT_NE(amount, nullptr);
+  EXPECT_EQ(amount->column_index(), 2u);
+}
+
+TEST(Binder, JoinRejectsAmbiguousUnqualifiedColumn) {
+  // Both sides have a `customer_id` column; referencing it unqualified
+  // outside the ON condition must fail rather than silently pick one side.
+  const auto stmt = sql::parse_sql(
+      "SELECT customer_id FROM read_parquet('/o.parquet') AS o "
+      "JOIN read_parquet('/c.parquet') AS c ON o.customer_id = c.customer_id");
+  EXPECT_THROW(bind_query(stmt, orders_schema(), customers_schema()), BindingError);
+}
+
+TEST(Binder, JoinRejectsUnknownTableQualifier) {
+  const auto stmt = sql::parse_sql(
+      "SELECT z.order_id FROM read_parquet('/o.parquet') AS o "
+      "JOIN read_parquet('/c.parquet') AS c ON o.customer_id = c.customer_id");
+  EXPECT_THROW(bind_query(stmt, orders_schema(), customers_schema()), BindingError);
+}
+
+TEST(Binder, JoinRejectsNonEqualityCondition) {
+  const auto stmt = sql::parse_sql(
+      "SELECT o.order_id FROM read_parquet('/o.parquet') AS o "
+      "JOIN read_parquet('/c.parquet') AS c ON o.customer_id > c.customer_id");
+  EXPECT_THROW(bind_query(stmt, orders_schema(), customers_schema()), BindingError);
+}
+
+TEST(Binder, JoinRejectsConditionComparingTwoColumnsFromTheSameSide) {
+  const auto stmt = sql::parse_sql(
+      "SELECT o.order_id FROM read_parquet('/o.parquet') AS o "
+      "JOIN read_parquet('/c.parquet') AS c ON o.customer_id = o.order_id");
+  EXPECT_THROW(bind_query(stmt, orders_schema(), customers_schema()), BindingError);
+}
+
+TEST(Binder, JoinRejectsMismatchedKeyTypes) {
+  // customer_id is INT64 on both sides in the fixture schemas; compare
+  // against a STRING column on the other side instead to force a type
+  // mismatch (implicit numeric promotion would insert a CastExpression,
+  // which this rejects since it's no longer a bare ColumnExpression).
+  const auto stmt = sql::parse_sql(
+      "SELECT o.order_id FROM read_parquet('/o.parquet') AS o "
+      "JOIN read_parquet('/c.parquet') AS c ON o.customer_id = c.name");
+  EXPECT_THROW(bind_query(stmt, orders_schema(), customers_schema()), BindingError);
+}
+
+TEST(Binder, JoinStarExpandsBothSidesInOrder) {
+  // Deliberately non-colliding field names on both sides: SELECT * would
+  // otherwise hit the ordinary "duplicate output column name" check twice
+  // over for a shared name like orders_schema()/customers_schema()'s
+  // `customer_id` -- a pre-existing, correct rejection, not a JOIN-star
+  // bug, but not what this test is trying to isolate.
+  const Schema left({Field{"order_id", int64_type(false)}, Field{"cust_id", int64_type(false)}});
+  const Schema right({Field{"cust_key", int64_type(false)}, Field{"name", string_type(false)}});
+  const auto stmt = sql::parse_sql(
+      "SELECT * FROM read_parquet('/o.parquet') AS o "
+      "JOIN read_parquet('/c.parquet') AS c ON o.cust_id = c.cust_key");
+  const BoundQuery bound = bind_query(stmt, left, right);
+  ASSERT_EQ(bound.select_list.size(), 4u);
+  EXPECT_EQ(bound.select_list[0].output_name, "order_id");
+  EXPECT_EQ(bound.select_list[1].output_name, "cust_id");
+  EXPECT_EQ(bound.select_list[2].output_name, "cust_key");
+  EXPECT_EQ(bound.select_list[3].output_name, "name");
+}
+
+TEST(Binder, JoinStarWithCollidingColumnNamesIsRejected) {
+  const auto stmt = sql::parse_sql(
+      "SELECT * FROM read_parquet('/o.parquet') AS o "
+      "JOIN read_parquet('/c.parquet') AS c ON o.customer_id = c.customer_id");
+  EXPECT_THROW(bind_query(stmt, orders_schema(), customers_schema()), BindingError);
 }
 
 }  // namespace

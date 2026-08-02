@@ -53,21 +53,30 @@ planner (which lives in `io`) consume both.
 
 KernelLake vendors `hyrise/sql-parser` (MIT license, pinned commit) via
 CMake `FetchContent` rather than hand-writing a parser. That grammar's
-`FROM` clause only accepts table names, joins, and subqueries -- it has no
+`FROM` clause accepts table names, joins, and subqueries -- but has no
 table-valued-function syntax. `kernellake::sql::parse_sql()` therefore
-recognizes the specific pattern `FROM read_parquet('path' [, 'path2', ...])`
-with a regex, extracts the path arguments, substitutes a plain placeholder
-identifier, and hands the rewritten text to the real parser. Any `FROM`
-clause that doesn't match this pattern (a bare table name, a join, a
-subquery) fails with a clear `SqlError` rather than being silently
-reinterpreted. This is a narrow, one-time syntax adapter, not general
-SQL-string rewriting -- optimizer rules always operate on the structured
-plan/expression trees, never on SQL text.
+finds every occurrence of `read_parquet('path' [, 'path2', ...])` in the
+query text with a regex, extracts each one's path arguments, and
+substitutes a distinct placeholder identifier for each occurrence, leaving
+the surrounding syntax (`JOIN`/`ON`/aliases/commas) completely untouched --
+hsql's own grammar still parses the real table-reference/join structure
+around those placeholders. `parse_sql()` then walks the resulting
+`fromTable` and only accepts two shapes: a single placeholder (the
+single-table MVP case) or exactly one `INNER JOIN ... ON` between two
+placeholders, both aliased (see "Hash joins" below); anything else (a real
+table name, a subquery, `LEFT`/`RIGHT`/`FULL`/`CROSS` JOIN, a comma-style
+join, 3+ `read_parquet(...)` sources) fails with a clear `SqlError` rather
+than being silently reinterpreted. This is a narrow, deliberately limited
+syntax adapter, not general SQL-string rewriting -- optimizer rules always
+operate on the structured plan/expression trees, never on SQL text.
 
 ## Supported SQL grammar (current)
 
 ```
 SELECT <items> FROM read_parquet('path' [, 'path2', ...])
+  [WHERE <expr>] [GROUP BY <cols>] [ORDER BY <cols>] [LIMIT <n>]
+
+SELECT <items> FROM read_parquet(...) AS a JOIN read_parquet(...) AS b ON <a.col = b.col>
   [WHERE <expr>] [GROUP BY <cols>] [ORDER BY <cols>] [LIMIT <n>]
 ```
 
@@ -91,12 +100,15 @@ SELECT <items> FROM read_parquet('path' [, 'path2', ...])
 - `DECIMAL(p, s)` columns and literals -- see "DECIMAL support" below
 - Aggregates: `SUM`, `COUNT`, `COUNT(*)`, `MIN`, `MAX`, `AVG` (`AVG` does
   not support a `DECIMAL` argument; see "DECIMAL support")
+- A two-table `INNER JOIN ... ON` with a single equality key (see "Hash
+  joins" below for the full scope)
 
 Not yet supported (fails clearly rather than being silently reinterpreted):
-`DISTINCT`, `HAVING`, set operations (`UNION`/etc.), `WITH`/CTEs, joins,
+`DISTINCT`, `HAVING`, set operations (`UNION`/etc.), `WITH`/CTEs,
 subqueries, `OFFSET`, window functions, `LIKE` outside a top-level `WHERE`
-AND-conjunct, `CASE` in `WHERE`/aggregate arguments, and any function other
-than the five aggregates above.
+AND-conjunct, `CASE` in `WHERE`/aggregate arguments, any function other than
+the five aggregates above, comma-style joins, `LEFT`/`RIGHT`/`FULL`/`CROSS`
+JOIN, multi-key or non-equality join conditions, and 3+-table joins.
 
 `GROUP BY <name>` resolves `<name>` against the base-table schema first,
 then falls back to matching a `SELECT`-list output alias -- this is what
@@ -122,8 +134,10 @@ aggregation -- not an arbitrary re-derived expression; `ORDER BY
 
 ## Logical plan and the optimizer
 
-Logical plan nodes: `LogicalScan`, `LogicalFilter`, `LogicalProjection`,
-`LogicalAggregate`, `LogicalSort`, `LogicalLimit`. `LogicalScan` always
+Logical plan nodes: `LogicalScan`, `LogicalJoin`, `LogicalFilter`,
+`LogicalProjection`, `LogicalAggregate`, `LogicalSort`, `LogicalLimit`.
+`LogicalJoin` is the only binary node (see "Hash joins" above); every other
+node, including `LogicalScan`, is a leaf or unary. `LogicalScan` always
 starts with every column and predicate the schema/query could reference;
 `kernellake::optimize()` then:
 
@@ -206,6 +220,7 @@ with the `dev` CMake preset alone.
 | `HashAggregateOperator` | `GROUP BY`: `cudf::groupby::streaming_groupby` accumulates partial groups across batches within `max_distinct_keys` (default 10M), `finalize()`d on last `next()` |
 | `LimitOperator` | `cudf::slice` + the `cudf::table` copy constructor to truncate the final batch |
 | `SortOperator` | `ORDER BY`: **blocking**, unlike every operator above -- consumes `child` to exhaustion, concatenates every batch (`cudf::concatenate`) into one table, then `cudf::stable_sorted_order` + `cudf::gather`. Memory footprint is the whole result set, not bounded like the streaming operators. |
+| `HashJoinOperator` | Two-table `INNER JOIN`: its *build* (right) side is **blocking** like `SortOperator` (consumed to exhaustion, concatenated into one table, then wraps a single `cudf::hash_join`); its *probe* (left) side streams normally, one `inner_join()` + double-`cudf::gather` per batch. See "Hash joins" above. |
 | `ArrowResultOperator` | Trivial passthrough; the actual `DeviceBatch` -> `arrow::RecordBatch` conversion happens in `QueryEngine::execute()` via `to_arrow_record_batch()`, since `PhysicalOperator::next()` must return a `DeviceBatch` |
 
 Two correctness details worth knowing if you touch these operators:
@@ -357,6 +372,75 @@ Two correctness details worth knowing if you touch these operators:
   `result_formatter.cpp` already does) rather than assuming a specific
   `arrow::Decimal128Array`/etc. subtype.
 
+### Hash joins
+
+- **Scope**: exactly two `read_parquet(...)` sources, both explicitly
+  aliased, joined with `INNER JOIN ... ON <a.col = b.col>` -- a single
+  equality between one plain column from each side, of identical type.
+  Comma-style joins (`FROM a, b WHERE a.k = b.k`), `LEFT`/`RIGHT`/`FULL`/
+  `CROSS` JOIN, multi-key/non-equality conditions, and 3+-table joins all
+  fail clearly at parse or bind time rather than being silently
+  reinterpreted. The right-hand (second) table is always the *build* side
+  (materialized in full before probing begins); put the smaller table
+  there for performance -- there is no cost-based optimizer to choose this
+  automatically.
+- **Combined-index design**: the binder resolves every column reference in
+  a JOIN query (qualified or not) to a `ColumnExpression` whose index is
+  into the *combined* `[left_schema fields..., right_schema fields...]`
+  row -- exactly what `HashJoinOperator` actually produces (left columns
+  gathered first, then right). This is what lets almost the entire rest of
+  the pipeline (the GPU expression compiler, the optimizer's column
+  collection, every operator except the join itself) treat a joined query
+  no differently from a single-table one above the join; only the physical
+  planner's `LogicalJoin` -> `HashJoinNode` conversion and the join
+  operator itself need to know two tables are involved at all. An
+  unqualified reference that exists on both sides is rejected as ambiguous
+  at bind time, same as SQL generally requires.
+- **Implicit promotion does not extend across a JOIN condition**: the two
+  key columns must already be the same type. Mixing e.g. `INT32` and
+  `INT64` join keys produces an implicit `CastExpression` around one side
+  during binding (the same promotion `WHERE` comparisons get), which is no
+  longer a bare `ColumnExpression` -- `extract_equi_join_keys()` in
+  binder.cpp rejects this with a clear `BindingError` rather than trying to
+  compile a cast into the join key extraction. Make both sides the same
+  type instead.
+- **No predicate pushdown across a join**: `LogicalScan::pushable_predicates()`
+  stays empty for both sides of a JOIN query (the optimizer's
+  `annotate_scan()` splits *required columns* by side using each
+  `ColumnExpression`'s combined index, but always discards
+  `pushable_predicates` collected above a `LogicalJoin` rather than routing
+  them to one side -- `PushablePredicate`'s bare column name has no way to
+  say which side it came from once two schemas are in play). Row-group
+  pruning still runs per-side in the physical planner; a JOIN query's WHERE
+  clause (beyond the ON condition) just never narrows it. Column pruning
+  (only reading columns actually referenced, on each side, including the
+  join key) still works normally.
+- **Known limitation**: remapping a column reference that sits *directly
+  above* the join (in a `Filter`/`Projection`/`Aggregate`/`Sort` whose
+  child is the join itself) matches by column *name* against the join's
+  combined output schema, the same way remapping above a plain scan always
+  has. If both JOIN sides happen to have a same-named column, an
+  unqualified reference to it *after* the join could resolve to the wrong
+  side -- not a concern for the join condition itself (bound with each
+  side's own index) or for any qualified reference (which the binder
+  resolves to a definite side up front), only for a hypothetical unqualified
+  post-join reference, which the binder's own ambiguity check already
+  rejects before this could matter in practice. `SELECT *` on a JOIN with
+  colliding column names is likewise rejected (the ordinary "duplicate
+  output column name" check).
+- **cudf::hash_join mechanics**: unlike every streaming operator elsewhere
+  in this codebase, `HashJoinOperator`'s *build* side must be fully
+  materialized before any output can be produced -- `cudf::hash_join`
+  builds its hash table once, up front, from a single `cudf::table_view`
+  (the same "consume child to exhaustion, concatenate into one table"
+  shape `SortOperator` uses, for an analogous reason). The *probe* side
+  streams through normally, one `inner_join()` call per incoming batch,
+  gathering matching rows from both the probe batch and the persistent
+  build table. A build side with zero rows short-circuits without ever
+  constructing a `cudf::hash_join` (an INNER JOIN against no rows can never
+  match anything); this is a real gap for LEFT JOIN outer rows should that
+  ever be added, but is correct for INNER JOIN's current scope.
+
 ### GPU dependency vendoring (no conda)
 
 The `gpu-dev` preset (`KERNELLAKE_WITH_CUDA=ON`) needs libcudf and RMM.
@@ -384,8 +468,8 @@ These are named as forward-declared types or documented models so later
 work has a clean seam to build against; none of them have implementations
 yet, and none are exposed as supported CLI features.
 
-**Future physical operators**: `HashJoin`, `Exchange`, `Spill`,
-`Repartition`, `MergeAggregate`, `Broadcast`.
+**Future physical operators**: `Exchange`, `Spill`, `Repartition`,
+`MergeAggregate`, `Broadcast`.
 
 **Future distributed model**:
 ```

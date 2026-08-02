@@ -89,8 +89,56 @@ TEST(SqlParser, RejectsMissingReadParquetSource) {
   EXPECT_THROW(parse_sql("SELECT a FROM sales"), SqlError);
 }
 
-TEST(SqlParser, RejectsJoins) {
+TEST(SqlParser, RejectsJoinsWithoutAliases) {
+  // Both sides of a JOIN must be aliased -- unqualified column references
+  // like `a.order_id` would otherwise have no way to pick a side.
   EXPECT_THROW(parse_sql("SELECT a FROM read_parquet('/x.parquet') JOIN read_parquet('/y.parquet') ON true"),
+               SqlError);
+}
+
+TEST(SqlParser, ParsesTwoTableInnerJoin) {
+  const auto stmt = parse_sql(
+      "SELECT a.x, b.y FROM read_parquet('/x.parquet') AS a "
+      "JOIN read_parquet('/y.parquet') AS b ON a.order_id = b.order_id");
+  ASSERT_TRUE(stmt.join.has_value());
+  EXPECT_EQ(stmt.join->left.paths, std::vector<std::string>{"/x.parquet"});
+  EXPECT_EQ(stmt.join->left.alias, "a");
+  EXPECT_EQ(stmt.join->right.paths, std::vector<std::string>{"/y.parquet"});
+  EXPECT_EQ(stmt.join->right.alias, "b");
+  ASSERT_NE(stmt.join->condition, nullptr);
+  const auto* condition = std::get_if<AstBinary>(&stmt.join->condition->node);
+  ASSERT_NE(condition, nullptr);
+  EXPECT_EQ(condition->op, AstBinaryOp::Eq);
+  const auto* left_ref = std::get_if<AstColumnRef>(&condition->left->node);
+  ASSERT_NE(left_ref, nullptr);
+  EXPECT_EQ(left_ref->name, "order_id");
+  ASSERT_TRUE(left_ref->table.has_value());
+  EXPECT_EQ(*left_ref->table, "a");
+
+  ASSERT_EQ(stmt.select_list.size(), 2u);
+  const auto* select_a = std::get_if<AstColumnRef>(&stmt.select_list[0]->node);
+  ASSERT_NE(select_a, nullptr);
+  EXPECT_EQ(select_a->name, "x");
+  ASSERT_TRUE(select_a->table.has_value());
+  EXPECT_EQ(*select_a->table, "a");
+}
+
+TEST(SqlParser, RejectsNonInnerJoin) {
+  EXPECT_THROW(parse_sql("SELECT a.x FROM read_parquet('/x.parquet') AS a "
+                         "LEFT JOIN read_parquet('/y.parquet') AS b ON a.order_id = b.order_id"),
+               SqlError);
+}
+
+TEST(SqlParser, RejectsCommaStyleJoin) {
+  EXPECT_THROW(parse_sql("SELECT a.x FROM read_parquet('/x.parquet') AS a, read_parquet('/y.parquet') AS b "
+                         "WHERE a.order_id = b.order_id"),
+               SqlError);
+}
+
+TEST(SqlParser, RejectsThreeReadParquetSources) {
+  EXPECT_THROW(parse_sql("SELECT a.x FROM read_parquet('/x.parquet') AS a "
+                         "JOIN read_parquet('/y.parquet') AS b ON a.order_id = b.order_id "
+                         "JOIN read_parquet('/z.parquet') AS c ON b.order_id = c.order_id"),
                SqlError);
 }
 

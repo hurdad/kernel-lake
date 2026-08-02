@@ -155,10 +155,15 @@ ExpressionPtr simplify_expression(const ExpressionPtr& expr) {
 // Expression-tree column collection, used for projection pushdown.
 // ---------------------------------------------------------------------------
 
-void collect_columns(const ExpressionPtr& expr, std::unordered_set<std::string>& out) {
+// Collects each referenced column's *index* (not name): required for
+// LogicalJoin, where a combined post-join row can have two same-named
+// columns from opposite sides, and only the index unambiguously says which
+// side a given ColumnExpression actually came from (see the LogicalJoin
+// branch in annotate_scan() below).
+void collect_columns(const ExpressionPtr& expr, std::unordered_set<std::size_t>& out) {
   if (expr == nullptr) return;
   if (const auto* column = dynamic_cast<const ColumnExpression*>(expr.get())) {
-    out.insert(column->name());
+    out.insert(column->column_index());
   } else if (const auto* binary = dynamic_cast<const BinaryExpression*>(expr.get())) {
     collect_columns(binary->left(), out);
     collect_columns(binary->right(), out);
@@ -271,6 +276,18 @@ LogicalPlanPtr rewrite_plan(const LogicalPlanPtr& node) {
     return node;
   }
 
+  if (const auto* join = dynamic_cast<const LogicalJoin*>(node.get())) {
+    // Nothing to simplify about the join itself (its "expression" is just
+    // two column indices, not an Expression tree) -- only its two subtrees
+    // (always a bare LogicalScan each in this version, since only
+    // `read_parquet(...)` sources can appear on either side of a JOIN) can
+    // need rewriting.
+    LogicalPlanPtr left = rewrite_plan(join->left());
+    LogicalPlanPtr right = rewrite_plan(join->right());
+    return std::make_shared<LogicalJoin>(std::move(left), std::move(right), join->left_key_index(),
+                                         join->right_key_index());
+  }
+
   if (const auto* filter = dynamic_cast<const LogicalFilter*>(node.get())) {
     LogicalPlanPtr child = rewrite_plan(filter->child());
     ExpressionPtr predicate = simplify_expression(filter->predicate());
@@ -347,7 +364,7 @@ LogicalPlanPtr rewrite_plan(const LogicalPlanPtr& node) {
 // schema, not the scan's, and are correctly excluded.
 // ---------------------------------------------------------------------------
 
-void annotate_scan(const LogicalPlanPtr& node, std::unordered_set<std::string>& required_columns,
+void annotate_scan(const LogicalPlanPtr& node, std::unordered_set<std::size_t>& required_columns,
                    std::vector<PushablePredicate>& pushable_predicates) {
   if (const auto* filter = dynamic_cast<const LogicalFilter*>(node.get())) {
     collect_columns(filter->predicate(), required_columns);
@@ -375,8 +392,44 @@ void annotate_scan(const LogicalPlanPtr& node, std::unordered_set<std::string>& 
     annotate_scan(projection->child(), required_columns, pushable_predicates);
   } else if (const auto* limit = dynamic_cast<const LogicalLimit*>(node.get())) {
     annotate_scan(limit->child(), required_columns, pushable_predicates);
+  } else if (const auto* join = dynamic_cast<const LogicalJoin*>(node.get())) {
+    // Splits the combined-index required-columns set collected so far by
+    // which side of the join each index actually belongs to -- unlike every
+    // other node above, a join has two independent scan subtrees below it,
+    // each needing its own local (offset-corrected) index space. The join
+    // key itself is required on both sides regardless of what's referenced
+    // above (HashJoinOperator needs it to build/probe), even if the query
+    // never otherwise selects it.
+    //
+    // Predicate pushdown does not cross a join in this version: any
+    // pushable_predicates collected above (from a WHERE clause that also
+    // mixes join-key columns) are deliberately dropped here rather than
+    // routed to one side, since PushablePredicate's bare column_name has no
+    // way to say which side it came from once two schemas are in play. Scan
+    // pruning still runs per-side in the physical planner; it just always
+    // sees an empty predicate list for a JOIN query. See docs/ARCHITECTURE.md.
+    const std::size_t left_count = join->left()->output_schema().field_count();
+    std::unordered_set<std::size_t> left_required;
+    std::unordered_set<std::size_t> right_required;
+    for (const std::size_t index : required_columns) {
+      if (index < left_count) {
+        left_required.insert(index);
+      } else {
+        right_required.insert(index - left_count);
+      }
+    }
+    left_required.insert(join->left_key_index());
+    right_required.insert(join->right_key_index());
+
+    std::vector<PushablePredicate> no_left_pushdown;
+    annotate_scan(join->left(), left_required, no_left_pushdown);
+    std::vector<PushablePredicate> no_right_pushdown;
+    annotate_scan(join->right(), right_required, no_right_pushdown);
   } else if (auto* scan = dynamic_cast<LogicalScan*>(node.get())) {
-    std::vector<std::string> columns(required_columns.begin(), required_columns.end());
+    std::vector<std::string> columns;
+    columns.reserve(required_columns.size());
+    for (const std::size_t index : required_columns)
+      columns.push_back(scan->output_schema().field(index).name);
     std::sort(columns.begin(), columns.end());
     scan->set_required_columns(std::move(columns));
     scan->set_pushable_predicates(std::move(pushable_predicates));
@@ -387,7 +440,7 @@ void annotate_scan(const LogicalPlanPtr& node, std::unordered_set<std::string>& 
 
 LogicalPlanPtr optimize(LogicalPlanPtr plan) {
   LogicalPlanPtr rewritten = rewrite_plan(plan);
-  std::unordered_set<std::string> required_columns;
+  std::unordered_set<std::size_t> required_columns;
   std::vector<PushablePredicate> pushable_predicates;
   annotate_scan(rewritten, required_columns, pushable_predicates);
   return rewritten;

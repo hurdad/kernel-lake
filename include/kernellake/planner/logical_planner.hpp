@@ -6,15 +6,16 @@
 namespace kernellake {
 
 // Builds the initial (unoptimized) logical plan from a bound query plus the
-// schema of its FROM source. Column indices inside `query`'s expressions
-// were assigned by the binder against `source_schema`, so this function must
-// be called with the same schema that was passed to bind_query().
+// schema(s) of its FROM source(s). Column indices inside `query`'s
+// expressions were assigned by the binder against these same schemas (in
+// the JOIN case, against their concatenation -- see LogicalJoin), so this
+// function must be called with the same schema(s) that were passed to the
+// matching bind_query() overload.
 //
-// Known MVP limitation: ORDER BY after GROUP BY is rejected with
-// PlanningError rather than silently sorting the wrong rows, since it would
-// require binding ORDER BY against the post-aggregation output schema
-// (aliases included), which is not yet implemented. ORDER BY on a
-// non-aggregate query works normally.
-[[nodiscard]] LogicalPlanPtr build_logical_plan(const BoundQuery& query, const Schema& source_schema);
+// `right_schema` must be non-null exactly when `query.join.has_value()` --
+// builds a LogicalJoin(LogicalScan(left), LogicalScan(right)) as the plan's
+// source instead of a single LogicalScan.
+[[nodiscard]] LogicalPlanPtr build_logical_plan(const BoundQuery& query, const Schema& source_schema,
+                                                const Schema* right_schema = nullptr);
 
 }  // namespace kernellake

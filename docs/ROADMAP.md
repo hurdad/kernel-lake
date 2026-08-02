@@ -105,6 +105,26 @@ and covered by passing tests -- not merely designed or stubbed.
   computed expression only resolves after `GROUP BY`, not on a plain query
   -- already true and documented before this work, not a new limitation,
   but not obvious until a DECIMAL `CAST` test tripped over it.
+- Hash joins: a two-table `INNER JOIN ... ON <a.col = b.col>` (single
+  equality key, both sides aliased `read_parquet(...)` sources) end to end --
+  a rewritten multi-occurrence `read_parquet(...)` regex adapter (parser.cpp),
+  qualified-column-aware binding with a combined `[left..., right...]`
+  column-index space (new `LogicalJoin`/`HashJoinNode`/`HashJoinOperator`),
+  and per-side required-column splitting in the optimizer. See "Hash joins"
+  in `docs/ARCHITECTURE.md` for the full scope (INNER only, one equality
+  key, no comma-style joins, no predicate pushdown across the join) and
+  known limitations (same-named columns on both sides can't be referenced
+  unqualified after the join). `HashJoinOperator` is the first operator
+  whose *build* side is blocking (like `SortOperator`) while its *probe*
+  side streams normally, built on `cudf::hash_join`. Verified end-to-end
+  against real two-file Parquet fixtures and cross-checked against DuckDB
+  (`tests/gpu/hash_join_test.cpp`, `tests/unit/binder_test.cpp`,
+  `tests/unit/sql_parser_test.cpp`). Caught and fixed one real bug in the
+  process: `operator_builder.cpp` would have built the join's two child
+  operator trees as two arguments of the same constructor call, which is
+  unspecified evaluation order in C++ and both recursive calls mutate a
+  shared `next_id` counter as a side effect -- fixed by sequencing them as
+  separate statements before either build() call actually ran.
 - `QueryEngine::execute()`, wired to the real operator pipeline for
   `gpu-dev` builds (a CPU-only stub throws `ExecutionError` for `dev`
   builds), and the `kernellake query` CLI command (`--sql`/`--file`,
@@ -123,7 +143,10 @@ and covered by passing tests -- not merely designed or stubbed.
   nullable column
 
 - TPC-H tooling (`lineitem`-only -- Q6 and Q1, both single-table; Q3/Q12/Q14
-  need hash joins, not implemented yet): `tools/generate_tpch.py` (synthetic
+  need multi-table joins across TPC-H's actual schema, which goes beyond
+  the two-table single-equality-key scope hash joins currently support --
+  see "Hash joins" in `docs/ARCHITECTURE.md` -- so still not wired up):
+  `tools/generate_tpch.py` (synthetic
   generator, not real `dbgen`), `benchmarks/tpch/queries/{q01,q06}.sql`,
   `tools/validate_tpch.py` (DuckDB cross-validation; the spec's `kernellake
   validate tpch` as a Python tool rather than a CLI subcommand, same choice
@@ -183,7 +206,8 @@ and covered by passing tests -- not merely designed or stubbed.
 
 - TPC-H `execution-only` benchmark mode (needs an operator-tree entry point
   that skips `ParquetScanOperator`); TPC-H at real SF1/SF10 scale (only
-  tested at SF0.01/SF0.1 so far); Q3/Q12/Q14 (need hash joins)
+  tested at SF0.01/SF0.1 so far); Q3/Q12/Q14 (need TPC-H's actual multi-way
+  join schema wired up against hash joins' current two-table scope)
 - A self-hosted GPU CI runner (would enable a `gpu-dev` build/test/
   benchmark/validate workflow to actually run in CI, rather than only
   locally) -- explicitly deferred; `hurdad/kernel-lake` is a public repo,
@@ -199,8 +223,10 @@ and covered by passing tests -- not merely designed or stubbed.
 ## Explicit non-goals for the MVP
 
 Distributed execution, multi-node/multi-GPU scheduling, Kubernetes
-operators, full Iceberg catalog integration, Arrow Flight SQL, joins, all
-22 TPC-H queries, cost-based optimization, fault-tolerant fragment
+operators, full Iceberg catalog integration, Arrow Flight SQL, joins beyond
+a two-table `INNER JOIN` with a single equality key (see "Hash joins" in
+`docs/ARCHITECTURE.md`), all 22 TPC-H queries, cost-based optimization,
+fault-tolerant fragment
 retries, query spilling, materialized views, transactions, data ingestion
 (`INSERT`/`UPDATE`/`DELETE`), a proprietary storage format, and a web UI.
 Interfaces may exist for some of these (see "Future architecture" in

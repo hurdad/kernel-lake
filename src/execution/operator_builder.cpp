@@ -4,6 +4,7 @@
 #include "kernellake/execution/arrow_result_operator.hpp"
 #include "kernellake/execution/filter_operator.hpp"
 #include "kernellake/execution/hash_aggregate_operator.hpp"
+#include "kernellake/execution/hash_join_operator.hpp"
 #include "kernellake/execution/limit_operator.hpp"
 #include "kernellake/execution/parquet_scan_operator.hpp"
 #include "kernellake/execution/projection_operator.hpp"
@@ -20,6 +21,18 @@ std::unique_ptr<PhysicalOperator> build(const PhysicalPlanPtr& node, std::size_t
     return std::make_unique<ParquetScanOperator>(next_id++, scan->fragments(), scan->columns(),
                                                  std::make_shared<const Schema>(scan->output_schema()),
                                                  pass_read_limit_bytes);
+  }
+  if (const auto* join = dynamic_cast<const HashJoinNode*>(node.get())) {
+    // Built as two separate statements, not two arguments of the same
+    // call: argument evaluation order is unspecified in C++, and both
+    // recursive build() calls mutate `next_id` as a side effect, so leaving
+    // it to the compiler would make operator ID assignment
+    // non-deterministic across the two subtrees.
+    std::unique_ptr<PhysicalOperator> left = build(join->left(), pass_read_limit_bytes, next_id);
+    std::unique_ptr<PhysicalOperator> right = build(join->right(), pass_read_limit_bytes, next_id);
+    return std::make_unique<HashJoinOperator>(next_id++, std::move(left), std::move(right),
+                                              join->left_key_index(), join->right_key_index(),
+                                              std::make_shared<const Schema>(join->output_schema()));
   }
   if (const auto* filter = dynamic_cast<const FilterNode*>(node.get())) {
     return std::make_unique<FilterOperator>(next_id++, build(filter->child(), pass_read_limit_bytes, next_id),

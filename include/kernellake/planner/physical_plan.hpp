@@ -68,6 +68,52 @@ class ParquetScanNode final : public PhysicalPlanNode {
   int files_considered_;
 };
 
+// A two-table INNER equi-join (see LogicalJoin). `left_key_index`/
+// `right_key_index` are into each side's *own already-narrowed* physical
+// scan schema (unlike LogicalJoin's, which are into the original,
+// pre-pruning logical schema) -- the physical planner translates by name
+// when converting a LogicalJoin, since narrowing can shift a column's
+// position. Output schema is the plain concatenation of the two children's
+// (already narrowed) schemas, in that order, matching exactly what
+// HashJoinOperator gathers into its output batch.
+class HashJoinNode final : public PhysicalPlanNode {
+ public:
+  HashJoinNode(PhysicalPlanPtr left, PhysicalPlanPtr right, std::size_t left_key_index,
+               std::size_t right_key_index)
+      : left_(std::move(left)),
+        right_(std::move(right)),
+        left_key_index_(left_key_index),
+        right_key_index_(right_key_index),
+        schema_(build_schema(left_->output_schema(), right_->output_schema())) {}
+
+  [[nodiscard]] const PhysicalPlanPtr& left() const noexcept { return left_; }
+  [[nodiscard]] const PhysicalPlanPtr& right() const noexcept { return right_; }
+  [[nodiscard]] std::size_t left_key_index() const noexcept { return left_key_index_; }
+  [[nodiscard]] std::size_t right_key_index() const noexcept { return right_key_index_; }
+  [[nodiscard]] const Schema& output_schema() const override { return schema_; }
+  [[nodiscard]] std::string_view node_name() const noexcept override { return "HashJoin"; }
+  [[nodiscard]] std::vector<PhysicalPlanPtr> children() const override { return {left_, right_}; }
+  [[nodiscard]] std::vector<std::pair<std::string, std::string>> explain_attributes() const override {
+    return {{"type", "INNER"},
+            {"left_key", left_->output_schema().field(left_key_index_).name},
+            {"right_key", right_->output_schema().field(right_key_index_).name}};
+  }
+
+ private:
+  static Schema build_schema(const Schema& left, const Schema& right) {
+    std::vector<Field> fields = left.fields();
+    const std::vector<Field>& right_fields = right.fields();
+    fields.insert(fields.end(), right_fields.begin(), right_fields.end());
+    return Schema(std::move(fields));
+  }
+
+  PhysicalPlanPtr left_;
+  PhysicalPlanPtr right_;
+  std::size_t left_key_index_;
+  std::size_t right_key_index_;
+  Schema schema_;
+};
+
 class FilterNode final : public PhysicalPlanNode {
  public:
   FilterNode(PhysicalPlanPtr child, ExpressionPtr predicate)
