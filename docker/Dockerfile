@@ -1,7 +1,8 @@
 # Single multi-stage Dockerfile publishing two images from one source of
-# truth: `dev` (full CUDA devel toolkit, everything needed to iterate on
+# truth: `dev` (full CUDA toolkit, everything needed to iterate on
 # KernelLake) and `runtime` (only the built binary plus its actual runtime
-# dependency closure). Build whichever you need with --target:
+# shared-library closure -- no compiler, no CUDA headers, no nvcc, no static
+# libs). Build whichever you need with --target:
 #
 #   docker build --target dev     -f docker/Dockerfile -t kernellake/kernellake:dev .
 #   docker build --target runtime -f docker/Dockerfile -t kernellake/kernellake:runtime .
@@ -11,34 +12,37 @@
 #   docker run --rm --gpus all -v /tmp/kernellake-sales:/data:ro \
 #     kernellake/kernellake:runtime query --sql "SELECT region, SUM(amount) FROM read_parquet('/data/*.parquet') GROUP BY region"
 #
-# NOT verified by an actual `docker build`/`docker run --gpus all` in this
-# repository's own development session -- Docker was not available there
-# (see docs/ROADMAP.md). Review and test before relying on either image.
+# Base: plain `ubuntu:26.04`, with CUDA installed via Ubuntu's own apt
+# `nvidia-cuda-toolkit` package (12.4.1) rather than NVIDIA's official
+# `nvidia/cuda` devel/runtime images -- verified by a real `docker build`
+# and `docker run --gpus all` (a full 214/214 test pass on real hardware)
+# in this project's own development session. See docs/ARCHITECTURE.md's
+# "Ubuntu 26.04 baseline" section for why: NVIDIA's apt Flight SQL package
+# doesn't link against Ubuntu 24.04's older system Abseil, otel-cpp has no
+# 24.04 apt package at all, and both work cleanly on 26.04. RAPIDS
+# libcudf/RMM stay on the same `-cu12` pinned wheels (cmake/ThirdPartyRapids.cmake)
+# -- CUDA 12.4 is a minor step down from the previously-pinned 12.6.3, not a
+# major-version change, and needs no re-vendoring.
 
 # ---------------------------------------------------------------------------
 # dev: full build environment, with the repository built inside it. Also a
 # complete, runnable image on its own (`--target dev`).
 # ---------------------------------------------------------------------------
-FROM nvidia/cuda:12.6.3-devel-ubuntu24.04 AS dev
+FROM ubuntu:26.04 AS dev
 
 ENV DEBIAN_FRONTEND=noninteractive
 
+# cmake comes straight from apt here: Ubuntu 26.04 ships 4.2.3, already
+# above the >= 3.30.4 libcudf's cudf-config.cmake requires -- unlike Ubuntu
+# 24.04 (3.28.3), no Kitware tarball download needed any more.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      build-essential ninja-build git pkg-config wget ca-certificates lsb-release \
+      build-essential cmake ninja-build git pkg-config wget ca-certificates lsb-release gnupg \
       python3 python3-pip \
       libgtest-dev libbenchmark-dev libspdlog-dev nlohmann-json3-dev libyaml-cpp-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# CMake >= 3.30.4 is required by libcudf's own cudf-config.cmake, newer
-# than Ubuntu 24.04's apt package (3.28.3) -- same Kitware binary tarball
-# approach documented in README.md's Requirements section.
-RUN wget -qO /tmp/cmake.tar.gz \
-      https://github.com/Kitware/CMake/releases/download/v3.30.4/cmake-3.30.4-linux-x86_64.tar.gz \
-    && tar -xzf /tmp/cmake.tar.gz -C /opt \
-    && ln -s /opt/cmake-3.30.4-linux-x86_64/bin/* /usr/local/bin/ \
-    && rm /tmp/cmake.tar.gz
-
-# Apache Arrow / Parquet C++ (official Apache Arrow apt repo)
+# Apache Arrow / Parquet C++ (official Apache Arrow apt repo; resolves to
+# the `resolute` suite automatically via lsb_release)
 RUN wget -O /tmp/arrow-apt-source.deb \
       "https://packages.apache.org/artifactory/arrow/ubuntu/apache-arrow-apt-source-latest-$(lsb_release --codename --short).deb" \
     && apt-get install -y -V /tmp/arrow-apt-source.deb \
@@ -46,44 +50,82 @@ RUN wget -O /tmp/arrow-apt-source.deb \
     && apt-get install -y --no-install-recommends libarrow-dev libparquet-dev libarrow-dataset-dev \
     && rm -rf /var/lib/apt/lists/* /tmp/arrow-apt-source.deb
 
+# CUDA toolkit + GPUDirect Storage headers, both from Ubuntu's own apt
+# repos. libcufile-dev is not pulled in by nvidia-cuda-toolkit itself but is
+# required by kvikio (a libcudf dependency) -- confirmed by a real
+# configure failure ("Compiled with cuFile support but cuFile not found")
+# before this line was added.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      nvidia-cuda-toolkit libcufile-dev \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /workspace
 COPY . .
 
 # RAPIDS libcudf/RMM/kvikio/nvcomp/rapids-logger are vendored automatically
 # by CMake FetchContent on first configure (cmake/ThirdPartyRapids.cmake,
 # pinned PyPI wheels, no conda) -- no separate install step needed here.
-# Do not hard-code a host-specific CUDA path: CUDAToolkit is located via
-# find_package(CUDAToolkit REQUIRED), which finds this image's own toolkit
-# install without any absolute path baked into CMakeLists.txt.
-RUN cmake --preset gpu-dev && cmake --build --preset gpu-dev
+#
+# CMAKE_CUDA_COMPILER: apt's nvidia-cuda-toolkit installs nvcc at
+# /usr/bin/nvcc (Debian packaging convention), not
+# /usr/local/cuda/bin/nvcc (NVIDIA installer/Docker-image convention,
+# still used by CMakePresets.json's gpu-dev preset for this project's own
+# non-container dev environment) -- overridden here, not in the preset
+# itself, so the two environments' actual toolchains each get their own
+# correct path without either one needing to guess the other's layout.
+#
+# CMAKE_CUDA_ARCHITECTURES: no GPU is visible during `docker build` (unlike
+# `docker run --gpus all`), so the top-level CMakeLists.txt's default of
+# "native" (query the actual device) cannot be used here -- it needs a real
+# device to probe. Volta through Hopper (70/75/80/86/89) get real compiled
+# code; Hopper's entry is also left without the "-real" suffix so its PTX
+# is embedded too, letting the driver JIT-compile for newer architectures
+# it doesn't have native code for (this is exactly what let the RTX 5060 Ti
+# used to verify this image, a Blackwell/sm_120 card newer than anything
+# CUDA 12.4's nvcc can target directly, run all 214 tests successfully).
+RUN cmake --preset gpu-dev \
+      -DCMAKE_CUDA_COMPILER=/usr/bin/nvcc \
+      -DCMAKE_CUDA_ARCHITECTURES="70-real;75-real;80-real;86-real;89" \
+    && cmake --build --preset gpu-dev
 
 ENTRYPOINT ["/workspace/build/gpu-dev/src/cli/kernellake"]
 CMD ["--help"]
 
 # ---------------------------------------------------------------------------
 # runtime-libs: not a published image (never built with --target) -- just
-# resolves `dev`'s binary's actual non-system runtime dependency closure so
-# the runtime stage below can copy exactly those files, without hard-coding
-# vendored library names/paths that would go stale on a RAPIDS version bump.
+# resolves `dev`'s binary's actual runtime shared-library closure so the
+# runtime stage below can copy exactly those files, without hard-coding
+# vendored library names/paths that would go stale on a RAPIDS/Arrow/CUDA
+# version bump. Only a short, fixed list of glibc/libgcc basenames is
+# excluded -- those are guaranteed present, at an identical version, on any
+# ubuntu:26.04 image (dev and runtime both build FROM one), so copying them
+# would be redundant, not a correctness concern either way.
 # ---------------------------------------------------------------------------
 FROM dev AS runtime-libs
 
 RUN mkdir -p /opt/kernellake-libs && \
     ldd build/gpu-dev/src/cli/kernellake | awk '{print $3}' | grep '^/' | sort -u | \
     while read -r lib; do \
-      case "$lib" in \
-        /lib/*|/lib64/*|/usr/lib/*) ;; \
+      case "$(basename "$lib")" in \
+        ld-linux-x86-64.so.2|libc.so.6|libm.so.6|libpthread.so.0|libdl.so.2|librt.so.1|libgcc_s.so.1|libstdc++.so.6) ;; \
         *) cp -Ln "$lib" /opt/kernellake-libs/ 2>/dev/null || true ;; \
       esac; \
     done
 
 # ---------------------------------------------------------------------------
-# runtime: only what's needed to run a built `kernellake` binary -- the CUDA
-# *runtime* (not devel/compiler) base image, the compiled binary, and
-# exactly the non-system shared libraries it needs. No compiler, no build
-# tools, no source tree. This is the default (last) stage.
+# runtime: only what's needed to run a built `kernellake` binary -- plain
+# ubuntu:26.04 (the same base `dev` used, so the excluded glibc/libgcc/
+# libstdc++ libraries above are guaranteed to match), the compiled binary,
+# and exactly its non-base-system shared library closure (CUDA runtime
+# .so's, Arrow/Parquet, RAPIDS, and every other vendored dependency). No
+# compiler, no nvcc, no CUDA headers, no static libraries, no source tree.
+# This is the default (last) stage.
 # ---------------------------------------------------------------------------
-FROM nvidia/cuda:12.6.3-runtime-ubuntu24.04 AS runtime
+FROM ubuntu:26.04 AS runtime
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates libstdc++6 \
+    && rm -rf /var/lib/apt/lists/*
 
 RUN mkdir -p /opt/kernellake/bin /opt/kernellake/lib
 COPY --from=dev /workspace/build/gpu-dev/src/cli/kernellake /opt/kernellake/bin/kernellake

@@ -250,6 +250,28 @@ and covered by passing tests -- not merely designed or stubbed.
   another runs the real `build_physical_plan` + `build_operator_tree`
   pipeline (the same one `QueryEngine::execute()` uses) end-to-end across
   those same conditions and checks the grouped sums/counts by hand
+- Bumped `docker/Dockerfile`'s baseline from Ubuntu 24.04/NVIDIA's official
+  `nvidia/cuda` images to plain `ubuntu:26.04` with CUDA installed via
+  apt's own `nvidia-cuda-toolkit` (12.4.1) -- resolves two real, confirmed
+  blockers (Arrow Flight SQL doesn't link against Ubuntu 24.04's system
+  Abseil; otel-cpp has no 24.04 apt package at all) without a CUDA
+  major-version bump or RAPIDS re-vendor (12.4.1 vs. the previously-pinned
+  12.6.3 are both CUDA 12.x, same `-cu12` wheels). Verified for real with
+  Docker, not inferred from package metadata: `docker build --target dev`
+  builds all 103 targets; `docker build --target runtime` produces a
+  shared-library-only 2.17 GB image (down from `dev`'s 14.1 GB, no
+  compiler/nvcc/headers); `docker run --gpus all` against a real GPU (RTX
+  5060 Ti, a Blackwell/sm_120 card newer than CUDA 12.4's nvcc can target
+  directly -- handled via embedded PTX + driver JIT) ran all 214 tests
+  successfully, and a real query against real generated data through the
+  `runtime` image alone produced correct GPU-executed results. See
+  `docs/ARCHITECTURE.md`'s "Ubuntu 26.04 baseline" section for the full
+  investigation, including the two extra apt packages this needed
+  (`gnupg`, for the Arrow apt source's postinst; `libcufile-dev`, for
+  kvikio's GPUDirect Storage dependency, not pulled in by
+  `nvidia-cuda-toolkit` itself). This project's own non-container `dev`/
+  `gpu-dev` presets and this sandbox's CUDA install are unaffected --
+  still Ubuntu 24.04, unchanged.
 
 ## Not yet started
 
@@ -266,9 +288,6 @@ and covered by passing tests -- not merely designed or stubbed.
   gets code execution on the runner's owner's hardware
 - Running `clang-tidy` across the whole tree and wiring it into CI (config
   spot-checked, not exhaustively run)
-- `docker run --gpus all` of the published `runtime` image against a real
-  GPU (the image builds and pushes successfully in CI; actually running it
-  hasn't been checked yet)
 - **A three-way benchmark: KernelLake-CPU vs. KernelLake-GPU vs. PySpark**
   (Phase 2 of the CPU-backend epic; Phase 1, the CPU backend itself, is
   done -- see "Done" above). PySpark is not yet installed (`pip install
@@ -282,23 +301,24 @@ and covered by passing tests -- not merely designed or stubbed.
 - **An Arrow Flight SQL server, otel-cpp observability, and a Helm chart**
   (a user-directed initiative beyond the original MVP scope, sequenced
   *after* the CPU-backend/benchmark epic above -- see the "Explicit
-  non-goals" note below on Flight SQL/Kubernetes). Phase 0 (above) is done;
-  still to build, in order: (1) the Flight SQL server itself (new
-  `kernellake-server` binary, `libarrow-flight-sql-dev`/`libgrpc++-dev` from
-  the same Apache Arrow apt repo already in use -- confirmed available, no
-  `FetchContent` vendoring needed for Flight itself), gated on a
-  version-compatibility spike against Ubuntu 24.04's older system gRPC; (2)
-  otel-cpp integration (vendored via `FetchContent`, building on Phase 0's
-  `MetricsRegistry`/NVTX instrumentation points); (3) a Helm chart deploying
-  the server as a Deployment+Service, now with a `backend: gpu|cpu` toggle
-  (mirroring `engine.backend` from the CPU-backend epic) so the same chart
-  can schedule onto GPU or CPU-only nodes, blocked on (1). A related
-  question -- bumping the Ubuntu baseline from 24.04 to 26.04 for
-  apt-native otel-cpp and Ubuntu's own `nvidia-cuda-toolkit` package instead
-  of the official `nvidia/cuda` Docker image -- was deliberately deferred:
-  otel-cpp vendors cleanly on 24.04 already, and swapping the CUDA
-  toolchain source is a real, unverified risk with no Docker available in
-  this project's dev environment to test it against.
+  non-goals" note below on Flight SQL/Kubernetes). Phase 0 (above) is done,
+  and the Ubuntu 26.04 Docker baseline bump (above) resolves the
+  version-compatibility question that used to gate this: Arrow Flight SQL
+  is now confirmed to link and run there (it does not on 24.04 -- see
+  `docs/ARCHITECTURE.md`). Still to build, in order: (1) the
+  `kernellake-server` binary itself and its query-mapping layer (the
+  dependency/link questions are answered; what's left is the actual
+  `FlightSqlServerBase` subclass wired to `QueryEngine`); (2) otel-cpp
+  integration (now apt-native on the 26.04 image rather than
+  `FetchContent`-vendored, building on Phase 0's `MetricsRegistry`/NVTX
+  instrumentation points); (3) a Helm chart deploying the server as a
+  Deployment+Service, with a `backend: gpu|cpu` toggle (mirroring
+  `engine.backend` from the CPU-backend epic) so the same chart can
+  schedule onto GPU or CPU-only nodes, blocked on (1). Note: this all
+  targets the Docker image specifically -- this project's own
+  non-container development environment (this sandbox) stays on Ubuntu
+  24.04, so `src/server/` development/testing happens via the
+  `kernellake-dev` Docker image, not the local `gpu-dev` preset directly.
 - Delta Lake read support (`read_delta(...)` alongside `read_parquet(...)`)
   -- explicitly deferred as its own follow-up plan, not forgotten. Reading
   `_delta_log/*.json` plus checkpoint Parquet files is required to

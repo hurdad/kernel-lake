@@ -196,8 +196,16 @@ cold/warm timing modes.
 ## Docker
 
 `docker/Dockerfile` is a single multi-stage file with two named targets:
-`dev` (full CUDA devel image, repo built inside it) and `runtime` (only the
-built binary plus its actual runtime dependency closure).
+`dev` (full CUDA toolkit image, repo built inside it -- 14.1 GB) and
+`runtime` (only the built binary plus its actual runtime shared-library
+closure, no compiler/headers/nvcc -- 2.17 GB). Both build on plain
+`ubuntu:26.04` with CUDA installed via apt's own `nvidia-cuda-toolkit`
+(12.4.1), not Ubuntu 24.04 or NVIDIA's official `nvidia/cuda` images --
+see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)'s "Ubuntu 26.04 baseline"
+section for why (Arrow Flight SQL and otel-cpp both need it). This is
+independent of the Requirements/Build sections above, which describe this
+project's own non-container Ubuntu 24.04 development environment --
+neither one needs to match the other.
 
 ```bash
 docker build --target dev     -f docker/Dockerfile -t kernellake/kernellake:dev .
@@ -210,11 +218,14 @@ docker run --rm --gpus all -v /tmp/kernellake-sales:/data:ro \
 targets to `ghcr.io/hurdad/kernel-lake:dev` and `:runtime`/`:latest` on
 every push to `main` -- but only after `format-check`, `cpu-build-test`,
 and `tpch-tooling-smoke` all succeed, so a broken build is never shipped as
-an image. **Confirmed working on real GitHub Actions**: all four jobs have
-succeeded end to end, including the image build/push (~10 minutes, no
-runner-disk issues) -- both images are live. `docker run --gpus all`
-against the published image hasn't been checked yet -- see
-[docs/ROADMAP.md](docs/ROADMAP.md).
+an image. `docker run --gpus all` against a real GPU (RTX 5060 Ti) has been
+verified for real against this Ubuntu 26.04 baseline: all 214 tests pass in
+the `dev` image, and a real query against real generated data through the
+`runtime` image alone produces correct GPU-executed results -- see
+`docs/ARCHITECTURE.md`. CI's own `docker-publish` job (building against the
+previous, pre-26.04 Dockerfile) had separately succeeded end to end on
+real GitHub Actions; re-confirming CI still passes with this baseline
+change is still pending.
 
 ## Project layout
 

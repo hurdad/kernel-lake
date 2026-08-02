@@ -618,6 +618,118 @@ the similarly-named package, is a trap: it only ships Python extension
 modules, not the plain `.so`). libcudf's own `cudf-config.cmake` requires
 CMake >= 3.30.4, newer than Ubuntu 24.04's apt package (3.28.3).
 
+### Ubuntu 26.04 baseline (`docker/Dockerfile`)
+
+`docker/Dockerfile`'s published images (`dev`/`runtime`) build on plain
+`ubuntu:26.04`, not Ubuntu 24.04 or NVIDIA's official `nvidia/cuda` devel/
+runtime images. This is a deliberate, empirically-verified departure from
+this project's own non-container development environment, which stays on
+Ubuntu 24.04 (nothing about the local `dev`/`gpu-dev` CMake presets or this
+sandbox's own CUDA install changed) -- the two are independent, and there
+is no requirement that they match.
+
+**Why**: two real, distro-level blockers, both confirmed by an actual
+`docker build`/`docker run --gpus all` in this project's own development
+session (not inferred from package metadata alone):
+
+- **Arrow Flight SQL doesn't link on Ubuntu 24.04.** Arrow 25.0.0's apt
+  package for `libarrow-flight-sql-dev` fails at final link with undefined
+  references like `absl::lts_20250127::synchronization_internal::
+  KernelTimeout::MakeAbsTimespec()`. Root cause, confirmed via `nm` on the
+  actual `.deb` contents: Ubuntu 24.04's own system Abseil (a 2022-06-23
+  snapshot) is too old for Arrow 25's minimum requirement, so Arrow's
+  24.04 package statically bundles a private, newer Abseil copy inside
+  `libarrow_bundled_dependencies.a` -- and that bundle is incomplete (the
+  translation unit defining `KernelTimeout::MakeAbsTimespec()` wasn't
+  included at Apache's own build time). On Ubuntu 26.04, `libarrow2500`
+  instead *dynamically depends on* a real system package,
+  `libabsl20260107`, because 26.04's system Abseil is new enough that
+  Arrow doesn't need to bundle its own -- the entire broken code path
+  doesn't exist. Verified for real: an empty `FlightSqlServerBase`
+  subclass builds, links, and calls `Init()` successfully in an
+  `ubuntu:26.04` container (needs `$<LINK_GROUP:RESCAN,...>` around
+  `ArrowFlightSql::arrow_flight_sql_static`/`ArrowFlight::arrow_flight_static`/
+  `Arrow::arrow_static`/`gRPC::grpc++` either way, since Arrow's own CMake
+  target doesn't declare `gRPC::grpc++` as a dependency).
+- **otel-cpp has no Ubuntu 24.04 apt package at all** (`FetchContent`
+  vendoring was the only option there). Ubuntu 26.04 ships
+  `opentelemetry-cpp-dev` (1.23.0) directly, with both OTLP/HTTP and
+  OTLP/gRPC exporter CMake targets pre-built -- both verified for real: a
+  minimal program creating and ending a span links and runs against each
+  exporter (the connection-refused errors in that test are expected --
+  no collector was listening -- not build failures).
+
+**CUDA: apt's `nvidia-cuda-toolkit`, not NVIDIA's `nvidia/cuda` image.**
+This was the original motivation for considering Ubuntu 26.04 at all
+(installing CUDA as a normal apt package rather than pinning a specific
+`nvidia/cuda:<version>-<devel|runtime>-ubuntu<version>` Docker tag).
+Two apt-level facts made this concrete rather than aspirational:
+
+- `nvidia-cuda-toolkit` on Ubuntu 26.04 is version **12.4.1** -- a *minor*
+  step down from the previously-pinned `nvidia/cuda:12.6.3`, not a major
+  version change. `cmake/ThirdPartyRapids.cmake`'s pinned RAPIDS wheels
+  stay exactly as they are (`-cu12`, unchanged) -- no re-vendoring needed.
+  (NVIDIA's own `nvidia/cuda` image, by contrast, only publishes
+  `ubuntu26.04` tags starting at CUDA 13.3 -- taking that path instead
+  would have forced a major CUDA version bump and a `-cu13` RAPIDS
+  re-vendor, a materially bigger and differently-risky change that was
+  considered and rejected in favor of the apt-toolkit path.)
+- `nvidia-cuda-toolkit` does **not** pull in `libcufile-dev` (GPUDirect
+  Storage), which `kvikio` (a libcudf dependency) requires --
+  `kvikio-config.cmake` fails configure outright ("Compiled with cuFile
+  support but cuFile not found") without it. `libcufile-dev` is a separate
+  apt package, but from the same repo at the matching `12.4.1-8` build
+  revision -- not a NVIDIA-repo dependency, still fully apt-native.
+
+nvcc lands at `/usr/bin/nvcc` under this packaging (Debian convention),
+not `/usr/local/cuda/bin/nvcc` (NVIDIA installer/Docker-image convention,
+which is what `CMakePresets.json`'s `gpu-dev` preset's
+`CMAKE_CUDA_COMPILER` default still points at, since that preset is for
+*this project's own* non-container Ubuntu 24.04 environment, unchanged).
+`docker/Dockerfile` overrides `CMAKE_CUDA_COMPILER=/usr/bin/nvcc` directly
+in its `cmake --preset gpu-dev` invocation instead of changing the shared
+preset default -- each environment gets its own correct path without
+either one needing to guess the other's layout.
+
+`CMAKE_CUDA_ARCHITECTURES` cannot be left at the top-level `CMakeLists.txt`
+default of `native` (which probes an actual device) inside
+`docker/Dockerfile`, since no GPU is visible during `docker build` (unlike
+`docker run --gpus all`). It's pinned explicitly instead:
+`"70-real;75-real;80-real;86-real;89"` -- real compiled code for
+Volta through Ada, with Hopper's entry left without the `-real` suffix so
+its PTX is embedded too, letting the driver JIT-compile for newer
+architectures with no native code in the binary at all. This is exactly
+what let an RTX 5060 Ti (Blackwell/sm_120 -- newer than anything CUDA
+12.4's nvcc can target directly) run the full test suite successfully
+against this image.
+
+**Verified for real, not just configured**: `docker build --target dev`
+completes (RAPIDS/libcudf/RMM/kvikio FetchContent vendoring, 103/103
+targets built); `docker build --target runtime` produces a 2.17 GB image
+(down from `dev`'s 14.1 GB) containing 22 shared libraries and the
+compiled binary only -- no compiler, no `nvcc`, no CUDA headers, no static
+libraries (`which nvcc gcc g++ cmake` all resolve to nothing inside it);
+`docker run --gpus all` against a real GPU (RTX 5060 Ti) ran **all 214
+tests successfully** in the `dev` image, and a real `GROUP BY` query
+against real generated Parquet data through the `runtime` image alone
+produced correct, GPU-executed results (`gpu_execution_seconds` and
+`peak_gpu_memory_bytes` populated, matching values from an equivalent
+local run).
+
+**`runtime` stage's shared-library closure.** `runtime-libs`'s `ldd`-based
+closure (used to avoid hard-coding vendored library names/paths that would
+go stale on a version bump) excludes only a short, fixed list of
+glibc/libgcc/libstdc++ basenames -- those are guaranteed present, at an
+identical version, on the `runtime` stage's `ubuntu:26.04` base, since
+`dev` builds `FROM` that exact same base. This differs from the
+NVIDIA-image-based design it replaced, which additionally excluded
+everything under `/usr/lib/*` on the assumption that the CUDA *runtime*
+Docker image (`nvidia/cuda:*-runtime-*`) pre-supplied those paths --  an
+assumption that no longer applies now that `runtime` is plain Ubuntu with
+no CUDA preinstalled, so CUDA's own shared libraries (`libcudart.so.12`,
+etc.) are now correctly included in the copied closure instead of silently
+assumed-present.
+
 ## Future architecture (interfaces only, not yet implemented)
 
 These are named as forward-declared types or documented models so later
