@@ -12,6 +12,7 @@ add_executable(kernellake_unit_tests
   parquet_metadata_test.cpp
   physical_planner_test.cpp
   query_engine_test.cpp
+  query_engine_execute_cpu_test.cpp
   sample_data_generator_test.cpp
 )
 

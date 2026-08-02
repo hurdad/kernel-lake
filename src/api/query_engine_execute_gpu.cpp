@@ -41,8 +41,17 @@ QueryResult QueryEngine::execute(std::string_view sql) const {
   const LogicalPlanPtr logical = plan_logical(sql, &metadata_inspection_seconds);
   const PhysicalPlanPtr physical = build_physical_plan(logical, store_);
 
-  RmmEnvironment rmm_environment(config_);
-  QueryResult result = execute(physical, rmm_environment);
+  QueryResult result;
+  if (config_.engine.backend == "cpu") {
+    // Deliberately skips constructing an RmmEnvironment at all -- the CPU
+    // backend touches no CUDA state, so a GPU-enabled build requesting the
+    // CPU backend shouldn't pay for (or risk failing on) RMM/device setup
+    // it doesn't need.
+    result = execute_cpu(physical);
+  } else {
+    RmmEnvironment rmm_environment(config_);
+    result = execute(physical, rmm_environment);
+  }
   result.metadata_inspection_seconds = metadata_inspection_seconds;
   // Overwrite the inner call's own elapsed_wall_seconds (which only covers
   // its own scope) with the full convenience-call duration, including

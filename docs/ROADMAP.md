@@ -128,6 +128,29 @@ and covered by passing tests -- not merely designed or stubbed.
   consistent as expected). `host_to_device_seconds` stays a documented
   `nullopt` -- there is no separate host-to-device transfer phase in the
   current architecture to time, not a gap that was missed.
+- A real CPU execution backend (Phase 1 of the CPU-backend/benchmark epic --
+  see "Not yet started" below for Phase 2): `src/execution_cpu/` translates
+  a `PhysicalPlanPtr` directly into an `arrow::acero::Declaration` tree and
+  runs it via `arrow::acero::DeclarationToTable()` (Apache Arrow's own
+  CPU-native streaming engine), rather than hand-rolled CPU operators.
+  Always built, in both `dev` and `gpu-dev` presets, needing no CUDA at
+  all; selected at runtime via `engine.backend: "cpu"` or `kernellake query
+  --backend cpu`. Covers `ParquetScan`/`Filter`/`Projection` (arithmetic
+  only)/`ScalarAggregate`/`HashAggregate`/`Sort`/`Limit` -- the same MVP
+  scope the GPU engine started with; `LIKE`/`IN`/`CASE`/`CAST`-to-`DECIMAL`-
+  or-`STRING`/`HashJoin` explicitly not yet supported (throws naming the
+  construct). Two real bugs surfaced only by running actual queries, not by
+  reading Arrow's headers: (1) Arrow Compute's kernel functions don't
+  self-register when statically linked -- every query failed with "No
+  function registered with name: ..." until `arrow::compute::Initialize()`
+  was called explicitly; (2) `COUNT(*)` needs the dedicated `count_all`/
+  `hash_count_all` functions, since `count`/`hash_count` reject an empty
+  target with "accepts 2 arguments but 1 passed". Cross-backend parity is
+  verified directly in `tests/gpu/query_engine_execute_test.cpp` (same SQL,
+  same Parquet fixture, both backends, values compared) -- see "CPU
+  execution backend" in `docs/ARCHITECTURE.md` for the full design,
+  including why the parity check compares column values rather than full
+  schema equality.
 - Hash joins: a two-table `INNER JOIN ... ON <a.col = b.col>` (single
   equality key, both sides aliased `read_parquet(...)` sources) end to end --
   a rewritten multi-occurrence `read_parquet(...)` regex adapter (parser.cpp),
@@ -246,24 +269,46 @@ and covered by passing tests -- not merely designed or stubbed.
 - `docker run --gpus all` of the published `runtime` image against a real
   GPU (the image builds and pushes successfully in CI; actually running it
   hasn't been checked yet)
+- **A three-way benchmark: KernelLake-CPU vs. KernelLake-GPU vs. PySpark**
+  (Phase 2 of the CPU-backend epic; Phase 1, the CPU backend itself, is
+  done -- see "Done" above). PySpark is not yet installed (`pip install
+  pyspark`; Java 21 is already present, local mode needs no cluster). Design
+  (`tools/benchmark_three_way.py`, not yet written): reuse the exact same
+  Parquet dataset for all three engines via the existing
+  `tools/generate_tpch.py`; validate correctness across all three *before*
+  trusting any timing number (this project's existing rule from
+  `tools/validate_tpch.py`, now applying to three engines instead of two);
+  report a clearly-labeled "unofficial, not a certified benchmark" table.
 - **An Arrow Flight SQL server, otel-cpp observability, and a Helm chart**
-  (a user-directed initiative beyond the original MVP scope -- see the
-  "Explicit non-goals" note below on Flight SQL/Kubernetes). Phase 0
-  (above) is done; still to build, in order: (1) the Flight SQL server
-  itself (new `kernellake-server` binary, `libarrow-flight-sql-dev`/
-  `libgrpc++-dev` from the same Apache Arrow apt repo already in use --
-  confirmed available, no `FetchContent` vendoring needed for Flight
-  itself), gated on a version-compatibility spike against Ubuntu 24.04's
-  older system gRPC; (2) otel-cpp integration (vendored via `FetchContent`,
-  building on Phase 0's `MetricsRegistry`/NVTX instrumentation points); (3)
-  a Helm chart deploying the server as a Deployment+Service with GPU
-  scheduling, blocked on (1). A related question -- bumping the Ubuntu
-  baseline from 24.04 to 26.04 for apt-native otel-cpp and Ubuntu's own
-  `nvidia-cuda-toolkit` package instead of the official `nvidia/cuda`
-  Docker image -- was deliberately deferred: otel-cpp vendors cleanly on
-  24.04 already, and swapping the CUDA toolchain source is a real,
-  unverified risk with no Docker available in this project's dev
-  environment to test it against.
+  (a user-directed initiative beyond the original MVP scope, sequenced
+  *after* the CPU-backend/benchmark epic above -- see the "Explicit
+  non-goals" note below on Flight SQL/Kubernetes). Phase 0 (above) is done;
+  still to build, in order: (1) the Flight SQL server itself (new
+  `kernellake-server` binary, `libarrow-flight-sql-dev`/`libgrpc++-dev` from
+  the same Apache Arrow apt repo already in use -- confirmed available, no
+  `FetchContent` vendoring needed for Flight itself), gated on a
+  version-compatibility spike against Ubuntu 24.04's older system gRPC; (2)
+  otel-cpp integration (vendored via `FetchContent`, building on Phase 0's
+  `MetricsRegistry`/NVTX instrumentation points); (3) a Helm chart deploying
+  the server as a Deployment+Service, now with a `backend: gpu|cpu` toggle
+  (mirroring `engine.backend` from the CPU-backend epic) so the same chart
+  can schedule onto GPU or CPU-only nodes, blocked on (1). A related
+  question -- bumping the Ubuntu baseline from 24.04 to 26.04 for
+  apt-native otel-cpp and Ubuntu's own `nvidia-cuda-toolkit` package instead
+  of the official `nvidia/cuda` Docker image -- was deliberately deferred:
+  otel-cpp vendors cleanly on 24.04 already, and swapping the CUDA
+  toolchain source is a real, unverified risk with no Docker available in
+  this project's dev environment to test it against.
+- Delta Lake read support (`read_delta(...)` alongside `read_parquet(...)`)
+  -- explicitly deferred as its own follow-up plan, not forgotten. Reading
+  `_delta_log/*.json` plus checkpoint Parquet files is required to
+  correctly identify a Delta table's active file set (globbing `*.parquet`
+  directly is wrong: it would include tombstoned/removed files and miss
+  schema evolution); no mature native C++ Delta implementation exists
+  (`delta-kernel-rs`'s C FFI, used by DuckDB's own Delta extension, is the
+  closest) and there is no Rust toolchain in this project's dev environment
+  yet, which makes this a genuinely new class of dependency deserving its
+  own spike rather than a fourth line item bolted onto the two epics above.
 
 ## Explicit non-goals for the MVP
 

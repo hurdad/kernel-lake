@@ -10,6 +10,13 @@ struct EngineSection {
   std::uint64_t batch_rows = 1'000'000;
   std::uint64_t result_batch_rows = 65'536;
   std::uint64_t query_memory_limit_bytes = 8ULL * 1024 * 1024 * 1024;
+  // "gpu" (default) or "cpu" -- see docs/ARCHITECTURE.md's CPU backend
+  // section. "gpu" on a CPU-only (dev preset) build throws the existing
+  // clear ExecutionError explaining why, exactly as it always has;
+  // requesting "cpu" works in *either* build, since the Acero-based CPU
+  // backend needs no CUDA at all. `kernellake query --backend cpu|gpu`
+  // overrides this per invocation without editing the config file.
+  std::string backend = "gpu";
 };
 
 struct MemorySection {

@@ -37,6 +37,8 @@ list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 include(CTest)
 
 find_package(Arrow REQUIRED)
+find_package(ArrowCompute REQUIRED)
+find_package(ArrowAcero REQUIRED)
 find_package(Parquet REQUIRED)
 find_package(spdlog REQUIRED)
 find_package(yaml-cpp REQUIRED)

@@ -6,6 +6,7 @@ add_subdirectory(planner)
 add_subdirectory(optimizer)
 add_subdirectory(storage)
 add_subdirectory(io)
+add_subdirectory(execution_cpu)
 add_subdirectory(api)
 add_subdirectory(generator)
 

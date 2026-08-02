@@ -45,6 +45,13 @@ struct QueryResult {
   std::optional<double> host_to_device_seconds;
   std::optional<double> device_to_host_seconds;
   std::optional<std::int64_t> peak_gpu_memory_bytes;
+  // Populated only by the CPU (Acero) execution backend -- kept as its own
+  // field rather than overloading gpu_execution_seconds, since the two
+  // backends measure genuinely different work (a single Acero
+  // DeclarationToTable() call vs. GPU operator pull-loop + device-to-host
+  // transfer) and conflating them under one name would misrepresent which
+  // backend actually ran.
+  std::optional<double> cpu_execution_seconds;
 };
 
 // The top-level entry point described in the spec: SQL in, either a plan
@@ -93,6 +100,17 @@ class QueryEngine {
   // happened before this call, in whatever produced `physical` (e.g.
   // explain()); a caller that wants it should time its own explain() call.
   [[nodiscard]] QueryResult execute(const PhysicalPlanPtr& physical, RmmEnvironment& rmm_environment) const;
+
+  // Runs an already-built physical plan on the Apache Arrow Acero CPU
+  // execution backend (see docs/ARCHITECTURE.md's CPU backend section).
+  // Always available, in both the `dev` and `gpu-dev` presets -- unlike the
+  // execute(physical, rmm_environment) overload above, this needs no CUDA
+  // and takes no external resource, since Acero owns its own thread pool
+  // internally. Throws PlanningError/ExecutionError for physical plan nodes
+  // this backend doesn't yet support (e.g. HashJoin). Like the GPU overload,
+  // leaves metadata_inspection_seconds null (planning already happened
+  // before this call).
+  [[nodiscard]] QueryResult execute_cpu(const PhysicalPlanPtr& physical) const;
 
  private:
   // `metadata_inspection_seconds_out`, when non-null, accumulates the time

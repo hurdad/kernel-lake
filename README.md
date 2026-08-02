@@ -76,9 +76,13 @@ and two of the first file's three row groups couldn't contain any
 `order_id < 50` rows, and skipped reading them entirely.
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full pipeline, the
-GPU operator set, and the CPU/GPU build split (`kernellake query` throws a
-clear `ExecutionError` when built without CUDA -- it never silently falls
-back to a CPU implementation).
+GPU operator set, the CPU execution backend (Apache Arrow Acero), and the
+CPU/GPU build split. `kernellake query` runs on the GPU by default when
+built with CUDA (`--backend gpu`, the default) and throws a clear
+`ExecutionError` for that backend on a CPU-only build -- it never silently
+substitutes a CPU implementation without being asked. Pass `--backend cpu`
+(or set `engine.backend: cpu`) to run on the always-available Acero CPU
+backend instead, in *either* build.
 
 ## Requirements
 
@@ -140,8 +144,8 @@ ctest --preset gpu-dev
 ./build/dev/src/cli/kernellake explain --logical --sql "..."   # pre-physical-planning view
 ./build/dev/src/cli/kernellake explain --format json --sql "..."
 
-# Run a query for real (requires a gpu-dev build; the dev build's binary
-# throws a clear ExecutionError explaining why instead)
+# Run a query on the GPU (requires a gpu-dev build; the dev build's binary
+# throws a clear ExecutionError for the (default) gpu backend instead)
 ./build/gpu-dev/src/cli/kernellake query \
   --sql "SELECT region, SUM(amount) FROM read_parquet('/tmp/kernellake-sales/*.parquet') \
          WHERE event_date >= DATE '2026-01-01' GROUP BY region"
@@ -149,6 +153,12 @@ ctest --preset gpu-dev
 ./build/gpu-dev/src/cli/kernellake query --sql "..." --format jsonl
 ./build/gpu-dev/src/cli/kernellake query --sql "..." --format arrow --output result.arrow
 ./build/gpu-dev/src/cli/kernellake query --sql "..." --stats   # prints measured metrics to stderr
+
+# Run the same query on the CPU (Apache Arrow Acero) instead -- works with
+# either build, including the CPU-only dev build. See docs/ARCHITECTURE.md
+# for this backend's current query-shape scope (no LIKE/IN/CASE/HashJoin yet).
+./build/dev/src/cli/kernellake query --backend cpu \
+  --sql "SELECT region, SUM(amount) FROM read_parquet('/tmp/kernellake-sales/*.parquet') GROUP BY region"
 ```
 
 Supported SQL grammar, the `read_parquet(...)` syntax, and everything

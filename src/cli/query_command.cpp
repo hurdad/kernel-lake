@@ -39,6 +39,7 @@ void print_stats(const QueryResult& result) {
   print_optional("metadata_inspection_seconds", result.metadata_inspection_seconds);
   print_optional("parquet_decoding_seconds", result.parquet_decoding_seconds);
   print_optional("gpu_execution_seconds", result.gpu_execution_seconds);
+  print_optional("cpu_execution_seconds", result.cpu_execution_seconds);
   print_optional("host_to_device_seconds", result.host_to_device_seconds);
   print_optional("device_to_host_seconds", result.device_to_host_seconds);
   print_optional("elapsed_wall_seconds", result.elapsed_wall_seconds);
@@ -51,6 +52,7 @@ int run_query(const std::vector<std::string_view>& args, const EngineConfig& con
   std::string file;
   std::string format_name = "table";
   std::optional<std::string> output_path;
+  std::optional<std::string> backend_override;
   bool show_stats = false;
 
   for (std::size_t i = 0; i < args.size(); ++i) {
@@ -62,9 +64,17 @@ int run_query(const std::vector<std::string_view>& args, const EngineConfig& con
       format_name = args[++i];
     } else if (args[i] == "--output" && i + 1 < args.size()) {
       output_path = std::string(args[++i]);
+    } else if (args[i] == "--backend" && i + 1 < args.size()) {
+      backend_override = std::string(args[++i]);
     } else if (args[i] == "--stats") {
       show_stats = true;
     }
+  }
+
+  if (backend_override && *backend_override != "cpu" && *backend_override != "gpu") {
+    std::fprintf(stderr, "kernellake query: --backend must be one of cpu|gpu, got '%s'\n",
+                 backend_override->c_str());
+    return 1;
   }
 
   if (sql.empty() && file.empty()) {
@@ -85,7 +95,9 @@ int run_query(const std::vector<std::string_view>& args, const EngineConfig& con
 
   try {
     const std::string query_sql = file.empty() ? sql : read_file_or_throw(file);
-    QueryEngine engine(config);
+    EngineConfig effective_config = config;
+    if (backend_override) effective_config.engine.backend = *backend_override;
+    QueryEngine engine(effective_config);
     const QueryResult result = engine.execute(query_sql);
     write_query_result(result, *format, output_path);
     if (show_stats) print_stats(result);

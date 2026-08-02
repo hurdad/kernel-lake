@@ -268,6 +268,86 @@ TEST_F(QueryEngineExecuteTest, ConvenienceWrapperPopulatesRealTimingFields) {
   EXPECT_FALSE(result.host_to_device_seconds.has_value());
 }
 
+// --- Phase 1: cross-backend parity (GPU vs. the Acero CPU backend) ---
+// Both backends translate the exact same PhysicalPlanPtr tree
+// (src/execution/operator_builder.cpp vs. src/execution_cpu/
+// acero_query_executor.cpp); this is the genuine two-backend correctness
+// check the CPU backend's own plan called for, not just "it runs" on
+// either side alone.
+
+// Compares column values only, not full RecordBatch/schema equality:
+// cudf's aggregate kernels happen not to allocate a null-mask buffer when a
+// particular result contains no nulls, so the GPU path's Arrow schema often
+// reports a field as "not null" incidentally (a property of that one
+// result, not a documented guarantee); Arrow Acero's hash aggregate kernels
+// always allocate one, reporting "nullable" instead. Neither backend
+// promises a specific nullability for aggregate outputs, so requiring
+// schema equality here would fail on an accidental implementation detail
+// unrelated to correctness -- values are the actual contract being tested.
+void expect_double_columns_match(const arrow::RecordBatch& gpu_batch, const arrow::RecordBatch& cpu_batch,
+                                 const std::string& column_name) {
+  const auto gpu_column =
+      std::static_pointer_cast<arrow::DoubleArray>(gpu_batch.GetColumnByName(column_name));
+  const auto cpu_column =
+      std::static_pointer_cast<arrow::DoubleArray>(cpu_batch.GetColumnByName(column_name));
+  ASSERT_NE(gpu_column, nullptr);
+  ASSERT_NE(cpu_column, nullptr);
+  ASSERT_EQ(gpu_column->length(), cpu_column->length());
+  for (std::int64_t i = 0; i < gpu_column->length(); ++i) {
+    EXPECT_DOUBLE_EQ(gpu_column->Value(i), cpu_column->Value(i)) << "row " << i;
+  }
+}
+
+TEST_F(QueryEngineExecuteTest, CpuBackendMatchesGpuBackendForFilterAndGroupedAggregate) {
+  const std::string sql = "SELECT region, SUM(amount) AS total FROM read_parquet('" + path_ +
+                          "') WHERE event_date >= DATE '2026-01-01' GROUP BY region ORDER BY region";
+  const QueryResult gpu_result = engine_.execute(sql);
+
+  EngineConfig cpu_config = default_config();
+  cpu_config.engine.backend = "cpu";
+  const QueryEngine cpu_engine(cpu_config);
+  const QueryResult cpu_result = cpu_engine.execute(sql);
+
+  ASSERT_EQ(gpu_result.batches.size(), 1u);
+  ASSERT_EQ(cpu_result.batches.size(), 1u);
+  EXPECT_EQ(gpu_result.rows_returned, cpu_result.rows_returned);
+
+  const arrow::RecordBatch& gpu_batch = *gpu_result.batches.front();
+  const arrow::RecordBatch& cpu_batch = *cpu_result.batches.front();
+  const auto gpu_region = std::static_pointer_cast<arrow::StringArray>(gpu_batch.GetColumnByName("region"));
+  const auto cpu_region = std::static_pointer_cast<arrow::StringArray>(cpu_batch.GetColumnByName("region"));
+  ASSERT_NE(gpu_region, nullptr);
+  ASSERT_NE(cpu_region, nullptr);
+  ASSERT_EQ(gpu_region->length(), cpu_region->length());
+  for (std::int64_t i = 0; i < gpu_region->length(); ++i) {
+    EXPECT_EQ(gpu_region->GetString(i), cpu_region->GetString(i)) << "row " << i;
+  }
+  expect_double_columns_match(gpu_batch, cpu_batch, "total");
+}
+
+TEST_F(QueryEngineExecuteTest, CpuBackendMatchesGpuBackendForCountStarAndLimit) {
+  const std::string sql = "SELECT region, COUNT(*) AS n FROM read_parquet('" + path_ +
+                          "') GROUP BY region ORDER BY n DESC LIMIT 1";
+  const QueryResult gpu_result = engine_.execute(sql);
+
+  EngineConfig cpu_config = default_config();
+  cpu_config.engine.backend = "cpu";
+  const QueryEngine cpu_engine(cpu_config);
+  const QueryResult cpu_result = cpu_engine.execute(sql);
+
+  ASSERT_EQ(gpu_result.batches.size(), 1u);
+  ASSERT_EQ(cpu_result.batches.size(), 1u);
+  const auto gpu_n =
+      std::static_pointer_cast<arrow::Int64Array>(gpu_result.batches.front()->GetColumnByName("n"));
+  const auto cpu_n =
+      std::static_pointer_cast<arrow::Int64Array>(cpu_result.batches.front()->GetColumnByName("n"));
+  ASSERT_NE(gpu_n, nullptr);
+  ASSERT_NE(cpu_n, nullptr);
+  ASSERT_EQ(gpu_n->length(), 1);
+  ASSERT_EQ(cpu_n->length(), 1);
+  EXPECT_EQ(gpu_n->Value(0), cpu_n->Value(0));
+}
+
 TEST_F(QueryEngineExecuteTest, SplitExecutionPathLeavesMetadataInspectionSecondsNull) {
   // The split entry point never does planning itself (see its doc comment
   // in query_engine.hpp) -- it cannot honestly report metadata_inspection_

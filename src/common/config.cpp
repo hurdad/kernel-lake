@@ -44,6 +44,7 @@ EngineConfig parse_config(const std::string& yaml_text) {
   config.engine.result_batch_rows = read_or(engine, "result_batch_rows", config.engine.result_batch_rows);
   config.engine.query_memory_limit_bytes =
       read_or(engine, "query_memory_limit_bytes", config.engine.query_memory_limit_bytes);
+  config.engine.backend = read_or(engine, "backend", config.engine.backend);
 
   const YAML::Node memory = root["memory"];
   config.memory.pool_initial_bytes = read_or(memory, "pool_initial_bytes", config.memory.pool_initial_bytes);
@@ -99,6 +100,10 @@ void validate_config(const EngineConfig& config) {
   }
   if (config.engine.query_memory_limit_bytes == 0) {
     throw ConfigurationError("engine.query_memory_limit_bytes must be > 0");
+  }
+  if (config.engine.backend != "gpu" && config.engine.backend != "cpu") {
+    throw ConfigurationError("engine.backend '" + config.engine.backend +
+                             "' is unsupported (expected 'gpu' or 'cpu')");
   }
 
   if (config.memory.pool_initial_bytes == 0) {

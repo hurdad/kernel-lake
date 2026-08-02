@@ -1,5 +1,7 @@
 add_library(kernellake_api STATIC
   query_engine.cpp
+  # Always built, in both presets -- see the comment at the top of the file.
+  query_engine_execute_cpu.cpp
   # Exactly one of these provides QueryEngine::execute() -- see the comment
   # at the top of each file. Never both, to avoid an ODR conflict.
   $<IF:$<BOOL:${KERNELLAKE_WITH_CUDA}>,query_engine_execute_gpu.cpp,query_engine_execute_stub.cpp>
@@ -17,6 +19,7 @@ target_link_libraries(kernellake_api PUBLIC
   kernellake_optimizer
   kernellake_storage
   kernellake_io
+  kernellake_execution_cpu
   Arrow::arrow_static
 )
 

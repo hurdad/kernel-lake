@@ -190,27 +190,28 @@ a `GROUP BY`, or `ScalarAggregate` when it does not; `LogicalSort` becomes
 libcudf, and RMM: `DeviceBatch` (the GPU-resident batch wrapping
 `cudf::table`), `ExecutionContext`, the `PhysicalOperator` streaming
 interface, and the concrete GPU operators (`kernellake_execution`,
-`kernellake_memory`; see `tests/gpu/`). There is no CPU-side equivalent of
-these operators anywhere -- the CPU-only `dev` preset does real parsing,
-binding, optimization, physical planning, and Parquet pruning, but nothing
-that can actually pull a row of data through a filter/join/aggregate. This
-is deliberate, not an oversight: KernelLake never substitutes a CPU
-implementation for GPU execution without saying so explicitly, so no
-hand-rolled CPU fallback engine exists at all, even a slow one.
+`kernellake_memory`; see `tests/gpu/`). This gate is about the GPU path
+specifically, not about whether queries can execute at all on a CPU-only
+build -- see "CPU execution backend" below for the real, always-available
+CPU path (`kernellake_execution_cpu`), which needs none of this.
 
 `QueryEngine::execute()` is built from one of two mutually exclusive
 translation units selected by a CMake generator expression on
 `KERNELLAKE_WITH_CUDA` (`src/api/query_engine_execute_gpu.cpp` vs.
-`_stub.cpp`): the GPU build runs the real operator pipeline
+`_stub.cpp`), plus a third, **always-built** translation unit
+(`query_engine_execute_cpu.cpp`) providing `execute_cpu()`. The GPU build's
+`execute(sql)` runs the real GPU operator pipeline by default
 (`kernellake/execution/operator_builder.hpp` turns a `PhysicalPlanPtr` into
 a `PhysicalOperator` tree, pulled to exhaustion inside
 `RmmEnvironment::track_query()` for per-query memory accounting, with each
 resulting `DeviceBatch` converted to an Arrow `RecordBatch` via
 `kernellake/execution/arrow_bridge.hpp`); the CPU-only `dev` preset's stub
-throws a clear `ExecutionError` instead. The `kernellake query` CLI command
+throws a clear `ExecutionError` instead -- **unless** `engine.backend` (or
+`kernellake query --backend`) is set to `"cpu"`, in which case both builds
+instead dispatch to `execute_cpu()`. The `kernellake query` CLI command
 (`src/cli/query_command.cpp`) is unconditionally built and calls
-`QueryEngine::execute()`, so its behavior likewise depends on which preset
-built it.
+`QueryEngine::execute()`, so which of these three paths actually runs
+depends on both which preset built it and the `backend` setting.
 
 Everything else in this document (parsing through physical planning and
 pruning), plus `kernellake generate-data`, is CPU-only and builds/tests
@@ -339,6 +340,92 @@ Two correctness details worth knowing if you touch these operators:
   version of this discriminator (checking only for `LogicalProjection`)
   wrongly treat a `Sort` sitting directly on `LogicalAggregate` as if it
   needed scan-schema remapping.
+
+### CPU execution backend (Apache Arrow Acero)
+
+Unlike the GPU path, the CPU backend is not a set of hand-rolled operators
+pulled batch-by-batch: `src/execution_cpu/acero_query_executor.cpp`
+translates a `PhysicalPlanPtr` directly into an `arrow::acero::Declaration`
+tree (Arrow's own CPU-native streaming execution engine) and runs it in one
+shot via `arrow::acero::DeclarationToTable()`, which returns an Arrow
+`arrow::Table` with no separate device-to-host bridging step needed. This
+module (`kernellake_execution_cpu`) is **always built**, in both the `dev`
+and `gpu-dev` presets, and depends on nothing CUDA-related -- selecting it
+is a runtime choice (`engine.backend: "cpu"`, or `kernellake query --backend
+cpu`), not a build-time one, and it works even on the CPU-only `dev` build,
+which cannot run the GPU path at all.
+
+**Scope for this phase**, matching the GPU engine's own original MVP order:
+`ParquetScan` -> `Filter` -> `Projection` (arithmetic/comparisons/`BETWEEN`/
+numeric `CAST` only) -> `ScalarAggregate`/`HashAggregate` (`SUM`/`COUNT`/
+`MIN`/`MAX`/`AVG`, grouping only by a plain column) -> `Sort` (by a plain
+column only) -> `Limit`. `LIKE`/`IN`/`CASE`/`CAST`-to-`DECIMAL`-or-`STRING`/
+`HashJoin` are not yet supported here -- `compile_expression_cpu()` and
+`acero_query_executor.cpp`'s `translate()` throw `ExecutionError`/
+`PlanningError` naming the specific unsupported construct rather than
+silently miscompiling. Arrow Compute's function registry is actually more
+complete than `cudf::ast` turned out to be for some of these (no "cannot
+output STRING" restriction, for instance), so extending this list later is
+likely less work than the GPU equivalents were -- just not free.
+
+**No index-based column remapping.** Acero resolves every `FieldRef` by
+name against real Arrow schemas at each stage of its `Declaration` tree, so
+this backend needs none of `physical_planner.cpp`'s
+`remap_columns()`/`find_scan_schema()` machinery the GPU path requires
+(see above) -- `ColumnExpression::name()` is sufficient and correct
+throughout `acero_query_executor.cpp`'s translator.
+
+**`arrow::compute::Initialize()` must be called before running any
+query.** Arrow Compute's kernel functions (`sum`, `hash_sum`,
+`greater_equal`, `sort_indices`, ...) do not self-register at static-init
+time when statically linked -- an omitted call leaves the global
+`FunctionRegistry` empty and every query fails with "No function
+registered with name: ...", regardless of which libraries are linked in.
+`execute_physical_plan_cpu()` calls it once via `std::call_once`
+(`ensure_compute_initialized()`) before building any `Declaration`.
+
+**`COUNT(*)` needs its own Arrow Compute functions.** `count`/`hash_count`
+require a real value-column argument (arity 1/2) and reject `COUNT(*)`'s
+empty target outright; Acero has dedicated arity-0/1 `count_all`/
+`hash_count_all` functions specifically for counting rows with no column
+input, which `translate_aggregate()` uses instead for
+`AggregateFunction::CountStar` (`Count`, i.e. `COUNT(column)`, still uses
+`count`/`hash_count` with `CountOptions::ONLY_VALID`, matching the GPU
+path's null-exclusion semantics).
+
+**Scan pruning is reused, not rediscovered.** `read_scan_table()` reads
+each `ParquetScanNode` fragment via `parquet::arrow::FileReader::
+GetRecordBatchReader(selected_row_groups, column_indices)`, honoring the
+exact row-group and column pruning decisions the physical planner already
+computed -- deliberately not routed through `arrow::dataset`, which would
+have no way to know about pruning this project's own physical planner
+already did. Unlike the GPU path's bounded-memory, pass-based streaming
+(`ParquetScanOperator`), this reads each fragment's selected row groups
+fully into memory: a real, documented MVP simplification, not a bounded
+streaming scan.
+
+**`QueryResult::cpu_execution_seconds`, not `gpu_execution_seconds`, times
+this backend.** The two fields are kept separate (both `std::optional`,
+mutually exclusive in practice) rather than overloading one name, since the
+two backends measure genuinely different work (one `DeclarationToTable()`
+call vs. an operator pull-loop plus a separate device-to-host transfer).
+`parquet_decoding_seconds`/`device_to_host_seconds`/
+`peak_gpu_memory_bytes` stay `nullopt` for this backend: Acero's
+`Declaration` tree runs as one opaque call with no per-node instrumentation
+hook wired up (unlike the GPU path's `MetricsRegistry`-wrapped operator
+tree), and there is no GPU memory to report.
+
+Cross-backend correctness is verified directly: `tests/gpu/
+query_engine_execute_test.cpp` runs the same SQL against the same Parquet
+fixture through both `execute()` (GPU) and a `backend: "cpu"`-configured
+`QueryEngine::execute()` (CPU) and asserts matching values -- comparing
+column *values* only, not full `RecordBatch`/schema equality, since cudf's
+aggregate kernels happen not to allocate a null-mask buffer when a
+particular result contains no nulls (making the GPU path's Arrow schema
+incidentally report a field as "not null"), while Arrow Acero's hash
+aggregate kernels always allocate one; neither backend actually promises a
+specific nullability for aggregate outputs, so requiring schema equality
+would fail on an implementation detail unrelated to correctness.
 
 ### LIKE/IN/CASE/CAST implementation notes
 
