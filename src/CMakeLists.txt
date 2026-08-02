@@ -9,6 +9,7 @@ add_subdirectory(io)
 add_subdirectory(execution_cpu)
 add_subdirectory(api)
 add_subdirectory(generator)
+add_subdirectory(observability)
 
 if(KERNELLAKE_WITH_CUDA)
   add_subdirectory(memory)

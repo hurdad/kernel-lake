@@ -15,6 +15,7 @@ add_executable(kernellake_unit_tests
   query_engine_execute_cpu_test.cpp
   sample_data_generator_test.cpp
   $<$<BOOL:${KERNELLAKE_BUILD_SERVER}>:flight_sql_server_test.cpp>
+  $<$<BOOL:${KERNELLAKE_ENABLE_OTEL}>:query_tracing_test.cpp>
 )
 
 target_link_libraries(kernellake_unit_tests PRIVATE
@@ -42,6 +43,16 @@ if(KERNELLAKE_BUILD_SERVER)
     ArrowFlight::arrow_flight_static
     gRPC::grpc++
     -Wl,--end-group
+  )
+endif()
+
+if(KERNELLAKE_ENABLE_OTEL)
+  # "exporters_in_memory" is a find_package component name, not a CMake
+  # target -- these two are the actual targets it provides.
+  target_link_libraries(kernellake_unit_tests PRIVATE
+    kernellake_observability
+    opentelemetry-cpp::in_memory_span_exporter
+    opentelemetry-cpp::in_memory_metric_exporter
   )
 endif()
 

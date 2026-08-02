@@ -311,6 +311,36 @@ and covered by passing tests -- not merely designed or stubbed.
   this (`KERNELLAKE_BUILD_SERVER` defaults `OFF`). CI coverage for
   `KERNELLAKE_BUILD_SERVER=ON` is a separate, still-open item -- see "Not
   yet started".
+- **OpenTelemetry observability** (Phase 2 of the Flight SQL/otel-cpp/
+  Helm-chart epic -- Phase 0 and Phase 1, `kernellake-server`, both done
+  above; Phase 3, a Helm chart, still open, see "Not yet started"). Built
+  behind `KERNELLAKE_ENABLE_OTEL` (default `OFF`; new `otel-dev` preset,
+  independent of `KERNELLAKE_BUILD_SERVER`), sourced from
+  `opentelemetry-cpp-dev` 1.23.0. One span + one histogram observation per
+  whole query (`kernellake query` and the server's
+  `GetFlightInfoStatement`), plus every existing `spdlog` call bridged into
+  OTel's Logs signal for free via a custom sink -- see
+  `docs/ARCHITECTURE.md`'s "OpenTelemetry observability" section for the
+  full design, the config schema (`observability.*` -- protocol choice
+  (`grpc`/`http`), TLS incl. HTTP-only mTLS, per-signal processor/batch/
+  sampler tuning exposing the underlying OTel SDK knobs directly), and five
+  real bugs found and fixed while implementing it (an `nostd::shared_ptr`
+  overload-resolution ambiguity, this apt package's ABI version lacking an
+  assumed convenience overload, a yaml-cpp nested-node-indexing throw,
+  OTLP/HTTP's per-signal path-suffix requirement, and the HTTP-vs-gRPC mTLS
+  availability difference). Per-operator spans are explicitly deferred, not
+  attempted. Verified for real: `otel-dev` (148/148 tests, including three
+  deterministic in-memory-exporter tests -- no network involved) plus a
+  manual smoke test against a real `docker run`'able collector
+  (`jaegertracing/all-in-one`) covering *both* protocols -- real spans with
+  full `QueryResult` attributes landed for both an `OK` and an `ERROR`
+  query, over OTLP/gRPC and, once a real path-suffix bug was found and
+  fixed, OTLP/HTTP too. `dev` (145/145), `gpu-dev` (214/214), and
+  `server-dev` (147/147) all reconfirmed unaffected. CI coverage added
+  (`otel-build-test` in `.github/workflows/ci.yml`, mirroring
+  `server-build-test`'s `container: ubuntu:26.04` structure -- needed for
+  the same reason: `opentelemetry-cpp-dev` has no Ubuntu 24.04 apt
+  package either).
 
 ## Not yet started
 
@@ -337,20 +367,20 @@ and covered by passing tests -- not merely designed or stubbed.
   trusting any timing number (this project's existing rule from
   `tools/validate_tpch.py`, now applying to three engines instead of two);
   report a clearly-labeled "unofficial, not a certified benchmark" table.
-- **otel-cpp observability and a Helm chart** (Phases 2-3 of the Flight
-  SQL/otel-cpp/Helm-chart epic -- Phase 0 and Phase 1, `kernellake-server`
-  itself, are both done, see "Done" above; see the "Explicit non-goals" note
-  below on Kubernetes). Still to build, in order: (2) otel-cpp integration
-  (apt-native on Ubuntu 26.04 -- both this project's Docker image and, as of
-  Phase 1's entry above, this sandbox itself -- rather than
-  `FetchContent`-vendored, building on Phase 0's `MetricsRegistry`/NVTX
-  instrumentation points); (3) a Helm chart deploying the server as a
+- **A Helm chart** (Phase 3 of the Flight SQL/otel-cpp/Helm-chart epic --
+  Phase 0, Phase 1 (`kernellake-server`), and Phase 2 (OpenTelemetry
+  observability) are all done, see "Done" above; see the "Explicit
+  non-goals" note below on Kubernetes). Deploys the server as a
   Deployment+Service, with a `backend: gpu|cpu` toggle (mirroring
   `engine.backend` from the CPU-backend epic) so the same chart can
-  schedule onto GPU or CPU-only nodes. Also still open: CI coverage for
-  `KERNELLAKE_BUILD_SERVER=ON` (no existing `.github/workflows/ci.yml` job
-  builds it yet); `docker/Dockerfile` doesn't build/ship `kernellake-server`
-  either (only `kernellake`), which Phase 3's Helm chart will need.
+  schedule onto GPU or CPU-only nodes, plus wiring for
+  `observability.otlp_endpoint` to point at a cluster-local collector.
+  Blocked on: `docker/Dockerfile` doesn't build/ship `kernellake-server`
+  yet either (only `kernellake`, and neither has `KERNELLAKE_ENABLE_OTEL`
+  set) -- needs a Docker image change first. CI coverage for both
+  `KERNELLAKE_BUILD_SERVER=ON` and `KERNELLAKE_ENABLE_OTEL=ON` is done
+  (`server-build-test`/`otel-build-test` in `.github/workflows/ci.yml`, see
+  "Done" above).
 - Delta Lake read support (`read_delta(...)` alongside `read_parquet(...)`)
   -- explicitly deferred as its own follow-up plan, not forgotten. Reading
   `_delta_log/*.json` plus checkpoint Parquet files is required to

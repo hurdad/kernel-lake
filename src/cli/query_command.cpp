@@ -6,6 +6,7 @@
 
 #include "kernellake/api/query_engine.hpp"
 #include "kernellake/common/errors.hpp"
+#include "kernellake/observability/query_tracing.hpp"
 #include "result_formatter.hpp"
 
 namespace kernellake::cli {
@@ -98,9 +99,17 @@ int run_query(const std::vector<std::string_view>& args, const EngineConfig& con
     EngineConfig effective_config = config;
     if (backend_override) effective_config.engine.backend = *backend_override;
     QueryEngine engine(effective_config);
-    const QueryResult result = engine.execute(query_sql);
-    write_query_result(result, *format, output_path);
-    if (show_stats) print_stats(result);
+
+    observability::QuerySpan span = observability::start_query_span("kernellake.query");
+    try {
+      const QueryResult result = engine.execute(query_sql);
+      span.finish(result, query_sql, effective_config.engine.backend);
+      write_query_result(result, *format, output_path);
+      if (show_stats) print_stats(result);
+    } catch (const KernelLakeError& e) {
+      span.finish_error(e, query_sql, effective_config.engine.backend);
+      throw;
+    }
   } catch (const KernelLakeError& e) {
     std::fprintf(stderr, "kernellake query: %s\n", e.what());
     return 1;

@@ -11,6 +11,7 @@
 #include "kernellake/common/config.hpp"
 #include "kernellake/common/errors.hpp"
 #include "kernellake/common/logging.hpp"
+#include "kernellake/observability/query_tracing.hpp"
 #include "kernellake/server/flight_sql_server.hpp"
 
 namespace {
@@ -57,10 +58,19 @@ int main(int argc, char** argv) {
     }
     kernellake::validate_config(config);
     kernellake::init_logging(config.logging);
+    kernellake::observability::init(config.observability);
   } catch (const kernellake::ConfigurationError& e) {
     std::fprintf(stderr, "kernellake-server: configuration error: %s\n", e.what());
     return 1;
   }
+
+  // Ensures observability::shutdown() (flushing any buffered spans/metrics/
+  // logs) runs on every return path below -- a no-op if
+  // observability::init() above was itself a no-op (disabled, or
+  // KERNELLAKE_ENABLE_OTEL=OFF).
+  struct ObservabilityShutdownGuard {
+    ~ObservabilityShutdownGuard() { kernellake::observability::shutdown(); }
+  } observability_shutdown_guard;
 
   // Constructing the server (and, for backend == "gpu", the RmmEnvironment
   // it owns via GpuExecutionCoordinator) happens here rather than inside

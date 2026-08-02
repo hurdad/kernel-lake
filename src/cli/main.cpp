@@ -11,6 +11,7 @@
 #include "kernellake/common/errors.hpp"
 #include "kernellake/common/logging.hpp"
 #include "kernellake/common/version.hpp"
+#include "kernellake/observability/query_tracing.hpp"
 
 namespace {
 
@@ -80,10 +81,19 @@ int main(int argc, char** argv) {
     }
     kernellake::validate_config(config);
     kernellake::init_logging(config.logging);
+    kernellake::observability::init(config.observability);
   } catch (const kernellake::ConfigurationError& e) {
     std::fprintf(stderr, "kernellake: configuration error: %s\n", e.what());
     return 1;
   }
+
+  // Ensures observability::shutdown() (flushing any buffered spans/metrics/
+  // logs) runs on every return path below, including the ones inside the
+  // command-dispatch try/catch -- a no-op if observability::init() above
+  // was itself a no-op (disabled, or KERNELLAKE_ENABLE_OTEL=OFF).
+  struct ObservabilityShutdownGuard {
+    ~ObservabilityShutdownGuard() { kernellake::observability::shutdown(); }
+  } observability_shutdown_guard;
 
   const std::string_view command = args[command_index];
   const std::vector<std::string_view> command_args(args.begin() + static_cast<long>(command_index) + 1,

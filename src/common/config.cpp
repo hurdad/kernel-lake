@@ -22,6 +22,49 @@ T read_or(const YAML::Node& node, const char* key, T fallback) {
   }
 }
 
+// yaml-cpp throws ("invalid node") if operator[] is called on a node that is
+// itself undefined (e.g. `observability["tracing"]` when the YAML has no
+// `observability:` key at all) -- unlike read_or above, which guards this
+// via its own `!node ||` short-circuit for a single level. Nested section
+// lookups (observability.tracing, .tracing.batch, etc.) need this guard
+// explicitly since they index two levels deep.
+YAML::Node child(const YAML::Node& node, const char* key) { return node ? node[key] : YAML::Node(); }
+
+// Shared by observability.tracing.batch and observability.logs.batch, which
+// have an identical shape.
+BatchExportConfig read_batch_export_config(const YAML::Node& node, BatchExportConfig fallback) {
+  const YAML::Node batch = child(node, "batch");
+  BatchExportConfig result = fallback;
+  result.max_queue_size = read_or(batch, "max_queue_size", result.max_queue_size);
+  result.max_export_batch_size = read_or(batch, "max_export_batch_size", result.max_export_batch_size);
+  result.schedule_delay_ms = read_or(batch, "schedule_delay_ms", result.schedule_delay_ms);
+  return result;
+}
+
+// Shared by observability.tracing and observability.logs, which have an
+// identical processor/batch validation shape.
+void validate_batch_export_config(const std::string& prefix, const std::string& processor,
+                                  const BatchExportConfig& batch) {
+  if (processor != "simple" && processor != "batch") {
+    throw ConfigurationError(prefix + ".processor '" + processor +
+                             "' is unsupported (expected 'simple' or 'batch')");
+  }
+  if (batch.max_queue_size == 0) {
+    throw ConfigurationError(prefix + ".batch.max_queue_size must be > 0");
+  }
+  if (batch.max_export_batch_size == 0) {
+    throw ConfigurationError(prefix + ".batch.max_export_batch_size must be > 0");
+  }
+  if (batch.max_export_batch_size > batch.max_queue_size) {
+    throw ConfigurationError(prefix + ".batch.max_export_batch_size (" +
+                             std::to_string(batch.max_export_batch_size) + ") must be <= " + prefix +
+                             ".batch.max_queue_size (" + std::to_string(batch.max_queue_size) + ")");
+  }
+  if (batch.schedule_delay_ms == 0) {
+    throw ConfigurationError(prefix + ".batch.schedule_delay_ms must be > 0");
+  }
+}
+
 }  // namespace
 
 EngineConfig default_config() {
@@ -77,6 +120,38 @@ EngineConfig parse_config(const std::string& yaml_text) {
   const YAML::Node server = root["server"];
   config.server.host = read_or(server, "host", config.server.host);
   config.server.port = read_or(server, "port", config.server.port);
+
+  const YAML::Node observability = root["observability"];
+  config.observability.enabled = read_or(observability, "enabled", config.observability.enabled);
+  config.observability.otlp_protocol =
+      read_or(observability, "otlp_protocol", config.observability.otlp_protocol);
+  config.observability.otlp_endpoint =
+      read_or(observability, "otlp_endpoint", config.observability.otlp_endpoint);
+  config.observability.service_name =
+      read_or(observability, "service_name", config.observability.service_name);
+  config.observability.use_tls = read_or(observability, "use_tls", config.observability.use_tls);
+  config.observability.tls_ca_cert_path =
+      read_or(observability, "tls_ca_cert_path", config.observability.tls_ca_cert_path);
+  config.observability.tls_client_cert_path =
+      read_or(observability, "tls_client_cert_path", config.observability.tls_client_cert_path);
+  config.observability.tls_client_key_path =
+      read_or(observability, "tls_client_key_path", config.observability.tls_client_key_path);
+
+  const YAML::Node tracing = child(observability, "tracing");
+  config.observability.tracing.processor = read_or(tracing, "processor", config.observability.tracing.processor);
+  config.observability.tracing.batch =
+      read_batch_export_config(tracing, config.observability.tracing.batch);
+  config.observability.tracing.sampler = read_or(tracing, "sampler", config.observability.tracing.sampler);
+
+  const YAML::Node metrics = child(observability, "metrics");
+  config.observability.metrics.export_interval_ms =
+      read_or(metrics, "export_interval_ms", config.observability.metrics.export_interval_ms);
+  config.observability.metrics.export_timeout_ms =
+      read_or(metrics, "export_timeout_ms", config.observability.metrics.export_timeout_ms);
+
+  const YAML::Node logs = child(observability, "logs");
+  config.observability.logs.processor = read_or(logs, "processor", config.observability.logs.processor);
+  config.observability.logs.batch = read_batch_export_config(logs, config.observability.logs.batch);
 
   return config;
 }
@@ -151,6 +226,33 @@ void validate_config(const EngineConfig& config) {
 
   if (config.server.port == 0) {
     throw ConfigurationError("server.port must be > 0");
+  }
+
+  if (config.observability.otlp_protocol != "grpc" && config.observability.otlp_protocol != "http") {
+    throw ConfigurationError("observability.otlp_protocol '" + config.observability.otlp_protocol +
+                             "' is unsupported (expected 'grpc' or 'http')");
+  }
+  if (config.observability.enabled && config.observability.otlp_endpoint.empty()) {
+    throw ConfigurationError(
+        "observability.otlp_endpoint must not be empty when observability.enabled is true");
+  }
+  if (config.observability.service_name.empty()) {
+    throw ConfigurationError("observability.service_name must not be empty");
+  }
+  validate_batch_export_config("observability.tracing", config.observability.tracing.processor,
+                               config.observability.tracing.batch);
+  if (config.observability.tracing.sampler != "default" && config.observability.tracing.sampler != "always" &&
+      config.observability.tracing.sampler != "never") {
+    throw ConfigurationError("observability.tracing.sampler '" + config.observability.tracing.sampler +
+                             "' is unsupported (expected 'default', 'always', or 'never')");
+  }
+  validate_batch_export_config("observability.logs", config.observability.logs.processor,
+                               config.observability.logs.batch);
+  if (config.observability.metrics.export_interval_ms == 0) {
+    throw ConfigurationError("observability.metrics.export_interval_ms must be > 0");
+  }
+  if (config.observability.metrics.export_timeout_ms == 0) {
+    throw ConfigurationError("observability.metrics.export_timeout_ms must be > 0");
   }
 }
 

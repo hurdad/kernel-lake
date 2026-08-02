@@ -55,13 +55,23 @@
       "cacheVariables": {
         "KERNELLAKE_BUILD_SERVER": "ON"
       }
+    },
+    {
+      "name": "otel-dev",
+      "displayName": "Development (CPU, OpenTelemetry OTLP/gRPC)",
+      "inherits": "dev",
+      "description": "CPU-only debug build with OpenTelemetry OTLP/gRPC tracing+metrics+logs export enabled. Requires opentelemetry-cpp-dev. Combine directly with -DKERNELLAKE_BUILD_SERVER=ON (no dedicated combined preset yet) to also exercise the Flight SQL server's query span.",
+      "cacheVariables": {
+        "KERNELLAKE_ENABLE_OTEL": "ON"
+      }
     }
   ],
   "buildPresets": [
     { "name": "dev", "configurePreset": "dev" },
     { "name": "release", "configurePreset": "release" },
     { "name": "gpu-dev", "configurePreset": "gpu-dev" },
-    { "name": "server-dev", "configurePreset": "server-dev" }
+    { "name": "server-dev", "configurePreset": "server-dev" },
+    { "name": "otel-dev", "configurePreset": "otel-dev" }
   ],
   "testPresets": [
     {
@@ -84,6 +94,12 @@
     {
       "name": "server-dev",
       "configurePreset": "server-dev",
+      "output": { "outputOnFailure": true },
+      "execution": { "noTestsAction": "error", "stopOnFailure": false }
+    },
+    {
+      "name": "otel-dev",
+      "configurePreset": "otel-dev",
       "output": { "outputOnFailure": true },
       "execution": { "noTestsAction": "error", "stopOnFailure": false }
     }

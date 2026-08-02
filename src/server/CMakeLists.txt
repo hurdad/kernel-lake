@@ -16,6 +16,7 @@ target_compile_features(kernellake_flight_sql_server PUBLIC cxx_std_20)
 target_link_libraries(kernellake_flight_sql_server PUBLIC
   kernellake_api
   kernellake_common
+  kernellake_observability
   ArrowFlightSql::arrow_flight_sql_static
   ArrowFlight::arrow_flight_static
   Arrow::arrow_static

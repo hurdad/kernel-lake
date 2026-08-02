@@ -32,3 +32,36 @@ benchmark:
 server:
   host: 0.0.0.0
   port: 31337
+
+# Only takes effect when built with KERNELLAKE_ENABLE_OTEL=ON. See
+# include/kernellake/common/config.hpp for full field docs -- notably:
+# otlp_endpoint's shape depends on otlp_protocol (host:port for grpc, a full
+# URL for http); use_tls/tls_ca_cert_path apply to grpc only (http uses the
+# endpoint's own scheme); tls_client_cert_path/tls_client_key_path (mTLS)
+# apply to http only.
+observability:
+  enabled: false
+  otlp_protocol: grpc  # grpc | http
+  otlp_endpoint: localhost:4317
+  service_name: kernellake
+  use_tls: false
+  tls_ca_cert_path: ""
+  tls_client_cert_path: ""
+  tls_client_key_path: ""
+  tracing:
+    processor: batch  # simple | batch
+    batch:
+      max_queue_size: 2048
+      max_export_batch_size: 512
+      schedule_delay_ms: 5000
+    sampler: default  # default | always | never
+  # Metrics always use a periodic reader (no simple/batch choice).
+  metrics:
+    export_interval_ms: 60000
+    export_timeout_ms: 30000
+  logs:
+    processor: batch  # simple | batch
+    batch:
+      max_queue_size: 2048
+      max_export_batch_size: 512
+      schedule_delay_ms: 5000

@@ -11,6 +11,9 @@ option(KERNELLAKE_ENABLE_S3 "Build the optional S3 object store implementation" 
 # docs/ARCHITECTURE.md's "Ubuntu 26.04 baseline" section -- Arrow Flight SQL
 # does not link on Ubuntu 24.04's system Abseil).
 option(KERNELLAKE_BUILD_SERVER "Build the Arrow Flight SQL server (kernellake-server)" OFF)
+# Requires opentelemetry-cpp-dev (apt-native on Ubuntu 26.04). OTLP/gRPC
+# export only -- see docs/ARCHITECTURE.md.
+option(KERNELLAKE_ENABLE_OTEL "Enable OpenTelemetry OTLP/gRPC tracing+metrics+logs export" OFF)
 
 if(KERNELLAKE_WITH_CUDA)
   project(kernellake LANGUAGES CXX CUDA)
@@ -65,6 +68,16 @@ if(KERNELLAKE_BUILD_SERVER)
   find_package(ArrowFlight REQUIRED)
   find_package(ArrowFlightSql REQUIRED)
   find_package(gRPC REQUIRED)
+endif()
+
+if(KERNELLAKE_ENABLE_OTEL)
+  # exporters_in_memory is only used by tests/unit/query_tracing_test.cpp,
+  # but it's small and header-light enough to just always request alongside
+  # the others rather than threading a KERNELLAKE_BUILD_TESTS condition
+  # through here too. exporters_otlp_http backs observability.otlp_protocol
+  # == "http" (see include/kernellake/common/config.hpp).
+  find_package(opentelemetry-cpp CONFIG REQUIRED
+    COMPONENTS sdk exporters_otlp_grpc exporters_otlp_http exporters_in_memory)
 endif()
 
 add_subdirectory(src)

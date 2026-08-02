@@ -9,6 +9,7 @@
 #include <utility>
 
 #include "kernellake/common/errors.hpp"
+#include "kernellake/observability/query_tracing.hpp"
 #include "kernellake/planner/physical_plan.hpp"
 
 namespace kernellake {
@@ -61,13 +62,18 @@ arrow::Result<std::unique_ptr<flight::FlightInfo>> KernelLakeFlightSqlServer::Ge
     const flight::ServerCallContext& /*context*/, const flight_sql::StatementQuery& command,
     const flight::FlightDescriptor& descriptor) {
   QueryResult result;
+  observability::QuerySpan span =
+      observability::start_query_span("kernellake.flight_sql.get_flight_info_statement");
   try {
     const PhysicalPlanPtr physical = engine_.explain(command.query);
     result = config_.engine.backend == "cpu" ? engine_.execute_cpu(physical)
                                              : gpu_coordinator_->execute(engine_, physical);
+    span.finish(result, command.query, config_.engine.backend);
   } catch (const KernelLakeError& e) {
+    span.finish_error(e, command.query, config_.engine.backend);
     return ToFlightStatus(e);
   } catch (const std::exception& e) {
+    span.finish_error(e, command.query, config_.engine.backend);
     return arrow::Status::UnknownError(e.what());
   }
 

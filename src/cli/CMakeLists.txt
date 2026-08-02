@@ -14,6 +14,7 @@ target_link_libraries(kernellake PRIVATE
   kernellake_io
   kernellake_api
   kernellake_generator
+  kernellake_observability
   Arrow::arrow_static
   nlohmann_json::nlohmann_json
 )

@@ -835,6 +835,131 @@ independent Python `adbc_driver_flightsql` client -- a real grouped
 aggregate query against `generate-data`-produced Parquet returned correct
 rows. `dev` (145/145) and `gpu-dev` (214/214) both reconfirmed unaffected.
 
+### OpenTelemetry observability (`KERNELLAKE_ENABLE_OTEL`)
+
+Phase 2 of the Flight SQL/otel-cpp/Helm-chart epic (Phase 1,
+`kernellake-server`, above). Built behind `KERNELLAKE_ENABLE_OTEL` (default
+`OFF`; a new `otel-dev` preset turns it on, independent of
+`KERNELLAKE_BUILD_SERVER` -- tracing applies equally to the CLI, so the two
+options are never bundled), sourced from `opentelemetry-cpp-dev` 1.23.0
+(apt-native on Ubuntu 26.04). Scope: one span + one histogram observation
+per whole query, at the two places a whole-query `QueryResult` is produced
+(`kernellake query`'s `run_query()`, and
+`KernelLakeFlightSqlServer::GetFlightInfoStatement`), plus every existing
+`spdlog` call in the codebase bridged into OTel's Logs signal for free via a
+custom sink -- no existing `spdlog::info/warn/error` call site needed to
+change. Per-operator spans and a Helm chart are explicitly **not**
+attempted here -- see `docs/ROADMAP.md`.
+
+**Module shape** (`include/kernellake/observability/query_tracing.hpp`,
+`src/observability/`): the public header never includes an
+opentelemetry-cpp type in either build. Real vs. no-op implementation is
+selected by `KERNELLAKE_ENABLE_OTEL` via two `.cpp` files
+(`query_tracing_otel.cpp`/`query_tracing_stub.cpp`), mirroring
+`query_engine_execute_{gpu,stub}.cpp`'s own established split -- never a
+runtime `#ifdef` inside an always-built file. `init_for_testing()` (used
+only by `tests/unit/query_tracing_test.cpp`) lives in its own third `.cpp`,
+`query_tracing_test_support.cpp`: it references
+`opentelemetry-cpp::in_memory_span_exporter`/`in_memory_metric_exporter`,
+which only `tests/unit/CMakeLists.txt` links, and a static archive pulls in
+whichever `.o` member actually resolves a referenced symbol -- keeping it
+in the same `.o` as `init()` pulled that whole object file (and its
+then-undefined in-memory-exporter symbols) into the CLI/server binaries
+too, confirmed by an actual link failure before the split. Shared
+implementation details (the `to_provider` conversion helper below, the
+spdlog bridge sink, `build_resource`, and the `g_enabled`/`g_tracer_name`/
+`g_query_duration_histogram` globals) live in a third, `src/`-local-only
+header, `internal.hpp`, included by both `.cpp` files but never installed.
+
+**Config** (`ObservabilitySection`, `include/kernellake/common/config.hpp`):
+`otlp_protocol` (`"grpc"` default, or `"http"`), `otlp_endpoint` (gRPC:
+`host:port`; HTTP: a base URL -- kernellake appends the OTLP spec's own
+per-signal path itself, see below), `service_name`, `use_tls`/
+`tls_ca_cert_path` (gRPC server-CA verification only), `tls_client_cert_path`/
+`tls_client_key_path` (HTTP-only mTLS -- see below), and per-signal
+`tracing`/`metrics`/`logs` sub-sections exposing the underlying OTel SDK's
+own processor/batch/sampler knobs directly (`processor: simple|batch` +
+`batch: {max_queue_size, max_export_batch_size, schedule_delay_ms}` for
+traces/logs, mirroring `BatchSpanProcessorOptions`/
+`BatchLogRecordProcessorOptions` field-for-field; `export_interval_ms`/
+`export_timeout_ms` for metrics, which have no simple/batch choice in the
+OTel SDK -- always a `PeriodicExportingMetricReader`; `tracing.sampler:
+default|always|never` selecting `ParentBased(AlwaysOn)`/`AlwaysOnSampler`/
+`AlwaysOffSampler`). Named `observability.tracing`/`.metrics`/`.logs`, not
+`.logging`, to avoid confusion with the existing top-level `LoggingSection`
+(spdlog's own console level/pattern, unrelated to OTel export).
+
+**Real bugs found while implementing this** (each confirmed by an actual
+compiler/linker/runtime failure, not predicted):
+
+- `opentelemetry::nostd::shared_ptr<Base>(std::move(some_unique_ptr<Derived>))`
+  is ambiguous in this ABI version -- three equally-viable candidate
+  constructors (`std::unique_ptr<T>&&`, OTel's own `nostd::unique_ptr<T>&&`,
+  and `std::shared_ptr<T>`) all match via one implicit conversion from a
+  `std::unique_ptr<Derived>` argument. Fixed by going through an exact-type
+  `nostd::shared_ptr<Derived>` first (`to_provider<Base, Derived>()` in
+  `internal.hpp`), then letting *that* upcast via `nostd::shared_ptr`'s own
+  templated `shared_ptr<U>&&` constructor -- unambiguous, since only one
+  candidate applies to a `nostd::shared_ptr` argument.
+- This apt package builds with `OPENTELEMETRY_ABI_VERSION_NO=1`, not 2 --
+  confirmed via an actual compile error listing only the 3-arg,
+  `Context`-taking `Histogram<T>::Record()` overloads as candidates. The
+  2-arg `Record(value, attributes)` convenience overload some OTel C++ code
+  online assumes is available is gated behind `#if
+  OPENTELEMETRY_ABI_VERSION_NO >= 2` and doesn't exist here; `QuerySpan::finish()`
+  passes an explicit empty `opentelemetry::context::Context{}` as the third
+  argument instead.
+- yaml-cpp's `YAML::Node::operator[]` throws ("invalid node") when called on
+  a node that is itself undefined (e.g. `observability["tracing"]` when the
+  YAML document has no `observability:` key at all) -- unlike
+  `config.cpp`'s existing `read_or()` helper, which guards this via its own
+  `!node ||` short-circuit for a single level of indexing. The new nested
+  `observability.tracing`/`.metrics`/`.logs`/`.tracing.batch`/`.logs.batch`
+  lookups index two levels deep, so they needed an explicit `child()` guard
+  helper -- found by an actual test failure (`Config.ParsesOverrides`,
+  a pre-existing test with no `observability:` key in its YAML at all,
+  broke immediately) before landing, not by inspection.
+- OTLP/HTTP needs the OTLP spec's per-signal path suffix
+  (`/v1/traces`/`/v1/metrics`/`/v1/logs`) appended to the endpoint
+  explicitly -- `OtlpHttp*ExporterOptions::url` is the *exact* endpoint, not
+  auto-suffixed the way gRPC's single multiplexed port needs no such
+  suffix. Found by a real request against a real collector (Jaeger)
+  returning HTTP 404 for the bare base URL and 200 once `/v1/traces` was
+  appended manually via `curl`; `fill_http_options()` now appends the
+  correct suffix per signal so `observability.otlp_endpoint` stays one
+  shared *base* URL in config, not three separate per-signal fields.
+- HTTP mTLS (`ssl_client_cert_path`/`ssl_client_key_path`) is
+  unconditionally present in `OtlpHttp*ExporterOptions`, unlike gRPC's
+  equivalent fields, which are compiled out behind
+  `ENABLE_OTLP_GRPC_SSL_MTLS_PREVIEW` (undefined in this apt package) --
+  confirmed by inspecting both header sets directly, not assumed from the
+  gRPC case. `ObservabilitySection.tls_client_cert_path`/
+  `tls_client_key_path` are therefore HTTP-only; silently ignored for gRPC.
+
+**Verified for real**: `otel-dev` (148/148 tests, including three
+deterministic in-memory-exporter tests -- span/histogram population,
+error-status handling, and the spdlog bridge actually receiving a real log
+record -- via a test-only `init_for_testing()` seam that swaps in
+`InMemorySpanExporter`/`InMemoryMetricExporter`/a small custom
+`LogRecordExporter` in place of the real OTLP ones, no network involved).
+Also a manual smoke test against a real, locally `docker run`'able
+collector (`jaegertracing/all-in-one`), covering both protocols: a real
+`kernellake query` (OTLP/gRPC, port 4317) produced a span in Jaeger with
+every populated `QueryResult` field as an attribute
+(`kernellake.rows_returned: 10`, `kernellake.elapsed_wall_seconds`, the SQL
+text, status `OK`), and a second query with invalid SQL produced a span
+with status `ERROR`; switching `otlp_protocol: http` (port 4318) reproduced
+the same successful trace export over OTLP/HTTP once the path-suffix bug
+above was fixed. Metrics/logs export attempts against Jaeger failed with a
+clean, expected error on *both* protocols (`unknown service
+opentelemetry.proto.collector.{metrics,logs}.v1.*Service` for gRPC, HTTP
+404 for HTTP) -- Jaeger's all-in-one image only implements the OTLP
+TraceService, being a tracing-only backend; this is a fact about Jaeger,
+not a bug in this integration, and the deterministic in-memory tests above
+already cover the metrics/logs code paths independent of any collector's
+service support. `dev` (145/145), `gpu-dev` (214/214), and `server-dev`
+(147/147) all reconfirmed unaffected.
+
 ## Future architecture (interfaces only, not yet implemented)
 
 These are named as forward-declared types or documented models so later
