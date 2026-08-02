@@ -19,6 +19,8 @@ class RecordBatch;
 
 namespace kernellake {
 
+class RmmEnvironment;
+
 // Execution and I/O metrics for one query. Every metric KernelLake cannot
 // yet measure (because execution requires GPU/libcudf, not yet built --
 // see docs/ARCHITECTURE.md) stays std::nullopt rather than being guessed at,
@@ -73,10 +75,33 @@ class QueryEngine {
 
   [[nodiscard]] PhysicalPlanPtr explain(std::string_view sql) const;
 
+  // Convenience entry point for one-shot callers (the CLI): plans and
+  // executes `sql` end to end, building and tearing down its own
+  // RmmEnvironment for the duration of this call. Fine for a one-query-
+  // per-process model; a long-lived caller (e.g. a server handling many
+  // requests) should prefer explain() + the execute(physical, rmm_environment)
+  // overload below instead, reusing one RmmEnvironment across requests --
+  // see docs/ARCHITECTURE.md's Concurrency notes for why rebuilding the RMM
+  // pool per request is both wrong under concurrency and wasteful even
+  // single-threaded.
   [[nodiscard]] QueryResult execute(std::string_view sql) const;
 
+  // Runs an already-built physical plan's GPU execution against an
+  // *externally owned* RmmEnvironment (constructed and torn down by the
+  // caller, once, not per call). `result.metadata_inspection_seconds` stays
+  // nullopt here -- planning (where that time is actually spent) already
+  // happened before this call, in whatever produced `physical` (e.g.
+  // explain()); a caller that wants it should time its own explain() call.
+  [[nodiscard]] QueryResult execute(const PhysicalPlanPtr& physical, RmmEnvironment& rmm_environment) const;
+
  private:
-  [[nodiscard]] LogicalPlanPtr plan_logical(std::string_view sql) const;
+  // `metadata_inspection_seconds_out`, when non-null, accumulates the time
+  // spent discovering/inspecting each FROM source's Parquet metadata (the
+  // JOIN case inspects two sources, hence "accumulates" rather than
+  // "assigns"). Left null by explain_logical()/explain(), which don't
+  // return a QueryResult to put it in.
+  [[nodiscard]] LogicalPlanPtr plan_logical(std::string_view sql,
+                                            double* metadata_inspection_seconds_out = nullptr) const;
 
   EngineConfig config_;
   mutable LocalObjectStore store_;

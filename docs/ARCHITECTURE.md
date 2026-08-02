@@ -190,24 +190,93 @@ a `GROUP BY`, or `ScalarAggregate` when it does not; `LogicalSort` becomes
 libcudf, and RMM: `DeviceBatch` (the GPU-resident batch wrapping
 `cudf::table`), `ExecutionContext`, the `PhysicalOperator` streaming
 interface, and the concrete GPU operators (`kernellake_execution`,
-`kernellake_memory`; see `tests/gpu/`). `QueryEngine::execute()` is built
-from one of two mutually exclusive translation units selected by a CMake
-generator expression on `KERNELLAKE_WITH_CUDA`
-(`src/api/query_engine_execute_gpu.cpp` vs. `_stub.cpp`): the GPU build runs
-the real operator pipeline (`kernellake/execution/operator_builder.hpp`
-turns a `PhysicalPlanPtr` into a `PhysicalOperator` tree, pulled to
-exhaustion inside `RmmEnvironment::track_query()` for per-query memory
-accounting, with each resulting `DeviceBatch` converted to an Arrow
-`RecordBatch` via `kernellake/execution/arrow_bridge.hpp`); the CPU-only
-`dev` preset's stub throws a clear `ExecutionError` instead -- KernelLake
-never substitutes a CPU implementation for GPU execution without saying so
-explicitly. The `kernellake query` CLI command (`src/cli/query_command.cpp`)
-is unconditionally built and calls `QueryEngine::execute()`, so its
-behavior likewise depends on which preset built it.
+`kernellake_memory`; see `tests/gpu/`). There is no CPU-side equivalent of
+these operators anywhere -- the CPU-only `dev` preset does real parsing,
+binding, optimization, physical planning, and Parquet pruning, but nothing
+that can actually pull a row of data through a filter/join/aggregate. This
+is deliberate, not an oversight: KernelLake never substitutes a CPU
+implementation for GPU execution without saying so explicitly, so no
+hand-rolled CPU fallback engine exists at all, even a slow one.
+
+`QueryEngine::execute()` is built from one of two mutually exclusive
+translation units selected by a CMake generator expression on
+`KERNELLAKE_WITH_CUDA` (`src/api/query_engine_execute_gpu.cpp` vs.
+`_stub.cpp`): the GPU build runs the real operator pipeline
+(`kernellake/execution/operator_builder.hpp` turns a `PhysicalPlanPtr` into
+a `PhysicalOperator` tree, pulled to exhaustion inside
+`RmmEnvironment::track_query()` for per-query memory accounting, with each
+resulting `DeviceBatch` converted to an Arrow `RecordBatch` via
+`kernellake/execution/arrow_bridge.hpp`); the CPU-only `dev` preset's stub
+throws a clear `ExecutionError` instead. The `kernellake query` CLI command
+(`src/cli/query_command.cpp`) is unconditionally built and calls
+`QueryEngine::execute()`, so its behavior likewise depends on which preset
+built it.
 
 Everything else in this document (parsing through physical planning and
 pruning), plus `kernellake generate-data`, is CPU-only and builds/tests
 with the `dev` CMake preset alone.
+
+### Concurrency: `RmmEnvironment`'s lifetime and the split execution API
+
+`QueryEngine::execute(std::string_view sql)` is a convenience wrapper: it
+plans, constructs its own `RmmEnvironment` (installing itself as the
+process's current CUDA device memory resource for the call's duration),
+executes, and tears that `RmmEnvironment` down again -- all inside one
+call. This is correct for a one-query-per-process model (the CLI) but not
+for a long-lived process serving many requests: two threads racing
+`RmmEnvironment` construction/destruction against the single process-wide
+current-device-resource slot is a real use-after-free risk (the same bug
+*class*, for a different trigger, as the sequential-test-runs race already
+found and fixed -- see "Done" in `docs/ROADMAP.md`), and rebuilding an
+entire RMM pool per request is wasteful even single-threaded.
+
+For that reason `QueryEngine` also exposes a split entry point:
+`explain(sql) -> PhysicalPlanPtr` (already reentrant -- parsing, binding,
+logical planning, optimization, and Parquet metadata inspection touch no
+shared mutable state) followed by
+`execute(const PhysicalPlanPtr&, RmmEnvironment&) -> QueryResult`, which
+takes an **externally owned** `RmmEnvironment` instead of building its own.
+A long-lived caller should construct exactly one `RmmEnvironment` at
+startup, reuse it across every request, and serialize calls to this split
+`execute()` through a single-flight queue (only the GPU-touching phase
+needs serializing; planning stays fully concurrent). `execute(sql)` itself
+is implemented in terms of this split pair -- it is not two independent
+code paths to keep in sync.
+
+The split entry point cannot honestly populate
+`QueryResult::metadata_inspection_seconds` (planning already happened
+before it was called, in whatever produced the `PhysicalPlanPtr`) -- it
+stays `nullopt` there, matching the "documented null, never an invented
+measurement" rule. `execute(sql)` measures it itself around its own
+`explain()`-equivalent call.
+
+### Real-time instrumentation: `MetricsRegistry` and NVTX
+
+Every node `operator_builder.cpp`'s `build_operator_tree()` returns is
+wrapped in `InstrumentedOperator`, a generic decorator that times each
+`next()` call and (when `ExecutionContext::metrics` is non-null) records it
+into a `MetricsRegistry` keyed by `PhysicalOperator::name()` -- no
+individual operator implements its own timing. Recorded totals are
+*inclusive* of children (a parent's `next()` call naturally invokes its
+already-separately-instrumented child's `next()` internally), so only a
+leaf operator's (e.g. `ParquetScanOperator`'s) total is true self time;
+`QueryResult::parquet_decoding_seconds` uses exactly that leaf total.
+`QueryResult::gpu_execution_seconds`/`device_to_host_seconds` are measured
+independently as plain wrapping timers around the operator-tree pull loop
+and each `to_arrow_record_batch()` call, respectively, rather than via the
+registry -- there is no meaningful "device to host" or "whole tree"
+*operator* to attribute those to.
+
+`QueryResult::host_to_device_seconds` stays `nullopt`: there is no separate
+host-to-device transfer phase to time in the current architecture (cudf's
+chunked Parquet reader decodes host file bytes directly into device memory
+in one call), not a gap that was simply missed.
+
+`ProfilingSection::nvtx` (in `EngineConfig`) makes the same
+`InstrumentedOperator` wrapper additionally emit an `nvtx3::scoped_range`
+per `next()` call, visible in `nsys`/Nsight Systems timelines -- one
+instrumentation point serves both the internal `MetricsRegistry` and
+external NVTX profiling.
 
 ### GPU operators
 

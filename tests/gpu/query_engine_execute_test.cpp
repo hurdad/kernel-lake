@@ -13,6 +13,7 @@
 #include <map>
 
 #include "kernellake/api/query_engine.hpp"
+#include "kernellake/memory/rmm_environment.hpp"
 
 namespace kernellake {
 namespace {
@@ -219,6 +220,65 @@ TEST_F(QueryEngineExecuteTest, CastConvertsAmountToInteger) {
   for (std::int64_t i = 0; i < result.batches.front()->num_rows(); ++i) values.push_back(column->Value(i));
   std::sort(values.begin(), values.end());
   EXPECT_EQ(values, (std::vector<std::int64_t>{3, 7, 100}));
+}
+
+// --- Phase 0: split execution path (explain() + execute(physical, rmm)) ---
+// exercised the same way a long-lived caller (e.g. a future Flight SQL
+// server) would use it: one RmmEnvironment built once, reused across the
+// plan-then-execute split, instead of QueryEngine::execute(sql)'s own
+// build-one-per-call convenience wrapper. See docs/ARCHITECTURE.md's
+// Concurrency notes and the split's own doc comments in query_engine.hpp.
+
+TEST_F(QueryEngineExecuteTest, SplitExecutionPathMatchesConvenienceWrapper) {
+  const std::string sql = "SELECT region, SUM(amount) AS total FROM read_parquet('" + path_ +
+                          "') WHERE event_date >= DATE '2026-01-01' GROUP BY region";
+  const QueryResult direct = engine_.execute(sql);
+
+  const PhysicalPlanPtr physical = engine_.explain(sql);
+  RmmEnvironment rmm_environment(default_config());
+  const QueryResult split = engine_.execute(physical, rmm_environment);
+
+  ASSERT_EQ(direct.batches.size(), 1u);
+  ASSERT_EQ(split.batches.size(), 1u);
+  EXPECT_EQ(direct.rows_returned, split.rows_returned);
+  EXPECT_TRUE(direct.batches.front()->Equals(*split.batches.front()));
+}
+
+TEST_F(QueryEngineExecuteTest, ConvenienceWrapperPopulatesRealTimingFields) {
+  const QueryResult result = engine_.execute("SELECT region, SUM(amount) AS total FROM read_parquet('" +
+                                             path_ + "') GROUP BY region");
+  ASSERT_TRUE(result.elapsed_wall_seconds.has_value());
+  ASSERT_TRUE(result.metadata_inspection_seconds.has_value());
+  ASSERT_TRUE(result.gpu_execution_seconds.has_value());
+  ASSERT_TRUE(result.device_to_host_seconds.has_value());
+  ASSERT_TRUE(result.parquet_decoding_seconds.has_value());
+
+  EXPECT_GE(*result.metadata_inspection_seconds, 0.0);
+  EXPECT_GE(*result.gpu_execution_seconds, 0.0);
+  EXPECT_GE(*result.device_to_host_seconds, 0.0);
+  EXPECT_GE(*result.parquet_decoding_seconds, 0.0);
+  // gpu_execution_seconds covers only operator-tree construction + the
+  // open/next/close pull loop; elapsed_wall_seconds additionally covers
+  // parsing/binding/planning/metadata inspection above it, so it must be
+  // at least as large.
+  EXPECT_GE(*result.elapsed_wall_seconds, *result.gpu_execution_seconds);
+  // No natural host-to-device boundary exists in this architecture yet
+  // (see query_engine_execute_gpu.cpp) -- must stay a documented null, not
+  // an invented zero.
+  EXPECT_FALSE(result.host_to_device_seconds.has_value());
+}
+
+TEST_F(QueryEngineExecuteTest, SplitExecutionPathLeavesMetadataInspectionSecondsNull) {
+  // The split entry point never does planning itself (see its doc comment
+  // in query_engine.hpp) -- it cannot honestly report metadata_inspection_
+  // seconds, so this must stay nullopt rather than 0.0.
+  const std::string sql = "SELECT region FROM read_parquet('" + path_ + "')";
+  const PhysicalPlanPtr physical = engine_.explain(sql);
+  RmmEnvironment rmm_environment(default_config());
+  const QueryResult result = engine_.execute(physical, rmm_environment);
+  EXPECT_FALSE(result.metadata_inspection_seconds.has_value());
+  ASSERT_TRUE(result.gpu_execution_seconds.has_value());
+  EXPECT_GE(*result.gpu_execution_seconds, 0.0);
 }
 
 }  // namespace

@@ -4,11 +4,11 @@
 #include <rmm/resource_ref.hpp>
 
 #include "kernellake/common/identifiers.hpp"
+#include "kernellake/execution/metrics_registry.hpp"
 
 namespace kernellake {
 
 class CancellationToken;
-class MetricsRegistry;
 class QueryMemoryTracker;
 
 // Explicit execution context, passed by reference through every operator

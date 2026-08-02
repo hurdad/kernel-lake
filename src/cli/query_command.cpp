@@ -36,6 +36,11 @@ void print_stats(const QueryResult& result) {
   print_optional("row_groups_considered", result.row_groups_considered);
   print_optional("row_groups_scanned", result.row_groups_scanned);
   print_optional("peak_gpu_memory_bytes", result.peak_gpu_memory_bytes);
+  print_optional("metadata_inspection_seconds", result.metadata_inspection_seconds);
+  print_optional("parquet_decoding_seconds", result.parquet_decoding_seconds);
+  print_optional("gpu_execution_seconds", result.gpu_execution_seconds);
+  print_optional("host_to_device_seconds", result.host_to_device_seconds);
+  print_optional("device_to_host_seconds", result.device_to_host_seconds);
   print_optional("elapsed_wall_seconds", result.elapsed_wall_seconds);
 }
 

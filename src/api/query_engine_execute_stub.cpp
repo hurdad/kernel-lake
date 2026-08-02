@@ -9,11 +9,22 @@
 
 namespace kernellake {
 
-QueryResult QueryEngine::execute(std::string_view /*sql*/) const {
+namespace {
+[[noreturn]] void throw_no_gpu_build() {
   throw ExecutionError(
       "query execution requires GPU operators (libcudf/RMM), which are not part of this build; "
       "use `kernellake explain --sql ...` to see the plan KernelLake would run, or build with "
       "-DKERNELLAKE_WITH_CUDA=ON once libcudf/RMM are installed");
+}
+}  // namespace
+
+QueryResult QueryEngine::execute(std::string_view /*sql*/) const {
+  throw_no_gpu_build();
+}
+
+QueryResult QueryEngine::execute(const PhysicalPlanPtr& /*physical*/,
+                                 RmmEnvironment& /*rmm_environment*/) const {
+  throw_no_gpu_build();
 }
 
 }  // namespace kernellake

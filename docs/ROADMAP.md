@@ -105,6 +105,29 @@ and covered by passing tests -- not merely designed or stubbed.
   computed expression only resolves after `GROUP BY`, not on a plain query
   -- already true and documented before this work, not a new limitation,
   but not obvious until a DECIMAL `CAST` test tripped over it.
+- Groundwork for a future long-lived server (Phase 0 of a larger,
+  in-progress epic -- see "Not yet started" below for the rest): split
+  `QueryEngine::execute(sql)` into a reentrant `explain(sql)` (already
+  existed) plus a new `execute(const PhysicalPlanPtr&, RmmEnvironment&)`
+  overload taking an *externally owned* `RmmEnvironment`, so a future
+  server can construct one `RmmEnvironment` at startup and reuse it across
+  requests instead of racing construction/destruction of it per request
+  (see "Concurrency" in `docs/ARCHITECTURE.md` for why that race is real,
+  not hypothetical). Also added real per-operator timing: every operator
+  the tree builds is now wrapped in a generic `InstrumentedOperator`
+  (`operator_builder.cpp`) that records wall-clock `next()` time into a new
+  `MetricsRegistry` (`ExecutionContext::metrics`, previously
+  forward-declared but never implemented) and emits an NVTX range when
+  `ProfilingSection::nvtx` is set (also previously an unused config bool).
+  This finally populates `QueryResult`'s `metadata_inspection_seconds`,
+  `parquet_decoding_seconds`, `gpu_execution_seconds`, and
+  `device_to_host_seconds` fields (verified via `kernellake query --stats`
+  against the real SF1 TPC-H data from the entry above -- e.g. a `GROUP BY
+  l_returnflag` query showed `parquet_decoding_seconds: 0.133`,
+  `gpu_execution_seconds: 0.187`, `elapsed_wall_seconds: 0.340`, internally
+  consistent as expected). `host_to_device_seconds` stays a documented
+  `nullopt` -- there is no separate host-to-device transfer phase in the
+  current architecture to time, not a gap that was missed.
 - Hash joins: a two-table `INNER JOIN ... ON <a.col = b.col>` (single
   equality key, both sides aliased `read_parquet(...)` sources) end to end --
   a rewritten multi-occurrence `read_parquet(...)` regex adapter (parser.cpp),
@@ -223,13 +246,33 @@ and covered by passing tests -- not merely designed or stubbed.
 - `docker run --gpus all` of the published `runtime` image against a real
   GPU (the image builds and pushes successfully in CI; actually running it
   hasn't been checked yet)
+- **An Arrow Flight SQL server, otel-cpp observability, and a Helm chart**
+  (a user-directed initiative beyond the original MVP scope -- see the
+  "Explicit non-goals" note below on Flight SQL/Kubernetes). Phase 0
+  (above) is done; still to build, in order: (1) the Flight SQL server
+  itself (new `kernellake-server` binary, `libarrow-flight-sql-dev`/
+  `libgrpc++-dev` from the same Apache Arrow apt repo already in use --
+  confirmed available, no `FetchContent` vendoring needed for Flight
+  itself), gated on a version-compatibility spike against Ubuntu 24.04's
+  older system gRPC; (2) otel-cpp integration (vendored via `FetchContent`,
+  building on Phase 0's `MetricsRegistry`/NVTX instrumentation points); (3)
+  a Helm chart deploying the server as a Deployment+Service with GPU
+  scheduling, blocked on (1). A related question -- bumping the Ubuntu
+  baseline from 24.04 to 26.04 for apt-native otel-cpp and Ubuntu's own
+  `nvidia-cuda-toolkit` package instead of the official `nvidia/cuda`
+  Docker image -- was deliberately deferred: otel-cpp vendors cleanly on
+  24.04 already, and swapping the CUDA toolchain source is a real,
+  unverified risk with no Docker available in this project's dev
+  environment to test it against.
 
 ## Explicit non-goals for the MVP
 
-Distributed execution, multi-node/multi-GPU scheduling, Kubernetes
-operators, full Iceberg catalog integration, Arrow Flight SQL, joins beyond
-a two-table `INNER JOIN` with a single equality key (see "Hash joins" in
-`docs/ARCHITECTURE.md`), all 22 TPC-H queries, cost-based optimization,
+Distributed execution, multi-node/multi-GPU scheduling, a Kubernetes
+*operator* (custom controller/CRDs -- the plain Helm chart in progress
+above is a Deployment+Service, not an operator), full Iceberg catalog
+integration, joins beyond a two-table `INNER JOIN` with a single equality
+key (see "Hash joins" in `docs/ARCHITECTURE.md`), all 22 TPC-H queries,
+cost-based optimization,
 fault-tolerant fragment
 retries, query spilling, materialized views, transactions, data ingestion
 (`INSERT`/`UPDATE`/`DELETE`), a proprietary storage format, and a web UI.
