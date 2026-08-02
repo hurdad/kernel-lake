@@ -74,6 +74,10 @@ EngineConfig parse_config(const std::string& yaml_text) {
   config.benchmark.verify_results = read_or(benchmark, "verify_results", config.benchmark.verify_results);
   config.benchmark.baseline = read_or(benchmark, "baseline", config.benchmark.baseline);
 
+  const YAML::Node server = root["server"];
+  config.server.host = read_or(server, "host", config.server.host);
+  config.server.port = read_or(server, "port", config.server.port);
+
   return config;
 }
 
@@ -143,6 +147,10 @@ void validate_config(const EngineConfig& config) {
   }
   if (config.benchmark.warmup_iterations < 0) {
     throw ConfigurationError("benchmark.warmup_iterations must be >= 0");
+  }
+
+  if (config.server.port == 0) {
+    throw ConfigurationError("server.port must be > 0");
   }
 }
 

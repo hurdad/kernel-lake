@@ -27,3 +27,8 @@ benchmark:
   output_format: json
   verify_results: true
   baseline: duckdb
+
+# Only consumed by kernellake-server (KERNELLAKE_BUILD_SERVER=ON).
+server:
+  host: 0.0.0.0
+  port: 31337

@@ -48,6 +48,14 @@ struct BenchmarkSection {
   std::string baseline = "duckdb";
 };
 
+// Only consumed by kernellake-server (KERNELLAKE_BUILD_SERVER); present
+// unconditionally here like every other section so EngineConfig has one
+// shape regardless of build options.
+struct ServerSection {
+  std::string host = "0.0.0.0";
+  std::uint16_t port = 31337;
+};
+
 struct EngineConfig {
   EngineSection engine;
   MemorySection memory;
@@ -55,6 +63,7 @@ struct EngineConfig {
   LoggingSection logging;
   ProfilingSection profiling;
   BenchmarkSection benchmark;
+  ServerSection server;
 };
 
 // Returns the built-in defaults, matching config/kernellake.yaml.

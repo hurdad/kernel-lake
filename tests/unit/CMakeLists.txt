@@ -14,6 +14,7 @@ add_executable(kernellake_unit_tests
   query_engine_test.cpp
   query_engine_execute_cpu_test.cpp
   sample_data_generator_test.cpp
+  $<$<BOOL:${KERNELLAKE_BUILD_SERVER}>:flight_sql_server_test.cpp>
 )
 
 target_link_libraries(kernellake_unit_tests PRIVATE
@@ -30,6 +31,19 @@ target_link_libraries(kernellake_unit_tests PRIVATE
   GTest::gtest
   GTest::gtest_main
 )
+
+if(KERNELLAKE_BUILD_SERVER)
+  # See src/server/CMakeLists.txt's comment on why this needs a raw
+  # -Wl,--start-group/--end-group wrap, not just a plain link.
+  target_link_libraries(kernellake_unit_tests PRIVATE
+    -Wl,--start-group
+    kernellake_flight_sql_server
+    ArrowFlightSql::arrow_flight_sql_static
+    ArrowFlight::arrow_flight_static
+    gRPC::grpc++
+    -Wl,--end-group
+  )
+endif()
 
 # kernellake_unit_tests is built (and run) under both the CPU-only `dev`
 # preset and the GPU-enabled `gpu-dev` preset. QueryEngine::execute()'s

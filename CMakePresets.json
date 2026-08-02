@@ -46,12 +46,22 @@
         "KERNELLAKE_BUILD_BENCHMARKS": "ON",
         "CMAKE_CUDA_COMPILER": "/usr/local/cuda/bin/nvcc"
       }
+    },
+    {
+      "name": "server-dev",
+      "displayName": "Development (CPU, Flight SQL server)",
+      "inherits": "dev",
+      "description": "CPU-only debug build with the Arrow Flight SQL server (kernellake-server) enabled. Requires libarrow-flight-dev, libarrow-flight-sql-dev, and gRPC.",
+      "cacheVariables": {
+        "KERNELLAKE_BUILD_SERVER": "ON"
+      }
     }
   ],
   "buildPresets": [
     { "name": "dev", "configurePreset": "dev" },
     { "name": "release", "configurePreset": "release" },
-    { "name": "gpu-dev", "configurePreset": "gpu-dev" }
+    { "name": "gpu-dev", "configurePreset": "gpu-dev" },
+    { "name": "server-dev", "configurePreset": "server-dev" }
   ],
   "testPresets": [
     {
@@ -68,6 +78,12 @@
     {
       "name": "gpu-dev",
       "configurePreset": "gpu-dev",
+      "output": { "outputOnFailure": true },
+      "execution": { "noTestsAction": "error", "stopOnFailure": false }
+    },
+    {
+      "name": "server-dev",
+      "configurePreset": "server-dev",
       "output": { "outputOnFailure": true },
       "execution": { "noTestsAction": "error", "stopOnFailure": false }
     }

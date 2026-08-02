@@ -622,11 +622,15 @@ CMake >= 3.30.4, newer than Ubuntu 24.04's apt package (3.28.3).
 
 `docker/Dockerfile`'s published images (`dev`/`runtime`) build on plain
 `ubuntu:26.04`, not Ubuntu 24.04 or NVIDIA's official `nvidia/cuda` devel/
-runtime images. This is a deliberate, empirically-verified departure from
-this project's own non-container development environment, which stays on
-Ubuntu 24.04 (nothing about the local `dev`/`gpu-dev` CMake presets or this
-sandbox's own CUDA install changed) -- the two are independent, and there
-is no requirement that they match.
+runtime images. This was originally a deliberate, empirically-verified
+departure from this project's own non-container development environment,
+which at the time stayed on Ubuntu 24.04 -- the two were independent, with
+no requirement that they match. That has since changed on its own: a later
+development session's own sandbox moved to Ubuntu 26.04 too (`lsb_release`:
+`resolute`), which is what let `kernellake-server`'s `server-dev` preset
+(see "Arrow Flight SQL server" below) be built and tested directly there,
+no Docker required. The independence point still holds either way -- there
+remains no requirement that the two match, they just currently happen to.
 
 **Why**: two real, distro-level blockers, both confirmed by an actual
 `docker build`/`docker run --gpus all` in this project's own development
@@ -682,14 +686,18 @@ Two apt-level facts made this concrete rather than aspirational:
   revision -- not a NVIDIA-repo dependency, still fully apt-native.
 
 nvcc lands at `/usr/bin/nvcc` under this packaging (Debian convention),
-not `/usr/local/cuda/bin/nvcc` (NVIDIA installer/Docker-image convention,
-which is what `CMakePresets.json`'s `gpu-dev` preset's
-`CMAKE_CUDA_COMPILER` default still points at, since that preset is for
-*this project's own* non-container Ubuntu 24.04 environment, unchanged).
-`docker/Dockerfile` overrides `CMAKE_CUDA_COMPILER=/usr/bin/nvcc` directly
-in its `cmake --preset gpu-dev` invocation instead of changing the shared
-preset default -- each environment gets its own correct path without
-either one needing to guess the other's layout.
+not `/usr/local/cuda/bin/nvcc` (NVIDIA installer/Docker-image convention).
+`CMakePresets.json`'s `gpu-dev` preset's `CMAKE_CUDA_COMPILER` default
+still points at the NVIDIA-installer path -- a stale assumption from when
+this project's own non-container environment used that convention; now
+that this project's own sandbox is on Ubuntu 26.04 too (see "Ubuntu 26.04
+baseline" above) with apt's `nvidia-cuda-toolkit`, invoking the `gpu-dev`
+preset here also needs an explicit `-DCMAKE_CUDA_COMPILER=/usr/bin/nvcc`
+override, same as `docker/Dockerfile` already does in its own `cmake
+--preset gpu-dev` invocation. Updating the preset's own default to match is
+a reasonable follow-up, not done here since both current environments work
+fine with the explicit override and neither depends on the preset default
+being correct.
 
 `CMAKE_CUDA_ARCHITECTURES` cannot be left at the top-level `CMakeLists.txt`
 default of `native` (which probes an actual device) inside
@@ -729,6 +737,103 @@ assumption that no longer applies now that `runtime` is plain Ubuntu with
 no CUDA preinstalled, so CUDA's own shared libraries (`libcudart.so.12`,
 etc.) are now correctly included in the copied closure instead of silently
 assumed-present.
+
+### Arrow Flight SQL server (`kernellake-server`)
+
+Phase 1 of the Flight SQL/otel-cpp/Helm-chart epic (see `docs/ROADMAP.md`).
+Built behind `KERNELLAKE_BUILD_SERVER` (default `OFF`; a `server-dev` CMake
+preset turns it on), so it adds no new required dependency for anyone not
+using it. `KernelLakeFlightSqlServer`
+(`include/kernellake/server/flight_sql_server.hpp`,
+`src/server/flight_sql_server.cpp`) subclasses
+`arrow::flight::sql::FlightSqlServerBase` and implements just
+`GetFlightInfoStatement`/`DoGetStatement` -- Arrow 25.0.0 declares the rest
+of that base class's RPCs virtual with default `NotImplemented` bodies, not
+pure virtual, so a minimal override compiles and serves real queries
+without touching prepared statements, catalog/schema/table listing, or
+`SqlInfo`. The two implemented RPCs deliberately execute the query
+*eagerly* inside `GetFlightInfoStatement` (the first RPC a client makes)
+and buffer the `QueryResult` in an in-process handle-keyed registry that
+`DoGetStatement` (the second RPC) streams from and then erases -- avoiding
+the need to keep a live cursor open across two separate gRPC calls that may
+not even land on the same connection, at the cost of buffering the whole
+result in host memory between the two calls. Every `KernelLakeError`
+subclass thrown by `QueryEngine` is translated to a matching generic
+`arrow::Status` code (`Invalid` for `SqlError`/`BindingError`/
+`PlanningError`/`OptimizationError`, `IOError` for `StorageError`,
+`ExecutionError`/`OutOfMemory` for the GPU-side errors) before it can cross
+the gRPC boundary as a raw C++ exception -- verified with a real ADBC
+Python client seeing a clean `INVALID_ARGUMENT` for bad SQL rather than a
+dropped connection.
+
+Respects `engine.backend: gpu|cpu` (new `ServerSection` in `EngineConfig`
+adds `server.host`/`server.port`) exactly like the CLI's `query --backend`
+flag -- not hardcoded to GPU. For `backend: gpu`, a long-lived server can't
+use `QueryEngine::execute(sql)`'s one-shot convenience overload (it builds
+and tears down its own `RmmEnvironment` per call -- a real
+use-after-free race under concurrent gRPC handler threads, per the
+Concurrency notes above); instead `GpuExecutionCoordinator`
+(`include/kernellake/server/gpu_execution_coordinator.hpp`) owns one
+`RmmEnvironment` for the server's whole lifetime and serializes GPU
+`execute()` calls behind a single mutex (single-flight -- sufficient given
+this project's existing "one query executes on the GPU at a time" MVP
+simplification; a real request queue is a reasonable future refinement).
+Split into `gpu_execution_coordinator_{gpu,stub}.cpp`, selected by
+`KERNELLAKE_WITH_CUDA` exactly like `query_engine_execute_{gpu,stub}.cpp`,
+so `server-dev` (CPU-only) needs no CUDA/RMM at all; requesting `backend:
+gpu` against such a build fails fast at server startup with a
+`ConfigurationError`, not silently at first query.
+
+**A real CMake linking gotcha, worth documenting precisely** since the
+earlier note above (end of "Ubuntu 26.04 baseline") turned out to be an
+incomplete fix once tried against this project's actual (non-minimal)
+dependency tree: wrapping `ArrowFlightSql::arrow_flight_sql_static`/
+`ArrowFlight::arrow_flight_static`/`Arrow::arrow_static`/`gRPC::grpc++` in
+CMake's `$<LINK_GROUP:RESCAN,...>` genex does **not** actually fix the
+undefined-reference failures in a project this size, for two independent
+reasons, both confirmed by inspecting the generated `ninja` link command
+directly rather than guessing from documentation:
+
+1. **`LINK_GROUP` only wraps the *explicitly listed* members in
+   `--start-group`/`--end-group`** -- it does not pull each member's own
+   transitively-required libraries inside the group boundary too.
+   `gRPC::grpc++`'s own dependency closure (`libgrpc.so`, every `libabsl_*`
+   library, `libgpr.so`, `libcares.so`, ...) still landed *after*
+   `--end-group` in the generated link line, textually separated from the
+   archives that actually reference symbols in them.
+2. **Including `Arrow::arrow_static` in the group is what the minimal
+   verified reproduction needed, but it creates a genuine CMake-level
+   dependency cycle in this project's real tree**: `Arrow::arrow_static` is
+   linked by nearly every other `kernellake_*` module too, so CMake's own
+   `LINK_GROUP` cycle detector sees "the group depends on
+   `kernellake_api`'s other libraries, which depend on `Arrow::arrow_static`,
+   which is itself inside the group" and refuses to generate the build at
+   configure time.
+
+The actual fix, in `src/server/CMakeLists.txt` and (for the test binary
+that also links `kernellake_flight_sql_server`) `tests/unit/CMakeLists.txt`:
+raw `-Wl,--start-group ... -Wl,--end-group` strings passed directly to
+`target_link_libraries`, not the `LINK_GROUP` genex. Being plain strings
+rather than CMake target names, they aren't analyzed by CMake's
+dependency-cycle detection at all, sidestepping problem (2); and while they
+turned out *not* to solve problem (1) via any special interleaving
+behavior either (transitively-required libraries still land after the
+literal `--end-group` marker, confirmed by inspecting the link line again
+after switching), the fix works anyway once applied consistently to
+*every* target that links `kernellake_flight_sql_server` directly (the
+`kernellake-server` executable itself, and separately the
+`kernellake_unit_tests` binary) -- the actual root cause was simply that
+`libarrow_flight_sql.a`/`libarrow_flight.a` and `libgrpc++.so` had never
+been placed adjacent to each other on the link line at all before this
+group existed anywhere in the command, not a subtler ordering problem
+requiring the full transitive closure to be inside the bracket.
+
+Verified for real: `server-dev` (147/147 tests, including a real
+`arrow::flight::sql::FlightSqlClient` round-trip test and an invalid-SQL
+error-path test) and a manual smoke test against a running server using an
+independent Python `adbc_driver_flightsql` client -- a real grouped
+aggregate query against `generate-data`-produced Parquet returned correct
+rows. `dev` (145/145) and `gpu-dev` (214/214) both reconfirmed unaffected.
 
 ## Future architecture (interfaces only, not yet implemented)
 

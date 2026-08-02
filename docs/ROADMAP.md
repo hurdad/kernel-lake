@@ -272,6 +272,45 @@ and covered by passing tests -- not merely designed or stubbed.
   `nvidia-cuda-toolkit` itself). This project's own non-container `dev`/
   `gpu-dev` presets and this sandbox's CUDA install are unaffected --
   still Ubuntu 24.04, unchanged.
+- **`kernellake-server`: an Arrow Flight SQL server wired to `QueryEngine`**
+  (Phase 1 of the Flight SQL/otel-cpp/Helm-chart epic below -- Phase 0,
+  above, was already done; Phases 2-3 remain, see "Not yet started"). This
+  session's own sandbox has itself since moved to Ubuntu 26.04 (`lsb_release`:
+  `resolute`), correcting the prior entry above's assumption that the
+  non-container dev environment would stay on 24.04 -- `server-dev` (new
+  preset, `KERNELLAKE_BUILD_SERVER=ON`) builds and tests directly here, no
+  Docker required, now that `libarrow-flight-dev`/`libarrow-flight-sql-dev`/
+  `libgrpc++-dev` are all real installable apt packages on this host.
+  `KernelLakeFlightSqlServer` (`src/server/flight_sql_server.cpp`)
+  implements `GetFlightInfoStatement`/`DoGetStatement` -- execute-eagerly
+  in the first RPC, stream-from-an-in-process-registry in the second, a
+  deliberate Phase 1 simplification over a live cursor -- translating
+  `KernelLakeError` subclasses to matching `arrow::Status` codes so no raw
+  C++ exception crosses the gRPC boundary. Respects `engine.backend:
+  gpu|cpu` exactly like the CLI's `--backend` flag; for `gpu`, a new
+  `GpuExecutionCoordinator` owns the one long-lived `RmmEnvironment` a
+  concurrent server needs (single-flight mutex), split gpu/stub like every
+  other CUDA-conditional module so `server-dev` needs no CUDA at all. Also
+  needed a real, non-obvious CMake fix: Arrow's `ArrowFlight`/`ArrowFlightSql`
+  targets don't declare `gRPC::grpc++` as a dependency, and CMake's
+  `$<LINK_GROUP:RESCAN,...>` genex turned out not to pull a grouped target's
+  *own* transitive link dependencies inside the group boundary (confirmed by
+  inspecting the generated link command) -- fixed with raw
+  `-Wl,--start-group`/`--end-group` strings instead, which also sidesteps a
+  false dependency-cycle CMake's LINK_GROUP analysis reported (from
+  `Arrow::arrow_static` being shared across the whole `kernellake_*` tree
+  outside any group). Verified for real: 147/147 tests pass under
+  `server-dev` (including two new `tests/unit/flight_sql_server_test.cpp`
+  cases -- a real `arrow::flight::sql::FlightSqlClient` round trip over
+  gRPC, and an invalid-SQL case asserting a clean `Invalid` status rather
+  than a dropped connection), plus a manual smoke test against a running
+  server using an *independent* Python `adbc_driver_flightsql` client (not
+  code from this project) running a real grouped aggregate against
+  `generate-data`-produced Parquet and getting correct rows back. `dev`
+  (145/145) and `gpu-dev` (214/214) both reconfirmed unaffected by any of
+  this (`KERNELLAKE_BUILD_SERVER` defaults `OFF`). CI coverage for
+  `KERNELLAKE_BUILD_SERVER=ON` is a separate, still-open item -- see "Not
+  yet started".
 
 ## Not yet started
 
@@ -298,27 +337,20 @@ and covered by passing tests -- not merely designed or stubbed.
   trusting any timing number (this project's existing rule from
   `tools/validate_tpch.py`, now applying to three engines instead of two);
   report a clearly-labeled "unofficial, not a certified benchmark" table.
-- **An Arrow Flight SQL server, otel-cpp observability, and a Helm chart**
-  (a user-directed initiative beyond the original MVP scope, sequenced
-  *after* the CPU-backend/benchmark epic above -- see the "Explicit
-  non-goals" note below on Flight SQL/Kubernetes). Phase 0 (above) is done,
-  and the Ubuntu 26.04 Docker baseline bump (above) resolves the
-  version-compatibility question that used to gate this: Arrow Flight SQL
-  is now confirmed to link and run there (it does not on 24.04 -- see
-  `docs/ARCHITECTURE.md`). Still to build, in order: (1) the
-  `kernellake-server` binary itself and its query-mapping layer (the
-  dependency/link questions are answered; what's left is the actual
-  `FlightSqlServerBase` subclass wired to `QueryEngine`); (2) otel-cpp
-  integration (now apt-native on the 26.04 image rather than
+- **otel-cpp observability and a Helm chart** (Phases 2-3 of the Flight
+  SQL/otel-cpp/Helm-chart epic -- Phase 0 and Phase 1, `kernellake-server`
+  itself, are both done, see "Done" above; see the "Explicit non-goals" note
+  below on Kubernetes). Still to build, in order: (2) otel-cpp integration
+  (apt-native on Ubuntu 26.04 -- both this project's Docker image and, as of
+  Phase 1's entry above, this sandbox itself -- rather than
   `FetchContent`-vendored, building on Phase 0's `MetricsRegistry`/NVTX
   instrumentation points); (3) a Helm chart deploying the server as a
   Deployment+Service, with a `backend: gpu|cpu` toggle (mirroring
   `engine.backend` from the CPU-backend epic) so the same chart can
-  schedule onto GPU or CPU-only nodes, blocked on (1). Note: this all
-  targets the Docker image specifically -- this project's own
-  non-container development environment (this sandbox) stays on Ubuntu
-  24.04, so `src/server/` development/testing happens via the
-  `kernellake-dev` Docker image, not the local `gpu-dev` preset directly.
+  schedule onto GPU or CPU-only nodes. Also still open: CI coverage for
+  `KERNELLAKE_BUILD_SERVER=ON` (no existing `.github/workflows/ci.yml` job
+  builds it yet); `docker/Dockerfile` doesn't build/ship `kernellake-server`
+  either (only `kernellake`), which Phase 3's Helm chart will need.
 - Delta Lake read support (`read_delta(...)` alongside `read_parquet(...)`)
   -- explicitly deferred as its own follow-up plan, not forgotten. Reading
   `_delta_log/*.json` plus checkpoint Parquet files is required to

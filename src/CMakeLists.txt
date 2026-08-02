@@ -16,3 +16,7 @@ if(KERNELLAKE_WITH_CUDA)
 endif()
 
 add_subdirectory(cli)
+
+if(KERNELLAKE_BUILD_SERVER)
+  add_subdirectory(server)
+endif()

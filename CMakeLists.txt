@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.26)
+cmake_minimum_required(VERSION 3.29)
 
 # CUDA is an optional language: it is only enabled when KERNELLAKE_WITH_CUDA is
 # turned on, which additionally requires libcudf/RMM to build the GPU
@@ -7,6 +7,10 @@ option(KERNELLAKE_WITH_CUDA "Enable CUDA and GPU execution (requires CUDA toolki
 option(KERNELLAKE_BUILD_TESTS "Build unit and integration tests" ON)
 option(KERNELLAKE_BUILD_BENCHMARKS "Build microbenchmarks and TPC-H benchmarks" ON)
 option(KERNELLAKE_ENABLE_S3 "Build the optional S3 object store implementation" OFF)
+# Requires libarrow-flight-dev, libarrow-flight-sql-dev, and gRPC (see
+# docs/ARCHITECTURE.md's "Ubuntu 26.04 baseline" section -- Arrow Flight SQL
+# does not link on Ubuntu 24.04's system Abseil).
+option(KERNELLAKE_BUILD_SERVER "Build the Arrow Flight SQL server (kernellake-server)" OFF)
 
 if(KERNELLAKE_WITH_CUDA)
   project(kernellake LANGUAGES CXX CUDA)
@@ -55,6 +59,12 @@ endif()
 if(KERNELLAKE_WITH_CUDA)
   find_package(CUDAToolkit REQUIRED)
   include(ThirdPartyRapids)
+endif()
+
+if(KERNELLAKE_BUILD_SERVER)
+  find_package(ArrowFlight REQUIRED)
+  find_package(ArrowFlightSql REQUIRED)
+  find_package(gRPC REQUIRED)
 endif()
 
 add_subdirectory(src)
