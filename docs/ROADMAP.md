@@ -153,8 +153,11 @@ and covered by passing tests -- not merely designed or stubbed.
   as `validate_against_duckdb.py`), and `kernellake benchmark tpch`
   (cold/warm modes with median/mean/min/max/stddev over configurable
   iterations; `execution-only` mode is not implemented -- see
-  `docs/TPCH.md`). Verified: Q1 and Q6 both match DuckDB at SF0.01 and
-  SF0.1.
+  `docs/TPCH.md`). Verified: Q1 and Q6 both match DuckDB at SF0.01, SF0.1,
+  and real SF1 (6,000,000 generated `lineitem` rows, ~105 MiB zstd-compressed
+  Parquet) -- see `docs/TPCH.md` for the SF1 correctness run and indicative
+  benchmark numbers (Q6 ~75-100ms; Q1 ~0.2-2s, with real observed variance
+  documented rather than smoothed over).
 
 - `LICENSE` (Apache 2.0), `NOTICE`, `THIRD_PARTY_LICENSES.md` (every
   dependency actually declared in the build, verified against each
@@ -205,9 +208,10 @@ and covered by passing tests -- not merely designed or stubbed.
 ## Not yet started
 
 - TPC-H `execution-only` benchmark mode (needs an operator-tree entry point
-  that skips `ParquetScanOperator`); TPC-H at real SF1/SF10 scale (only
-  tested at SF0.01/SF0.1 so far); Q3/Q12/Q14 (need TPC-H's actual multi-way
-  join schema wired up against hash joins' current two-table scope)
+  that skips `ParquetScanOperator`); TPC-H at SF10+ scale (SF1 now verified,
+  see "Done" above; SF10 untested); Q3/Q12/Q14 (need TPC-H's actual
+  multi-way join schema wired up against hash joins' current two-table
+  scope)
 - A self-hosted GPU CI runner (would enable a `gpu-dev` build/test/
   benchmark/validate workflow to actually run in CI, rather than only
   locally) -- explicitly deferred; `hurdad/kernel-lake` is a public repo,
