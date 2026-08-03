@@ -123,10 +123,15 @@ FROM dev-base AS dev-cpu
 WORKDIR /workspace
 COPY . .
 
+# ctest runs here (unlike dev-gpu below): tests/unit/ is CPU-only and
+# needs no GPU device, so it can run at `docker build` time same as
+# CI's cpu-build-test/server-build-test/otel-build-test jobs do outside
+# Docker -- a broken build never makes it into runtime-cpu.
 RUN cmake --preset dev \
       -DKERNELLAKE_BUILD_SERVER=ON \
       -DKERNELLAKE_ENABLE_OTEL=ON \
-    && cmake --build --preset dev
+    && cmake --build --preset dev \
+    && ctest --preset dev --output-on-failure
 
 ENTRYPOINT ["/workspace/build/dev/src/cli/kernellake"]
 CMD ["--help"]
@@ -171,6 +176,13 @@ COPY . .
 # it doesn't have native code for (this is exactly what let the RTX 5060 Ti
 # used to verify this image, a Blackwell/sm_120 card newer than anything
 # CUDA 12.4's nvcc can target directly, run all 214 tests successfully).
+#
+# No `ctest` here (unlike dev-cpu above): tests/gpu/ needs a real GPU
+# device to run, which `docker build` never has (only `docker run --gpus
+# all` does) -- per this project's own rule, a skipped-GPU test must never
+# be reported as passing, so it isn't run here at all rather than faked.
+# Verify gpu-dev's tests with a real `docker run --gpus all` against this
+# image instead (see README.md/docs/ARCHITECTURE.md).
 RUN cmake --preset gpu-dev \
       -DCMAKE_CUDA_COMPILER=/usr/bin/nvcc \
       -DCMAKE_CUDA_ARCHITECTURES="70-real;75-real;80-real;86-real;89" \
