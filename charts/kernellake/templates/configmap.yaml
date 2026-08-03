@@ -1,0 +1,43 @@
+{{/*
+Renders a real kernellake.yaml (see include/kernellake/common/config.hpp /
+config/kernellake.yaml for the full shape) from this chart's thin values
+surface. Any section/field not set here falls back to kernellake's own
+compiled-in default -- parse_config() only overrides keys actually present
+in the YAML (src/common/config.cpp's read_or() helper), so a minimal file
+here is intentional, not an oversight.
+*/}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "kernellake.fullname" . }}
+  labels:
+    {{- include "kernellake.labels" . | nindent 4 }}
+{{/*
+Every numeric value below is piped through `| int64`: Helm/sprig's generic
+YAML->JSON->interface{} value decoding turns whole numbers into float64,
+and Go's default float64 formatting switches to scientific notation past a
+few digits (confirmed by an actual `helm template` run rendering
+"1e+06"/"8.589934592e+09" before these casts were added) -- yaml-cpp on
+the receiving end would either reject or misparse that.
+*/}}
+data:
+  kernellake.yaml: |
+    engine:
+      backend: {{ .Values.backend }}
+      batch_rows: {{ .Values.config.engine.batchRows | int64 }}
+      result_batch_rows: {{ .Values.config.engine.resultBatchRows | int64 }}
+      query_memory_limit_bytes: {{ .Values.config.engine.queryMemoryLimitBytes | int64 }}
+
+    storage:
+      local_root: {{ .Values.config.storage.localRoot | quote }}
+
+    server:
+      host: 0.0.0.0
+      port: {{ .Values.service.port | int64 }}
+
+    observability:
+      enabled: {{ .Values.observability.enabled }}
+      otlp_protocol: {{ .Values.observability.otlpProtocol }}
+      otlp_endpoint: {{ .Values.observability.otlpEndpoint | quote }}
+      service_name: {{ .Values.observability.serviceName | quote }}
+      use_tls: {{ .Values.observability.useTls }}

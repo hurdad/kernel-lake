@@ -1,0 +1,12 @@
+apiVersion: v2
+name: kernellake
+description: |
+  KernelLake Arrow Flight SQL server (kernellake-server) as a plain
+  Kubernetes Deployment+Service -- not an operator (no CRDs/controller),
+  see docs/ROADMAP.md's "Explicit non-goals" section in the source repo.
+type: application
+version: 0.1.0
+appVersion: "0.1.0-dev"
+home: https://github.com/hurdad/kernel-lake
+sources:
+  - https://github.com/hurdad/kernel-lake

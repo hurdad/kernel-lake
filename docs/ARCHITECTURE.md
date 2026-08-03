@@ -724,6 +724,31 @@ produced correct, GPU-executed results (`gpu_execution_seconds` and
 `peak_gpu_memory_bytes` populated, matching values from an equivalent
 local run).
 
+**Update, found during Phase 3 verification (see "Docker image and Helm
+chart" below): this no longer reproduces on the same RTX 5060 Ti.** A
+later `docker run --gpus all` smoke test on the same physical machine
+returned `0` rows for a real `COUNT(*)` against a real 5000-row Parquet
+file on the GPU backend -- silently wrong, not an error -- while the
+identical query against the identical file returned the correct `5000` on
+the CPU backend. Reproduced outside Docker too, against the plain local
+`build/gpu-dev/src/cli/kernellake` binary. Root cause: `nvcc --version`
+on this host is CUDA 12.4.131, and CUDA support for Blackwell/`sm_120`
+(this RTX 5060 Ti's real compute capability, confirmed via `nvidia-smi
+--query-gpu=compute_cap`) wasn't added until CUDA 12.8 -- so neither
+native SASS nor a JIT-compilable PTX for this GPU's actual architecture
+exists in a CUDA-12.4-built binary, and whatever in the RMM/cudf/kernel-
+launch path hits that mismatch is failing silently rather than raising.
+Whether the "verified for real" claim above was accurate at the time (a
+different driver/toolkit combination, since updated) or the GPU test
+suite's assertions simply don't catch a silently-empty result the way an
+ADBC round trip against generated data does is not yet root-caused --
+tracked as its own open item, see `docs/ROADMAP.md`, "Not yet started".
+Not a regression introduced by Phase 3's own changes (Phase 3 touches
+neither `CMAKE_CUDA_ARCHITECTURES` nor any GPU execution code); found
+incidentally while smoke-testing the Phase 3 Docker/Helm work on real
+hardware, and left as a real, disclosed gap rather than silently patched
+over or ignored.
+
 **`runtime` stage's shared-library closure.** `runtime-libs`'s `ldd`-based
 closure (used to avoid hard-coding vendored library names/paths that would
 go stale on a version bump) excludes only a short, fixed list of
@@ -959,6 +984,111 @@ not a bug in this integration, and the deterministic in-memory tests above
 already cover the metrics/logs code paths independent of any collector's
 service support. `dev` (145/145), `gpu-dev` (214/214), and `server-dev`
 (147/147) all reconfirmed unaffected.
+
+### Docker image and Helm chart (`docker/Dockerfile`, `charts/kernellake/`)
+
+Phase 3 of the Flight SQL/otel-cpp/Helm-chart epic (Phase 0, Phase 1
+`kernellake-server`, and Phase 2 OpenTelemetry, all above). Closes the
+blocker Phase 2 left open: `docker/Dockerfile`'s `dev`/`runtime` images
+previously built and shipped only the `kernellake` CLI, with
+`KERNELLAKE_BUILD_SERVER`/`KERNELLAKE_ENABLE_OTEL` both off -- a Helm
+chart would have had nothing to deploy.
+
+**Dockerfile changes**: one new apt-install layer in the `dev` stage for
+`libarrow-flight-dev`/`libarrow-flight-sql-dev`/`libgrpc++-dev`/
+`protobuf-compiler-grpc`/`opentelemetry-cpp-dev` (the same package list
+`server-build-test`/`otel-build-test`'s CI jobs already install on this
+same `ubuntu:26.04` base -- no new apt source needed, Flight/Flight SQL
+come from the Arrow repo already configured above this point, gRPC/
+opentelemetry-cpp are plain Ubuntu universe packages); `-DKERNELLAKE_BUILD_SERVER=ON
+-DKERNELLAKE_ENABLE_OTEL=ON` added to the existing `cmake --preset
+gpu-dev` invocation, producing `build/gpu-dev/src/server/kernellake-server`
+alongside the existing `.../src/cli/kernellake`. `runtime-libs`'s `ldd`
+closure now unions both binaries' shared-library dependencies (`{ ldd
+kernellake; ldd kernellake-server; } | awk ... | sort -u`) rather than
+just the CLI's; `runtime` copies both binaries. The image's own
+`ENTRYPOINT`/`CMD` stay pointed at the `kernellake` CLI, unchanged --
+existing `docker run` usage keeps working exactly as documented; the Helm
+chart's Deployment overrides `command` to run `kernellake-server` instead,
+a single image serving two purposes via command override rather than two
+separate images.
+
+**A real, pre-existing gap found and fixed while verifying this, not
+caused by the changes above**: there was no `.dockerignore`. `COPY . .`
+in the `dev` stage was therefore copying the *host's own* `build/`
+directory (real `CMakeCache.txt` files from this project's own local
+`dev`/`gpu-dev`/`server-dev`/`otel-dev` preset builds) into the image,
+where `cmake --preset gpu-dev` then refused to reconfigure it -- confirmed
+by an actual `docker build --target dev` failure: `"CMake Error: The
+current CMakeCache.txt directory ... is different than the directory
+.../build/gpu-dev where CMakeCache.txt was created."` This was always
+latent (any `docker build` run from a working tree with a local `build/`
+directory already present would have hit it) but had gone unnoticed
+because no prior `docker build` in this project's history had been run
+from a tree with local builds already sitting in it. Fixed by adding
+`.dockerignore`, excluding `build/`/`CMakeFiles/`/`CMakeCache.txt`/etc.
+(mirroring `.gitignore`'s own build-artifact list) plus `.git/`.
+
+**Helm chart** (`charts/kernellake/`): a plain Deployment + Service --
+explicitly **not** a Kubernetes operator, no CRDs/custom controller, per
+`docs/ROADMAP.md`'s "Explicit non-goals" section. `values.yaml` exposes a
+thin surface (`backend: cpu|gpu` mirroring `engine.backend`, `service.port`
+matching `ServerSection`'s own `31337` default, `observability.*` mirroring
+the top-level `ObservabilitySection` fields -- per-signal processor/batch/
+sampler tuning stays at kernellake's own compiled-in defaults, not yet
+exposed through Helm values). `templates/configmap.yaml` renders a real
+`kernellake.yaml` from those values; `templates/deployment.yaml` overrides
+`command` to run `kernellake-server --config /etc/kernellake/kernellake.yaml`,
+uses `tcpSocket` readiness/liveness probes (Flight SQL is a gRPC protocol
+with no HTTP health endpoint to poll -- a TCP-connect probe is the honest
+choice, not an invented HTTP endpoint that doesn't exist), and merges in a
+`nvidia.com/gpu` resource request when `backend: gpu` (assumes an NVIDIA
+device plugin is already installed on the cluster, standard prerequisite
+for any GPU pod on Kubernetes -- this chart does not install one itself).
+
+A real bug found while writing the chart: Helm/Sprig's generic
+YAML-through-`interface{}` value decoding turns whole numbers into
+`float64`, and Go's default float64 formatting switches to scientific
+notation for round values past a few digits -- confirmed by an actual
+`helm template` run rendering `batch_rows: 1e+06` and
+`query_memory_limit_bytes: 8.589934592e+09` instead of plain integers,
+which yaml-cpp on the receiving end would reject or misparse. Fixed by
+piping every numeric value (`batch_rows`, `result_batch_rows`,
+`query_memory_limit_bytes`, `service.port`, `replicaCount`,
+`containerPort`) through Sprig's `| int64` in `configmap.yaml`,
+`deployment.yaml`, and `service.yaml`.
+
+**Verified for real**:
+- `docker build --target dev` (full CUDA/RAPIDS build from scratch, no
+  cache) completed, linking both `src/cli/kernellake` and
+  `src/server/kernellake-server` (`[216/226] Linking CXX executable
+  src/server/kernellake-server`), all 226 build targets.
+- `docker build --target runtime` completed; both binaries run inside the
+  `runtime` image with no missing shared-library errors (`kernellake
+  --help` and `kernellake-server --help` both execute cleanly, confirming
+  the unioned `ldd` closure is complete for both binaries, not just the
+  one it was originally computed for).
+- A real end-to-end smoke test against the `runtime` image on real
+  hardware: `kernellake generate-data` produced a 5000-row Parquet file
+  into a mounted volume; `kernellake-server` (CPU backend) started inside
+  a container built from that image, `docker run -p 31337:31337`; an
+  independent Python `adbc_driver_flightsql` client (same client used for
+  Phase 1's own smoke test, not code from this project) connected over the
+  network and ran a real `COUNT(*)` (correct: `5000`) and a real `GROUP
+  BY region` (correct per-region counts) through the actual Flight SQL
+  server running inside the container. GPU backend was also smoke-tested
+  through the same container and returned incorrect results -- see the
+  update appended to "Ubuntu 26.04 baseline" above; a pre-existing,
+  unrelated bug, not caused by this phase's changes.
+- `helm lint charts/kernellake` clean; `helm template` for all three
+  meaningfully different value combinations (defaults/CPU, `--set
+  backend=gpu`, `--set observability.enabled=true`) renders without error
+  and with no scientific-notation regressions; all three piped through
+  `kubeconform -strict` (a genuinely offline Kubernetes schema validator --
+  `kubectl apply --dry-run=client` was tried first and confirmed to still
+  require a live API server for resource-kind discovery even with
+  `--validate=false`, so it wasn't usable here) reported `Valid: 3,
+  Invalid: 0, Errors: 0`.
 
 ## Future architecture (interfaces only, not yet implemented)
 

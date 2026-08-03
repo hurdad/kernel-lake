@@ -1,0 +1,85 @@
+{{/*
+A plain Deployment -- not an operator, no CRDs/controller (see
+docs/ROADMAP.md's "Explicit non-goals" section in the source repo).
+Overrides the image's own default ENTRYPOINT (the kernellake CLI) via
+`command` to run kernellake-server instead -- see docker/Dockerfile's own
+comment on why this is one image serving two purposes, not two images.
+*/}}
+{{- $resources := .Values.resources | default dict }}
+{{- if eq .Values.backend "gpu" }}
+{{- $limits := (get $resources "limits") | default dict }}
+{{- $limits = merge $limits (dict .Values.gpu.resourceName (.Values.gpu.count | int)) }}
+{{- $resources = merge $resources (dict "limits" $limits) }}
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "kernellake.fullname" . }}
+  labels:
+    {{- include "kernellake.labels" . | nindent 4 }}
+spec:
+  # See templates/configmap.yaml's comment on why numeric values need an
+  # explicit int64 cast here.
+  replicas: {{ .Values.replicaCount | int64 }}
+  selector:
+    matchLabels:
+      {{- include "kernellake.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "kernellake.selectorLabels" . | nindent 8 }}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      containers:
+        - name: kernellake-server
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            - /opt/kernellake/bin/kernellake-server
+            - --config
+            - /etc/kernellake/kernellake.yaml
+          ports:
+            - name: flight-sql
+              # See templates/configmap.yaml's comment on why numeric
+              # values need an explicit int64 cast here.
+              containerPort: {{ .Values.service.port | int64 }}
+              protocol: TCP
+          # Flight SQL is a gRPC protocol with no HTTP health endpoint to
+          # poll -- a TCP-connect probe against the server port is the
+          # honest choice here, not an invented HTTP endpoint that doesn't
+          # exist.
+          readinessProbe:
+            tcpSocket:
+              port: flight-sql
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: flight-sql
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          volumeMounts:
+            - name: config
+              mountPath: /etc/kernellake
+              readOnly: true
+          resources:
+            {{- toYaml $resources | nindent 12 }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "kernellake.fullname" . }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

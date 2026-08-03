@@ -1,0 +1,32 @@
+KernelLake Flight SQL server ({{ .Values.backend }} backend) deployed as {{ include "kernellake.fullname" . }}.
+
+In-cluster clients connect to:
+  grpc://{{ include "kernellake.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.service.port }}
+
+From outside the cluster, port-forward first:
+  kubectl port-forward --namespace {{ .Release.Namespace }} svc/{{ include "kernellake.fullname" . }} {{ .Values.service.port }}:{{ .Values.service.port }}
+
+Then connect with any Arrow Flight SQL client, e.g. the ADBC Python driver
+(the same one used to verify kernellake-server itself -- see
+docs/ARCHITECTURE.md's "Arrow Flight SQL server" section):
+
+  import adbc_driver_flightsql.dbapi as flight_sql
+  conn = flight_sql.connect("grpc://localhost:{{ .Values.service.port }}")
+  cur = conn.cursor()
+  cur.execute("SELECT region, SUM(amount) AS total FROM read_parquet('/data/*.parquet') GROUP BY region")
+  print(cur.fetchall())
+
+{{- if eq .Values.backend "gpu" }}
+
+backend: gpu requests {{ .Values.gpu.count }} x {{ .Values.gpu.resourceName }} --
+this cluster needs an NVIDIA device plugin already installed (this chart
+does not install one). See README.md.
+{{- end }}
+{{- if .Values.observability.enabled }}
+
+OpenTelemetry export is enabled, sending {{ .Values.observability.otlpProtocol }}
+to {{ .Values.observability.otlpEndpoint }}. Confirm a collector is actually
+reachable at that address -- see docs/ARCHITECTURE.md's "OpenTelemetry
+observability" section for what happens when one isn't (clean, logged
+export errors, not a crash).
+{{- end }}

@@ -1,0 +1,31 @@
+# Host CMake build directories -- copying these in would carry a stale
+# CMakeCache.txt generated at the host's absolute path (e.g.
+# /home/user/git/kernel-lake/build/gpu-dev), which cmake then refuses to
+# reconfigure inside the image (source/binary dir mismatch against
+# /workspace). Confirmed by a real `docker build --target dev` failure:
+# "CMake Error: The current CMakeCache.txt directory ... is different than
+# the directory ... where CMakeCache.txt was created."
+build/
+Build/
+build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+install_manifest.txt
+compile_commands.json
+
+# Version control metadata, not needed in the build context
+.git/
+.gitignore
+
+# Editor/IDE
+.idea/
+.vscode/
+
+# Testing artifacts / caches
+Testing/
+.cache/
+
+# Python
+__pycache__/
+*.pyc

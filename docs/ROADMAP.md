@@ -341,8 +341,58 @@ and covered by passing tests -- not merely designed or stubbed.
   `server-build-test`'s `container: ubuntu:26.04` structure -- needed for
   the same reason: `opentelemetry-cpp-dev` has no Ubuntu 24.04 apt
   package either).
+- **Docker image + Helm chart** (Phase 3 of the Flight SQL/otel-cpp/
+  Helm-chart epic -- Phase 0, Phase 1 (`kernellake-server`), and Phase 2
+  (OpenTelemetry observability) all done above). `docker/Dockerfile`'s
+  `dev`/`runtime` images now build and ship `kernellake-server` with
+  `KERNELLAKE_ENABLE_OTEL=ON`, alongside the existing `kernellake` CLI --
+  see `docs/ARCHITECTURE.md`, "Docker image and Helm chart", for the apt
+  package list, the `runtime-libs` `ldd`-closure change to cover both
+  binaries, and a real pre-existing `.dockerignore` gap found and fixed
+  along the way (the host's own local `build/` directory, with real
+  `CMakeCache.txt`s, was being copied into the image and breaking
+  `cmake --preset gpu-dev` inside the container). `charts/kernellake/` is
+  a plain Deployment+Service (explicitly not an operator, see "Explicit
+  non-goals" below), with a `backend: cpu|gpu` toggle mirroring
+  `engine.backend` and an `observability.*` values surface mirroring
+  `ObservabilitySection`'s top-level fields. Verified for real: `docker
+  build --target dev`/`--target runtime` both complete and produce working
+  binaries; a real ADBC Flight SQL round trip (`COUNT(*)`, `GROUP BY`)
+  against a real 5000-row Parquet file through `kernellake-server` running
+  inside the `runtime` image (CPU backend) returned correct results;
+  `helm lint`/`helm template` (three value combinations) piped through
+  `kubeconform -strict` all passed with no schema errors. GPU backend was
+  also smoke-tested through the same container and returned incorrect
+  (silently empty) results -- a real, pre-existing bug unrelated to this
+  phase's own changes, see the new "GPU backend gives silently wrong
+  results on Blackwell/CUDA 12.4" item below.
 
 ## Not yet started
+
+- **GPU backend gives silently wrong results on Blackwell/CUDA 12.4**
+  (found incidentally while smoke-testing Phase 3's Docker/Helm work on
+  real hardware, not part of that phase's own scope). On this project's
+  own RTX 5060 Ti (Blackwell, compute capability 12.0 per `nvidia-smi
+  --query-gpu=compute_cap`) with the currently-installed CUDA 12.4.131
+  toolkit (`nvcc --version`), a real `COUNT(*)` against a real 5000-row
+  Parquet file returns `0` on the GPU backend -- silently wrong, no error
+  raised -- while the CPU backend returns the correct `5000` against the
+  identical file. Reproduces both through `docker run --gpus all` and
+  directly against the plain local `build/gpu-dev/src/cli/kernellake`
+  binary, so it is not Docker-specific. Root cause is believed to be that
+  CUDA support for Blackwell/`sm_120` wasn't added until CUDA 12.8 -- 12.4
+  can produce neither native SASS nor a JIT-compilable PTX for this GPU's
+  real architecture -- but where in the RMM/cudf/kernel-launch path the
+  resulting failure is being swallowed instead of raised is not yet
+  root-caused. `docs/ARCHITECTURE.md`'s "Ubuntu 26.04 baseline" section
+  previously documented this same GPU model producing correct GPU-executed
+  results; whether that was accurate at the time (a since-changed driver/
+  toolkit combination) or the GPU test suite's own assertions simply don't
+  catch a silently-empty result the way a real ADBC round trip does is
+  also not yet determined. Upgrading to CUDA 12.8+ (a bigger change than
+  it sounds -- see "Ubuntu 26.04 baseline"'s own note on why a CUDA major/
+  minor bump was previously avoided) is the likely fix but not yet
+  attempted.
 
 - TPC-H `execution-only` benchmark mode (needs an operator-tree entry point
   that skips `ParquetScanOperator`); TPC-H at SF10+ scale (SF1 now verified,
@@ -367,20 +417,6 @@ and covered by passing tests -- not merely designed or stubbed.
   trusting any timing number (this project's existing rule from
   `tools/validate_tpch.py`, now applying to three engines instead of two);
   report a clearly-labeled "unofficial, not a certified benchmark" table.
-- **A Helm chart** (Phase 3 of the Flight SQL/otel-cpp/Helm-chart epic --
-  Phase 0, Phase 1 (`kernellake-server`), and Phase 2 (OpenTelemetry
-  observability) are all done, see "Done" above; see the "Explicit
-  non-goals" note below on Kubernetes). Deploys the server as a
-  Deployment+Service, with a `backend: gpu|cpu` toggle (mirroring
-  `engine.backend` from the CPU-backend epic) so the same chart can
-  schedule onto GPU or CPU-only nodes, plus wiring for
-  `observability.otlp_endpoint` to point at a cluster-local collector.
-  Blocked on: `docker/Dockerfile` doesn't build/ship `kernellake-server`
-  yet either (only `kernellake`, and neither has `KERNELLAKE_ENABLE_OTEL`
-  set) -- needs a Docker image change first. CI coverage for both
-  `KERNELLAKE_BUILD_SERVER=ON` and `KERNELLAKE_ENABLE_OTEL=ON` is done
-  (`server-build-test`/`otel-build-test` in `.github/workflows/ci.yml`, see
-  "Done" above).
 - Delta Lake read support (`read_delta(...)` alongside `read_parquet(...)`)
   -- explicitly deferred as its own follow-up plan, not forgotten. Reading
   `_delta_log/*.json` plus checkpoint Parquet files is required to
@@ -395,8 +431,9 @@ and covered by passing tests -- not merely designed or stubbed.
 ## Explicit non-goals for the MVP
 
 Distributed execution, multi-node/multi-GPU scheduling, a Kubernetes
-*operator* (custom controller/CRDs -- the plain Helm chart in progress
-above is a Deployment+Service, not an operator), full Iceberg catalog
+*operator* (custom controller/CRDs -- the plain Helm chart above,
+`charts/kernellake/`, is a Deployment+Service, not an operator), full
+Iceberg catalog
 integration, joins beyond a two-table `INNER JOIN` with a single equality
 key (see "Hash joins" in `docs/ARCHITECTURE.md`), all 22 TPC-H queries,
 cost-based optimization,

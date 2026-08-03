@@ -53,6 +53,23 @@ open-source-licensed end to end, and anyone redistributing such a build
 should read nvCOMP's and the CUDA Toolkit's EULAs directly rather than
 relying on this summary.
 
+## Linked into `kernellake-server` (`KERNELLAKE_BUILD_SERVER=ON`) / OpenTelemetry export (`KERNELLAKE_ENABLE_OTEL=ON`) only
+
+Both default `OFF` in the local `dev`/`gpu-dev` presets, but the published
+`docker/Dockerfile` `runtime` image turns both on (see
+`docs/ARCHITECTURE.md`'s "Docker image: kernellake-server + OpenTelemetry"
+section) -- these are genuinely shipped in the default distributed
+artifact, verified against each package's own installed
+`/usr/share/doc/<pkg>/copyright`, not assumed from general knowledge.
+
+| Dependency | License | Source | How it's consumed |
+| --- | --- | --- | --- |
+| Apache Arrow Flight / Flight SQL C++ | Apache-2.0 | Same Apache Arrow release as the base Arrow entry above | System package (`libarrow-flight-dev`, `libarrow-flight-sql-dev`, official Apache Arrow apt repo) |
+| gRPC | Apache-2.0 | github.com/grpc/grpc | System package (`libgrpc++-dev`, `protobuf-compiler-grpc`) |
+| Abseil | Apache-2.0 | github.com/abseil/abseil-cpp | System package, transitive dependency of gRPC and (on Ubuntu 26.04) Arrow itself -- see `docs/ARCHITECTURE.md`'s "Ubuntu 26.04 baseline" section |
+| Protocol Buffers | BSD-3-Clause | github.com/protocolbuffers/protobuf | System package (`libprotobuf-dev`), transitive dependency of gRPC and Arrow Flight |
+| opentelemetry-cpp | Apache-2.0 | github.com/open-telemetry/opentelemetry-cpp | System package (`opentelemetry-cpp-dev`, apt-native on Ubuntu 26.04 only -- see `docs/ARCHITECTURE.md`) |
+
 ## Declared but not yet actually used
 
 | Dependency | License | Notes |

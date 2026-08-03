@@ -1,0 +1,66 @@
+# Default values for the kernellake chart. See README.md for the full
+# values reference. Defaults to backend: cpu so `helm install` with zero
+# overrides works without requiring a GPU node/device plugin.
+
+image:
+  repository: ghcr.io/hurdad/kernel-lake
+  tag: runtime
+  pullPolicy: IfNotPresent
+
+replicaCount: 1
+
+# "cpu" or "gpu" -- mirrors engine.backend / `kernellake query --backend`.
+# "gpu" adds a gpu.resourceName request/limit and expects an NVIDIA device
+# plugin already installed on the cluster (this chart does not install
+# one -- see README.md).
+backend: cpu
+
+service:
+  type: ClusterIP
+  # Matches ServerSection's own default (include/kernellake/common/config.hpp).
+  port: 31337
+
+# Only consulted when backend: gpu.
+gpu:
+  resourceName: nvidia.com/gpu
+  count: 1
+
+# User-supplied CPU/memory requests/limits, merged with the automatic GPU
+# resource request above when backend: gpu. Left empty by default --
+# Kubernetes' own scheduler defaults apply until you set these.
+resources: {}
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+podAnnotations: {}
+
+# A thin surface over EngineConfig (include/kernellake/common/config.hpp) --
+# every field not listed here keeps kernellake's own compiled-in default.
+# Rendered into a ConfigMap at /etc/kernellake/kernellake.yaml -- see
+# templates/configmap.yaml for the full mapping.
+config:
+  engine:
+    batchRows: 1000000
+    resultBatchRows: 65536
+    queryMemoryLimitBytes: 8589934592
+  storage:
+    localRoot: /
+
+# Only takes effect if the image was built with KERNELLAKE_ENABLE_OTEL=ON
+# (docker/Dockerfile's runtime image is). See docs/ARCHITECTURE.md's
+# "OpenTelemetry observability" section for the full config schema this is
+# a thin surface over -- per-signal processor/batch/sampler tuning stays at
+# kernellake's own compiled-in defaults for this first chart pass.
+observability:
+  enabled: false
+  # "grpc" or "http".
+  otlpProtocol: grpc
+  # e.g. "otel-collector.observability.svc.cluster.local:4317" (grpc) or
+  # "http://otel-collector.observability.svc.cluster.local:4318" (http,
+  # base URL -- kernellake appends the OTLP spec's own per-signal path
+  # itself).
+  otlpEndpoint: ""
+  serviceName: kernellake-server
+  useTls: false
