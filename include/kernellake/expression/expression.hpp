@@ -33,7 +33,7 @@ class Expression {
 class ColumnExpression final : public Expression {
  public:
   ColumnExpression(std::string name, std::size_t column_index, DataType type)
-      : name_(std::move(name)), column_index_(column_index), type_(std::move(type)) {}
+      : name_(std::move(name)), column_index_(column_index), type_(type) {}
 
   [[nodiscard]] const std::string& name() const noexcept { return name_; }
   [[nodiscard]] std::size_t column_index() const noexcept { return column_index_; }
@@ -57,10 +57,10 @@ using LiteralStorage = std::variant<std::monostate, bool, std::int64_t, double, 
 
 class LiteralExpression final : public Expression {
  public:
-  LiteralExpression(LiteralStorage value, DataType type) : value_(std::move(value)), type_(std::move(type)) {}
+  LiteralExpression(LiteralStorage value, DataType type) : value_(std::move(value)), type_(type) {}
 
   [[nodiscard]] static LiteralExpression make_null(DataType type) {
-    return LiteralExpression(std::monostate{}, std::move(type));
+    return LiteralExpression(std::monostate{}, type);
   }
   [[nodiscard]] static LiteralExpression make_bool(bool value) {
     return LiteralExpression(value, boolean_type(false));
@@ -95,7 +95,7 @@ class LiteralExpression final : public Expression {
 // Binary expressions
 // ---------------------------------------------------------------------------
 
-enum class BinaryOperator {
+enum class BinaryOperator : std::uint8_t {
   Add,
   Subtract,
   Multiply,
@@ -118,7 +118,7 @@ enum class BinaryOperator {
 class BinaryExpression final : public Expression {
  public:
   BinaryExpression(BinaryOperator op, ExpressionPtr left, ExpressionPtr right, DataType result_type)
-      : op_(op), left_(std::move(left)), right_(std::move(right)), type_(std::move(result_type)) {}
+      : op_(op), left_(std::move(left)), right_(std::move(right)), type_(result_type) {}
 
   [[nodiscard]] BinaryOperator op() const noexcept { return op_; }
   [[nodiscard]] const ExpressionPtr& left() const noexcept { return left_; }
@@ -137,7 +137,7 @@ class BinaryExpression final : public Expression {
 // Unary expressions
 // ---------------------------------------------------------------------------
 
-enum class UnaryOperator {
+enum class UnaryOperator : std::uint8_t {
   Not,
   Negate,
   IsNull,
@@ -149,7 +149,7 @@ enum class UnaryOperator {
 class UnaryExpression final : public Expression {
  public:
   UnaryExpression(UnaryOperator op, ExpressionPtr operand, DataType result_type)
-      : op_(op), operand_(std::move(operand)), type_(std::move(result_type)) {}
+      : op_(op), operand_(std::move(operand)), type_(result_type) {}
 
   [[nodiscard]] UnaryOperator op() const noexcept { return op_; }
   [[nodiscard]] const ExpressionPtr& operand() const noexcept { return operand_; }
@@ -169,7 +169,7 @@ class UnaryExpression final : public Expression {
 class CastExpression final : public Expression {
  public:
   CastExpression(ExpressionPtr operand, DataType target_type)
-      : operand_(std::move(operand)), type_(std::move(target_type)) {}
+      : operand_(std::move(operand)), type_(target_type) {}
 
   [[nodiscard]] const ExpressionPtr& operand() const noexcept { return operand_; }
   [[nodiscard]] const DataType& result_type() const override { return type_; }
@@ -256,9 +256,7 @@ class CaseExpression final : public Expression {
   };
 
   CaseExpression(std::vector<WhenThen> when_then, ExpressionPtr else_branch, DataType result_type)
-      : when_then_(std::move(when_then)),
-        else_branch_(std::move(else_branch)),
-        type_(std::move(result_type)) {}
+      : when_then_(std::move(when_then)), else_branch_(std::move(else_branch)), type_(result_type) {}
 
   [[nodiscard]] const std::vector<WhenThen>& when_then() const noexcept { return when_then_; }
   [[nodiscard]] const ExpressionPtr& else_branch() const noexcept { return else_branch_; }  // may be null
@@ -268,7 +266,9 @@ class CaseExpression final : public Expression {
     for (const WhenThen& branch : when_then_) {
       text += " WHEN " + branch.condition->to_string() + " THEN " + branch.result->to_string();
     }
-    if (else_branch_ != nullptr) text += " ELSE " + else_branch_->to_string();
+    if (else_branch_ != nullptr) {
+      text += " ELSE " + else_branch_->to_string();
+    }
     return text + " END";
   }
 
@@ -282,7 +282,7 @@ class CaseExpression final : public Expression {
 // Aggregates
 // ---------------------------------------------------------------------------
 
-enum class AggregateFunction {
+enum class AggregateFunction : std::uint8_t {
   Sum,
   Count,
   CountStar,
@@ -297,7 +297,7 @@ class AggregateExpression final : public Expression {
  public:
   // `argument` is null only for CountStar (COUNT(*) has no operand).
   AggregateExpression(AggregateFunction function, ExpressionPtr argument, DataType result_type)
-      : function_(function), argument_(std::move(argument)), type_(std::move(result_type)) {}
+      : function_(function), argument_(std::move(argument)), type_(result_type) {}
 
   [[nodiscard]] AggregateFunction function() const noexcept { return function_; }
   [[nodiscard]] const ExpressionPtr& argument() const noexcept { return argument_; }

@@ -8,7 +8,7 @@
 
 namespace kernellake {
 
-enum class TypeId {
+enum class TypeId : std::uint8_t {
   Boolean,
   Int32,
   Int64,

@@ -27,5 +27,6 @@ target_compile_features(kernellake_common PUBLIC cxx_std_20)
 target_link_libraries(kernellake_common PUBLIC
   yaml-cpp::yaml-cpp
   spdlog::spdlog
+  fmt::fmt
   Arrow::arrow_static
 )

@@ -35,7 +35,7 @@ spec:
     spec:
       containers:
         - name: kernellake-server
-          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          image: "{{ .Values.image.repository | default (printf "ghcr.io/hurdad/kernel-lake-%s" .Values.backend) }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           command:
             - /opt/kernellake/bin/kernellake-server

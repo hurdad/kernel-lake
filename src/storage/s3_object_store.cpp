@@ -1,6 +1,7 @@
 #include "kernellake/storage/s3_object_store.hpp"
 
 #include <arrow/filesystem/s3fs.h>
+#include <fmt/format.h>
 
 #include <cstdlib>
 #include <mutex>
@@ -17,7 +18,7 @@ void ensure_s3_initialized() {
   std::call_once(flag, [] {
     const arrow::Status status = arrow::fs::EnsureS3Initialized();
     if (!status.ok()) {
-      throw StorageError("s3: failed to initialize AWS SDK: " + status.ToString());
+      throw StorageError(fmt::format("s3: failed to initialize AWS SDK: {}", status.ToString()));
     }
   });
 }
@@ -56,7 +57,7 @@ std::shared_ptr<arrow::fs::FileSystem> make_s3_filesystem(const S3Section& confi
   const arrow::Result<std::shared_ptr<arrow::fs::S3FileSystem>> result =
       arrow::fs::S3FileSystem::Make(options);
   if (!result.ok()) {
-    throw StorageError("s3: failed to construct filesystem: " + result.status().ToString());
+    throw StorageError(fmt::format("s3: failed to construct filesystem: {}", result.status().ToString()));
   }
   return *result;
 }

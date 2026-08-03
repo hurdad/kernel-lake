@@ -21,6 +21,6 @@ namespace kernellake {
 // All rules operate on the structured plan/expression trees -- never on SQL
 // text -- and return a new, potentially smaller/simpler plan; correctness is
 // never traded for a more aggressive rewrite.
-[[nodiscard]] LogicalPlanPtr optimize(LogicalPlanPtr plan);
+[[nodiscard]] LogicalPlanPtr optimize(const LogicalPlanPtr& plan);
 
 }  // namespace kernellake

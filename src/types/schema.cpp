@@ -37,7 +37,9 @@ std::string DataType::to_string() const {
   if (id == TypeId::Decimal) {
     result += "(" + std::to_string(precision.value_or(0)) + "," + std::to_string(scale.value_or(0)) + ")";
   }
-  if (!nullable) result += " NOT NULL";
+  if (!nullable) {
+    result += " NOT NULL";
+  }
   return result;
 }
 
@@ -81,7 +83,9 @@ Schema::Schema(std::vector<Field> fields) : fields_(std::move(fields)) {}
 std::optional<std::size_t> Schema::find_field(std::string_view name) const {
   const auto it =
       std::find_if(fields_.begin(), fields_.end(), [&](const Field& f) { return f.name == name; });
-  if (it == fields_.end()) return std::nullopt;
+  if (it == fields_.end()) {
+    return std::nullopt;
+  }
   return static_cast<std::size_t>(std::distance(fields_.begin(), it));
 }
 

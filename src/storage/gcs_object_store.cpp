@@ -1,6 +1,7 @@
 #include "kernellake/storage/gcs_object_store.hpp"
 
 #include <arrow/filesystem/gcsfs.h>
+#include <fmt/format.h>
 
 #include <chrono>
 #include <ctime>
@@ -23,9 +24,10 @@ arrow::fs::TimePoint parse_iso8601_utc(const std::string& text) {
   std::istringstream stream(text);
   stream >> std::get_time(&tm, "%Y-%m-%dT%H:%M:%S");
   if (stream.fail()) {
-    throw StorageError("gcs: storage.gcs.access_token_expiration '" + text +
-                       "' is not a valid ISO-8601 UTC timestamp (expected e.g. "
-                       "'2026-01-01T00:00:00Z')");
+    throw StorageError(fmt::format(
+        "gcs: storage.gcs.access_token_expiration '{}' is not a valid ISO-8601 UTC timestamp (expected e.g. "
+        "'2026-01-01T00:00:00Z')",
+        text));
   }
   const std::time_t time = timegm(&tm);
   return std::chrono::time_point_cast<arrow::fs::TimePoint::duration>(
@@ -72,7 +74,7 @@ std::shared_ptr<arrow::fs::FileSystem> make_gcs_filesystem(const GcsSection& con
   const arrow::Result<std::shared_ptr<arrow::fs::GcsFileSystem>> result =
       arrow::fs::GcsFileSystem::Make(build_options(config));
   if (!result.ok()) {
-    throw StorageError("gcs: failed to construct filesystem: " + result.status().ToString());
+    throw StorageError(fmt::format("gcs: failed to construct filesystem: {}", result.status().ToString()));
   }
   return *result;
 }

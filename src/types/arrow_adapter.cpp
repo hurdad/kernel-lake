@@ -1,5 +1,7 @@
 #include "kernellake/types/arrow_adapter.hpp"
 
+#include <fmt/format.h>
+
 #include "kernellake/common/errors.hpp"
 
 namespace kernellake {
@@ -32,12 +34,16 @@ DataType from_arrow_type(const std::shared_ptr<arrow::DataType>& type, bool null
     case arrow::Type::TIMESTAMP:
       return timestamp_type(nullable);
     case arrow::Type::DECIMAL128: {
+      // Tag-checked downcast: the switch on type->id() already guarantees
+      // *type is really a Decimal128Type.
+      // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
       const auto& decimal = static_cast<const arrow::Decimal128Type&>(*type);
       return decimal_type(decimal.precision(), decimal.scale(), nullable);
     }
     default:
-      throw PlanningError("unsupported Arrow type '" + type->ToString() +
-                          "': KernelLake's type system does not yet cover this type");
+      throw PlanningError(
+          fmt::format("unsupported Arrow type '{}': KernelLake's type system does not yet cover this type",
+                      type->ToString()));
   }
 }
 

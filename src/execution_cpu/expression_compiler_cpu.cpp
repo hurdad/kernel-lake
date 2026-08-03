@@ -3,6 +3,7 @@
 #include <arrow/compute/api_scalar.h>
 #include <arrow/compute/cast.h>
 #include <arrow/scalar.h>
+#include <fmt/format.h>
 
 #include "kernellake/common/errors.hpp"
 #include "kernellake/types/arrow_adapter.hpp"
@@ -12,16 +13,28 @@ namespace kernellake {
 namespace {
 
 double as_double(const LiteralStorage& value) {
-  if (std::holds_alternative<std::int64_t>(value)) return static_cast<double>(std::get<std::int64_t>(value));
-  if (std::holds_alternative<double>(value)) return std::get<double>(value);
-  if (std::holds_alternative<bool>(value)) return std::get<bool>(value) ? 1.0 : 0.0;
+  if (std::holds_alternative<std::int64_t>(value)) {
+    return static_cast<double>(std::get<std::int64_t>(value));
+  }
+  if (std::holds_alternative<double>(value)) {
+    return std::get<double>(value);
+  }
+  if (std::holds_alternative<bool>(value)) {
+    return std::get<bool>(value) ? 1.0 : 0.0;
+  }
   return 0.0;
 }
 
 std::int64_t as_int64(const LiteralStorage& value) {
-  if (std::holds_alternative<std::int64_t>(value)) return std::get<std::int64_t>(value);
-  if (std::holds_alternative<double>(value)) return static_cast<std::int64_t>(std::get<double>(value));
-  if (std::holds_alternative<bool>(value)) return std::get<bool>(value) ? 1 : 0;
+  if (std::holds_alternative<std::int64_t>(value)) {
+    return std::get<std::int64_t>(value);
+  }
+  if (std::holds_alternative<double>(value)) {
+    return static_cast<std::int64_t>(std::get<double>(value));
+  }
+  if (std::holds_alternative<bool>(value)) {
+    return std::get<bool>(value) ? 1 : 0;
+  }
   return 0;
 }
 
@@ -131,8 +144,8 @@ arrow::compute::Expression compile_expression_cpu(const Expression& expr) {
   }
   if (const auto* cast = dynamic_cast<const CastExpression*>(&expr)) {
     if (cast->result_type().id == TypeId::Decimal || cast->result_type().id == TypeId::String) {
-      throw ExecutionError("CAST to " + cast->result_type().to_string() +
-                           " is not yet supported by the CPU execution backend");
+      throw ExecutionError(fmt::format("CAST to {} is not yet supported by the CPU execution backend",
+                                       cast->result_type().to_string()));
     }
     arrow::compute::CastOptions options;
     options.to_type = to_arrow_type(cast->result_type());

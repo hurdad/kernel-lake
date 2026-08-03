@@ -2,6 +2,7 @@
 
 #include <arrow/c/bridge.h>
 #include <cudf/interop.hpp>
+#include <fmt/format.h>
 
 #include <vector>
 
@@ -26,8 +27,8 @@ std::shared_ptr<arrow::RecordBatch> to_arrow_record_batch(const DeviceBatch& bat
   arrow::Result<std::shared_ptr<arrow::RecordBatch>> result =
       arrow::ImportRecordBatch(&device_array->array, arrow_schema.get());
   if (!result.ok()) {
-    throw ExecutionError("failed to import Arrow record batch from cudf table: " +
-                         result.status().ToString());
+    throw ExecutionError(
+        fmt::format("failed to import Arrow record batch from cudf table: {}", result.status().ToString()));
   }
   return *result;
 }
@@ -37,7 +38,7 @@ DeviceBatch from_arrow_record_batch(const arrow::RecordBatch& batch, std::shared
   ArrowSchema c_schema{};
   const arrow::Status status = arrow::ExportRecordBatch(batch, &c_array, &c_schema);
   if (!status.ok()) {
-    throw ExecutionError("failed to export Arrow record batch for cudf: " + status.ToString());
+    throw ExecutionError(fmt::format("failed to export Arrow record batch for cudf: {}", status.ToString()));
   }
 
   // Unlike the to-Arrow direction, cudf::from_arrow does NOT release the

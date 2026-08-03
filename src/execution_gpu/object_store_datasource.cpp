@@ -2,6 +2,7 @@
 
 #include <arrow/buffer.h>
 #include <arrow/io/interfaces.h>
+#include <fmt/format.h>
 
 #include "kernellake/common/errors.hpp"
 
@@ -37,8 +38,8 @@ std::unique_ptr<cudf::io::datasource::buffer> ObjectStoreDatasource::host_read(s
   const arrow::Result<std::shared_ptr<arrow::Buffer>> result =
       object_->as_arrow_file()->ReadAt(static_cast<std::int64_t>(offset), static_cast<std::int64_t>(size));
   if (!result.ok()) {
-    throw StorageError("failed to read " + std::to_string(size) + " bytes at offset " +
-                       std::to_string(offset) + ": " + result.status().ToString());
+    throw StorageError(
+        fmt::format("failed to read {} bytes at offset {}: {}", size, offset, result.status().ToString()));
   }
   return std::make_unique<ArrowBufferDatasourceBuffer>(*result);
 }
@@ -47,8 +48,8 @@ std::size_t ObjectStoreDatasource::host_read(std::size_t offset, std::size_t siz
   const arrow::Result<std::int64_t> result = object_->as_arrow_file()->ReadAt(
       static_cast<std::int64_t>(offset), static_cast<std::int64_t>(size), dst);
   if (!result.ok()) {
-    throw StorageError("failed to read " + std::to_string(size) + " bytes at offset " +
-                       std::to_string(offset) + ": " + result.status().ToString());
+    throw StorageError(
+        fmt::format("failed to read {} bytes at offset {}: {}", size, offset, result.status().ToString()));
   }
   return static_cast<std::size_t>(*result);
 }

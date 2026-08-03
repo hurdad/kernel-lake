@@ -15,10 +15,18 @@ namespace kernellake::cli {
 namespace {
 
 std::string literal_to_string(const LiteralStorage& value) {
-  if (std::holds_alternative<std::string>(value)) return "'" + std::get<std::string>(value) + "'";
-  if (std::holds_alternative<std::int64_t>(value)) return std::to_string(std::get<std::int64_t>(value));
-  if (std::holds_alternative<double>(value)) return std::to_string(std::get<double>(value));
-  if (std::holds_alternative<bool>(value)) return std::get<bool>(value) ? "TRUE" : "FALSE";
+  if (std::holds_alternative<std::string>(value)) {
+    return "'" + std::get<std::string>(value) + "'";
+  }
+  if (std::holds_alternative<std::int64_t>(value)) {
+    return std::to_string(std::get<std::int64_t>(value));
+  }
+  if (std::holds_alternative<double>(value)) {
+    return std::to_string(std::get<double>(value));
+  }
+  if (std::holds_alternative<bool>(value)) {
+    return std::get<bool>(value) ? "TRUE" : "FALSE";
+  }
   return "NULL";
 }
 
@@ -124,15 +132,21 @@ int run_inspect_parquet(const std::vector<std::string_view>& args, const EngineC
     const std::vector<ObjectInfo> files = discover_parquet_files(store, {path});
     std::vector<FileMetadata> metadata;
     metadata.reserve(files.size());
-    for (const ObjectInfo& file : files) metadata.push_back(inspect_parquet_file(store, file.uri));
+    for (const ObjectInfo& file : files) {
+      metadata.push_back(inspect_parquet_file(store, file.uri));
+    }
     validate_schema_compatibility(metadata);
 
     if (format == "json") {
       nlohmann::json array = nlohmann::json::array();
-      for (const FileMetadata& meta : metadata) array.push_back(to_json(meta));
+      for (const FileMetadata& meta : metadata) {
+        array.push_back(to_json(meta));
+      }
       std::printf("%s\n", array.dump(2).c_str());
     } else {
-      for (const FileMetadata& meta : metadata) print_text(meta);
+      for (const FileMetadata& meta : metadata) {
+        print_text(meta);
+      }
     }
   } catch (const KernelLakeError& e) {
     std::fprintf(stderr, "kernellake inspect-parquet: %s\n", e.what());

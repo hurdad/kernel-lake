@@ -3,6 +3,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+#include <fmt/format.h>
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
@@ -31,7 +32,9 @@ namespace {
 // cleared."
 void evict_from_page_cache(const std::string& path) {
   const int fd = ::open(path.c_str(), O_RDONLY);
-  if (fd < 0) return;
+  if (fd < 0) {
+    return;
+  }
   ::posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
   ::close(fd);
 }
@@ -50,7 +53,9 @@ std::string strip_comments_and_substitute(const std::string& text, const std::st
 
 std::string read_file_or_throw(const std::string& path) {
   std::ifstream stream(path);
-  if (!stream) throw StorageError("failed to open TPC-H query file '" + path + "'");
+  if (!stream) {
+    throw StorageError(fmt::format("failed to open TPC-H query file '{}'", path));
+  }
   std::ostringstream contents;
   contents << stream.rdbuf();
   return contents.str();
@@ -69,14 +74,20 @@ double mean_of(const std::vector<double>& values) {
 double median_of(std::vector<double> values) {
   std::sort(values.begin(), values.end());
   const std::size_t n = values.size();
-  if (n % 2 == 1) return values[n / 2];
+  if (n % 2 == 1) {
+    return values[n / 2];
+  }
   return (values[n / 2 - 1] + values[n / 2]) / 2.0;
 }
 
 double stddev_of(const std::vector<double>& values, double mean) {
-  if (values.size() < 2) return 0.0;
+  if (values.size() < 2) {
+    return 0.0;
+  }
   double sum_sq = 0.0;
-  for (const double v : values) sum_sq += (v - mean) * (v - mean);
+  for (const double v : values) {
+    sum_sq += (v - mean) * (v - mean);
+  }
   return std::sqrt(sum_sq / static_cast<double>(values.size() - 1));
 }
 
@@ -155,22 +166,30 @@ int run_benchmark_tpch(const std::vector<std::string_view>& args, const EngineCo
 
     const auto run_once = [&]() -> IterationMetrics {
       if (mode == "cold") {
-        for (const ObjectInfo& file : files) evict_from_page_cache(file.uri.value());
+        for (const ObjectInfo& file : files) {
+          evict_from_page_cache(file.uri.value());
+        }
       }
       const QueryResult result = engine.execute(sql);
       return IterationMetrics{result.elapsed_wall_seconds.value_or(0.0), result.rows_returned.value_or(0),
                               result.peak_gpu_memory_bytes.value_or(0)};
     };
 
-    for (int i = 0; i < warmup_iterations; ++i) run_once();
+    for (int i = 0; i < warmup_iterations; ++i) {
+      run_once();
+    }
 
     std::vector<IterationMetrics> measurements;
     measurements.reserve(static_cast<std::size_t>(iterations));
-    for (int i = 0; i < iterations; ++i) measurements.push_back(run_once());
+    for (int i = 0; i < iterations; ++i) {
+      measurements.push_back(run_once());
+    }
 
     std::vector<double> wall_seconds;
     wall_seconds.reserve(measurements.size());
-    for (const IterationMetrics& m : measurements) wall_seconds.push_back(m.wall_seconds);
+    for (const IterationMetrics& m : measurements) {
+      wall_seconds.push_back(m.wall_seconds);
+    }
     const double mean = mean_of(wall_seconds);
 
     nlohmann::json report;
@@ -181,7 +200,9 @@ int run_benchmark_tpch(const std::vector<std::string_view>& args, const EngineCo
     report["query_file"] = query_file;
     report["mode"] = mode;
     report["data"] = data;
-    if (scale_factor) report["scale_factor"] = *scale_factor;
+    if (scale_factor) {
+      report["scale_factor"] = *scale_factor;
+    }
     report["warmup_iterations"] = warmup_iterations;
     report["iterations"] = iterations;
     report["cache_clearing"] =
@@ -211,7 +232,9 @@ int run_benchmark_tpch(const std::vector<std::string_view>& args, const EngineCo
     const std::string rendered = report.dump(2);
     if (output_path) {
       std::ofstream out(*output_path);
-      if (!out) throw StorageError("failed to open output file '" + *output_path + "'");
+      if (!out) {
+        throw StorageError(fmt::format("failed to open output file '{}'", *output_path));
+      }
       out << rendered << "\n";
     } else {
       std::printf("%s\n", rendered.c_str());

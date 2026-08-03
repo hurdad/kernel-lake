@@ -1,5 +1,7 @@
 #include "generic_fs_object_store.hpp"
 
+#include <fmt/format.h>
+
 #include <algorithm>
 #include <filesystem>
 
@@ -24,7 +26,9 @@ bool glob_match(std::string_view pattern, std::string_view text) {
       return false;
     }
   }
-  while (p < pattern.size() && pattern[p] == '*') ++p;
+  while (p < pattern.size() && pattern[p] == '*') {
+    ++p;
+  }
   return p == pattern.size();
 }
 
@@ -34,7 +38,9 @@ bool has_glob_chars(std::string_view text) {
 
 std::string strip_scheme(const Uri& uri) {
   const std::string_view scheme = uri.scheme();
-  if (scheme == "file") return uri.value();
+  if (scheme == "file") {
+    return uri.value();
+  }
   // scheme + "://" -- Uri::scheme() finds the text before "://" itself, so
   // this is always a valid offset for a non-"file" scheme.
   return uri.value().substr(scheme.size() + 3);
@@ -50,7 +56,7 @@ class GenericRandomAccessObject final : public RandomAccessObject {
   [[nodiscard]] std::uint64_t size() const override {
     const arrow::Result<std::int64_t> result = file_->GetSize();
     if (!result.ok()) {
-      throw StorageError("failed to stat opened file: " + result.status().ToString());
+      throw StorageError(fmt::format("failed to stat opened file: {}", result.status().ToString()));
     }
     return static_cast<std::uint64_t>(*result);
   }
@@ -67,7 +73,9 @@ class GenericRandomAccessObject final : public RandomAccessObject {
 // by strip_scheme).
 std::pair<std::string, std::string> split_last_component(const std::string& path) {
   const std::size_t slash = path.find_last_of('/');
-  if (slash == std::string::npos) return {"", path};
+  if (slash == std::string::npos) {
+    return {"", path};
+  }
   return {path.substr(0, slash), path.substr(slash + 1)};
 }
 
@@ -84,19 +92,23 @@ std::vector<ObjectInfo> generic_fs_list(const std::shared_ptr<arrow::fs::FileSys
     selector.allow_not_found = true;
     const arrow::Result<arrow::fs::FileInfoVector> result = fs->GetFileInfo(selector);
     if (!result.ok()) {
-      throw StorageError(std::string(backend_label) + ": failed to list '" + prefix.value() +
-                         "': " + result.status().ToString());
+      throw StorageError(fmt::format("{}: failed to list '{}': {}", backend_label, prefix.value(),
+                                     result.status().ToString()));
     }
     std::vector<ObjectInfo> results;
     for (const arrow::fs::FileInfo& info : *result) {
-      if (!info.IsFile()) continue;
+      if (!info.IsFile()) {
+        continue;
+      }
       const auto [entry_dir, entry_name] = split_last_component(info.path());
-      if (!glob_match(last_component, entry_name)) continue;
+      if (!glob_match(last_component, entry_name)) {
+        continue;
+      }
       results.push_back(ObjectInfo{Uri(std::string(prefix.scheme()) + "://" + info.path()),
                                    static_cast<std::uint64_t>(info.size())});
     }
     if (results.empty()) {
-      throw StorageError(std::string(backend_label) + ": no files matched pattern '" + prefix.value() + "'");
+      throw StorageError(fmt::format("{}: no files matched pattern '{}'", backend_label, prefix.value()));
     }
     std::sort(results.begin(), results.end(),
               [](const ObjectInfo& a, const ObjectInfo& b) { return a.uri < b.uri; });
@@ -105,12 +117,12 @@ std::vector<ObjectInfo> generic_fs_list(const std::shared_ptr<arrow::fs::FileSys
 
   const arrow::Result<arrow::fs::FileInfo> info_result = fs->GetFileInfo(path);
   if (!info_result.ok()) {
-    throw StorageError(std::string(backend_label) + ": failed to inspect '" + prefix.value() +
-                       "': " + info_result.status().ToString());
+    throw StorageError(fmt::format("{}: failed to inspect '{}': {}", backend_label, prefix.value(),
+                                   info_result.status().ToString()));
   }
   const arrow::fs::FileInfo& info = *info_result;
   if (info.type() == arrow::fs::FileType::NotFound) {
-    throw StorageError(std::string(backend_label) + ": path does not exist: '" + prefix.value() + "'");
+    throw StorageError(fmt::format("{}: path does not exist: '{}'", backend_label, prefix.value()));
   }
 
   if (info.IsDirectory()) {
@@ -119,19 +131,23 @@ std::vector<ObjectInfo> generic_fs_list(const std::shared_ptr<arrow::fs::FileSys
     selector.allow_not_found = true;
     const arrow::Result<arrow::fs::FileInfoVector> dir_result = fs->GetFileInfo(selector);
     if (!dir_result.ok()) {
-      throw StorageError(std::string(backend_label) + ": failed to list '" + prefix.value() +
-                         "': " + dir_result.status().ToString());
+      throw StorageError(fmt::format("{}: failed to list '{}': {}", backend_label, prefix.value(),
+                                     dir_result.status().ToString()));
     }
     std::vector<ObjectInfo> results;
     for (const arrow::fs::FileInfo& entry : *dir_result) {
-      if (!entry.IsFile()) continue;
-      if (entry.extension() != "parquet") continue;
+      if (!entry.IsFile()) {
+        continue;
+      }
+      if (entry.extension() != "parquet") {
+        continue;
+      }
       results.push_back(ObjectInfo{Uri(std::string(prefix.scheme()) + "://" + entry.path()),
                                    static_cast<std::uint64_t>(entry.size())});
     }
     if (results.empty()) {
-      throw StorageError(std::string(backend_label) + ": directory contains no Parquet files: '" +
-                         prefix.value() + "'");
+      throw StorageError(
+          fmt::format("{}: directory contains no Parquet files: '{}'", backend_label, prefix.value()));
     }
     std::sort(results.begin(), results.end(),
               [](const ObjectInfo& a, const ObjectInfo& b) { return a.uri < b.uri; });
@@ -146,8 +162,8 @@ std::unique_ptr<RandomAccessObject> generic_fs_open(const std::shared_ptr<arrow:
   const std::string path = strip_scheme(uri);
   const arrow::Result<std::shared_ptr<arrow::io::RandomAccessFile>> result = fs->OpenInputFile(path);
   if (!result.ok()) {
-    throw StorageError(std::string(backend_label) + ": failed to open '" + uri.value() +
-                       "': " + result.status().ToString());
+    throw StorageError(
+        fmt::format("{}: failed to open '{}': {}", backend_label, uri.value(), result.status().ToString()));
   }
   return std::make_unique<GenericRandomAccessObject>(*result);
 }

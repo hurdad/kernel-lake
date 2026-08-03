@@ -7,6 +7,7 @@
 #include <cudf/scalar/scalar_factories.hpp>
 #include <cudf/transform.hpp>
 #include <cudf/unary.hpp>
+#include <fmt/format.h>
 
 #include <numeric>
 
@@ -160,7 +161,8 @@ void HashAggregateOperator::open(ExecutionContext& context) {
   for (const NamedExpression& item : aggregates_) {
     const auto* aggregate = dynamic_cast<const AggregateExpression*>(item.expr.get());
     if (aggregate == nullptr) {
-      throw ExecutionError("HashAggregateOperator item '" + item.name + "' is not an AggregateExpression");
+      throw ExecutionError(
+          fmt::format("HashAggregateOperator item '{}' is not an AggregateExpression", item.name));
     }
     // COUNT(*) has no natural argument column; reuse group_by[0]'s compiled
     // form (materialized at its own dedicated table slot below, via

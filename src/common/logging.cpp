@@ -1,5 +1,6 @@
 #include "kernellake/common/logging.hpp"
 
+#include <fmt/format.h>
 #include <spdlog/spdlog.h>
 
 #include "kernellake/common/config.hpp"
@@ -10,7 +11,7 @@ namespace kernellake {
 void init_logging(const LoggingSection& config) {
   const spdlog::level::level_enum level = spdlog::level::from_str(config.level);
   if (level == spdlog::level::off && config.level != "off") {
-    throw ConfigurationError("logging.level '" + config.level + "' is not a recognized level");
+    throw ConfigurationError(fmt::format("logging.level '{}' is not a recognized level", config.level));
   }
   spdlog::set_level(level);
 

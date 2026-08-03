@@ -2,6 +2,7 @@
 
 #include <cudf/wrappers/durations.hpp>
 #include <cudf/wrappers/timestamps.hpp>
+#include <fmt/format.h>
 
 #include "kernellake/common/errors.hpp"
 #include "kernellake/execution_gpu/cudf_adapter.hpp"
@@ -239,9 +240,10 @@ const cudf::ast::expression& ExpressionCompiler::compile_cast(const CastExpressi
     case TypeId::Float64:
       return tree_.emplace<cudf::ast::operation>(cudf::ast::ast_operator::CAST_TO_FLOAT64, operand);
     default:
-      throw ExecutionError("CAST to " + expr.result_type().to_string() +
-                           " is not supported for GPU row-wise expressions (cudf::ast only "
-                           "supports widening casts to INT64/UINT64/FLOAT64)");
+      throw ExecutionError(
+          fmt::format("CAST to {} is not supported for GPU row-wise expressions (cudf::ast only "
+                      "supports widening casts to INT64/UINT64/FLOAT64)",
+                      expr.result_type().to_string()));
   }
 }
 

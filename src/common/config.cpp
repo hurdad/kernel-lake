@@ -1,5 +1,6 @@
 #include "kernellake/common/config.hpp"
 
+#include <fmt/format.h>
 #include <yaml-cpp/yaml.h>
 
 #include <algorithm>
@@ -16,11 +17,13 @@ namespace {
 
 template <typename T>
 T read_or(const YAML::Node& node, const char* key, T fallback) {
-  if (!node || !node[key]) return fallback;
+  if (!node || !node[key]) {
+    return fallback;
+  }
   try {
     return node[key].as<T>();
   } catch (const YAML::Exception& e) {
-    throw ConfigurationError(std::string("invalid value for '") + key + "': " + e.what());
+    throw ConfigurationError(fmt::format("invalid value for '{}': {}", key, e.what()));
   }
 }
 
@@ -39,12 +42,14 @@ YAML::Node child(const YAML::Node& node, const char* key) {
 // own field type, std::unordered_map<std::string, std::string>).
 std::unordered_map<std::string, std::string> read_string_map(const YAML::Node& node) {
   std::unordered_map<std::string, std::string> result;
-  if (!node) return result;
+  if (!node) {
+    return result;
+  }
   for (const auto& entry : node) {
     try {
       result.emplace(entry.first.as<std::string>(), entry.second.as<std::string>());
     } catch (const YAML::Exception& e) {
-      throw ConfigurationError(std::string("invalid string map entry: ") + e.what());
+      throw ConfigurationError(fmt::format("invalid string map entry: {}", e.what()));
     }
   }
   return result;
@@ -66,22 +71,22 @@ BatchExportConfig read_batch_export_config(const YAML::Node& node, BatchExportCo
 void validate_batch_export_config(const std::string& prefix, const std::string& processor,
                                   const BatchExportConfig& batch) {
   if (processor != "simple" && processor != "batch") {
-    throw ConfigurationError(prefix + ".processor '" + processor +
-                             "' is unsupported (expected 'simple' or 'batch')");
+    throw ConfigurationError(
+        fmt::format("{}.processor '{}' is unsupported (expected 'simple' or 'batch')", prefix, processor));
   }
   if (batch.max_queue_size == 0) {
-    throw ConfigurationError(prefix + ".batch.max_queue_size must be > 0");
+    throw ConfigurationError(fmt::format("{}.batch.max_queue_size must be > 0", prefix));
   }
   if (batch.max_export_batch_size == 0) {
-    throw ConfigurationError(prefix + ".batch.max_export_batch_size must be > 0");
+    throw ConfigurationError(fmt::format("{}.batch.max_export_batch_size must be > 0", prefix));
   }
   if (batch.max_export_batch_size > batch.max_queue_size) {
-    throw ConfigurationError(prefix + ".batch.max_export_batch_size (" +
-                             std::to_string(batch.max_export_batch_size) + ") must be <= " + prefix +
-                             ".batch.max_queue_size (" + std::to_string(batch.max_queue_size) + ")");
+    throw ConfigurationError(
+        fmt::format("{}.batch.max_export_batch_size ({}) must be <= {}.batch.max_queue_size ({})", prefix,
+                    batch.max_export_batch_size, prefix, batch.max_queue_size));
   }
   if (batch.schedule_delay_ms == 0) {
-    throw ConfigurationError(prefix + ".batch.schedule_delay_ms must be > 0");
+    throw ConfigurationError(fmt::format("{}.batch.schedule_delay_ms must be > 0", prefix));
   }
 }
 
@@ -96,7 +101,7 @@ EngineConfig parse_config(const std::string& yaml_text) {
   try {
     root = YAML::Load(yaml_text);
   } catch (const YAML::Exception& e) {
-    throw ConfigurationError(std::string("failed to parse YAML configuration: ") + e.what());
+    throw ConfigurationError(fmt::format("failed to parse YAML configuration: {}", e.what()));
   }
 
   EngineConfig config;
@@ -170,14 +175,14 @@ EngineConfig parse_config(const std::string& yaml_text) {
     try {
       gcs_opts.retry_limit_seconds = gcs["retry_limit_seconds"].as<double>();
     } catch (const YAML::Exception& e) {
-      throw ConfigurationError(std::string("invalid value for 'retry_limit_seconds': ") + e.what());
+      throw ConfigurationError(fmt::format("invalid value for 'retry_limit_seconds': {}", e.what()));
     }
   }
   if (gcs && gcs["project_id"]) {
     try {
       gcs_opts.project_id = gcs["project_id"].as<std::string>();
     } catch (const YAML::Exception& e) {
-      throw ConfigurationError(std::string("invalid value for 'project_id': ") + e.what());
+      throw ConfigurationError(fmt::format("invalid value for 'project_id': {}", e.what()));
     }
   }
 
@@ -273,8 +278,8 @@ EngineConfig parse_config(const std::string& yaml_text) {
 EngineConfig load_config_file(const std::string& path) {
   std::ifstream file(path);
   if (!file) {
-    throw ConfigurationError("cannot open configuration file '" + path +
-                             "': check that the path exists and is readable");
+    throw ConfigurationError(
+        fmt::format("cannot open configuration file '{}': check that the path exists and is readable", path));
   }
   std::ostringstream buffer;
   buffer << file.rdbuf();
@@ -283,7 +288,7 @@ EngineConfig load_config_file(const std::string& path) {
 
 void validate_config(const EngineConfig& config) {
   if (config.engine.device_id < 0) {
-    throw ConfigurationError("engine.device_id must be >= 0, got " + std::to_string(config.engine.device_id));
+    throw ConfigurationError(fmt::format("engine.device_id must be >= 0, got {}", config.engine.device_id));
   }
   if (config.engine.batch_rows == 0) {
     throw ConfigurationError("engine.batch_rows must be > 0");
@@ -295,26 +300,28 @@ void validate_config(const EngineConfig& config) {
     throw ConfigurationError("engine.query_memory_limit_bytes must be > 0");
   }
   if (config.engine.backend != "gpu" && config.engine.backend != "cpu") {
-    throw ConfigurationError("engine.backend '" + config.engine.backend +
-                             "' is unsupported (expected 'gpu' or 'cpu')");
+    throw ConfigurationError(
+        fmt::format("engine.backend '{}' is unsupported (expected 'gpu' or 'cpu')", config.engine.backend));
   }
 
   if (config.memory.pool_initial_bytes == 0) {
     throw ConfigurationError("memory.pool_initial_bytes must be > 0");
   }
   if (config.memory.pool_max_bytes < config.memory.pool_initial_bytes) {
-    throw ConfigurationError("memory.pool_max_bytes (" + std::to_string(config.memory.pool_max_bytes) +
-                             ") must be >= memory.pool_initial_bytes (" +
-                             std::to_string(config.memory.pool_initial_bytes) + ")");
+    throw ConfigurationError(
+        fmt::format("memory.pool_max_bytes ({}) must be >= memory.pool_initial_bytes ({})",
+                    config.memory.pool_max_bytes, config.memory.pool_initial_bytes));
   }
 
   static constexpr std::array<const char*, 5> kS3CredentialsKinds = {"anonymous", "default", "explicit",
                                                                      "role", "web_identity"};
   if (std::find(kS3CredentialsKinds.begin(), kS3CredentialsKinds.end(), config.storage.s3.credentials_kind) ==
       kS3CredentialsKinds.end()) {
-    throw ConfigurationError("storage.s3.credentials_kind '" + config.storage.s3.credentials_kind +
-                             "' is unsupported (expected 'anonymous', 'default', 'explicit', 'role', or "
-                             "'web_identity')");
+    throw ConfigurationError(
+        fmt::format("storage.s3.credentials_kind '{}' is unsupported (expected 'anonymous', 'default', "
+                    "'explicit', 'role', or "
+                    "'web_identity')",
+                    config.storage.s3.credentials_kind));
   }
   if (config.storage.s3.credentials_kind == "role" && config.storage.s3.options.role_arn.empty()) {
     throw ConfigurationError(
@@ -322,17 +329,19 @@ void validate_config(const EngineConfig& config) {
         "storage.s3.credentials_kind is 'role'");
   }
   if (config.storage.s3.options.scheme != "https" && config.storage.s3.options.scheme != "http") {
-    throw ConfigurationError("storage.s3.scheme '" + config.storage.s3.options.scheme +
-                             "' is unsupported (expected 'https' or 'http')");
+    throw ConfigurationError(fmt::format("storage.s3.scheme '{}' is unsupported (expected 'https' or 'http')",
+                                         config.storage.s3.options.scheme));
   }
 
   static constexpr std::array<const char*, 4> kGcsCredentialsKinds = {"anonymous", "default", "access_token",
                                                                       "service_account_json"};
   if (std::find(kGcsCredentialsKinds.begin(), kGcsCredentialsKinds.end(),
                 config.storage.gcs.credentials_kind) == kGcsCredentialsKinds.end()) {
-    throw ConfigurationError("storage.gcs.credentials_kind '" + config.storage.gcs.credentials_kind +
-                             "' is unsupported (expected 'anonymous', 'default', 'access_token', or "
-                             "'service_account_json')");
+    throw ConfigurationError(
+        fmt::format("storage.gcs.credentials_kind '{}' is unsupported (expected 'anonymous', 'default', "
+                    "'access_token', or "
+                    "'service_account_json')",
+                    config.storage.gcs.credentials_kind));
   }
   if (config.storage.gcs.credentials_kind == "access_token" && config.storage.gcs.access_token.empty()) {
     throw ConfigurationError(
@@ -345,8 +354,9 @@ void validate_config(const EngineConfig& config) {
         "storage.gcs.credentials_kind is 'service_account_json'");
   }
   if (config.storage.gcs.options.scheme != "https" && config.storage.gcs.options.scheme != "http") {
-    throw ConfigurationError("storage.gcs.scheme '" + config.storage.gcs.options.scheme +
-                             "' is unsupported (expected 'https' or 'http')");
+    throw ConfigurationError(
+        fmt::format("storage.gcs.scheme '{}' is unsupported (expected 'https' or 'http')",
+                    config.storage.gcs.options.scheme));
   }
 
   static constexpr std::array<const char*, 9> kAzureCredentialsKinds = {
@@ -354,10 +364,11 @@ void validate_config(const EngineConfig& config) {
       "managed_identity", "cli",       "workload_identity",  "environment"};
   if (std::find(kAzureCredentialsKinds.begin(), kAzureCredentialsKinds.end(),
                 config.storage.azure.credentials_kind) == kAzureCredentialsKinds.end()) {
-    throw ConfigurationError(
-        "storage.azure.credentials_kind '" + config.storage.azure.credentials_kind +
-        "' is unsupported (expected 'default', 'anonymous', 'storage_shared_key', 'sas_token', "
-        "'client_secret', 'managed_identity', 'cli', 'workload_identity', or 'environment')");
+    throw ConfigurationError(fmt::format(
+        "storage.azure.credentials_kind '{}' is unsupported (expected 'default', 'anonymous', "
+        "'storage_shared_key', 'sas_token', 'client_secret', 'managed_identity', 'cli', 'workload_identity', "
+        "or 'environment')",
+        config.storage.azure.credentials_kind));
   }
   if (config.storage.azure.credentials_kind == "storage_shared_key" &&
       config.storage.azure.storage_shared_key.empty()) {
@@ -378,15 +389,15 @@ void validate_config(const EngineConfig& config) {
   }
   if (config.storage.azure.options.blob_storage_scheme != "https" &&
       config.storage.azure.options.blob_storage_scheme != "http") {
-    throw ConfigurationError("storage.azure.blob_storage_scheme '" +
-                             config.storage.azure.options.blob_storage_scheme +
-                             "' is unsupported (expected 'https' or 'http')");
+    throw ConfigurationError(
+        fmt::format("storage.azure.blob_storage_scheme '{}' is unsupported (expected 'https' or 'http')",
+                    config.storage.azure.options.blob_storage_scheme));
   }
   if (config.storage.azure.options.dfs_storage_scheme != "https" &&
       config.storage.azure.options.dfs_storage_scheme != "http") {
-    throw ConfigurationError("storage.azure.dfs_storage_scheme '" +
-                             config.storage.azure.options.dfs_storage_scheme +
-                             "' is unsupported (expected 'https' or 'http')");
+    throw ConfigurationError(
+        fmt::format("storage.azure.dfs_storage_scheme '{}' is unsupported (expected 'https' or 'http')",
+                    config.storage.azure.options.dfs_storage_scheme));
   }
 
   static constexpr std::array<const char*, 7> kLogLevels = {"trace",   "debug", "info",    "warn",
@@ -399,18 +410,20 @@ void validate_config(const EngineConfig& config) {
     }
   }
   if (!level_ok) {
-    throw ConfigurationError("logging.level '" + config.logging.level +
-                             "' is not a recognized level "
-                             "(expected one of trace/debug/info/warn/error/critical)");
+    throw ConfigurationError(
+        fmt::format("logging.level '{}' is not a recognized level "
+                    "(expected one of trace/debug/info/warn/error/critical)",
+                    config.logging.level));
   }
 
   if (config.benchmark.output_format != "json" && config.benchmark.output_format != "csv") {
-    throw ConfigurationError("benchmark.output_format '" + config.benchmark.output_format +
-                             "' is unsupported (expected 'json' or 'csv')");
+    throw ConfigurationError(
+        fmt::format("benchmark.output_format '{}' is unsupported (expected 'json' or 'csv')",
+                    config.benchmark.output_format));
   }
   if (config.benchmark.baseline != "duckdb" && config.benchmark.baseline != "none") {
-    throw ConfigurationError("benchmark.baseline '" + config.benchmark.baseline +
-                             "' is unsupported (expected 'duckdb' or 'none')");
+    throw ConfigurationError(fmt::format(
+        "benchmark.baseline '{}' is unsupported (expected 'duckdb' or 'none')", config.benchmark.baseline));
   }
   if (config.benchmark.default_iterations <= 0) {
     throw ConfigurationError("benchmark.default_iterations must be > 0");
@@ -424,8 +437,9 @@ void validate_config(const EngineConfig& config) {
   }
 
   if (config.observability.otlp_protocol != "grpc" && config.observability.otlp_protocol != "http") {
-    throw ConfigurationError("observability.otlp_protocol '" + config.observability.otlp_protocol +
-                             "' is unsupported (expected 'grpc' or 'http')");
+    throw ConfigurationError(
+        fmt::format("observability.otlp_protocol '{}' is unsupported (expected 'grpc' or 'http')",
+                    config.observability.otlp_protocol));
   }
   if (config.observability.enabled && config.observability.otlp_endpoint.empty()) {
     throw ConfigurationError(
@@ -438,8 +452,9 @@ void validate_config(const EngineConfig& config) {
                                config.observability.tracing.batch);
   if (config.observability.tracing.sampler != "default" && config.observability.tracing.sampler != "always" &&
       config.observability.tracing.sampler != "never") {
-    throw ConfigurationError("observability.tracing.sampler '" + config.observability.tracing.sampler +
-                             "' is unsupported (expected 'default', 'always', or 'never')");
+    throw ConfigurationError(fmt::format(
+        "observability.tracing.sampler '{}' is unsupported (expected 'default', 'always', or 'never')",
+        config.observability.tracing.sampler));
   }
   validate_batch_export_config("observability.logs", config.observability.logs.processor,
                                config.observability.logs.batch);

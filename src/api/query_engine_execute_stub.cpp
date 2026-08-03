@@ -29,7 +29,9 @@ namespace {
 }  // namespace
 
 QueryResult QueryEngine::execute(std::string_view sql) const {
-  if (config_.engine.backend != "cpu") throw_no_gpu_build();
+  if (config_.engine.backend != "cpu") {
+    throw_no_gpu_build();
+  }
 
   const auto wall_start = std::chrono::steady_clock::now();
 

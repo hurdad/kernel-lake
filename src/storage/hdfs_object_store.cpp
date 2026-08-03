@@ -1,6 +1,7 @@
 #include "kernellake/storage/hdfs_object_store.hpp"
 
 #include <arrow/filesystem/hdfs.h>
+#include <fmt/format.h>
 
 #include "generic_fs_object_store.hpp"
 #include "kernellake/common/errors.hpp"
@@ -22,7 +23,7 @@ std::shared_ptr<arrow::fs::FileSystem> make_hdfs_filesystem(const HdfsSection& c
   const arrow::Result<std::shared_ptr<arrow::fs::HadoopFileSystem>> result =
       arrow::fs::HadoopFileSystem::Make(config.options);
   if (!result.ok()) {
-    throw StorageError("hdfs: failed to construct filesystem: " + result.status().ToString());
+    throw StorageError(fmt::format("hdfs: failed to construct filesystem: {}", result.status().ToString()));
   }
   return *result;
 }
@@ -30,7 +31,9 @@ std::shared_ptr<arrow::fs::FileSystem> make_hdfs_filesystem(const HdfsSection& c
 Uri strip_authority(const Uri& uri) {
   const std::string path = detail::strip_scheme(uri);
   const std::size_t slash = path.find('/');
-  if (slash == std::string::npos) return Uri("hdfs://" + path);
+  if (slash == std::string::npos) {
+    return Uri("hdfs://" + path);
+  }
   return Uri("hdfs://" + path.substr(slash));
 }
 

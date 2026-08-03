@@ -3,6 +3,7 @@
 #include <arrow/acero/api.h>
 #include <arrow/compute/api_aggregate.h>
 #include <arrow/compute/initialize.h>
+#include <fmt/format.h>
 #include <parquet/arrow/reader.h>
 
 #include <chrono>
@@ -28,7 +29,8 @@ void ensure_compute_initialized() {
   std::call_once(once, [] {
     const arrow::Status status = arrow::compute::Initialize();
     if (!status.ok()) {
-      throw ExecutionError("failed to initialize the Arrow Compute function registry: " + status.ToString());
+      throw ExecutionError(
+          fmt::format("failed to initialize the Arrow Compute function registry: {}", status.ToString()));
     }
   });
 }
@@ -57,22 +59,23 @@ std::shared_ptr<arrow::Table> read_scan_table(const ParquetScanNode& scan, Objec
     try {
       raw_reader = parquet::ParquetFileReader::Open(store.open(fragment.file)->as_arrow_file());
     } catch (const parquet::ParquetException& e) {
-      throw StorageError("failed to open Parquet file '" + fragment.file.value() +
-                         "' for CPU scan: " + e.what());
+      throw StorageError(
+          fmt::format("failed to open Parquet file '{}' for CPU scan: {}", fragment.file.value(), e.what()));
     }
 
     arrow::Result<std::unique_ptr<parquet::arrow::FileReader>> reader_result =
         parquet::arrow::FileReader::Make(arrow::default_memory_pool(), std::move(raw_reader));
     if (!reader_result.ok()) {
-      throw StorageError("failed to open Parquet file '" + fragment.file.value() +
-                         "' for CPU scan: " + reader_result.status().ToString());
+      throw StorageError(fmt::format("failed to open Parquet file '{}' for CPU scan: {}",
+                                     fragment.file.value(), reader_result.status().ToString()));
     }
     std::unique_ptr<parquet::arrow::FileReader> reader = std::move(*reader_result);
 
     std::shared_ptr<arrow::Schema> file_schema;
     const arrow::Status schema_status = reader->GetSchema(&file_schema);
     if (!schema_status.ok()) {
-      throw StorageError("failed to read Parquet schema for CPU scan: " + schema_status.ToString());
+      throw StorageError(
+          fmt::format("failed to read Parquet schema for CPU scan: {}", schema_status.ToString()));
     }
 
     std::vector<int> column_indices;
@@ -80,7 +83,8 @@ std::shared_ptr<arrow::Table> read_scan_table(const ParquetScanNode& scan, Objec
     for (const std::string& name : columns) {
       const int index = file_schema->GetFieldIndex(name);
       if (index < 0) {
-        throw StorageError("column '" + name + "' not found in Parquet file '" + fragment.file.value() + "'");
+        throw StorageError(
+            fmt::format("column '{}' not found in Parquet file '{}'", name, fragment.file.value()));
       }
       column_indices.push_back(index);
     }
@@ -88,19 +92,24 @@ std::shared_ptr<arrow::Table> read_scan_table(const ParquetScanNode& scan, Objec
     arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> rb_reader_result =
         reader->GetRecordBatchReader(fragment.selected_row_groups, column_indices);
     if (!rb_reader_result.ok()) {
-      throw StorageError("failed to build a record batch reader for CPU scan: " +
-                         rb_reader_result.status().ToString());
+      throw StorageError(fmt::format("failed to build a record batch reader for CPU scan: {}",
+                                     rb_reader_result.status().ToString()));
     }
     std::unique_ptr<arrow::RecordBatchReader> rb_reader = std::move(*rb_reader_result);
-    if (table_schema == nullptr) table_schema = rb_reader->schema();
+    if (table_schema == nullptr) {
+      table_schema = rb_reader->schema();
+    }
 
     while (true) {
       std::shared_ptr<arrow::RecordBatch> batch;
       const arrow::Status next_status = rb_reader->ReadNext(&batch);
       if (!next_status.ok()) {
-        throw StorageError("failed reading a Parquet batch for CPU scan: " + next_status.ToString());
+        throw StorageError(
+            fmt::format("failed reading a Parquet batch for CPU scan: {}", next_status.ToString()));
       }
-      if (batch == nullptr) break;
+      if (batch == nullptr) {
+        break;
+      }
       all_batches.push_back(std::move(batch));
     }
   }
@@ -108,12 +117,15 @@ std::shared_ptr<arrow::Table> read_scan_table(const ParquetScanNode& scan, Objec
   // No fragments at all (every file/row-group was pruned away): fall back
   // to the scan's own declared (narrowed) schema so the result is a real,
   // correctly-typed empty table rather than a null schema.
-  if (table_schema == nullptr) table_schema = to_arrow_schema(scan.output_schema());
+  if (table_schema == nullptr) {
+    table_schema = to_arrow_schema(scan.output_schema());
+  }
 
   arrow::Result<std::shared_ptr<arrow::Table>> table_result =
       arrow::Table::FromRecordBatches(table_schema, all_batches);
   if (!table_result.ok()) {
-    throw StorageError("failed to assemble the CPU scan's result table: " + table_result.status().ToString());
+    throw StorageError(
+        fmt::format("failed to assemble the CPU scan's result table: {}", table_result.status().ToString()));
   }
   return *table_result;
 }
@@ -130,9 +142,10 @@ std::shared_ptr<arrow::Table> read_scan_table(const ParquetScanNode& scan, Objec
 const std::string& require_plain_column_name(const ExpressionPtr& expr, const char* context) {
   const auto* column = dynamic_cast<const ColumnExpression*>(expr.get());
   if (column == nullptr) {
-    throw PlanningError(std::string(context) +
-                        " by a computed expression is not yet supported by the CPU execution backend "
-                        "(only a plain column reference is) -- see docs/ARCHITECTURE.md");
+    throw PlanningError(
+        fmt::format("{} by a computed expression is not yet supported by the CPU execution backend "
+                    "(only a plain column reference is) -- see docs/ARCHITECTURE.md",
+                    context));
   }
   return column->name();
 }
@@ -151,7 +164,7 @@ arrow::compute::Aggregate translate_aggregate(const AggregateExpression& aggrega
                                               const std::string& output_name, bool grouped) {
   std::vector<arrow::FieldRef> target;
   if (aggregate.argument() != nullptr) {
-    target.push_back(arrow::FieldRef(require_plain_column_name(aggregate.argument(), "aggregating")));
+    target.emplace_back(require_plain_column_name(aggregate.argument(), "aggregating"));
   }
   switch (aggregate.function()) {
     case AggregateFunction::Sum:
@@ -215,7 +228,8 @@ arrow::acero::Declaration translate(const PhysicalPlanPtr& node, ObjectStore& st
     for (const NamedExpression& item : hash_aggregate->aggregates()) {
       const auto* aggregate = dynamic_cast<const AggregateExpression*>(item.expr.get());
       if (aggregate == nullptr) {
-        throw ExecutionError("HashAggregateNode item '" + item.name + "' is not an AggregateExpression");
+        throw ExecutionError(
+            fmt::format("HashAggregateNode item '{}' is not an AggregateExpression", item.name));
       }
       aggregates.push_back(translate_aggregate(*aggregate, item.name, /*grouped=*/true));
     }
@@ -230,7 +244,8 @@ arrow::acero::Declaration translate(const PhysicalPlanPtr& node, ObjectStore& st
     for (const NamedExpression& item : scalar_aggregate->aggregates()) {
       const auto* aggregate = dynamic_cast<const AggregateExpression*>(item.expr.get());
       if (aggregate == nullptr) {
-        throw ExecutionError("ScalarAggregateNode item '" + item.name + "' is not an AggregateExpression");
+        throw ExecutionError(
+            fmt::format("ScalarAggregateNode item '{}' is not an AggregateExpression", item.name));
       }
       aggregates.push_back(translate_aggregate(*aggregate, item.name, /*grouped=*/false));
     }
@@ -264,9 +279,11 @@ arrow::acero::Declaration translate(const PhysicalPlanPtr& node, ObjectStore& st
   if (const auto* arrow_result = dynamic_cast<const ArrowResultNode*>(node.get())) {
     return translate(arrow_result->child(), store);
   }
-  throw PlanningError("physical plan node '" + std::string(node->node_name()) +
-                      "' is not yet supported by the CPU execution backend (e.g. HashJoin isn't yet) -- see "
-                      "docs/ARCHITECTURE.md");
+  throw PlanningError(
+      fmt::format("physical plan node '{}' is not yet supported by the CPU execution backend (e.g. HashJoin "
+                  "isn't yet) -- "
+                  "see docs/ARCHITECTURE.md",
+                  node->node_name()));
 }
 
 }  // namespace
@@ -279,7 +296,7 @@ CpuQueryExecutionResult execute_physical_plan_cpu(const PhysicalPlanPtr& physica
   const arrow::Result<std::shared_ptr<arrow::Table>> table_result =
       arrow::acero::DeclarationToTable(declaration);
   if (!table_result.ok()) {
-    throw ExecutionError("CPU execution backend failed: " + table_result.status().ToString());
+    throw ExecutionError(fmt::format("CPU execution backend failed: {}", table_result.status().ToString()));
   }
 
   CpuQueryExecutionResult result;

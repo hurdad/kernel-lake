@@ -1,6 +1,7 @@
 #include "kernellake/storage/local_object_store.hpp"
 
 #include <arrow/io/file.h>
+#include <fmt/format.h>
 
 #include <algorithm>
 #include <filesystem>
@@ -34,7 +35,9 @@ bool glob_match(std::string_view pattern, std::string_view text) {
       return false;
     }
   }
-  while (p < pattern.size() && pattern[p] == '*') ++p;
+  while (p < pattern.size() && pattern[p] == '*') {
+    ++p;
+  }
   return p == pattern.size();
 }
 
@@ -43,16 +46,20 @@ bool has_glob_chars(std::string_view text) {
 }
 
 [[noreturn]] void fail_missing(const std::string& path) {
-  throw StorageError("path does not exist: '" + path +
-                     "' (check the path and that KernelLake has read access)");
+  throw StorageError(
+      fmt::format("path does not exist: '{}' (check the path and that KernelLake has read access)", path));
 }
 
 std::vector<ObjectInfo> list_directory_matching(const fs::path& dir, std::string_view pattern) {
   std::vector<ObjectInfo> results;
   for (const auto& entry : fs::directory_iterator(dir)) {
-    if (!entry.is_regular_file()) continue;
+    if (!entry.is_regular_file()) {
+      continue;
+    }
     const std::string filename = entry.path().filename().string();
-    if (!glob_match(pattern, filename)) continue;
+    if (!glob_match(pattern, filename)) {
+      continue;
+    }
     results.push_back(ObjectInfo{Uri(entry.path().string()), static_cast<std::uint64_t>(entry.file_size())});
   }
   std::sort(results.begin(), results.end(),
@@ -67,7 +74,7 @@ class LocalRandomAccessObject final : public RandomAccessObject {
   [[nodiscard]] std::uint64_t size() const override {
     const arrow::Result<std::int64_t> result = file_->GetSize();
     if (!result.ok()) {
-      throw StorageError("failed to stat opened file: " + result.status().ToString());
+      throw StorageError(fmt::format("failed to stat opened file: {}", result.status().ToString()));
     }
     return static_cast<std::uint64_t>(*result);
   }
@@ -85,22 +92,26 @@ std::vector<ObjectInfo> LocalObjectStore::list(const Uri& prefix) {
 
   if (has_glob_chars(path.filename().string())) {
     const fs::path dir = path.parent_path().empty() ? fs::path(".") : path.parent_path();
-    if (!fs::exists(dir) || !fs::is_directory(dir)) fail_missing(prefix.value());
+    if (!fs::exists(dir) || !fs::is_directory(dir)) {
+      fail_missing(prefix.value());
+    }
     std::vector<ObjectInfo> results = list_directory_matching(dir, path.filename().string());
     if (results.empty()) {
-      throw StorageError("no files matched pattern '" + prefix.value() + "'");
+      throw StorageError(fmt::format("no files matched pattern '{}'", prefix.value()));
     }
     return results;
   }
 
   std::error_code ec;
   const bool exists = fs::exists(path, ec);
-  if (!exists) fail_missing(prefix.value());
+  if (!exists) {
+    fail_missing(prefix.value());
+  }
 
   if (fs::is_directory(path, ec)) {
     std::vector<ObjectInfo> results = list_directory_matching(path, "*.parquet");
     if (results.empty()) {
-      throw StorageError("directory contains no Parquet files: '" + prefix.value() + "'");
+      throw StorageError(fmt::format("directory contains no Parquet files: '{}'", prefix.value()));
     }
     return results;
   }
@@ -111,7 +122,7 @@ std::vector<ObjectInfo> LocalObjectStore::list(const Uri& prefix) {
 std::unique_ptr<RandomAccessObject> LocalObjectStore::open(const Uri& uri) {
   arrow::Result<std::shared_ptr<arrow::io::ReadableFile>> result = arrow::io::ReadableFile::Open(uri.value());
   if (!result.ok()) {
-    throw StorageError("failed to open '" + uri.value() + "': " + result.status().ToString());
+    throw StorageError(fmt::format("failed to open '{}': {}", uri.value(), result.status().ToString()));
   }
   return std::make_unique<LocalRandomAccessObject>(*result);
 }

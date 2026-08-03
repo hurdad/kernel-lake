@@ -33,8 +33,8 @@ helm install kernellake charts/kernellake \
 
 | Key | Default | Description |
 | --- | --- | --- |
-| `image.repository` | `ghcr.io/hurdad/kernel-lake` | Image repository (built from `docker/Dockerfile`'s `runtime` target) |
-| `image.tag` | `runtime` | Image tag |
+| `image.repository` | `""` (auto: `ghcr.io/hurdad/kernel-lake-cpu` or `-gpu`, picked from `backend` below) | Image repository (built from `docker/Dockerfile`'s `runtime-cpu`/`runtime-gpu` targets); set explicitly to override |
+| `image.tag` | `latest` | Image tag |
 | `backend` | `cpu` | `cpu` or `gpu` -- mirrors `engine.backend` |
 | `service.type` | `ClusterIP` | Kubernetes Service type |
 | `service.port` | `31337` | Flight SQL port (matches `ServerSection`'s own default) |
@@ -46,7 +46,7 @@ helm install kernellake charts/kernellake \
 | `config.engine.resultBatchRows` | `65536` | `engine.result_batch_rows` |
 | `config.engine.queryMemoryLimitBytes` | `8589934592` | `engine.query_memory_limit_bytes` |
 | `config.storage.localRoot` | `/` | `storage.local_root` |
-| `observability.enabled` | `false` | Only takes effect if the image was built with `KERNELLAKE_ENABLE_OTEL=ON` (the `runtime` image is) |
+| `observability.enabled` | `false` | Only takes effect if the image was built with `KERNELLAKE_ENABLE_OTEL=ON` (both `runtime-cpu` and `runtime-gpu` are) |
 | `observability.otlpProtocol` | `grpc` | `grpc` or `http` |
 | `observability.otlpEndpoint` | `""` | Collector endpoint -- `host:port` for `grpc`, a base URL for `http` |
 | `observability.serviceName` | `kernellake-server` | OTel `service.name` resource attribute |

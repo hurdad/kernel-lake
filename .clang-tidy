@@ -3,6 +3,7 @@ Checks: >
   -*,
   bugprone-*,
   -bugprone-easily-swappable-parameters,
+  -bugprone-forward-declaration-namespace,
   performance-*,
   modernize-use-override,
   modernize-use-nullptr,

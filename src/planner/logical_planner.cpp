@@ -1,5 +1,7 @@
 #include "kernellake/planner/logical_planner.hpp"
 
+#include <fmt/format.h>
+
 #include <unordered_map>
 
 #include "kernellake/common/errors.hpp"
@@ -81,8 +83,8 @@ LogicalPlanPtr build_logical_plan(const BoundQuery& query, const Schema& source_
       } else {
         const auto pos_it = group_by_positions.find(item.expr->to_string());
         if (pos_it == group_by_positions.end()) {
-          throw PlanningError("SELECT item '" + item.output_name +
-                              "' is neither an aggregate nor a GROUP BY column");
+          throw PlanningError(fmt::format("SELECT item '{}' is neither an aggregate nor a GROUP BY column",
+                                          item.output_name));
         }
         absolute_index = pos_it->second;
       }

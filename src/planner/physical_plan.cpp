@@ -12,7 +12,9 @@ std::string join_names(const std::vector<std::string>& names) {
   std::ostringstream out;
   out << "[";
   for (std::size_t i = 0; i < names.size(); ++i) {
-    if (i > 0) out << ", ";
+    if (i > 0) {
+      out << ", ";
+    }
     out << names[i];
   }
   out << "]";
@@ -23,7 +25,9 @@ std::string join_named_expressions(const std::vector<NamedExpression>& items) {
   std::ostringstream out;
   out << "[";
   for (std::size_t i = 0; i < items.size(); ++i) {
-    if (i > 0) out << ", ";
+    if (i > 0) {
+      out << ", ";
+    }
     out << items[i].expr->to_string() << " AS " << items[i].name;
   }
   out << "]";
@@ -58,7 +62,10 @@ std::vector<std::pair<std::string, std::string>> ProjectionNode::explain_attribu
 
 std::vector<std::pair<std::string, std::string>> HashAggregateNode::explain_attributes() const {
   std::vector<std::string> group_by_names;
-  for (const NamedExpression& item : group_by_) group_by_names.push_back(item.name);
+  group_by_names.reserve(group_by_.size());
+  for (const NamedExpression& item : group_by_) {
+    group_by_names.push_back(item.name);
+  }
   return {
       {"group_by", join_names(group_by_names)},
       {"aggregates", join_named_expressions(aggregates_)},

@@ -2,9 +2,15 @@
 # values reference. Defaults to backend: cpu so `helm install` with zero
 # overrides works without requiring a GPU node/device plugin.
 
+# repository left empty by default: templates/deployment.yaml picks
+# ghcr.io/hurdad/kernel-lake-cpu or -gpu itself based on `backend` below
+# (docker/Dockerfile publishes the two as separate images, not one image
+# with a cpu/gpu tag, since only the GPU one needs CUDA/RAPIDS in its
+# shared-library closure). Set this explicitly to override with your own
+# built/pushed image instead.
 image:
-  repository: ghcr.io/hurdad/kernel-lake
-  tag: runtime
+  repository: ""
+  tag: latest
   pullPolicy: IfNotPresent
 
 replicaCount: 1
@@ -49,10 +55,11 @@ config:
     localRoot: /
 
 # Only takes effect if the image was built with KERNELLAKE_ENABLE_OTEL=ON
-# (docker/Dockerfile's runtime image is). See docs/ARCHITECTURE.md's
-# "OpenTelemetry observability" section for the full config schema this is
-# a thin surface over -- per-signal processor/batch/sampler tuning stays at
-# kernellake's own compiled-in defaults for this first chart pass.
+# (both docker/Dockerfile's runtime-cpu and runtime-gpu images are). See
+# docs/ARCHITECTURE.md's "OpenTelemetry observability" section for the full
+# config schema this is a thin surface over -- per-signal processor/batch/
+# sampler tuning stays at kernellake's own compiled-in defaults for this
+# first chart pass.
 observability:
   enabled: false
   # "grpc" or "http".

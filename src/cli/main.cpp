@@ -106,7 +106,9 @@ int main(int argc, char** argv) {
     ~S3ShutdownGuard() {
       if (arrow::fs::IsS3Initialized()) {
         const arrow::Status status = arrow::fs::FinalizeS3();
-        if (!status.ok()) spdlog::warn("arrow::fs::FinalizeS3() failed: {}", status.ToString());
+        if (!status.ok()) {
+          spdlog::warn("arrow::fs::FinalizeS3() failed: {}", status.ToString());
+        }
       }
     }
   } s3_shutdown_guard;

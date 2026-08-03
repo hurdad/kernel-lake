@@ -6,6 +6,7 @@
 #include <cudf/reduction.hpp>
 #include <cudf/scalar/scalar_factories.hpp>
 #include <cudf/transform.hpp>
+#include <fmt/format.h>
 
 #include "kernellake/common/errors.hpp"
 #include "kernellake/execution_gpu/cudf_adapter.hpp"
@@ -37,7 +38,8 @@ void ScalarAggregateOperator::open(ExecutionContext& context) {
   for (const NamedExpression& item : aggregates_) {
     const auto* aggregate = dynamic_cast<const AggregateExpression*>(item.expr.get());
     if (aggregate == nullptr) {
-      throw ExecutionError("ScalarAggregateOperator item '" + item.name + "' is not an AggregateExpression");
+      throw ExecutionError(
+          fmt::format("ScalarAggregateOperator item '{}' is not an AggregateExpression", item.name));
     }
     Accumulator state;
     state.function = aggregate->function();

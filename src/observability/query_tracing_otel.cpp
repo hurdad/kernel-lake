@@ -152,8 +152,12 @@ std::unique_ptr<logs_sdk::LogRecordExporter> build_log_exporter(const Observabil
 }
 
 std::unique_ptr<trace_sdk::Sampler> build_sampler(const std::string& sampler_name) {
-  if (sampler_name == "always") return trace_sdk::AlwaysOnSamplerFactory::Create();
-  if (sampler_name == "never") return trace_sdk::AlwaysOffSamplerFactory::Create();
+  if (sampler_name == "always") {
+    return trace_sdk::AlwaysOnSamplerFactory::Create();
+  }
+  if (sampler_name == "never") {
+    return trace_sdk::AlwaysOffSamplerFactory::Create();
+  }
   // "default": ParentBased(AlwaysOn) -- sample unless an incoming parent
   // context says not to; matches the OTel spec's own recommended default
   // root-sampling behavior.
@@ -170,7 +174,9 @@ opentelemetry::nostd::unique_ptr<metrics_api::Histogram<double>> g_query_duratio
 }  // namespace detail
 
 void init(const ObservabilitySection& config) {
-  if (!config.enabled) return;
+  if (!config.enabled) {
+    return;
+  }
 
   const resource_sdk::Resource resource = build_resource(config.service_name);
   g_tracer_name = config.service_name;
@@ -220,7 +226,9 @@ void init(const ObservabilitySection& config) {
 }
 
 void shutdown() {
-  if (!g_enabled) return;
+  if (!g_enabled) {
+    return;
+  }
 
   if (auto* provider =
           dynamic_cast<trace_sdk::TracerProvider*>(trace_api::Provider::GetTracerProvider().get())) {
@@ -249,11 +257,15 @@ QuerySpan::QuerySpan(QuerySpan&&) noexcept = default;
 QuerySpan& QuerySpan::operator=(QuerySpan&&) noexcept = default;
 
 QuerySpan::~QuerySpan() {
-  if (impl_ && impl_->span && impl_->span->IsRecording()) impl_->span->End();
+  if (impl_ && impl_->span && impl_->span->IsRecording()) {
+    impl_->span->End();
+  }
 }
 
 QuerySpan start_query_span(std::string_view operation_name) {
-  if (!g_enabled) return QuerySpan();
+  if (!g_enabled) {
+    return QuerySpan();
+  }
 
   QuerySpan span;
   span.impl_ = std::make_unique<QuerySpan::Impl>();
@@ -276,34 +288,54 @@ void set_common_attributes(trace_api::Span& span, std::string_view sql, std::str
 }  // namespace
 
 void QuerySpan::finish(const QueryResult& result, std::string_view sql, std::string_view backend) {
-  if (!impl_) return;
+  if (!impl_) {
+    return;
+  }
   trace_api::Span& span = *impl_->span;
 
   set_common_attributes(span, sql, backend);
-  if (result.rows_returned) span.SetAttribute("kernellake.rows_returned", *result.rows_returned);
-  if (result.rows_scanned) span.SetAttribute("kernellake.rows_scanned", *result.rows_scanned);
-  if (result.files_considered) span.SetAttribute("kernellake.files_considered", *result.files_considered);
-  if (result.files_scanned) span.SetAttribute("kernellake.files_scanned", *result.files_scanned);
-  if (result.row_groups_considered)
+  if (result.rows_returned) {
+    span.SetAttribute("kernellake.rows_returned", *result.rows_returned);
+  }
+  if (result.rows_scanned) {
+    span.SetAttribute("kernellake.rows_scanned", *result.rows_scanned);
+  }
+  if (result.files_considered) {
+    span.SetAttribute("kernellake.files_considered", *result.files_considered);
+  }
+  if (result.files_scanned) {
+    span.SetAttribute("kernellake.files_scanned", *result.files_scanned);
+  }
+  if (result.row_groups_considered) {
     span.SetAttribute("kernellake.row_groups_considered", *result.row_groups_considered);
-  if (result.row_groups_scanned)
+  }
+  if (result.row_groups_scanned) {
     span.SetAttribute("kernellake.row_groups_scanned", *result.row_groups_scanned);
-  if (result.compressed_bytes_read)
+  }
+  if (result.compressed_bytes_read) {
     span.SetAttribute("kernellake.compressed_bytes_read", *result.compressed_bytes_read);
-  if (result.parquet_decoding_seconds)
+  }
+  if (result.parquet_decoding_seconds) {
     span.SetAttribute("kernellake.parquet_decoding_seconds", *result.parquet_decoding_seconds);
-  if (result.gpu_execution_seconds)
+  }
+  if (result.gpu_execution_seconds) {
     span.SetAttribute("kernellake.gpu_execution_seconds", *result.gpu_execution_seconds);
-  if (result.cpu_execution_seconds)
+  }
+  if (result.cpu_execution_seconds) {
     span.SetAttribute("kernellake.cpu_execution_seconds", *result.cpu_execution_seconds);
-  if (result.host_to_device_seconds)
+  }
+  if (result.host_to_device_seconds) {
     span.SetAttribute("kernellake.host_to_device_seconds", *result.host_to_device_seconds);
-  if (result.device_to_host_seconds)
+  }
+  if (result.device_to_host_seconds) {
     span.SetAttribute("kernellake.device_to_host_seconds", *result.device_to_host_seconds);
-  if (result.peak_gpu_memory_bytes)
+  }
+  if (result.peak_gpu_memory_bytes) {
     span.SetAttribute("kernellake.peak_gpu_memory_bytes", *result.peak_gpu_memory_bytes);
-  if (result.elapsed_wall_seconds)
+  }
+  if (result.elapsed_wall_seconds) {
     span.SetAttribute("kernellake.elapsed_wall_seconds", *result.elapsed_wall_seconds);
+  }
 
   span.SetStatus(trace_api::StatusCode::kOk);
   span.End();
@@ -321,7 +353,9 @@ void QuerySpan::finish(const QueryResult& result, std::string_view sql, std::str
 }
 
 void QuerySpan::finish_error(const std::exception& e, std::string_view sql, std::string_view backend) {
-  if (!impl_) return;
+  if (!impl_) {
+    return;
+  }
   trace_api::Span& span = *impl_->span;
 
   set_common_attributes(span, sql, backend);

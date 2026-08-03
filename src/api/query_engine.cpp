@@ -21,7 +21,9 @@ Schema inspect_source_schema(ObjectStore& store, const std::vector<std::string>&
   const std::vector<ObjectInfo> files = discover_parquet_files(store, paths);
   std::vector<FileMetadata> metadata;
   metadata.reserve(files.size());
-  for (const ObjectInfo& file : files) metadata.push_back(inspect_parquet_file(store, file.uri));
+  for (const ObjectInfo& file : files) {
+    metadata.push_back(inspect_parquet_file(store, file.uri));
+  }
   validate_schema_compatibility(metadata);
   if (elapsed_seconds_out != nullptr) {
     *elapsed_seconds_out += std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
@@ -41,13 +43,13 @@ LogicalPlanPtr QueryEngine::plan_logical(std::string_view sql,
         inspect_source_schema(store_, ast.join->right.paths, metadata_inspection_seconds_out);
     const BoundQuery bound = bind_query(ast, left_schema, right_schema);
     LogicalPlanPtr logical = build_logical_plan(bound, left_schema, &right_schema);
-    return optimize(std::move(logical));
+    return optimize(logical);
   }
 
   const Schema source_schema = inspect_source_schema(store_, ast.from.paths, metadata_inspection_seconds_out);
   const BoundQuery bound = bind_query(ast, source_schema);
   LogicalPlanPtr logical = build_logical_plan(bound, source_schema);
-  return optimize(std::move(logical));
+  return optimize(logical);
 }
 
 LogicalPlanPtr QueryEngine::explain_logical(std::string_view sql) const {

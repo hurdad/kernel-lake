@@ -17,7 +17,9 @@ namespace {
 // ---------------------------------------------------------------------------
 
 std::optional<double> literal_as_double(const LiteralExpression& literal) {
-  if (literal.is_null()) return std::nullopt;
+  if (literal.is_null()) {
+    return std::nullopt;
+  }
   if (std::holds_alternative<std::int64_t>(literal.value())) {
     return static_cast<double>(std::get<std::int64_t>(literal.value()));
   }
@@ -89,10 +91,14 @@ ExpressionPtr simplify_expression(const ExpressionPtr& expr) {
         }
       }
       if (const auto* inner = dynamic_cast<const UnaryExpression*>(operand.get())) {
-        if (inner->op() == UnaryOperator::Not) return inner->operand();
+        if (inner->op() == UnaryOperator::Not) {
+          return inner->operand();
+        }
       }
     }
-    if (operand.get() == unary->operand().get()) return expr;
+    if (operand.get() == unary->operand().get()) {
+      return expr;
+    }
     return std::make_shared<UnaryExpression>(unary->op(), std::move(operand), unary->result_type());
   }
   if (const auto* binary = dynamic_cast<const BinaryExpression*>(expr.get())) {
@@ -133,18 +139,26 @@ ExpressionPtr simplify_expression(const ExpressionPtr& expr) {
       }
     }
 
-    if (left.get() == binary->left().get() && right.get() == binary->right().get()) return expr;
+    if (left.get() == binary->left().get() && right.get() == binary->right().get()) {
+      return expr;
+    }
     return std::make_shared<BinaryExpression>(op, std::move(left), std::move(right), binary->result_type());
   }
   if (const auto* cast = dynamic_cast<const CastExpression*>(expr.get())) {
     ExpressionPtr operand = simplify_expression(cast->operand());
-    if (operand.get() == cast->operand().get()) return expr;
+    if (operand.get() == cast->operand().get()) {
+      return expr;
+    }
     return std::make_shared<CastExpression>(std::move(operand), cast->result_type());
   }
   if (const auto* aggregate = dynamic_cast<const AggregateExpression*>(expr.get())) {
-    if (aggregate->argument() == nullptr) return expr;
+    if (aggregate->argument() == nullptr) {
+      return expr;
+    }
     ExpressionPtr argument = simplify_expression(aggregate->argument());
-    if (argument.get() == aggregate->argument().get()) return expr;
+    if (argument.get() == aggregate->argument().get()) {
+      return expr;
+    }
     return std::make_shared<AggregateExpression>(aggregate->function(), std::move(argument),
                                                  aggregate->result_type());
   }
@@ -161,7 +175,9 @@ ExpressionPtr simplify_expression(const ExpressionPtr& expr) {
 // side a given ColumnExpression actually came from (see the LogicalJoin
 // branch in annotate_scan() below).
 void collect_columns(const ExpressionPtr& expr, std::unordered_set<std::size_t>& out) {
-  if (expr == nullptr) return;
+  if (expr == nullptr) {
+    return;
+  }
   if (const auto* column = dynamic_cast<const ColumnExpression*>(expr.get())) {
     out.insert(column->column_index());
   } else if (const auto* binary = dynamic_cast<const BinaryExpression*>(expr.get())) {
@@ -218,14 +234,18 @@ BinaryOperator flip(BinaryOperator op) {
 
 void collect_pushable_predicates(const ExpressionPtr& predicate, std::vector<PushablePredicate>& out) {
   const auto* binary = dynamic_cast<const BinaryExpression*>(predicate.get());
-  if (binary == nullptr) return;
+  if (binary == nullptr) {
+    return;
+  }
 
   if (binary->op() == BinaryOperator::And) {
     collect_pushable_predicates(binary->left(), out);
     collect_pushable_predicates(binary->right(), out);
     return;
   }
-  if (!is_comparison(binary->op())) return;
+  if (!is_comparison(binary->op())) {
+    return;
+  }
 
   const Expression* left = unwrap_cast(binary->left().get());
   const Expression* right = unwrap_cast(binary->right().get());
@@ -261,12 +281,20 @@ LogicalPlanPtr insert_limit(LogicalPlanPtr node, std::int64_t limit) {
 
 bool is_identity_projection(const LogicalProjection& projection, const Schema& child_schema) {
   const std::vector<NamedExpression>& items = projection.items();
-  if (items.size() != child_schema.field_count()) return false;
+  if (items.size() != child_schema.field_count()) {
+    return false;
+  }
   for (std::size_t i = 0; i < items.size(); ++i) {
     const auto* column = dynamic_cast<const ColumnExpression*>(items[i].expr.get());
-    if (column == nullptr) return false;
-    if (column->column_index() != i) return false;
-    if (items[i].name != child_schema.field(i).name) return false;
+    if (column == nullptr) {
+      return false;
+    }
+    if (column->column_index() != i) {
+      return false;
+    }
+    if (items[i].name != child_schema.field(i).name) {
+      return false;
+    }
   }
   return true;
 }
@@ -371,7 +399,9 @@ void annotate_scan(const LogicalPlanPtr& node, std::unordered_set<std::size_t>& 
     collect_pushable_predicates(filter->predicate(), pushable_predicates);
     annotate_scan(filter->child(), required_columns, pushable_predicates);
   } else if (const auto* sort = dynamic_cast<const LogicalSort*>(node.get())) {
-    for (const LogicalSort::Key& key : sort->keys()) collect_columns(key.expr, required_columns);
+    for (const LogicalSort::Key& key : sort->keys()) {
+      collect_columns(key.expr, required_columns);
+    }
     annotate_scan(sort->child(), required_columns, pushable_predicates);
   } else if (const auto* aggregate = dynamic_cast<const LogicalAggregate*>(node.get())) {
     for (const NamedExpression& item : aggregate->group_by()) {
@@ -428,8 +458,9 @@ void annotate_scan(const LogicalPlanPtr& node, std::unordered_set<std::size_t>& 
   } else if (auto* scan = dynamic_cast<LogicalScan*>(node.get())) {
     std::vector<std::string> columns;
     columns.reserve(required_columns.size());
-    for (const std::size_t index : required_columns)
+    for (const std::size_t index : required_columns) {
       columns.push_back(scan->output_schema().field(index).name);
+    }
     std::sort(columns.begin(), columns.end());
     scan->set_required_columns(std::move(columns));
     scan->set_pushable_predicates(std::move(pushable_predicates));
@@ -438,7 +469,7 @@ void annotate_scan(const LogicalPlanPtr& node, std::unordered_set<std::size_t>& 
 
 }  // namespace
 
-LogicalPlanPtr optimize(LogicalPlanPtr plan) {
+LogicalPlanPtr optimize(const LogicalPlanPtr& plan) {
   LogicalPlanPtr rewritten = rewrite_plan(plan);
   std::unordered_set<std::size_t> required_columns;
   std::vector<PushablePredicate> pushable_predicates;

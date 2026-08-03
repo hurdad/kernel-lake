@@ -1,5 +1,7 @@
 #include "kernellake/planner/binder.hpp"
 
+#include <fmt/format.h>
+
 #include <algorithm>
 #include <unordered_map>
 #include <unordered_set>
@@ -63,17 +65,26 @@ DataType promote_numeric(const DataType& a, const DataType& b) {
       if (a.precision == b.precision && a.scale == b.scale) {
         return DataType{a.id, a.nullable || b.nullable, a.precision, a.scale};
       }
-      throw BindingError("mixing two DECIMAL types with different precision/scale is not yet supported (" +
-                         a.to_string() + " vs. " + b.to_string() + ")");
+      throw BindingError(fmt::format(
+          "mixing two DECIMAL types with different precision/scale is not yet supported ({} vs. {})",
+          a.to_string(), b.to_string()));
     }
     const DataType& decimal_side = a.id == TypeId::Decimal ? a : b;
     return DataType{decimal_side.id, a.nullable || b.nullable, decimal_side.precision, decimal_side.scale};
   }
   const bool nullable = a.nullable || b.nullable;
-  if (is_floating(a.id) || is_floating(b.id)) return float64_type(nullable);
-  if (a.id == TypeId::UInt64 || b.id == TypeId::UInt64) return uint64_type(nullable);
-  if (a.id == TypeId::Int64 || b.id == TypeId::Int64) return int64_type(nullable);
-  if (a.id == TypeId::UInt32 || b.id == TypeId::UInt32) return uint32_type(nullable);
+  if (is_floating(a.id) || is_floating(b.id)) {
+    return float64_type(nullable);
+  }
+  if (a.id == TypeId::UInt64 || b.id == TypeId::UInt64) {
+    return uint64_type(nullable);
+  }
+  if (a.id == TypeId::Int64 || b.id == TypeId::Int64) {
+    return int64_type(nullable);
+  }
+  if (a.id == TypeId::UInt32 || b.id == TypeId::UInt32) {
+    return uint32_type(nullable);
+  }
   return int32_type(nullable);
 }
 
@@ -86,14 +97,30 @@ DataType promote_numeric(const DataType& a, const DataType& b) {
 // executable yet" constructs.
 DataType resolve_cast_type_name(const AstCast& node, bool nullable) {
   const std::string& name = node.type_name;
-  if (name == "BIGINT") return int64_type(nullable);
-  if (name == "INT") return int32_type(nullable);
-  if (name == "BOOLEAN") return boolean_type(nullable);
-  if (name == "DOUBLE") return float64_type(nullable);
-  if (name == "FLOAT") return float32_type(nullable);
-  if (name == "DATE") return date32_type(nullable);
-  if (name == "DATETIME") return timestamp_type(nullable);
-  if (name == "VARCHAR") return string_type(nullable);
+  if (name == "BIGINT") {
+    return int64_type(nullable);
+  }
+  if (name == "INT") {
+    return int32_type(nullable);
+  }
+  if (name == "BOOLEAN") {
+    return boolean_type(nullable);
+  }
+  if (name == "DOUBLE") {
+    return float64_type(nullable);
+  }
+  if (name == "FLOAT") {
+    return float32_type(nullable);
+  }
+  if (name == "DATE") {
+    return date32_type(nullable);
+  }
+  if (name == "DATETIME") {
+    return timestamp_type(nullable);
+  }
+  if (name == "VARCHAR") {
+    return string_type(nullable);
+  }
   if (name == "DECIMAL") {
     // hsql parses a bare `DECIMAL` (no parens) as precision=scale=0; require
     // an explicit precision/scale rather than guessing a default, matching
@@ -103,18 +130,17 @@ DataType resolve_cast_type_name(const AstCast& node, bool nullable) {
       throw BindingError("CAST to DECIMAL requires explicit precision and scale, e.g. DECIMAL(10, 2)");
     }
     if (node.decimal_precision > 38) {
-      throw BindingError("DECIMAL precision must be between 1 and 38, got " +
-                         std::to_string(node.decimal_precision));
+      throw BindingError(
+          fmt::format("DECIMAL precision must be between 1 and 38, got {}", node.decimal_precision));
     }
     if (node.decimal_scale < 0 || node.decimal_scale > node.decimal_precision) {
-      throw BindingError("DECIMAL scale must be between 0 and precision (" +
-                         std::to_string(node.decimal_precision) + "), got " +
-                         std::to_string(node.decimal_scale));
+      throw BindingError(fmt::format("DECIMAL scale must be between 0 and precision ({}), got {}",
+                                     node.decimal_precision, node.decimal_scale));
     }
     return decimal_type(static_cast<std::int32_t>(node.decimal_precision),
                         static_cast<std::int32_t>(node.decimal_scale), nullable);
   }
-  throw BindingError("CAST to unknown type '" + name + "'");
+  throw BindingError(fmt::format("CAST to unknown type '{}'", name));
 }
 
 ExpressionPtr cast_if_needed(ExpressionPtr expr, const DataType& target) {
@@ -133,8 +159,10 @@ ExpressionPtr cast_if_needed(ExpressionPtr expr, const DataType& target) {
     if (const auto* literal = dynamic_cast<const LiteralExpression*>(expr.get())) {
       return std::make_shared<LiteralExpression>(literal->value(), target);
     }
-    throw BindingError("mixing DECIMAL with a non-literal " + current.to_string() +
-                       " is not yet supported -- wrap it in an explicit CAST(... AS DECIMAL(p, s))");
+    throw BindingError(
+        fmt::format("mixing DECIMAL with a non-literal {} is not yet supported -- wrap it in an explicit "
+                    "CAST(... AS DECIMAL(p, s))",
+                    current.to_string()));
   }
   return std::make_shared<CastExpression>(std::move(expr), target);
 }
@@ -147,7 +175,7 @@ bool contains_aggregate(const AstExprPtr& expr) {
           return true;
         } else if constexpr (std::is_same_v<T, AstBinary>) {
           return contains_aggregate(node.left) || contains_aggregate(node.right);
-        } else if constexpr (std::is_same_v<T, AstUnary>) {
+        } else if constexpr (std::is_same_v<T, AstUnary> || std::is_same_v<T, AstCast>) {
           return contains_aggregate(node.operand);
         } else if constexpr (std::is_same_v<T, AstBetween>) {
           return contains_aggregate(node.value) || contains_aggregate(node.lower) ||
@@ -155,15 +183,17 @@ bool contains_aggregate(const AstExprPtr& expr) {
         } else if constexpr (std::is_same_v<T, AstLike>) {
           return contains_aggregate(node.value) || contains_aggregate(node.pattern);
         } else if constexpr (std::is_same_v<T, AstIn>) {
-          if (contains_aggregate(node.value)) return true;
+          if (contains_aggregate(node.value)) {
+            return true;
+          }
           return std::any_of(node.list.begin(), node.list.end(), contains_aggregate);
         } else if constexpr (std::is_same_v<T, AstCase>) {
           for (const auto& [condition, result] : node.when_then) {
-            if (contains_aggregate(condition) || contains_aggregate(result)) return true;
+            if (contains_aggregate(condition) || contains_aggregate(result)) {
+              return true;
+            }
           }
           return node.else_branch != nullptr && contains_aggregate(node.else_branch);
-        } else if constexpr (std::is_same_v<T, AstCast>) {
-          return contains_aggregate(node.operand);
         } else {
           return false;
         }
@@ -180,25 +210,31 @@ bool references_ungrouped_column(const AstExprPtr& expr, const std::vector<std::
       [&](const auto& node) -> bool {
         using T = std::decay_t<decltype(node)>;
         if constexpr (std::is_same_v<T, AstColumnRef>) {
-          if (inside_aggregate) return false;
+          if (inside_aggregate) {
+            return false;
+          }
           return std::find(group_by.begin(), group_by.end(), node.name) == group_by.end();
         } else if constexpr (std::is_same_v<T, AstBinary>) {
           return references_ungrouped_column(node.left, group_by, inside_aggregate) ||
                  references_ungrouped_column(node.right, group_by, inside_aggregate);
-        } else if constexpr (std::is_same_v<T, AstUnary>) {
+        } else if constexpr (std::is_same_v<T, AstUnary> || std::is_same_v<T, AstCast>) {
           return references_ungrouped_column(node.operand, group_by, inside_aggregate);
         } else if constexpr (std::is_same_v<T, AstBetween>) {
           return references_ungrouped_column(node.value, group_by, inside_aggregate) ||
                  references_ungrouped_column(node.lower, group_by, inside_aggregate) ||
                  references_ungrouped_column(node.upper, group_by, inside_aggregate);
         } else if constexpr (std::is_same_v<T, AstAggregate>) {
-          if (node.argument == nullptr) return false;
+          if (node.argument == nullptr) {
+            return false;
+          }
           return references_ungrouped_column(node.argument, group_by, true);
         } else if constexpr (std::is_same_v<T, AstLike>) {
           return references_ungrouped_column(node.value, group_by, inside_aggregate) ||
                  references_ungrouped_column(node.pattern, group_by, inside_aggregate);
         } else if constexpr (std::is_same_v<T, AstIn>) {
-          if (references_ungrouped_column(node.value, group_by, inside_aggregate)) return true;
+          if (references_ungrouped_column(node.value, group_by, inside_aggregate)) {
+            return true;
+          }
           return std::any_of(node.list.begin(), node.list.end(), [&](const AstExprPtr& item) {
             return references_ungrouped_column(item, group_by, inside_aggregate);
           });
@@ -211,8 +247,6 @@ bool references_ungrouped_column(const AstExprPtr& expr, const std::vector<std::
           }
           return node.else_branch != nullptr &&
                  references_ungrouped_column(node.else_branch, group_by, inside_aggregate);
-        } else if constexpr (std::is_same_v<T, AstCast>) {
-          return references_ungrouped_column(node.operand, group_by, inside_aggregate);
         } else {
           return false;
         }
@@ -262,8 +296,9 @@ class Binder {
       }
       return fields;
     }
-    for (std::size_t i = 0; i < left_schema_->field_count(); ++i)
+    for (std::size_t i = 0; i < left_schema_->field_count(); ++i) {
       fields.emplace_back(left_schema_->field(i), i);
+    }
     const std::size_t offset = left_schema_->field_count();
     for (std::size_t i = 0; i < right_schema_->field_count(); ++i) {
       fields.emplace_back(right_schema_->field(i), offset + i);
@@ -276,23 +311,38 @@ class Binder {
   // BY's "does this match a base column" check, which needs the same
   // ambiguity handling a real column reference does.
   [[nodiscard]] std::optional<std::size_t> find_field_by_plain_name(const std::string& name) const {
-    if (input_schema_ != nullptr) return input_schema_->find_field(name);
+    if (input_schema_ != nullptr) {
+      return input_schema_->find_field(name);
+    }
     const std::optional<std::size_t> left_index = left_schema_->find_field(name);
     const std::optional<std::size_t> right_index = right_schema_->find_field(name);
     if (left_index && right_index) {
-      throw BindingError("ambiguous column '" + name +
-                         "' (present on both sides of the JOIN; qualify it with " + left_alias_.value() +
-                         "." + name + " or " + right_alias_.value() + "." + name + ")");
+      // left_alias_/right_alias_ are always set here: this overload only runs
+      // when input_schema_ == nullptr, i.e. the two-schema (JOIN) Binder
+      // constructor was used, which requires both aliases as plain
+      // std::string constructor arguments (see the Binder(std::string
+      // left_alias, ...) overload above).
+      const std::string& left = *left_alias_;    // NOLINT(bugprone-unchecked-optional-access)
+      const std::string& right = *right_alias_;  // NOLINT(bugprone-unchecked-optional-access)
+      throw BindingError(fmt::format(
+          "ambiguous column '{}' (present on both sides of the JOIN; qualify it with {}.{} or {}.{})", name,
+          left, name, right, name));
     }
-    if (left_index) return *left_index;
-    if (right_index) return left_schema_->field_count() + *right_index;
+    if (left_index) {
+      return left_index;
+    }
+    if (right_index) {
+      return left_schema_->field_count() + *right_index;
+    }
     return std::nullopt;
   }
 
  private:
   ExpressionPtr resolve_column(const Schema& schema, std::size_t offset, const std::string& name) {
     const auto index = schema.find_field(name);
-    if (!index) throw BindingError("unknown column '" + name + "'");
+    if (!index) {
+      throw BindingError(fmt::format("unknown column '{}'", name));
+    }
     const Field& field = schema.field(*index);
     return std::make_shared<ColumnExpression>(field.name, offset + *index, field.type);
   }
@@ -300,20 +350,29 @@ class Binder {
   ExpressionPtr bind_node(const AstColumnRef& node, bool) {
     if (input_schema_ != nullptr) {
       if (node.table.has_value()) {
-        throw BindingError("qualified column reference '" + *node.table + "." + node.name +
-                           "' is only valid in a JOIN query");
+        throw BindingError(fmt::format("qualified column reference '{}.{}' is only valid in a JOIN query",
+                                       *node.table, node.name));
       }
       return resolve_column(*input_schema_, 0, node.name);
     }
     if (node.table.has_value()) {
-      if (*node.table == left_alias_) return resolve_column(*left_schema_, 0, node.name);
-      if (*node.table == right_alias_)
+      if (*node.table == left_alias_) {
+        return resolve_column(*left_schema_, 0, node.name);
+      }
+      if (*node.table == right_alias_) {
         return resolve_column(*right_schema_, left_schema_->field_count(), node.name);
-      throw BindingError("unknown table qualifier '" + *node.table + "' (expected '" + left_alias_.value() +
-                         "' or '" + right_alias_.value() + "')");
+      }
+      // See find_field_by_plain_name()'s comment: left_alias_/right_alias_
+      // are always set on this path (input_schema_ == nullptr).
+      const std::string& left = *left_alias_;    // NOLINT(bugprone-unchecked-optional-access)
+      const std::string& right = *right_alias_;  // NOLINT(bugprone-unchecked-optional-access)
+      throw BindingError(
+          fmt::format("unknown table qualifier '{}' (expected '{}' or '{}')", *node.table, left, right));
     }
     const std::optional<std::size_t> combined_index = find_field_by_plain_name(node.name);
-    if (!combined_index) throw BindingError("unknown column '" + node.name + "'");
+    if (!combined_index) {
+      throw BindingError(fmt::format("unknown column '{}'", node.name));
+    }
     if (*combined_index < left_schema_->field_count()) {
       return resolve_column(*left_schema_, 0, node.name);
     }
@@ -409,8 +468,8 @@ class Binder {
 
     if (is_arithmetic(op)) {
       if (!is_numeric(lt.id) || !is_numeric(rt.id)) {
-        throw BindingError("arithmetic operator '" + std::string(kernellake::to_string(op)) +
-                           "' requires numeric operands, got " + lt.to_string() + " and " + rt.to_string());
+        throw BindingError(fmt::format("arithmetic operator '{}' requires numeric operands, got {} and {}",
+                                       kernellake::to_string(op), lt.to_string(), rt.to_string()));
       }
       const DataType result_type = promote_numeric(lt, rt);
       return std::make_shared<BinaryExpression>(op, cast_if_needed(std::move(left), result_type),
@@ -419,8 +478,8 @@ class Binder {
 
     if (is_logical(op)) {
       if (lt.id != TypeId::Boolean || rt.id != TypeId::Boolean) {
-        throw BindingError("AND/OR require boolean operands, got " + lt.to_string() + " and " +
-                           rt.to_string());
+        throw BindingError(
+            fmt::format("AND/OR require boolean operands, got {} and {}", lt.to_string(), rt.to_string()));
       }
       return std::make_shared<BinaryExpression>(op, std::move(left), std::move(right),
                                                 boolean_type(result_nullable));
@@ -440,7 +499,8 @@ class Binder {
                                                 cast_if_needed(std::move(right), common),
                                                 boolean_type(result_nullable));
     }
-    throw BindingError("incompatible comparison between " + lt.to_string() + " and " + rt.to_string());
+    throw BindingError(
+        fmt::format("incompatible comparison between {} and {}", lt.to_string(), rt.to_string()));
   }
 
   ExpressionPtr bind_node(const AstUnary& node, bool allow_aggregates) {
@@ -449,12 +509,13 @@ class Binder {
     switch (node.op) {
       case AstUnaryOp::Not:
         if (operand_type.id != TypeId::Boolean) {
-          throw BindingError("NOT requires a boolean operand, got " + operand_type.to_string());
+          throw BindingError(fmt::format("NOT requires a boolean operand, got {}", operand_type.to_string()));
         }
         return std::make_shared<UnaryExpression>(UnaryOperator::Not, std::move(operand), operand_type);
       case AstUnaryOp::Negate:
         if (!is_numeric(operand_type.id)) {
-          throw BindingError("unary '-' requires a numeric operand, got " + operand_type.to_string());
+          throw BindingError(
+              fmt::format("unary '-' requires a numeric operand, got {}", operand_type.to_string()));
         }
         return std::make_shared<UnaryExpression>(UnaryOperator::Negate, std::move(operand), operand_type);
       case AstUnaryOp::IsNull:
@@ -475,12 +536,14 @@ class Binder {
     auto unify = [&](ExpressionPtr bound, const char* side) {
       const DataType& vt = value->result_type();
       const DataType& bt = bound->result_type();
-      if (vt.id == bt.id && vt.precision == bt.precision && vt.scale == bt.scale) return bound;
+      if (vt.id == bt.id && vt.precision == bt.precision && vt.scale == bt.scale) {
+        return bound;
+      }
       if (is_numeric(vt.id) && is_numeric(bt.id)) {
         return cast_if_needed(std::move(bound), promote_numeric(vt, bt));
       }
-      throw BindingError(std::string("BETWEEN ") + side + " bound type " + bt.to_string() +
-                         " is incompatible with value type " + vt.to_string());
+      throw BindingError(fmt::format("BETWEEN {} bound type {} is incompatible with value type {}", side,
+                                     bt.to_string(), vt.to_string()));
     };
     lower = unify(std::move(lower), "lower");
     upper = unify(std::move(upper), "upper");
@@ -515,7 +578,7 @@ class Binder {
                                                      int64_type(false));
       case AstAggregateFunc::Sum: {
         if (!is_numeric(arg_type.id)) {
-          throw BindingError("SUM requires a numeric argument, got " + arg_type.to_string());
+          throw BindingError(fmt::format("SUM requires a numeric argument, got {}", arg_type.to_string()));
         }
         // DECIMAL keeps its own precision/scale unchanged (like MIN/MAX
         // below) rather than being cast to a wider type first: cudf's own
@@ -536,7 +599,7 @@ class Binder {
       }
       case AstAggregateFunc::Avg: {
         if (!is_numeric(arg_type.id)) {
-          throw BindingError("AVG requires a numeric argument, got " + arg_type.to_string());
+          throw BindingError(fmt::format("AVG requires a numeric argument, got {}", arg_type.to_string()));
         }
         if (arg_type.id == TypeId::Decimal) {
           throw BindingError("AVG over DECIMAL is not yet supported -- CAST the argument to DOUBLE first");
@@ -561,7 +624,8 @@ class Binder {
   ExpressionPtr bind_node(const AstLike& node, bool allow_aggregates) {
     ExpressionPtr value = bind(node.value, allow_aggregates);
     if (value->result_type().id != TypeId::String) {
-      throw BindingError("LIKE requires a STRING operand, got " + value->result_type().to_string());
+      throw BindingError(
+          fmt::format("LIKE requires a STRING operand, got {}", value->result_type().to_string()));
     }
     // The pattern must be a compile-time string constant -- a per-row
     // pattern column would need cudf::strings::like's column-of-patterns
@@ -575,7 +639,9 @@ class Binder {
   }
 
   ExpressionPtr bind_node(const AstIn& node, bool allow_aggregates) {
-    if (node.list.empty()) throw BindingError("IN requires at least one value");
+    if (node.list.empty()) {
+      throw BindingError("IN requires at least one value");
+    }
     ExpressionPtr value = bind(node.value, allow_aggregates);
     ExpressionPtr result;
     for (const AstExprPtr& item : node.list) {
@@ -583,7 +649,9 @@ class Binder {
       result = result == nullptr ? std::move(comparison)
                                  : combine_binary(AstBinaryOp::Or, std::move(result), std::move(comparison));
     }
-    if (!node.negated) return result;
+    if (!node.negated) {
+      return result;
+    }
     return std::make_shared<UnaryExpression>(UnaryOperator::Not, std::move(result), boolean_type(false));
   }
 
@@ -593,8 +661,8 @@ class Binder {
     for (const auto& [condition, then_result] : node.when_then) {
       ExpressionPtr bound_condition = bind(condition, allow_aggregates);
       if (bound_condition->result_type().id != TypeId::Boolean) {
-        throw BindingError("CASE WHEN condition must be boolean, got " +
-                           bound_condition->result_type().to_string());
+        throw BindingError(fmt::format("CASE WHEN condition must be boolean, got {}",
+                                       bound_condition->result_type().to_string()));
       }
       branches.emplace_back(std::move(bound_condition), bind(then_result, allow_aggregates));
     }
@@ -607,16 +675,22 @@ class Binder {
     bool any_nullable = common.nullable || bound_else == nullptr;
     auto unify = [&](const DataType& branch_type) {
       any_nullable = any_nullable || branch_type.nullable;
-      if (branch_type.id == common.id) return;
+      if (branch_type.id == common.id) {
+        return;
+      }
       if (is_numeric(common.id) && is_numeric(branch_type.id)) {
         common = promote_numeric(common, branch_type);
         return;
       }
-      throw BindingError("CASE branches have incompatible result types: " + common.to_string() + " and " +
-                         branch_type.to_string());
+      throw BindingError(fmt::format("CASE branches have incompatible result types: {} and {}",
+                                     common.to_string(), branch_type.to_string()));
     };
-    for (std::size_t i = 1; i < branches.size(); ++i) unify(branches[i].second->result_type());
-    if (bound_else != nullptr) unify(bound_else->result_type());
+    for (std::size_t i = 1; i < branches.size(); ++i) {
+      unify(branches[i].second->result_type());
+    }
+    if (bound_else != nullptr) {
+      unify(bound_else->result_type());
+    }
     common.nullable = any_nullable;
 
     std::vector<CaseExpression::WhenThen> final_branches;
@@ -673,9 +747,9 @@ BoundQuery bind_query_common(const sql::AstSelectStatement& stmt, Binder& binder
   // item is bound.
   std::unordered_map<std::string, std::size_t> alias_to_select_index;
 
-  auto add_select_item = [&](ExpressionPtr expr, std::string name) {
+  auto add_select_item = [&](const ExpressionPtr& expr, std::string name) {
     if (!seen_names.insert(name).second) {
-      throw BindingError("duplicate output column name '" + name + "'");
+      throw BindingError(fmt::format("duplicate output column name '{}'", name));
     }
     alias_to_select_index[name] = result.select_list.size();
     output_fields.push_back(Field{name, expr->result_type()});
@@ -702,7 +776,7 @@ BoundQuery bind_query_common(const sql::AstSelectStatement& stmt, Binder& binder
     std::string name = item->alias.value_or(std::holds_alternative<AstColumnRef>(item->node)
                                                 ? std::get<AstColumnRef>(item->node).name
                                                 : bound->to_string());
-    add_select_item(std::move(bound), std::move(name));
+    add_select_item(bound, std::move(name));
   }
 
   result.output_schema = Schema(std::move(output_fields));
@@ -713,8 +787,8 @@ BoundQuery bind_query_common(const sql::AstSelectStatement& stmt, Binder& binder
     }
     ExpressionPtr where = binder.bind(stmt.where, /*allow_aggregates=*/false);
     if (where->result_type().id != TypeId::Boolean) {
-      throw BindingError("WHERE clause must be a boolean expression, got " +
-                         where->result_type().to_string());
+      throw BindingError(
+          fmt::format("WHERE clause must be a boolean expression, got {}", where->result_type().to_string()));
     }
     result.where = std::move(where);
   }
@@ -750,7 +824,7 @@ BoundQuery bind_query_common(const sql::AstSelectStatement& stmt, Binder& binder
       result.group_by.push_back(result.select_list[alias->second].expr);
       select_indices_used_as_group_by_alias.insert(alias->second);
     } else {
-      throw BindingError("unknown column '" + ref.name + "' in GROUP BY");
+      throw BindingError(fmt::format("unknown column '{}' in GROUP BY", ref.name));
     }
     group_by_names.push_back(ref.name);
   }
@@ -758,8 +832,12 @@ BoundQuery bind_query_common(const sql::AstSelectStatement& stmt, Binder& binder
   if (is_aggregate_query) {
     for (std::size_t i = 0; i < stmt.select_list.size(); ++i) {
       const AstExprPtr& item = stmt.select_list[i];
-      if (std::holds_alternative<AstStar>(item->node)) continue;  // handled during expansion above
-      if (select_indices_used_as_group_by_alias.count(i) != 0) continue;
+      if (std::holds_alternative<AstStar>(item->node)) {
+        continue;  // handled during expansion above
+      }
+      if (select_indices_used_as_group_by_alias.count(i) != 0) {
+        continue;
+      }
       if (references_ungrouped_column(item, group_by_names, /*inside_aggregate=*/false)) {
         throw BindingError(
             "column referenced in SELECT list must appear in GROUP BY or be used inside an "
@@ -786,8 +864,8 @@ BoundQuery bind_query_common(const sql::AstSelectStatement& stmt, Binder& binder
       }
       const std::optional<std::size_t> index = result.output_schema.find_field(column->name);
       if (!index) {
-        throw BindingError("ORDER BY after GROUP BY: '" + column->name +
-                           "' is not one of this query's output columns");
+        throw BindingError(fmt::format(
+            "ORDER BY after GROUP BY: '{}' is not one of this query's output columns", column->name));
       }
       const Field& field = result.output_schema.field(*index);
       result.order_by.push_back(BoundOrderByItem{
@@ -860,7 +938,11 @@ BoundQuery bind_query(const sql::AstSelectStatement& stmt, const Schema& left_sc
   const bool is_aggregate_query =
       !stmt.group_by.empty() ||
       std::any_of(stmt.select_list.begin(), stmt.select_list.end(), contains_aggregate);
-  Binder binder(*stmt.join->left.alias, left_schema, *stmt.join->right.alias, right_schema);
+  // parser.cpp rejects a JOIN whose sides aren't both aliased (see its
+  // "both sides of a JOIN must be aliased" check) before an AstJoinClause is
+  // ever constructed, so left.alias/right.alias are always set here.
+  Binder binder(*stmt.join->left.alias, left_schema,     // NOLINT(bugprone-unchecked-optional-access)
+                *stmt.join->right.alias, right_schema);  // NOLINT(bugprone-unchecked-optional-access)
 
   const ExpressionPtr condition = binder.bind(stmt.join->condition, /*allow_aggregates=*/false);
   const auto [left_key_index, right_key_index] = extract_equi_join_keys(condition, left_schema.field_count());

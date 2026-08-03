@@ -25,6 +25,14 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+# This project doesn't use C++20 modules, but CMake >= 3.28's Ninja generator
+# scans for them by default, which injects -fmodules-ts/-fdeps-format=/
+# -fmodule-mapper= flags into compile_commands.json's per-file commands.
+# clang/clang-tidy invoked directly against those commands (outside Ninja's
+# own build, which supplies the referenced .modmap files) reject those flags
+# outright -- confirmed via a real `run-clang-tidy-18` run failing on every
+# translation unit with "unknown argument" until this was turned off.
+set(CMAKE_CXX_SCAN_FOR_MODULES OFF)
 
 if(KERNELLAKE_WITH_CUDA)
   set(CMAKE_CUDA_STANDARD 20)
@@ -60,11 +68,11 @@ endif()
 # it, sidesteps the whole class of problem: every library on every final
 # executable's link line stays available for symbol resolution regardless
 # of position. This project ships application binaries (not libraries
-# other projects link against), and the `runtime` Docker image's own
-# shared-library closure is computed from actual `ldd` output rather than
-# trusting a minimal DT_NEEDED list either way (see docker/Dockerfile's
-# runtime-libs stage) -- so the larger DT_NEEDED lists this produces have
-# no real downside here.
+# other projects link against), and the `runtime-cpu`/`runtime-gpu` Docker
+# images' own shared-library closures are each computed from actual `ldd`
+# output rather than trusting a minimal DT_NEEDED list either way (see
+# docker/Dockerfile's runtime-libs-cpu/runtime-libs-gpu stages) -- so the
+# larger DT_NEEDED lists this produces have no real downside here.
 add_link_options(-Wl,--no-as-needed)
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
@@ -76,6 +84,7 @@ find_package(ArrowCompute REQUIRED)
 find_package(ArrowAcero REQUIRED)
 find_package(Parquet REQUIRED)
 find_package(spdlog REQUIRED)
+find_package(fmt REQUIRED)
 find_package(yaml-cpp REQUIRED)
 find_package(nlohmann_json REQUIRED)
 # Needed by every executable linking kernellake_common (see

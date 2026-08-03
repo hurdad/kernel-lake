@@ -1,5 +1,7 @@
 #include "kernellake/execution_gpu/cuda_utils.hpp"
 
+#include <fmt/format.h>
+
 #include <string>
 #include <utility>
 
@@ -9,7 +11,7 @@ namespace kernellake {
 
 void check_cuda(cudaError_t status, std::string_view operation) {
   if (status != cudaSuccess) {
-    throw CudaError(std::string(operation) + " failed: " + cudaGetErrorString(status));
+    throw CudaError(fmt::format("{} failed: {}", operation, cudaGetErrorString(status)));
   }
 }
 

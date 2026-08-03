@@ -195,37 +195,53 @@ cold/warm timing modes.
 
 ## Docker
 
-`docker/Dockerfile` is a single multi-stage file with two named targets:
-`dev` (full CUDA toolkit image, repo built inside it -- 14.1 GB) and
-`runtime` (only the built binary plus its actual runtime shared-library
-closure, no compiler/headers/nvcc -- 2.17 GB). Both build on plain
-`ubuntu:26.04` with CUDA installed via apt's own `nvidia-cuda-toolkit`
-(12.4.1), not Ubuntu 24.04 or NVIDIA's official `nvidia/cuda` images --
-see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)'s "Ubuntu 26.04 baseline"
-section for why (Arrow Flight SQL and otel-cpp both need it). This is
-independent of the Requirements/Build sections above, which describe this
-project's own non-container Ubuntu 24.04 development environment --
-neither one needs to match the other.
+`docker/Dockerfile` is a single multi-stage file publishing two runtime
+images: `runtime-cpu` (no CUDA/RAPIDS at all -- 456 MB) and `runtime-gpu`
+(full CUDA/RAPIDS closure -- 2.17 GB). Both ship the same two binaries
+(`kernellake`, `kernellake-server`); they differ only in whether the GPU
+execution backend is compiled in. The `dev-cpu`/`dev-gpu` build stages
+(full toolchain, repo built inside them -- the GPU one is 14.1 GB) are
+intermediate only and are never published. Every stage builds on plain
+`ubuntu:26.04`, with `runtime-gpu`/`dev-gpu` installing CUDA via apt's own
+`nvidia-cuda-toolkit` (12.4.1), not Ubuntu 24.04 or NVIDIA's official
+`nvidia/cuda` images -- see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)'s
+"Ubuntu 26.04 baseline" section for why (Arrow Flight SQL and otel-cpp both
+need it). This is independent of the Requirements/Build sections above,
+which describe this project's own non-container Ubuntu 24.04 development
+environment -- neither one needs to match the other.
 
 ```bash
-docker build --target dev     -f docker/Dockerfile -t kernellake/kernellake:dev .
-docker build --target runtime -f docker/Dockerfile -t kernellake/kernellake:runtime .
+docker build --target runtime-cpu -f docker/Dockerfile -t kernellake/kernellake:runtime-cpu .
+docker build --target runtime-gpu -f docker/Dockerfile -t kernellake/kernellake:runtime-gpu .
 docker run --rm --gpus all -v /tmp/kernellake-sales:/data:ro \
-  kernellake/kernellake:runtime query --sql "SELECT region, SUM(amount) FROM read_parquet('/data/*.parquet') GROUP BY region"
+  kernellake/kernellake:runtime-gpu query --backend gpu --sql "SELECT region, SUM(amount) FROM read_parquet('/data/*.parquet') GROUP BY region"
+docker run --rm -v /tmp/kernellake-sales:/data:ro \
+  kernellake/kernellake:runtime-cpu query --sql "SELECT region, SUM(amount) FROM read_parquet('/data/*.parquet') GROUP BY region"
 ```
 
-`.github/workflows/ci.yml`'s `docker-publish` job builds and pushes both
-targets to `ghcr.io/hurdad/kernel-lake:dev` and `:runtime`/`:latest` on
-every push to `main` -- but only after `format-check`, `cpu-build-test`,
-and `tpch-tooling-smoke` all succeed, so a broken build is never shipped as
-an image. `docker run --gpus all` against a real GPU (RTX 5060 Ti) has been
-verified for real against this Ubuntu 26.04 baseline: all 214 tests pass in
-the `dev` image, and a real query against real generated data through the
-`runtime` image alone produces correct GPU-executed results -- see
-`docs/ARCHITECTURE.md`. CI's own `docker-publish` job (building against the
-previous, pre-26.04 Dockerfile) had separately succeeded end to end on
-real GitHub Actions; re-confirming CI still passes with this baseline
-change is still pending.
+`.github/workflows/ci.yml`'s `docker-publish` job builds and pushes
+`runtime-cpu` to `ghcr.io/hurdad/kernel-lake-cpu:latest` and `runtime-gpu`
+to `ghcr.io/hurdad/kernel-lake-gpu:latest` on every push to `main` -- but
+only after `format-check`, `cpu-build-test`, and `tpch-tooling-smoke` all
+succeed, so a broken build is never shipped as an image.
+`kernel-lake-cpu:latest` is a multi-arch (`linux/amd64`+`linux/arm64`)
+manifest -- every `runtime-cpu` dependency is a plain apt package with a
+real arm64 build on Ubuntu 26.04, confirmed by a real
+`docker buildx build --platform linux/arm64` (via QEMU user-mode emulation;
+no arm64 hardware or runner was used to verify this). `kernel-lake-gpu` is
+`linux/amd64` only for now -- CUDA/RAPIDS' own arm64 support needs real
+arm64 GPU hardware (e.g. NVIDIA Grace/Jetson) to verify, which hasn't
+happened yet; see `docs/ROADMAP.md`. `docker run --gpus all` against a real
+GPU (RTX 5060 Ti) has been verified for real against this Ubuntu 26.04
+baseline: all 214 tests pass in the `dev-gpu` image, and a real query
+against real generated data through the `runtime-gpu` image alone produces
+correct GPU-executed results -- see `docs/ARCHITECTURE.md`. `runtime-cpu`
+has been verified for real too: a real `docker build --target runtime-cpu`,
+`generate-data`, and `query --backend cpu` against real generated data all
+produce correct results through the built image. CI's own `docker-publish`
+job (building against the previous, pre-cpu/gpu-split Dockerfile) had
+separately succeeded end to end on real GitHub Actions; re-confirming CI
+still passes with this restructuring is still pending.
 
 ## Project layout
 

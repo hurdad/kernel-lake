@@ -39,10 +39,18 @@ std::optional<int> compare_literals(const LiteralStorage& a, const LiteralStorag
 }
 
 std::string literal_to_string(const LiteralStorage& value) {
-  if (std::holds_alternative<std::string>(value)) return "'" + std::get<std::string>(value) + "'";
-  if (std::holds_alternative<std::int64_t>(value)) return std::to_string(std::get<std::int64_t>(value));
-  if (std::holds_alternative<double>(value)) return std::to_string(std::get<double>(value));
-  if (std::holds_alternative<bool>(value)) return std::get<bool>(value) ? "TRUE" : "FALSE";
+  if (std::holds_alternative<std::string>(value)) {
+    return "'" + std::get<std::string>(value) + "'";
+  }
+  if (std::holds_alternative<std::int64_t>(value)) {
+    return std::to_string(std::get<std::int64_t>(value));
+  }
+  if (std::holds_alternative<double>(value)) {
+    return std::to_string(std::get<double>(value));
+  }
+  if (std::holds_alternative<bool>(value)) {
+    return std::get<bool>(value) ? "TRUE" : "FALSE";
+  }
   return "NULL";
 }
 
@@ -50,14 +58,20 @@ std::string literal_to_string(const LiteralStorage& value) {
 // `stats`, or nullopt if the row group must still be scanned for it.
 std::optional<std::string> predicate_proves_empty(const PushablePredicate& predicate,
                                                   const ColumnStatistics& stats) {
-  if (!stats.has_min_max) return std::nullopt;
+  if (!stats.has_min_max) {
+    return std::nullopt;
+  }
   const auto* literal_expr = dynamic_cast<const LiteralExpression*>(predicate.literal.get());
-  if (literal_expr == nullptr || literal_expr->is_null()) return std::nullopt;
+  if (literal_expr == nullptr || literal_expr->is_null()) {
+    return std::nullopt;
+  }
   const LiteralStorage& literal = literal_expr->value();
 
   const std::optional<int> cmp_min = compare_literals(stats.min_value, literal);
   const std::optional<int> cmp_max = compare_literals(stats.max_value, literal);
-  if (!cmp_min.has_value() || !cmp_max.has_value()) return std::nullopt;
+  if (!cmp_min.has_value() || !cmp_max.has_value()) {
+    return std::nullopt;
+  }
 
   std::ostringstream reason;
   reason << predicate.column_name << " " << to_string(predicate.op) << " " << literal_to_string(literal)
@@ -66,24 +80,36 @@ std::optional<std::string> predicate_proves_empty(const PushablePredicate& predi
 
   switch (predicate.op) {
     case BinaryOperator::Equal:
-      if (*cmp_min > 0 || *cmp_max < 0) return reason.str() + ": literal outside range";
+      if (*cmp_min > 0 || *cmp_max < 0) {
+        return reason.str() + ": literal outside range";
+      }
       return std::nullopt;
     case BinaryOperator::NotEqual:
       // Only provably empty when every value in the group equals the
       // literal (min == max == literal): then NotEqual rejects every row.
-      if (*cmp_min == 0 && *cmp_max == 0) return reason.str() + ": all values equal literal";
+      if (*cmp_min == 0 && *cmp_max == 0) {
+        return reason.str() + ": all values equal literal";
+      }
       return std::nullopt;
     case BinaryOperator::Less:
-      if (*cmp_min >= 0) return reason.str() + ": min >= literal";
+      if (*cmp_min >= 0) {
+        return reason.str() + ": min >= literal";
+      }
       return std::nullopt;
     case BinaryOperator::LessEqual:
-      if (*cmp_min > 0) return reason.str() + ": min > literal";
+      if (*cmp_min > 0) {
+        return reason.str() + ": min > literal";
+      }
       return std::nullopt;
     case BinaryOperator::Greater:
-      if (*cmp_max <= 0) return reason.str() + ": max <= literal";
+      if (*cmp_max <= 0) {
+        return reason.str() + ": max <= literal";
+      }
       return std::nullopt;
     case BinaryOperator::GreaterEqual:
-      if (*cmp_max < 0) return reason.str() + ": max < literal";
+      if (*cmp_max < 0) {
+        return reason.str() + ": max < literal";
+      }
       return std::nullopt;
     default:
       return std::nullopt;
@@ -100,7 +126,9 @@ ScanDecision evaluate_pruning(const FileMetadata& file, const std::vector<Pushab
     std::optional<std::string> skip_reason;
     for (const PushablePredicate& predicate : predicates) {
       const auto it = row_group.column_statistics.find(predicate.column_name);
-      if (it == row_group.column_statistics.end()) continue;
+      if (it == row_group.column_statistics.end()) {
+        continue;
+      }
       if (std::optional<std::string> reason = predicate_proves_empty(predicate, it->second)) {
         skip_reason = "row_group " + std::to_string(row_group.index) + " skipped: " + *reason;
         break;
@@ -115,7 +143,7 @@ ScanDecision evaluate_pruning(const FileMetadata& file, const std::vector<Pushab
   }
 
   if (decision.skipped_row_groups.empty() && !predicates.empty()) {
-    decision.reasons.push_back("no row groups could be proven safe to skip from available statistics");
+    decision.reasons.emplace_back("no row groups could be proven safe to skip from available statistics");
   }
 
   return decision;

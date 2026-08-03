@@ -1,5 +1,7 @@
 #include "commands.hpp"
 
+#include <fmt/format.h>
+
 #include <cstdio>
 #include <fstream>
 #include <sstream>
@@ -15,18 +17,24 @@ namespace {
 
 [[nodiscard]] std::string read_file_or_throw(const std::string& path) {
   std::ifstream stream(path);
-  if (!stream) throw ExecutionError("failed to open SQL file '" + path + "'");
+  if (!stream) {
+    throw ExecutionError(fmt::format("failed to open SQL file '{}'", path));
+  }
   std::ostringstream contents;
   contents << stream.rdbuf();
   return contents.str();
 }
 
 void print_optional(const char* label, const std::optional<std::int64_t>& value) {
-  if (value) std::fprintf(stderr, "  %s: %lld\n", label, static_cast<long long>(*value));
+  if (value) {
+    std::fprintf(stderr, "  %s: %lld\n", label, static_cast<long long>(*value));
+  }
 }
 
 void print_optional(const char* label, const std::optional<double>& value) {
-  if (value) std::fprintf(stderr, "  %s: %.6f\n", label, *value);
+  if (value) {
+    std::fprintf(stderr, "  %s: %.6f\n", label, *value);
+  }
 }
 
 void print_stats(const QueryResult& result) {
@@ -97,7 +105,9 @@ int run_query(const std::vector<std::string_view>& args, const EngineConfig& con
   try {
     const std::string query_sql = file.empty() ? sql : read_file_or_throw(file);
     EngineConfig effective_config = config;
-    if (backend_override) effective_config.engine.backend = *backend_override;
+    if (backend_override) {
+      effective_config.engine.backend = *backend_override;
+    }
     QueryEngine engine(effective_config);
 
     observability::QuerySpan span = observability::start_query_span("kernellake.query");
@@ -105,7 +115,9 @@ int run_query(const std::vector<std::string_view>& args, const EngineConfig& con
       const QueryResult result = engine.execute(query_sql);
       span.finish(result, query_sql, effective_config.engine.backend);
       write_query_result(result, *format, output_path);
-      if (show_stats) print_stats(result);
+      if (show_stats) {
+        print_stats(result);
+      }
     } catch (const KernelLakeError& e) {
       span.finish_error(e, query_sql, effective_config.engine.backend);
       throw;

@@ -58,7 +58,7 @@ class LogicalScan final : public LogicalPlanNode {
  public:
   LogicalScan(std::vector<std::string> source_paths, Schema schema)
       : source_paths_(std::move(source_paths)),
-        schema_(schema),
+        schema_(std::move(schema)),
         required_columns_(all_field_names(schema_)) {}
 
   [[nodiscard]] const std::vector<std::string>& source_paths() const noexcept { return source_paths_; }
@@ -87,7 +87,9 @@ class LogicalScan final : public LogicalPlanNode {
   static std::vector<std::string> all_field_names(const Schema& schema) {
     std::vector<std::string> names;
     names.reserve(schema.field_count());
-    for (const Field& field : schema.fields()) names.push_back(field.name);
+    for (const Field& field : schema.fields()) {
+      names.push_back(field.name);
+    }
     return names;
   }
 

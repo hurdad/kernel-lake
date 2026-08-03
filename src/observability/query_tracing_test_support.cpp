@@ -35,7 +35,9 @@ std::unique_ptr<logs_sdk::Recordable> TestLogRecordExporter::MakeRecordable() no
 
 opentelemetry::sdk::common::ExportResult TestLogRecordExporter::Export(
     const opentelemetry::nostd::span<std::unique_ptr<logs_sdk::Recordable>>& new_records) noexcept {
-  for (auto& record : new_records) records.push_back(std::move(record));
+  for (auto& record : new_records) {
+    records.push_back(std::move(record));
+  }
   return opentelemetry::sdk::common::ExportResult::kSuccess;
 }
 

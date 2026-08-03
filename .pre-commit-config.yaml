@@ -1,9 +1,18 @@
 # Optional local pre-commit hook (spec: "optional pre-commit configuration").
 # Install with: pip install pre-commit && pre-commit install
-# Only checks formatting -- clang-tidy is not wired in here since it hasn't
-# been run/verified in this repository's own development environment (see
-# docs/roadmap.md) and could produce untriaged false positives across the
-# CUDA/RAPIDS-heavy parts of the codebase.
+#
+# clang-tidy needs a real compile_commands.json (`cmake --preset dev` at
+# minimum -- CMAKE_EXPORT_COMPILE_COMMANDS is ON for every preset, see root
+# CMakeLists.txt) to already exist at build/dev before this hook can run;
+# it is scoped to build/dev's own file set (the `dev` preset -- everything
+# except src/server/, src/execution_gpu/, src/memory/rmm_environment.cpp,
+# src/api/query_engine_execute_gpu.cpp, and
+# src/observability/query_tracing_otel.cpp/query_tracing_test_support.cpp),
+# since those need the server-dev/otel-dev/gpu-dev presets built instead --
+# CI's clang-tidy/server-build-test/otel-build-test jobs cover those against
+# their own preset builds (see .github/workflows/ci.yml); a single local git
+# hook can't reasonably require every contributor to configure and build
+# three extra presets just to commit.
 repos:
   - repo: local
     hooks:
@@ -12,3 +21,17 @@ repos:
         entry: clang-format --style=file -i
         language: system
         files: \.(cpp|hpp)$
+      - id: clang-tidy
+        name: clang-tidy
+        entry: clang-tidy-18 -p build/dev -quiet --warnings-as-errors=*
+        language: system
+        files: ^src/.*\.cpp$
+        exclude: >-
+          (?x)^src/(
+            server/.* |
+            execution_gpu/.* |
+            memory/rmm_environment\.cpp |
+            api/query_engine_execute_gpu\.cpp |
+            observability/query_tracing_otel\.cpp |
+            observability/query_tracing_test_support\.cpp
+          )$

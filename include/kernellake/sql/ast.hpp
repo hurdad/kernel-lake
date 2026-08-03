@@ -34,7 +34,7 @@ struct AstColumnRef {
 // SELECT * — expanded against the FROM schema during binding.
 struct AstStar {};
 
-enum class AstLiteralKind {
+enum class AstLiteralKind : std::uint8_t {
   Integer,
   Float,
   String,
@@ -51,7 +51,7 @@ struct AstLiteral {
   bool bool_value = false;     // Boolean
 };
 
-enum class AstBinaryOp {
+enum class AstBinaryOp : std::uint8_t {
   Add,
   Subtract,
   Multiply,
@@ -72,7 +72,7 @@ struct AstBinary {
   AstExprPtr right;
 };
 
-enum class AstUnaryOp {
+enum class AstUnaryOp : std::uint8_t {
   Not,
   Negate,
   IsNull,
@@ -90,7 +90,7 @@ struct AstBetween {
   AstExprPtr upper;
 };
 
-enum class AstAggregateFunc {
+enum class AstAggregateFunc : std::uint8_t {
   Sum,
   Count,
   CountStar,

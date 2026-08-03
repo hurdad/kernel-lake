@@ -1,5 +1,7 @@
 #include "kernellake/io/physical_planner.hpp"
 
+#include <fmt/format.h>
+
 #include <algorithm>
 
 #include "kernellake/common/errors.hpp"
@@ -27,9 +29,10 @@ ExpressionPtr remap_columns(const ExpressionPtr& expr, const Schema& scan_schema
   if (const auto* column = dynamic_cast<const ColumnExpression*>(expr.get())) {
     const std::optional<std::size_t> index = scan_schema.find_field(column->name());
     if (!index) {
-      throw PlanningError("physical planner: column '" + column->name() +
-                          "' referenced above the scan but missing from its pruned column list "
-                          "(internal error)");
+      throw PlanningError(fmt::format(
+          "physical planner: column '{}' referenced above the scan but missing from its pruned column list "
+          "(internal error)",
+          column->name()));
     }
     return std::make_shared<ColumnExpression>(column->name(), *index, column->result_type());
   }
@@ -102,10 +105,16 @@ std::vector<NamedExpression> remap_named(const std::vector<NamedExpression>& ite
 // references after the join -- avoid colliding column names across joined
 // tables, or select/rename them distinctly, until this is tightened.
 const Schema* find_scan_schema(const PhysicalPlanNode& node) {
-  if (const auto* scan = dynamic_cast<const ParquetScanNode*>(&node)) return &scan->output_schema();
-  if (const auto* join = dynamic_cast<const HashJoinNode*>(&node)) return &join->output_schema();
+  if (const auto* scan = dynamic_cast<const ParquetScanNode*>(&node)) {
+    return &scan->output_schema();
+  }
+  if (const auto* join = dynamic_cast<const HashJoinNode*>(&node)) {
+    return &join->output_schema();
+  }
   for (const PhysicalPlanPtr& child : node.children()) {
-    if (const Schema* found = find_scan_schema(*child)) return found;
+    if (const Schema* found = find_scan_schema(*child)) {
+      return found;
+    }
   }
   return nullptr;
 }
@@ -114,7 +123,9 @@ PhysicalPlanPtr convert_scan(const LogicalScan& scan, ObjectStore& store) {
   const std::vector<ObjectInfo> files = discover_parquet_files(store, scan.source_paths());
   std::vector<FileMetadata> metadata;
   metadata.reserve(files.size());
-  for (const ObjectInfo& file : files) metadata.push_back(inspect_parquet_file(store, file.uri));
+  for (const ObjectInfo& file : files) {
+    metadata.push_back(inspect_parquet_file(store, file.uri));
+  }
   validate_schema_compatibility(metadata);
 
   std::vector<PhysicalFileFragment> fragments;
@@ -223,7 +234,9 @@ PhysicalPlanPtr convert(const LogicalPlanPtr& node, ObjectStore& store) {
         dynamic_cast<const LogicalJoin*>(projection->child().get()) != nullptr;
     std::vector<NamedExpression> items = projection->items();
     if (items_reference_scan_schema) {
-      if (const Schema* scan_schema = find_scan_schema(*child)) items = remap_named(items, *scan_schema);
+      if (const Schema* scan_schema = find_scan_schema(*child)) {
+        items = remap_named(items, *scan_schema);
+      }
     }
     return std::make_shared<ProjectionNode>(std::move(child), std::move(items));
   }
@@ -265,7 +278,9 @@ PhysicalPlanPtr convert(const LogicalPlanPtr& node, ObjectStore& store) {
         dynamic_cast<const LogicalJoin*>(sort->child().get()) != nullptr;
     if (keys_reference_scan_schema) {
       if (const Schema* scan_schema = find_scan_schema(*child)) {
-        for (LogicalSort::Key& key : keys) key.expr = remap_columns(key.expr, *scan_schema);
+        for (LogicalSort::Key& key : keys) {
+          key.expr = remap_columns(key.expr, *scan_schema);
+        }
       }
     }
     return std::make_shared<SortNode>(std::move(child), std::move(keys));

@@ -1,6 +1,7 @@
 #include "kernellake/execution_gpu/parquet_scan_operator.hpp"
 
 #include <cudf/io/parquet_schema.hpp>
+#include <fmt/format.h>
 
 #include <algorithm>
 
@@ -66,7 +67,7 @@ void ParquetScanOperator::open(ExecutionContext& context) {
           context.memory_resource);
     }
   } catch (const std::exception& e) {
-    throw StorageError("failed to open Parquet source for scanning: " + std::string(e.what()));
+    throw StorageError(fmt::format("failed to open Parquet source for scanning: {}", e.what()));
   }
 }
 

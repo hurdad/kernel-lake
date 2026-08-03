@@ -1,5 +1,7 @@
 #include "kernellake/execution_gpu/device_batch.hpp"
 
+#include <fmt/format.h>
+
 #include "kernellake/common/errors.hpp"
 
 namespace kernellake {
@@ -8,9 +10,9 @@ namespace {
 
 void validate(const cudf::table& table, const Schema& schema) {
   if (static_cast<std::size_t>(table.num_columns()) != schema.field_count()) {
-    throw ExecutionError("DeviceBatch column/schema mismatch: table has " +
-                         std::to_string(table.num_columns()) + " columns, schema has " +
-                         std::to_string(schema.field_count()) + " fields");
+    throw ExecutionError(
+        fmt::format("DeviceBatch column/schema mismatch: table has {} columns, schema has {} fields",
+                    table.num_columns(), schema.field_count()));
   }
 }
 

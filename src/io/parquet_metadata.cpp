@@ -1,5 +1,6 @@
 #include "kernellake/io/parquet_metadata.hpp"
 
+#include <fmt/format.h>
 #include <parquet/arrow/schema.h>
 #include <parquet/exception.h>
 #include <parquet/file_reader.h>
@@ -15,29 +16,41 @@ namespace kernellake {
 
 namespace {
 
+// Each static_cast below is a tag-checked downcast, not a blind one: the
+// switch on stats.physical_type() is exactly parquet::Statistics's own
+// discriminant for which concrete TypedStatistics<T> subclass `stats`
+// actually is (the same static_cast-after-switch idiom Parquet's own C++
+// implementation uses internally) -- dynamic_cast would add RTTI overhead
+// for a check this switch has already made redundant.
 std::optional<LiteralStorage> decode_statistic(const parquet::Statistics& stats, bool want_min) {
   switch (stats.physical_type()) {
     case parquet::Type::BOOLEAN: {
+      // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
       const auto& typed = static_cast<const parquet::BoolStatistics&>(stats);
       return LiteralStorage{want_min ? typed.min() : typed.max()};
     }
     case parquet::Type::INT32: {
+      // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
       const auto& typed = static_cast<const parquet::Int32Statistics&>(stats);
       return LiteralStorage{static_cast<std::int64_t>(want_min ? typed.min() : typed.max())};
     }
     case parquet::Type::INT64: {
+      // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
       const auto& typed = static_cast<const parquet::Int64Statistics&>(stats);
       return LiteralStorage{static_cast<std::int64_t>(want_min ? typed.min() : typed.max())};
     }
     case parquet::Type::FLOAT: {
+      // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
       const auto& typed = static_cast<const parquet::FloatStatistics&>(stats);
       return LiteralStorage{static_cast<double>(want_min ? typed.min() : typed.max())};
     }
     case parquet::Type::DOUBLE: {
+      // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
       const auto& typed = static_cast<const parquet::DoubleStatistics&>(stats);
       return LiteralStorage{want_min ? typed.min() : typed.max()};
     }
     case parquet::Type::BYTE_ARRAY: {
+      // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
       const auto& typed = static_cast<const parquet::ByteArrayStatistics&>(stats);
       const parquet::ByteArray& value = want_min ? typed.min() : typed.max();
       return LiteralStorage{std::string(reinterpret_cast<const char*>(value.ptr), value.len)};
@@ -52,10 +65,14 @@ std::optional<LiteralStorage> decode_statistic(const parquet::Statistics& stats,
 
 ColumnStatistics extract_column_statistics(const parquet::ColumnChunkMetaData& column) {
   ColumnStatistics result;
-  if (!column.is_stats_set()) return result;
+  if (!column.is_stats_set()) {
+    return result;
+  }
 
   const std::shared_ptr<parquet::Statistics> stats = column.statistics();
-  if (stats == nullptr) return result;
+  if (stats == nullptr) {
+    return result;
+  }
 
   if (stats->HasNullCount()) {
     result.has_null_count = true;
@@ -84,13 +101,14 @@ FileMetadata inspect_parquet_file(ObjectStore& store, const Uri& path) {
     reader = parquet::ParquetFileReader::Open(object->as_arrow_file());
     file_meta = reader->metadata();
   } catch (const parquet::ParquetException& e) {
-    throw StorageError("failed to read Parquet metadata for '" + path.value() + "': " + e.what());
+    throw StorageError(fmt::format("failed to read Parquet metadata for '{}': {}", path.value(), e.what()));
   }
 
   std::shared_ptr<arrow::Schema> arrow_schema;
   const arrow::Status status = parquet::arrow::FromParquetSchema(file_meta->schema(), &arrow_schema);
   if (!status.ok()) {
-    throw StorageError("failed to convert Parquet schema for '" + path.value() + "': " + status.ToString());
+    throw StorageError(
+        fmt::format("failed to convert Parquet schema for '{}': {}", path.value(), status.ToString()));
   }
 
   FileMetadata result;
@@ -119,25 +137,28 @@ FileMetadata inspect_parquet_file(ObjectStore& store, const Uri& path) {
 }
 
 void validate_schema_compatibility(const std::vector<FileMetadata>& files) {
-  if (files.size() < 2) return;
+  if (files.size() < 2) {
+    return;
+  }
   const Schema& reference = files.front().schema;
   for (std::size_t i = 1; i < files.size(); ++i) {
     const Schema& candidate = files[i].schema;
-    if (candidate.equals(reference)) continue;
+    if (candidate.equals(reference)) {
+      continue;
+    }
 
     const std::size_t common = std::min(reference.field_count(), candidate.field_count());
     for (std::size_t f = 0; f < common; ++f) {
       if (!(reference.field(f) == candidate.field(f))) {
-        throw StorageError("schema mismatch between '" + files.front().path.value() + "' and '" +
-                           files[i].path.value() + "': field " + std::to_string(f) + " is " +
-                           reference.field(f).name + " " + reference.field(f).type.to_string() + " vs " +
-                           candidate.field(f).name + " " + candidate.field(f).type.to_string());
+        throw StorageError(fmt::format("schema mismatch between '{}' and '{}': field {} is {} {} vs {} {}",
+                                       files.front().path.value(), files[i].path.value(), f,
+                                       reference.field(f).name, reference.field(f).type.to_string(),
+                                       candidate.field(f).name, candidate.field(f).type.to_string()));
       }
     }
-    throw StorageError("schema mismatch between '" + files.front().path.value() + "' and '" +
-                       files[i].path.value() + "': different column counts (" +
-                       std::to_string(reference.field_count()) + " vs " +
-                       std::to_string(candidate.field_count()) + ")");
+    throw StorageError(fmt::format(
+        "schema mismatch between '{}' and '{}': different column counts ({} vs {})",
+        files.front().path.value(), files[i].path.value(), reference.field_count(), candidate.field_count()));
   }
 }
 

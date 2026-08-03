@@ -1,40 +1,69 @@
-# Single multi-stage Dockerfile publishing two images from one source of
-# truth: `dev` (full CUDA toolkit, everything needed to iterate on
-# KernelLake) and `runtime` (only the built binary plus its actual runtime
-# shared-library closure -- no compiler, no CUDA headers, no nvcc, no static
-# libs). Build whichever you need with --target:
+# Single multi-stage Dockerfile publishing two runtime images from one
+# source of truth: `runtime-cpu` (CPU-only, no CUDA/RAPIDS -- built from the
+# `dev` preset) and `runtime-gpu` (full CUDA/RAPIDS build -- built from the
+# `gpu-dev` preset). Both ship the same two binaries (kernellake CLI,
+# kernellake-server with OpenTelemetry export) plus exactly their own
+# non-base-system shared-library closure -- no compiler, no CUDA headers,
+# no nvcc, no static libs, no source tree. The intermediate `dev-cpu`/
+# `dev-gpu` build stages (full toolchain, repo built inside them) are never
+# tagged/pushed on their own -- only `--target runtime-cpu`/`runtime-gpu`
+# are published (see .github/workflows/ci.yml's docker-publish job); build
+# either dev stage directly with --target if you want a full build
+# environment to iterate in.
 #
-#   docker build --target dev     -f docker/Dockerfile -t kernellake/kernellake:dev .
-#   docker build --target runtime -f docker/Dockerfile -t kernellake/kernellake:runtime .
-#   docker build                  -f docker/Dockerfile -t kernellake/kernellake:runtime .   # runtime is the default (last) stage
+# Currently linux/amd64 only. arm64 is a planned follow-up (see
+# docs/ROADMAP.md) -- runtime-cpu's dependency list is all plain apt
+# packages so it's likely straightforward on arm64 (Ubuntu 26.04 ships
+# arm64 builds of every package used here); runtime-gpu needs NVIDIA's
+# arm64 CUDA support (Jetson/Grace-class hardware) verified separately
+# before publishing an arm64 variant of it. The eventual goal is one
+# multi-arch manifest per tag (`docker buildx build --platform
+# linux/amd64,linux/arm64 ...`), not a separate arch-suffixed tag.
 #
-# Run either the same way (the spec's own usage example):
+#   docker build --target dev-cpu     -f docker/Dockerfile -t kernellake/kernellake:dev-cpu .
+#   docker build --target dev-gpu     -f docker/Dockerfile -t kernellake/kernellake:dev-gpu .
+#   docker build --target runtime-cpu -f docker/Dockerfile -t kernellake/kernellake:runtime-cpu .
+#   docker build --target runtime-gpu -f docker/Dockerfile -t kernellake/kernellake:runtime-gpu .
+#   docker build                      -f docker/Dockerfile -t kernellake/kernellake:runtime-cpu . # runtime-cpu is the default (last) stage
+#
+# Run either runtime image the same way (the spec's own usage example, GPU
+# variant):
 #   docker run --rm --gpus all -v /tmp/kernellake-sales:/data:ro \
-#     kernellake/kernellake:runtime query --sql "SELECT region, SUM(amount) FROM read_parquet('/data/*.parquet') GROUP BY region"
+#     kernellake/kernellake:runtime-gpu query --backend gpu --sql "SELECT region, SUM(amount) FROM read_parquet('/data/*.parquet') GROUP BY region"
 #
-# Base: plain `ubuntu:26.04`, with CUDA installed via Ubuntu's own apt
-# `nvidia-cuda-toolkit` package (12.4.1) rather than NVIDIA's official
-# `nvidia/cuda` devel/runtime images -- verified by a real `docker build`
-# and `docker run --gpus all` (a full 214/214 test pass on real hardware)
-# in this project's own development session. See docs/ARCHITECTURE.md's
-# "Ubuntu 26.04 baseline" section for why: NVIDIA's apt Flight SQL package
-# doesn't link against Ubuntu 24.04's older system Abseil, otel-cpp has no
-# 24.04 apt package at all, and both work cleanly on 26.04. RAPIDS
-# libcudf/RMM stay on the same `-cu12` pinned wheels (cmake/ThirdPartyRapids.cmake)
-# -- CUDA 12.4 is a minor step down from the previously-pinned 12.6.3, not a
-# major-version change, and needs no re-vendoring.
+# The CPU image needs no --gpus flag and defaults to the CPU backend:
+#   docker run --rm -v /tmp/kernellake-sales:/data:ro \
+#     kernellake/kernellake:runtime-cpu query --sql "SELECT region, SUM(amount) FROM read_parquet('/data/*.parquet') GROUP BY region"
+#
+# Base: plain `ubuntu:26.04`, with CUDA (runtime-gpu only) installed via
+# Ubuntu's own apt `nvidia-cuda-toolkit` package (12.4.1) rather than
+# NVIDIA's official `nvidia/cuda` devel/runtime images -- verified by a real
+# `docker build` and `docker run --gpus all` (a full 214/214 test pass on
+# real hardware) in this project's own development session. See
+# docs/ARCHITECTURE.md's "Ubuntu 26.04 baseline" section for why: NVIDIA's
+# apt Flight SQL package doesn't link against Ubuntu 24.04's older system
+# Abseil, otel-cpp has no 24.04 apt package at all, and both work cleanly
+# on 26.04. RAPIDS libcudf/RMM stay on the same `-cu12` pinned wheels
+# (cmake/ThirdPartyRapids.cmake) -- CUDA 12.4 is a minor step down from the
+# previously-pinned 12.6.3, not a major-version change, and needs no
+# re-vendoring.
 #
 # Phase 3 (docs/ROADMAP.md): also builds and ships kernellake-server
 # (KERNELLAKE_BUILD_SERVER=ON) with OpenTelemetry export enabled
 # (KERNELLAKE_ENABLE_OTEL=ON), alongside the kernellake CLI -- both
-# binaries, one image. See charts/kernellake/ for the Helm chart deploying
-# kernellake-server as a Deployment+Service on top of this image.
+# binaries, one image, same scope in runtime-cpu and runtime-gpu (they
+# differ only in whether the GPU execution backend is compiled in). See
+# charts/kernellake/ for the Helm chart deploying kernellake-server as a
+# Deployment+Service on top of these images (it picks runtime-cpu or
+# runtime-gpu based on the chart's own `backend` value).
 
 # ---------------------------------------------------------------------------
-# dev: full build environment, with the repository built inside it. Also a
-# complete, runnable image on its own (`--target dev`).
+# dev-base: everything shared between the CPU-only and GPU build
+# environments -- core toolchain, Arrow/Parquet, cloud object storage deps,
+# and kernellake-server/OpenTelemetry deps. Not a runnable image on its own
+# (no COPY of the repo, no build).
 # ---------------------------------------------------------------------------
-FROM ubuntu:26.04 AS dev
+FROM ubuntu:26.04 AS dev-base
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -70,6 +99,45 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       libxml2-dev uuid-dev \
     && rm -rf /var/lib/apt/lists/*
 
+# kernellake-server (KERNELLAKE_BUILD_SERVER) + OpenTelemetry export
+# (KERNELLAKE_ENABLE_OTEL) dependencies -- the exact same package lists
+# already verified in .github/workflows/ci.yml's server-build-test/
+# otel-build-test jobs, which run inside this same ubuntu:26.04 base.
+# libarrow-flight-dev/libarrow-flight-sql-dev come from the Arrow apt repo
+# configured above; libgrpc++-dev/protobuf-compiler-grpc/
+# opentelemetry-cpp-dev are plain Ubuntu universe packages. Needed in both
+# the CPU and GPU dev images now that both ship kernellake-server.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      libarrow-flight-dev libarrow-flight-sql-dev \
+      libgrpc++-dev protobuf-compiler-grpc \
+      opentelemetry-cpp-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# ---------------------------------------------------------------------------
+# dev-cpu: full CPU-only build environment, repo built inside it (`dev`
+# preset + BUILD_SERVER/ENABLE_OTEL, no CUDA at all). Also a complete,
+# runnable image on its own (`--target dev-cpu`).
+# ---------------------------------------------------------------------------
+FROM dev-base AS dev-cpu
+
+WORKDIR /workspace
+COPY . .
+
+RUN cmake --preset dev \
+      -DKERNELLAKE_BUILD_SERVER=ON \
+      -DKERNELLAKE_ENABLE_OTEL=ON \
+    && cmake --build --preset dev
+
+ENTRYPOINT ["/workspace/build/dev/src/cli/kernellake"]
+CMD ["--help"]
+
+# ---------------------------------------------------------------------------
+# dev-gpu: full GPU build environment, repo built inside it (`gpu-dev`
+# preset + BUILD_SERVER/ENABLE_OTEL). Also a complete, runnable image on
+# its own (`--target dev-gpu`).
+# ---------------------------------------------------------------------------
+FROM dev-base AS dev-gpu
+
 # CUDA toolkit + GPUDirect Storage headers, both from Ubuntu's own apt
 # repos. libcufile-dev is not pulled in by nvidia-cuda-toolkit itself but is
 # required by kvikio (a libcudf dependency) -- confirmed by a real
@@ -77,20 +145,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # before this line was added.
 RUN apt-get update && apt-get install -y --no-install-recommends \
       nvidia-cuda-toolkit libcufile-dev \
-    && rm -rf /var/lib/apt/lists/*
-
-# kernellake-server (KERNELLAKE_BUILD_SERVER) + OpenTelemetry export
-# (KERNELLAKE_ENABLE_OTEL) dependencies -- the exact same package lists
-# already verified in .github/workflows/ci.yml's server-build-test/
-# otel-build-test jobs, which run inside this same ubuntu:26.04 base.
-# libarrow-flight-dev/libarrow-flight-sql-dev come from the Arrow apt repo
-# configured above; libgrpc++-dev/protobuf-compiler-grpc/
-# opentelemetry-cpp-dev are plain Ubuntu universe packages, same as
-# nvidia-cuda-toolkit itself -- no additional apt source needed.
-RUN apt-get update && apt-get install -y --no-install-recommends \
-      libarrow-flight-dev libarrow-flight-sql-dev \
-      libgrpc++-dev protobuf-compiler-grpc \
-      opentelemetry-cpp-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /workspace
@@ -117,11 +171,6 @@ COPY . .
 # it doesn't have native code for (this is exactly what let the RTX 5060 Ti
 # used to verify this image, a Blackwell/sm_120 card newer than anything
 # CUDA 12.4's nvcc can target directly, run all 214 tests successfully).
-# KERNELLAKE_BUILD_SERVER/KERNELLAKE_ENABLE_OTEL are independent CMake
-# options, not tied to the gpu-dev preset's own inherited variables -- both
-# compose cleanly as extra cache-variable overrides here, no new preset
-# needed. Produces build/gpu-dev/src/server/kernellake-server alongside the
-# existing build/gpu-dev/src/cli/kernellake.
 RUN cmake --preset gpu-dev \
       -DCMAKE_CUDA_COMPILER=/usr/bin/nvcc \
       -DCMAKE_CUDA_ARCHITECTURES="70-real;75-real;80-real;86-real;89" \
@@ -133,17 +182,30 @@ ENTRYPOINT ["/workspace/build/gpu-dev/src/cli/kernellake"]
 CMD ["--help"]
 
 # ---------------------------------------------------------------------------
-# runtime-libs: not a published image (never built with --target) -- just
-# resolves both binaries' actual runtime shared-library closure (their
-# union) so the runtime stage below can copy exactly those files, without
-# hard-coding vendored library names/paths that would go stale on a
-# RAPIDS/Arrow/CUDA/gRPC/otel version bump. Only a short, fixed list of
-# glibc/libgcc basenames is excluded -- those are guaranteed present, at an
-# identical version, on any ubuntu:26.04 image (dev and runtime both build
-# FROM one), so copying them would be redundant, not a correctness concern
-# either way.
+# runtime-libs-{cpu,gpu}: not published images (never built with --target
+# directly by CI) -- just resolves both binaries' actual runtime
+# shared-library closure (their union) so the runtime-{cpu,gpu} stages
+# below can copy exactly those files, without hard-coding vendored library
+# names/paths that would go stale on a RAPIDS/Arrow/gRPC/otel version bump.
+# Only a short, fixed list of glibc/libgcc basenames is excluded -- those
+# are guaranteed present, at an identical version, on any ubuntu:26.04
+# image (every stage here builds FROM one), so copying them would be
+# redundant, not a correctness concern either way.
 # ---------------------------------------------------------------------------
-FROM dev AS runtime-libs
+FROM dev-cpu AS runtime-libs-cpu
+
+RUN mkdir -p /opt/kernellake-libs && \
+    { ldd build/dev/src/cli/kernellake; \
+      ldd build/dev/src/server/kernellake-server; } | \
+    awk '{print $3}' | grep '^/' | sort -u | \
+    while read -r lib; do \
+      case "$(basename "$lib")" in \
+        ld-linux-x86-64.so.2|libc.so.6|libm.so.6|libpthread.so.0|libdl.so.2|librt.so.1|libgcc_s.so.1|libstdc++.so.6) ;; \
+        *) cp -Ln "$lib" /opt/kernellake-libs/ 2>/dev/null || true ;; \
+      esac; \
+    done
+
+FROM dev-gpu AS runtime-libs-gpu
 
 RUN mkdir -p /opt/kernellake-libs && \
     { ldd build/gpu-dev/src/cli/kernellake; \
@@ -157,30 +219,52 @@ RUN mkdir -p /opt/kernellake-libs && \
     done
 
 # ---------------------------------------------------------------------------
-# runtime: only what's needed to run the built binaries -- plain
-# ubuntu:26.04 (the same base `dev` used, so the excluded glibc/libgcc/
+# runtime-gpu: only what's needed to run the built binaries -- plain
+# ubuntu:26.04 (the same base dev-gpu used, so the excluded glibc/libgcc/
 # libstdc++ libraries above are guaranteed to match), the two compiled
 # binaries (kernellake, kernellake-server), and exactly their combined
 # non-base-system shared library closure (CUDA runtime .so's, Arrow/
 # Parquet, RAPIDS, gRPC, opentelemetry-cpp, and every other vendored
 # dependency). No compiler, no nvcc, no CUDA headers, no static libraries,
-# no source tree. This is the default (last) stage.
+# no source tree.
 #
 # ENTRYPOINT stays the kernellake CLI, unchanged -- the README's own `docker
 # run` example still works as documented. charts/kernellake/'s Deployment
 # overrides `command` to run kernellake-server instead; one image serving
 # two purposes via command override, not two separate images.
 # ---------------------------------------------------------------------------
-FROM ubuntu:26.04 AS runtime
+FROM ubuntu:26.04 AS runtime-gpu
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates libstdc++6 \
     && rm -rf /var/lib/apt/lists/*
 
 RUN mkdir -p /opt/kernellake/bin /opt/kernellake/lib
-COPY --from=dev /workspace/build/gpu-dev/src/cli/kernellake /opt/kernellake/bin/kernellake
-COPY --from=dev /workspace/build/gpu-dev/src/server/kernellake-server /opt/kernellake/bin/kernellake-server
-COPY --from=runtime-libs /opt/kernellake-libs/ /opt/kernellake/lib/
+COPY --from=dev-gpu /workspace/build/gpu-dev/src/cli/kernellake /opt/kernellake/bin/kernellake
+COPY --from=dev-gpu /workspace/build/gpu-dev/src/server/kernellake-server /opt/kernellake/bin/kernellake-server
+COPY --from=runtime-libs-gpu /opt/kernellake-libs/ /opt/kernellake/lib/
+
+ENV LD_LIBRARY_PATH=/opt/kernellake/lib
+ENTRYPOINT ["/opt/kernellake/bin/kernellake"]
+CMD ["--help"]
+
+# ---------------------------------------------------------------------------
+# runtime-cpu: same as runtime-gpu above but from dev-cpu/runtime-libs-cpu
+# -- no CUDA/RAPIDS shared libraries in the closure at all. This is the
+# default (last) stage, matching the rest of this project treating the CPU
+# backend as the default/primary one (KERNELLAKE_WITH_CUDA is OFF by
+# default -- see root CMakeLists.txt).
+# ---------------------------------------------------------------------------
+FROM ubuntu:26.04 AS runtime-cpu
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates libstdc++6 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN mkdir -p /opt/kernellake/bin /opt/kernellake/lib
+COPY --from=dev-cpu /workspace/build/dev/src/cli/kernellake /opt/kernellake/bin/kernellake
+COPY --from=dev-cpu /workspace/build/dev/src/server/kernellake-server /opt/kernellake/bin/kernellake-server
+COPY --from=runtime-libs-cpu /opt/kernellake-libs/ /opt/kernellake/lib/
 
 ENV LD_LIBRARY_PATH=/opt/kernellake/lib
 ENTRYPOINT ["/opt/kernellake/bin/kernellake"]

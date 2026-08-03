@@ -5,6 +5,7 @@
 // QueryEngine::execute()), this file always exists alongside whichever of
 // those two is selected.
 #include <arrow/table.h>
+#include <fmt/format.h>
 
 #include <chrono>
 
@@ -18,9 +19,13 @@ namespace kernellake {
 namespace {
 
 const ParquetScanNode* find_parquet_scan(const PhysicalPlanNode& node) {
-  if (const auto* scan = dynamic_cast<const ParquetScanNode*>(&node)) return scan;
+  if (const auto* scan = dynamic_cast<const ParquetScanNode*>(&node)) {
+    return scan;
+  }
   for (const PhysicalPlanPtr& child : node.children()) {
-    if (const ParquetScanNode* found = find_parquet_scan(*child)) return found;
+    if (const ParquetScanNode* found = find_parquet_scan(*child)) {
+      return found;
+    }
   }
   return nullptr;
 }
@@ -42,10 +47,12 @@ QueryResult QueryEngine::execute_cpu(const PhysicalPlanPtr& physical) const {
     std::shared_ptr<arrow::RecordBatch> batch;
     const arrow::Status status = batch_reader.ReadNext(&batch);
     if (!status.ok()) {
-      throw ExecutionError("failed to split the CPU execution backend's result table into batches: " +
-                           status.ToString());
+      throw ExecutionError(fmt::format(
+          "failed to split the CPU execution backend's result table into batches: {}", status.ToString()));
     }
-    if (batch == nullptr) break;
+    if (batch == nullptr) {
+      break;
+    }
     result.batches.push_back(std::move(batch));
   }
 

@@ -2,6 +2,7 @@
 
 #include <arrow/api.h>
 #include <arrow/io/file.h>
+#include <fmt/format.h>
 #include <parquet/arrow/writer.h>
 
 #include <cmath>
@@ -23,9 +24,15 @@ constexpr std::int32_t kMaxEventDate = 20818;  // 2026-12-31
 constexpr std::int64_t kMicrosPerDay = 86'400'000'000;
 
 void validate(const SampleDataGeneratorOptions& options) {
-  if (options.output_dir.empty()) throw ConfigurationError("generate-data: --output is required");
-  if (options.rows <= 0) throw ConfigurationError("generate-data: --rows must be positive");
-  if (options.files <= 0) throw ConfigurationError("generate-data: --files must be positive");
+  if (options.output_dir.empty()) {
+    throw ConfigurationError("generate-data: --output is required");
+  }
+  if (options.rows <= 0) {
+    throw ConfigurationError("generate-data: --rows must be positive");
+  }
+  if (options.files <= 0) {
+    throw ConfigurationError("generate-data: --files must be positive");
+  }
   if (options.row_group_rows <= 0) {
     throw ConfigurationError("generate-data: --row-group-rows must be positive");
   }
@@ -36,7 +43,9 @@ void validate(const SampleDataGeneratorOptions& options) {
   if (options.null_rate < 0.0 || options.null_rate > 1.0) {
     throw ConfigurationError("generate-data: --null-rate must be within [0, 1]");
   }
-  if (options.skew < 0.0) throw ConfigurationError("generate-data: --skew must be non-negative");
+  if (options.skew < 0.0) {
+    throw ConfigurationError("generate-data: --skew must be non-negative");
+  }
 }
 
 // skew == 0 samples every index in [0, cardinality) uniformly; increasing
@@ -48,7 +57,9 @@ int skewed_index(std::mt19937_64& rng, int cardinality, double skew) {
   const double u = unit(rng);
   const double biased = std::pow(u, 1.0 + skew);
   int index = static_cast<int>(biased * static_cast<double>(cardinality));
-  if (index >= cardinality) index = cardinality - 1;
+  if (index >= cardinality) {
+    index = cardinality - 1;
+  }
   return index;
 }
 
@@ -88,29 +99,45 @@ std::shared_ptr<arrow::Table> generate_batch_table(const SampleDataGeneratorOpti
   arrow::Status status;
   for (std::int64_t i = 0; i < row_count; ++i) {
     status = order_id_builder.Append(first_order_id + i);
-    if (!status.ok()) throw StorageError("generate-data: " + status.ToString());
+    if (!status.ok()) {
+      throw StorageError(fmt::format("generate-data: {}", status.ToString()));
+    }
     status = customer_id_builder.Append(customer_dist(rng));
-    if (!status.ok()) throw StorageError("generate-data: " + status.ToString());
+    if (!status.ok()) {
+      throw StorageError(fmt::format("generate-data: {}", status.ToString()));
+    }
     status = region_builder.Append(
         "region-" + std::to_string(skewed_index(rng, options.region_cardinality, options.skew)));
-    if (!status.ok()) throw StorageError("generate-data: " + status.ToString());
+    if (!status.ok()) {
+      throw StorageError(fmt::format("generate-data: {}", status.ToString()));
+    }
     status = amount_builder.Append(amount_dist(rng));
-    if (!status.ok()) throw StorageError("generate-data: " + status.ToString());
+    if (!status.ok()) {
+      throw StorageError(fmt::format("generate-data: {}", status.ToString()));
+    }
     const std::int32_t event_date = date_dist(rng);
     status = event_date_builder.Append(event_date);
-    if (!status.ok()) throw StorageError("generate-data: " + status.ToString());
+    if (!status.ok()) {
+      throw StorageError(fmt::format("generate-data: {}", status.ToString()));
+    }
     status = event_time_builder.Append(static_cast<std::int64_t>(event_date) * kMicrosPerDay +
                                        time_of_day_dist(rng));
-    if (!status.ok()) throw StorageError("generate-data: " + status.ToString());
+    if (!status.ok()) {
+      throw StorageError(fmt::format("generate-data: {}", status.ToString()));
+    }
     status = category_builder.Append(
         "category-" + std::to_string(skewed_index(rng, options.category_cardinality, options.skew)));
-    if (!status.ok()) throw StorageError("generate-data: " + status.ToString());
+    if (!status.ok()) {
+      throw StorageError(fmt::format("generate-data: {}", status.ToString()));
+    }
     if (null_dist(rng)) {
       status = discount_builder.AppendNull();
     } else {
       status = discount_builder.Append(discount_dist(rng));
     }
-    if (!status.ok()) throw StorageError("generate-data: " + status.ToString());
+    if (!status.ok()) {
+      throw StorageError(fmt::format("generate-data: {}", status.ToString()));
+    }
   }
 
   std::shared_ptr<arrow::Array> order_id, customer_id, region, amount, event_date, event_time, category,
@@ -134,8 +161,8 @@ SampleDataGenerationResult generate_sample_data(const SampleDataGeneratorOptions
   std::error_code ec;
   fs::create_directories(options.output_dir, ec);
   if (ec) {
-    throw StorageError("generate-data: failed to create output directory '" + options.output_dir +
-                       "': " + ec.message());
+    throw StorageError(fmt::format("generate-data: failed to create output directory '{}': {}",
+                                   options.output_dir, ec.message()));
   }
 
   const std::shared_ptr<parquet::WriterProperties> writer_properties = [&] {
@@ -160,7 +187,9 @@ SampleDataGenerationResult generate_sample_data(const SampleDataGeneratorOptions
   std::int64_t next_order_id = 0;
   for (int file_index = 0; file_index < options.files; ++file_index) {
     const std::int64_t rows_this_file = base_rows_per_file + (file_index < extra_rows ? 1 : 0);
-    if (rows_this_file == 0) continue;
+    if (rows_this_file == 0) {
+      continue;
+    }
 
     const std::shared_ptr<arrow::Table> table =
         generate_batch_table(options, next_order_id, rows_this_file, rng);
@@ -173,13 +202,14 @@ SampleDataGenerationResult generate_sample_data(const SampleDataGeneratorOptions
     arrow::Result<std::shared_ptr<arrow::io::FileOutputStream>> sink =
         arrow::io::FileOutputStream::Open(file_path.string());
     if (!sink.ok()) {
-      throw StorageError("generate-data: failed to open '" + file_path.string() +
-                         "': " + sink.status().ToString());
+      throw StorageError(fmt::format("generate-data: failed to open '{}': {}", file_path.string(),
+                                     sink.status().ToString()));
     }
     const arrow::Status status = parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), *sink,
                                                             options.row_group_rows, writer_properties);
     if (!status.ok()) {
-      throw StorageError("generate-data: failed to write '" + file_path.string() + "': " + status.ToString());
+      throw StorageError(
+          fmt::format("generate-data: failed to write '{}': {}", file_path.string(), status.ToString()));
     }
 
     result.file_paths.push_back(file_path.string());

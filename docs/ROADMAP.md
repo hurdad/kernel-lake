@@ -211,32 +211,78 @@ and covered by passing tests -- not merely designed or stubbed.
   that the CUDA Toolkit and RAPIDS's vendored `nvcomp` component are
   NVIDIA proprietary SDK/EULA dependencies, not open source)
 - `.clang-format` (the whole existing C++ tree has been reformatted to
-  match and is currently clean); `.clang-tidy` config, spot-checked with a
-  real `clang-tidy-18` run against a compiled source file (one real finding,
-  34,609 non-user-code warnings correctly suppressed by `HeaderFilterRegex`)
-  but not run across the whole tree and not wired into CI yet; optional
-  `.pre-commit-config.yaml` (clang-format only)
-- `docker/Dockerfile` (single file, multi-stage, two named targets:
-  `dev` -- full CUDA devel image with the repo built inside it -- and
-  `runtime` -- only the built binary plus its actual non-system runtime
-  dependency closure, resolved via `ldd` rather than hard-coded vendored
-  paths) and `.github/workflows/ci.yml`, one workflow with four jobs in
-  dependency order: `format-check` and `cpu-build-test` (parallel,
-  CPU-only build+test on the `dev` preset) -> `tpch-tooling-smoke`
-  (`needs: cpu-build-test`; small-scale `generate_tpch.py` run plus
-  `kernellake explain` -- not `query` -- against both query files) ->
-  `docker-publish` (`needs:` all three, `if: github.event_name !=
-  'pull_request'`; builds both `docker/Dockerfile` targets and pushes
-  them to `ghcr.io/<owner>/<repo>:dev` and `:runtime`/`:latest` using
-  `GITHUB_TOKEN`). **Confirmed on real GitHub Actions infrastructure**
-  (run `30718829266`, 2026-08-01): all four jobs succeeded end to end,
-  including `docker-publish` (~10 minutes, no runner-disk issues) --
-  both images are live at `ghcr.io/hurdad/kernel-lake:dev`/`:runtime`/
-  `:latest`. Cross-workflow `needs:` isn't a GitHub Actions feature, which
-  is why this is one file rather than a separate docker-publish.yml
-  gated some other way. GPU-dependent work (the `gpu-dev` preset,
-  `tests/gpu/`, real query execution, DuckDB validation, TPC-H
-  benchmarks) is intentionally not in this workflow -- standard
+  match and is currently clean); `.clang-tidy` config, now run for real
+  across every CPU/server/otel-buildable `src/*.cpp` (`dev`, `server-dev`,
+  and `otel-dev` presets -- everything except `src/execution_gpu/`,
+  `src/memory/rmm_environment.cpp`, and
+  `src/api/query_engine_execute_gpu.cpp`, which need `gpu-dev`/real
+  libcudf/RMM not available in this environment) via a real
+  `run-clang-tidy-18` run, zero warnings after fixing every real finding
+  (233 `readability-braces-around-statements` and friends auto-fixed;
+  a genuine dead-code bug caught and fixed --
+  `LogicalPlanNode::explain_text_recursive`'s `is_root` ternary evaluated
+  to the same string on both branches, confirmed by comparing against
+  `PhysicalPlanNode`'s equivalent, which has no such branch at all; several
+  `bugprone-branch-clone`/`bugprone-optional-value-conversion` simplifications;
+  `bugprone-unchecked-optional-access` findings resolved with documented
+  NOLINTs where an invariant established elsewhere in the code already
+  guarantees safety, not blanket-suppressed; a project-wide
+  `CMAKE_CXX_SCAN_FOR_MODULES OFF` needed first, since CMake >= 3.28's
+  Ninja module-dependency-scanning flags in `compile_commands.json`
+  otherwise make every file unparseable by clang-tidy directly) and wired
+  into both CI (a standalone `clang-tidy` job plus a scoped step each in
+  `server-build-test`/`otel-build-test` for their own preset-only files)
+  and `.pre-commit-config.yaml` (now clang-format **and** clang-tidy,
+  scoped to `build/dev`'s own file set for the same reason)
+- `docker/Dockerfile` (single file, multi-stage, publishing two runtime
+  targets from shared build stages: `runtime-cpu` -- no CUDA/RAPIDS at all,
+  456 MB, built and run for real in this session -- and `runtime-gpu` --
+  full CUDA/RAPIDS closure, 2.17 GB (carried over from this same stage's
+  pre-restructuring size; its own build steps are unchanged by this
+  restructuring, just moved behind the new shared `dev-base` stage and
+  renamed, so not independently re-measured here); the `dev-cpu`/`dev-gpu`
+  build stages, 14.1 GB for the GPU one (same caveat), are
+  intermediate-only and never published) and `.github/workflows/ci.yml`,
+  one workflow with seven jobs in dependency order: `format-check` and
+  `clang-tidy` (independent lint jobs) and `cpu-build-test` (CPU-only
+  build+test on the `dev` preset) -> `tpch-tooling-smoke` (`needs:
+  cpu-build-test`; small-scale `generate_tpch.py` run plus `kernellake
+  explain` -- not `query` -- against both query files), `server-build-test`,
+  `otel-build-test` -> `docker-publish` (`needs: [format-check,
+  cpu-build-test, tpch-tooling-smoke]`, `if: github.event_name !=
+  'pull_request'`; builds `runtime-cpu`/`runtime-gpu` and pushes them to
+  `ghcr.io/<owner>/<repo>-cpu:latest` and `-gpu:latest` using
+  `GITHUB_TOKEN`). `kernel-lake-cpu:latest` is a multi-arch
+  (`linux/amd64`+`linux/arm64`) manifest via `docker buildx`
+  (`docker/setup-qemu-action`) -- every `runtime-cpu` dependency is a plain
+  apt package with a real arm64 build on Ubuntu 26.04, confirmed by a real
+  `docker buildx build --platform linux/arm64 --target runtime-cpu`
+  completing successfully (10m34s wall clock, apt installs plus ~90 C++
+  translation units including Arrow/Parquet/Flight/gRPC/OpenTelemetry
+  headers) via QEMU user-mode emulation (`tonistiigi/binfmt`) on this
+  project's own amd64 development machine, with the resulting image then
+  run for real too (`docker run --platform linux/arm64`, `--help` and
+  `uname -m` both correct) -- no arm64 hardware or CI runner was used.
+  `kernel-lake-gpu` stays `linux/amd64`-only: CUDA/
+  RAPIDS' own arm64 support (nvidia-cuda-toolkit/libcufile-dev's arm64 apt
+  packages, `cmake/ThirdPartyRapids.cmake`'s pinned `-cu12` wheels) hasn't
+  been verified, and unlike the CPU image a build-only smoke test can't
+  catch a real GPU-execution regression anyway -- that needs real arm64 GPU
+  hardware (NVIDIA Grace/Jetson), not available here (see "Not yet
+  started"). `runtime-cpu` was verified for real in this session (a real
+  `docker build`, `generate-data`, and `query --backend cpu` against real
+  generated data all produced correct output through the built image).
+  **The previous, pre-clang-tidy/pre-cpu-gpu-split version of this workflow
+  was separately confirmed on real GitHub Actions infrastructure** (run
+  `30718829266`, 2026-08-01, all four of its jobs succeeded end to end,
+  including `docker-publish` publishing `ghcr.io/hurdad/kernel-lake:dev`/
+  `:runtime`/`:latest`, ~10 minutes, no runner-disk issues) -- re-confirming
+  CI on real GitHub Actions with this session's clang-tidy/docker-split
+  changes is still pending. Cross-workflow `needs:` isn't a GitHub Actions
+  feature, which is why this is one file rather than a separate
+  docker-publish.yml gated some other way. GPU-dependent work (the
+  `gpu-dev` preset, `tests/gpu/`, real query execution, DuckDB validation,
+  TPC-H benchmarks) is intentionally not in this workflow -- standard
   GitHub-hosted runners have no GPU, and a skipped-GPU job must never be
   reported as passing; that needs a self-hosted GPU runner, not
   configured here (see "Not yet started")
@@ -487,8 +533,17 @@ and covered by passing tests -- not merely designed or stubbed.
   and a self-hosted runner must never be reachable from `pull_request`
   events (only `push` to `main`, after review) or an outside contributor
   gets code execution on the runner's owner's hardware
-- Running `clang-tidy` across the whole tree and wiring it into CI (config
-  spot-checked, not exhaustively run)
+- `linux/arm64` support for the `kernel-lake-gpu` image (CUDA/RAPIDS'
+  own arm64 apt/wheel availability unverified) -- needs real arm64 GPU
+  hardware (NVIDIA Grace/Jetson) to verify the GPU execution path at all,
+  not just a build-only smoke test, and none is available in this
+  environment; `kernel-lake-cpu` already publishes a real multi-arch
+  (`linux/amd64`+`linux/arm64`) manifest (see "Done" above)
+- Extending `run-clang-tidy-18` to `src/execution_gpu/`,
+  `src/memory/rmm_environment.cpp`, and
+  `src/api/query_engine_execute_gpu.cpp` -- needs a real `gpu-dev` build
+  (libcudf/RMM), not available in this environment; every other
+  CPU/server/otel-buildable file is now covered (see "Done" above)
 - **A three-way benchmark: KernelLake-CPU vs. KernelLake-GPU vs. PySpark**
   (Phase 2 of the CPU-backend epic; Phase 1, the CPU backend itself, is
   done -- see "Done" above). PySpark is not yet installed (`pip install

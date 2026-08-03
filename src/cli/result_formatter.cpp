@@ -4,6 +4,7 @@
 #include <arrow/csv/writer.h>
 #include <arrow/io/file.h>
 #include <arrow/ipc/writer.h>
+#include <fmt/format.h>
 
 #include <algorithm>
 #include <cstdio>
@@ -15,7 +16,7 @@ namespace kernellake::cli {
 namespace {
 
 [[nodiscard]] std::string arrow_status_message(const arrow::Status& status, std::string_view context) {
-  return std::string(context) + ": " + status.ToString();
+  return fmt::format("{}: {}", context, status.ToString());
 }
 
 // A generic scalar-to-text conversion covering every Arrow type KernelLake
@@ -23,10 +24,13 @@ namespace {
 // ToString() already renders each concrete type correctly, so there is no
 // need to hand-roll per-type formatting here.
 [[nodiscard]] std::string scalar_text(const arrow::Array& column, std::int64_t row) {
-  if (column.IsNull(row)) return "NULL";
+  if (column.IsNull(row)) {
+    return "NULL";
+  }
   arrow::Result<std::shared_ptr<arrow::Scalar>> scalar = column.GetScalar(row);
-  if (!scalar.ok())
+  if (!scalar.ok()) {
     throw ExecutionError(arrow_status_message(scalar.status(), "failed to read result value"));
+  }
   return (*scalar)->ToString();
 }
 
@@ -80,15 +84,18 @@ void write_table_format(const QueryResult& result, std::FILE* out) {
   const std::vector<std::string> headers = [&] {
     std::vector<std::string> names;
     if (result.schema) {
-      for (const std::shared_ptr<arrow::Field>& field : result.schema->fields())
+      for (const std::shared_ptr<arrow::Field>& field : result.schema->fields()) {
         names.push_back(field->name());
+      }
     }
     return names;
   }();
 
   std::vector<std::size_t> widths;
   widths.reserve(headers.size());
-  for (const std::string& header : headers) widths.push_back(header.size());
+  for (const std::string& header : headers) {
+    widths.push_back(header.size());
+  }
 
   // Column widths must span every row across every batch, so render every
   // cell to text once and keep it rather than computing widths in one pass
@@ -118,7 +125,9 @@ void write_table_format(const QueryResult& result, std::FILE* out) {
     std::fprintf(out, "%s  ", std::string(widths[col], '-').c_str());
   }
   std::fputc('\n', out);
-  for (const std::vector<std::string>& row : rows) print_row(row);
+  for (const std::vector<std::string>& row : rows) {
+    print_row(row);
+  }
 }
 
 void write_jsonl_format(const QueryResult& result, std::FILE* out) {
@@ -126,7 +135,9 @@ void write_jsonl_format(const QueryResult& result, std::FILE* out) {
     for (std::int64_t row = 0; row < batch->num_rows(); ++row) {
       std::string line = "{";
       for (int col = 0; col < batch->num_columns(); ++col) {
-        if (col > 0) line += ",";
+        if (col > 0) {
+          line += ",";
+        }
         line += "\"" + json_escape(batch->schema()->field(col)->name()) + "\":";
         const arrow::Array& column = *batch->column(col);
         if (column.IsNull(row)) {
@@ -156,14 +167,18 @@ void write_csv_format(const QueryResult& result, const std::optional<std::string
   const std::shared_ptr<arrow::io::OutputStream> sink = open_binary_sink(output_path);
   arrow::Result<std::shared_ptr<arrow::Table>> table =
       arrow::Table::FromRecordBatches(result.schema, result.batches);
-  if (!table.ok())
+  if (!table.ok()) {
     throw ExecutionError(arrow_status_message(table.status(), "failed to assemble CSV output"));
+  }
   const arrow::Status status =
       arrow::csv::WriteCSV(**table, arrow::csv::WriteOptions::Defaults(), sink.get());
-  if (!status.ok()) throw ExecutionError(arrow_status_message(status, "failed to write CSV output"));
+  if (!status.ok()) {
+    throw ExecutionError(arrow_status_message(status, "failed to write CSV output"));
+  }
   const arrow::Status close_status = sink->Close();
-  if (!close_status.ok())
+  if (!close_status.ok()) {
     throw ExecutionError(arrow_status_message(close_status, "failed to close CSV output"));
+  }
 }
 
 void write_arrow_ipc_format(const QueryResult& result, const std::optional<std::string>& output_path) {
@@ -175,7 +190,9 @@ void write_arrow_ipc_format(const QueryResult& result, const std::optional<std::
   }
   for (const std::shared_ptr<arrow::RecordBatch>& batch : result.batches) {
     const arrow::Status status = (*writer)->WriteRecordBatch(*batch);
-    if (!status.ok()) throw ExecutionError(arrow_status_message(status, "failed to write Arrow IPC batch"));
+    if (!status.ok()) {
+      throw ExecutionError(arrow_status_message(status, "failed to write Arrow IPC batch"));
+    }
   }
   const arrow::Status close_status = (*writer)->Close();
   if (!close_status.ok()) {
@@ -190,10 +207,18 @@ void write_arrow_ipc_format(const QueryResult& result, const std::optional<std::
 }  // namespace
 
 std::optional<ResultFormat> parse_result_format(std::string_view name) {
-  if (name == "table") return ResultFormat::Table;
-  if (name == "csv") return ResultFormat::Csv;
-  if (name == "jsonl") return ResultFormat::JsonLines;
-  if (name == "arrow") return ResultFormat::ArrowIpc;
+  if (name == "table") {
+    return ResultFormat::Table;
+  }
+  if (name == "csv") {
+    return ResultFormat::Csv;
+  }
+  if (name == "jsonl") {
+    return ResultFormat::JsonLines;
+  }
+  if (name == "arrow") {
+    return ResultFormat::ArrowIpc;
+  }
   return std::nullopt;
 }
 
@@ -202,16 +227,30 @@ void write_query_result(const QueryResult& result, ResultFormat format,
   switch (format) {
     case ResultFormat::Table: {
       std::FILE* out = output_path ? std::fopen(output_path->c_str(), "w") : stdout;
-      if (out == nullptr) throw ExecutionError("failed to open query result output '" + *output_path + "'");
+      // out == nullptr only when output_path was set (fopen failed): stdout
+      // is never null, so the !output_path branch above can't reach here.
+      if (out == nullptr) {
+        throw ExecutionError(fmt::format("failed to open query result output '{}'",
+                                         *output_path));  // NOLINT(bugprone-unchecked-optional-access)
+      }
       write_table_format(result, out);
-      if (output_path) std::fclose(out);
+      if (output_path) {
+        std::fclose(out);
+      }
       return;
     }
     case ResultFormat::JsonLines: {
       std::FILE* out = output_path ? std::fopen(output_path->c_str(), "w") : stdout;
-      if (out == nullptr) throw ExecutionError("failed to open query result output '" + *output_path + "'");
+      // See ResultFormat::Table's branch above: out == nullptr implies
+      // output_path was set.
+      if (out == nullptr) {
+        throw ExecutionError(fmt::format("failed to open query result output '{}'",
+                                         *output_path));  // NOLINT(bugprone-unchecked-optional-access)
+      }
       write_jsonl_format(result, out);
-      if (output_path) std::fclose(out);
+      if (output_path) {
+        std::fclose(out);
+      }
       return;
     }
     case ResultFormat::Csv:

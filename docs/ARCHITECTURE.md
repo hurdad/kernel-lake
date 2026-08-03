@@ -620,7 +620,17 @@ CMake >= 3.30.4, newer than Ubuntu 24.04's apt package (3.28.3).
 
 ### Ubuntu 26.04 baseline (`docker/Dockerfile`)
 
-`docker/Dockerfile`'s published images (`dev`/`runtime`) build on plain
+Everything in this section was verified against `docker/Dockerfile`'s
+original two-target shape (`dev`/`runtime`, GPU-enabled, the only shape
+that existed at the time). A later session split that GPU build path into
+`dev-gpu`/`runtime-gpu` and added a separate CPU-only `dev-cpu`/
+`runtime-cpu` path alongside it (see README.md's "Docker" section and
+docs/ROADMAP.md for the current shape and what's published) -- the
+`dev-gpu`/`runtime-gpu` stages are exactly this section's `dev`/`runtime`,
+renamed, with no change to their own build steps, so every fact below still
+applies to them unchanged.
+
+`docker/Dockerfile`'s GPU build path build on plain
 `ubuntu:26.04`, not Ubuntu 24.04 or NVIDIA's official `nvidia/cuda` devel/
 runtime images. This was originally a deliberate, empirically-verified
 departure from this project's own non-container development environment,

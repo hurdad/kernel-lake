@@ -1,5 +1,7 @@
 #include "kernellake/storage/file_discovery.hpp"
 
+#include <fmt/format.h>
+
 #include <algorithm>
 
 #include "kernellake/common/errors.hpp"
@@ -26,7 +28,7 @@ std::vector<ObjectInfo> discover_parquet_files(ObjectStore& store, const std::ve
     std::vector<ObjectInfo> listed = store.list(Uri(source));
     for (ObjectInfo& info : listed) {
       if (!has_parquet_extension(info.uri.value())) {
-        throw StorageError("not a Parquet file (unsupported format): '" + info.uri.value() + "'");
+        throw StorageError(fmt::format("not a Parquet file (unsupported format): '{}'", info.uri.value()));
       }
       all_files.push_back(std::move(info));
     }

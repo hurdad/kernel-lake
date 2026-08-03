@@ -5,7 +5,9 @@
 namespace kernellake {
 
 std::string LiteralExpression::to_string() const {
-  if (is_null()) return "NULL";
+  if (is_null()) {
+    return "NULL";
+  }
   return std::visit(
       [](const auto& value) -> std::string {
         using T = std::decay_t<decltype(value)>;
@@ -120,7 +122,6 @@ std::string_view to_string(AggregateFunction function) noexcept {
     case AggregateFunction::Sum:
       return "SUM";
     case AggregateFunction::Count:
-      return "COUNT";
     case AggregateFunction::CountStar:
       return "COUNT";
     case AggregateFunction::Min:

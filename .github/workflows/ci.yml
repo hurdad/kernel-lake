@@ -1,6 +1,7 @@
-# KernelLake CI. One workflow, six jobs, in dependency order:
+# KernelLake CI. One workflow, seven jobs, in dependency order:
 #
 #   format-check ------------------+
+#   clang-tidy ---------------------+
 #                                   +--> docker-publish (push to main only)
 #   cpu-build-test --+--> tpch-tooling-smoke --+
 #                     +--> server-build-test --+
@@ -8,25 +9,33 @@
 #
 # docker-publish only starts once format-check, cpu-build-test, AND
 # tpch-tooling-smoke have all succeeded (via `needs:`) -- a broken build or
-# a query file that stops parsing is never shipped as an image.
-# server-build-test/otel-build-test are independent of docker-publish's
-# gating: they exist to catch KERNELLAKE_BUILD_SERVER/KERNELLAKE_ENABLE_OTEL
-# regressions specifically (docker/Dockerfile's own `cmake --preset gpu-dev`
-# invocation turns both on unconditionally, so a failure there would also
-# break docker-publish, but these two jobs run the CPU-only server-dev/
-# otel-dev presets instead of gpu-dev, so their pass/fail is deliberately
-# independent of what docker-publish actually ships). Cross-workflow
-# `needs:` isn't a feature GitHub Actions has, which is why this is one
-# file instead of a separate docker-publish.yml gated some other way (e.g.
-# `workflow_run`, which has its own checkout/SHA gotchas).
+# a query file that stops parsing is never shipped as an image. clang-tidy
+# (like format-check) is a standalone lint job with no `needs:` of its own
+# and isn't in docker-publish's `needs:` list either -- a clang-tidy
+# regression should be visibly red on the PR/commit, same as any other job,
+# but a lint-only finding blocking the docker image specifically wasn't
+# judged worth coupling here (unlike format-check, which already gated
+# docker-publish before this job existed, so it stayed as-is rather than
+# being second-guessed). server-build-test/otel-build-test are independent
+# of docker-publish's gating: they exist to catch
+# KERNELLAKE_BUILD_SERVER/KERNELLAKE_ENABLE_OTEL regressions specifically
+# (docker/Dockerfile's own `cmake --preset gpu-dev` invocation turns both on
+# unconditionally, so a failure there would also break docker-publish, but
+# these two jobs run the CPU-only server-dev/otel-dev presets instead of
+# gpu-dev, so their pass/fail is deliberately independent of what
+# docker-publish actually ships). Cross-workflow `needs:` isn't a feature
+# GitHub Actions has, which is why this is one file instead of a separate
+# docker-publish.yml gated some other way (e.g. `workflow_run`, which has
+# its own checkout/SHA gotchas).
 #
 # Every job's underlying shell commands (apt installs, CMake presets,
 # ctest, docker buildx) mirror commands actually run and verified in this
-# repository's own development environment. All four build-and-test jobs
-# (cpu-build-test, tpch-tooling-smoke, server-build-test, otel-build-test)
-# run inside a plain `ubuntu:26.04` container (the `container:` key, on the
-# same `ubuntu-24.04` GitHub-hosted runner -- there is no `ubuntu-26.04`
-# runner label yet) rather than on the runner's own Ubuntu 24.04 directly:
+# repository's own development environment. All five build-and-test jobs
+# (clang-tidy, cpu-build-test, tpch-tooling-smoke, server-build-test,
+# otel-build-test) run inside a plain `ubuntu:26.04` container (the
+# `container:` key, on the same `ubuntu-24.04` GitHub-hosted runner --
+# there is no `ubuntu-26.04` runner label yet) rather than on the runner's
+# own Ubuntu 24.04 directly:
 # libarrow-flight-sql-dev and opentelemetry-cpp-dev have always needed
 # 26.04 (see docs/ARCHITECTURE.md's "Ubuntu 26.04 baseline" section for
 # why -- Ubuntu 24.04's system Abseil is too old, so Arrow bundles its own
@@ -67,6 +76,59 @@ jobs:
           shopt -s globstar
           files=$(find src include tests -name '*.cpp' -o -name '*.hpp')
           clang-format-18 --style=file --dry-run --Werror $files
+
+  # Covers every CPU-buildable src/*.cpp (the `dev` preset's own scope, same
+  # as cpu-build-test below) against .clang-tidy's checks (bugprone-*,
+  # performance-*, plus a handful of readability/cppcoreguidelines rules --
+  # see .clang-tidy's own comments for what's deliberately excluded and
+  # why). Needs a real build, not just `cmake --preset dev`: some included
+  # headers only exist after FetchContent/build (e.g. hsql-src), and
+  # HeaderFilterRegex still needs real Arrow/Parquet headers on disk to
+  # resolve #includes correctly while parsing each translation unit.
+  # server-build-test/otel-build-test below cover their own preset-specific
+  # extra files (src/server/*.cpp, src/observability/query_tracing_otel.cpp)
+  # in their own steps, since those need their own extra apt packages this
+  # job doesn't install. GPU-only files (src/execution_gpu/*.cpp,
+  # src/api/query_engine_execute_gpu.cpp, src/memory/rmm_environment.cpp,
+  # src/server/gpu_execution_coordinator_gpu.cpp) are excluded for the same
+  # reason the rest of this CI file never builds gpu-dev at all: no GPU/
+  # libcudf/RMM on a standard GitHub-hosted runner (see this file's
+  # top-of-file comment) -- verify those locally with a real gpu-dev build
+  # before merging a change that touches them.
+  clang-tidy:
+    runs-on: ubuntu-24.04
+    container: ubuntu:26.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install core toolchain
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build git pkg-config wget ca-certificates lsb-release gnupg \
+            python3 python3-pip \
+            libgtest-dev libbenchmark-dev libspdlog-dev nlohmann-json3-dev libyaml-cpp-dev \
+            libxml2-dev uuid-dev clang-tidy-18
+      - name: Install Apache Arrow / Parquet C++
+        run: |
+          wget -O /tmp/arrow-apt-source.deb \
+            "https://packages.apache.org/artifactory/arrow/ubuntu/apache-arrow-apt-source-latest-$(lsb_release --codename --short).deb"
+          apt-get install -y -V /tmp/arrow-apt-source.deb
+          apt-get update
+          apt-get install -y --no-install-recommends libarrow-dev libparquet-dev libarrow-dataset-dev
+      - name: Configure and build (dev preset, CPU-only)
+        run: |
+          cmake --preset dev
+          cmake --build --preset dev
+      - name: Run clang-tidy
+        run: |
+          files=$(find src -name '*.cpp' \
+            ! -path 'src/execution_gpu/*' \
+            ! -name 'query_engine_execute_gpu.cpp' \
+            ! -name 'rmm_environment.cpp' \
+            ! -path 'src/server/*' \
+            ! -name 'query_tracing_otel.cpp' \
+            ! -name 'query_tracing_test_support.cpp')
+          run-clang-tidy-18 -p build/dev -quiet -j "$(nproc)" -warnings-as-errors='*' $files
 
   cpu-build-test:
     # See this file's own top-of-file comment: plain ubuntu:26.04 (via
@@ -178,7 +240,7 @@ jobs:
             build-essential cmake ninja-build git pkg-config wget ca-certificates lsb-release gnupg \
             python3 python3-pip \
             libgtest-dev libbenchmark-dev libspdlog-dev nlohmann-json3-dev libyaml-cpp-dev \
-            libxml2-dev uuid-dev
+            libxml2-dev uuid-dev clang-tidy-18
       - name: Install Apache Arrow / Parquet / Flight SQL C++
         run: |
           wget -O /tmp/arrow-apt-source.deb \
@@ -196,6 +258,12 @@ jobs:
         run: cmake --build --preset server-dev
       - name: Test
         run: ctest --preset server-dev --output-on-failure
+      # The clang-tidy job above covers every file the `dev` preset builds;
+      # src/server/*.cpp only exists in this preset (KERNELLAKE_BUILD_SERVER),
+      # so it's checked here instead, against this job's own already-built
+      # server-dev compile_commands.json.
+      - name: Run clang-tidy (src/server -- server-dev-only files)
+        run: run-clang-tidy-18 -p build/server-dev -quiet -j "$(nproc)" -warnings-as-errors='*' src/server/*.cpp
 
   otel-build-test:
     # kernellake's OpenTelemetry integration (KERNELLAKE_ENABLE_OTEL=ON)
@@ -228,7 +296,7 @@ jobs:
             build-essential cmake ninja-build git pkg-config wget ca-certificates lsb-release gnupg \
             python3 python3-pip \
             libgtest-dev libbenchmark-dev libspdlog-dev nlohmann-json3-dev libyaml-cpp-dev \
-            libxml2-dev uuid-dev
+            libxml2-dev uuid-dev clang-tidy-18
       - name: Install Apache Arrow / Parquet C++
         run: |
           wget -O /tmp/arrow-apt-source.deb \
@@ -246,6 +314,14 @@ jobs:
         run: cmake --build --preset otel-dev
       - name: Test
         run: ctest --preset otel-dev --output-on-failure
+      # See server-build-test's own equivalent step: src/observability's
+      # OTEL-specific files only exist in this preset
+      # (KERNELLAKE_ENABLE_OTEL), so they're checked here against this job's
+      # own already-built otel-dev compile_commands.json.
+      - name: Run clang-tidy (src/observability -- otel-dev-only files)
+        run: |
+          run-clang-tidy-18 -p build/otel-dev -quiet -j "$(nproc)" -warnings-as-errors='*' \
+            src/observability/query_tracing_otel.cpp src/observability/query_tracing_test_support.cpp
 
   docker-publish:
     runs-on: ubuntu-24.04
@@ -271,9 +347,17 @@ jobs:
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache
           docker system prune -af
 
-      - name: Compute lowercase image name
+      # Two separate repositories, not one repository with :cpu/:gpu tags --
+      # kernel-lake-cpu and kernel-lake-gpu (each :latest). Only the two
+      # runtime-{cpu,gpu} targets are published; the dev-{cpu,gpu} build
+      # stages (full toolchain, source tree) are intermediate-only now (see
+      # docker/Dockerfile's own top-of-file comment) -- nothing publishes a
+      # :dev image any more.
+      - name: Compute lowercase repository base name
         id: image
-        run: echo "name=ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+        run: echo "base=ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-qemu-action@v3
 
       - uses: docker/setup-buildx-action@v3
 
@@ -284,26 +368,45 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push dev image
+      # linux/amd64,linux/arm64: every dependency runtime-cpu needs is a
+      # plain apt package with a real arm64 build on Ubuntu 26.04 (verified
+      # by a real docker buildx build --platform linux/arm64 -- runs under
+      # QEMU user-mode emulation on this project's own amd64 development
+      # machine, since no arm64 runner is available either here or on
+      # GitHub-hosted infrastructure yet). docker/build-push-action pushes
+      # one multi-arch manifest list per tag, not a separate arch-suffixed
+      # tag -- `docker pull ghcr.io/.../kernel-lake-cpu:latest` resolves to
+      # the right architecture automatically on either host.
+      - name: Build and push CPU runtime image
         uses: docker/build-push-action@v6
         with:
           context: .
           file: docker/Dockerfile
-          target: dev
+          target: runtime-cpu
+          platforms: linux/amd64,linux/arm64
           push: true
-          tags: ${{ steps.image.outputs.name }}:dev
-          cache-from: type=gha,scope=dev
-          cache-to: type=gha,mode=max,scope=dev
+          tags: ${{ steps.image.outputs.base }}-cpu:latest
+          cache-from: type=gha,scope=runtime-cpu
+          cache-to: type=gha,mode=max,scope=runtime-cpu
 
-      - name: Build and push runtime image
+      # linux/amd64 only, for now: nvidia-cuda-toolkit/libcufile-dev's own
+      # arm64 apt availability and RAPIDS libcudf/RMM's arm64 wheel support
+      # (cmake/ThirdPartyRapids.cmake's pinned `-cu12` PyPI wheels) haven't
+      # been verified for real yet -- unlike runtime-cpu above, getting this
+      # wrong can't be caught by a build-only smoke test (CUDA/RAPIDS code
+      # only actually exercises real GPU execution paths at `docker run
+      # --gpus all` time, which needs real arm64 GPU hardware, e.g. NVIDIA
+      # Grace/Jetson, to verify at all -- see docs/ROADMAP.md). Extending
+      # this to linux/amd64,linux/arm64 is a tracked follow-up once that
+      # verification happens, not an oversight.
+      - name: Build and push GPU runtime image
         uses: docker/build-push-action@v6
         with:
           context: .
           file: docker/Dockerfile
-          target: runtime
+          target: runtime-gpu
+          platforms: linux/amd64
           push: true
-          tags: |
-            ${{ steps.image.outputs.name }}:runtime
-            ${{ steps.image.outputs.name }}:latest
-          cache-from: type=gha,scope=runtime
-          cache-to: type=gha,mode=max,scope=runtime
+          tags: ${{ steps.image.outputs.base }}-gpu:latest
+          cache-from: type=gha,scope=runtime-gpu
+          cache-to: type=gha,mode=max,scope=runtime-gpu

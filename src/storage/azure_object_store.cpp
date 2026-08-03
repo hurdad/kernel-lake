@@ -1,6 +1,7 @@
 #include "kernellake/storage/azure_object_store.hpp"
 
 #include <arrow/filesystem/azurefs.h>
+#include <fmt/format.h>
 
 #include "generic_fs_object_store.hpp"
 #include "kernellake/common/errors.hpp"
@@ -47,14 +48,14 @@ std::shared_ptr<arrow::fs::FileSystem> make_azure_filesystem(const AzureSection&
     status = options.ConfigureDefaultCredential();
   }
   if (!status.ok()) {
-    throw StorageError("azure: failed to configure '" + config.credentials_kind +
-                       "' credentials: " + status.ToString());
+    throw StorageError(fmt::format("azure: failed to configure '{}' credentials: {}", config.credentials_kind,
+                                   status.ToString()));
   }
 
   const arrow::Result<std::shared_ptr<arrow::fs::AzureFileSystem>> result =
       arrow::fs::AzureFileSystem::Make(options);
   if (!result.ok()) {
-    throw StorageError("azure: failed to construct filesystem: " + result.status().ToString());
+    throw StorageError(fmt::format("azure: failed to construct filesystem: {}", result.status().ToString()));
   }
   return *result;
 }

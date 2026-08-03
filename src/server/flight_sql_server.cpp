@@ -50,7 +50,8 @@ arrow::Status ToFlightStatus(const KernelLakeError& error) {
 
 }  // namespace
 
-KernelLakeFlightSqlServer::KernelLakeFlightSqlServer(EngineConfig config) : config_(config), engine_(config) {
+KernelLakeFlightSqlServer::KernelLakeFlightSqlServer(const EngineConfig& config)
+    : config_(config), engine_(config) {
   if (config_.engine.backend == "gpu") {
     gpu_coordinator_ = std::make_unique<GpuExecutionCoordinator>(config_);
   }
@@ -78,7 +79,9 @@ arrow::Result<std::unique_ptr<flight::FlightInfo>> KernelLakeFlightSqlServer::Ge
   }
 
   std::int64_t total_records = 0;
-  for (const auto& batch : result.batches) total_records += batch->num_rows();
+  for (const auto& batch : result.batches) {
+    total_records += batch->num_rows();
+  }
 
   std::string handle;
   std::shared_ptr<arrow::Schema> schema = result.schema;

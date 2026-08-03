@@ -148,7 +148,10 @@ class ProjectionNode final : public PhysicalPlanNode {
  private:
   static Schema build_schema(const std::vector<NamedExpression>& items) {
     std::vector<Field> fields;
-    for (const NamedExpression& item : items) fields.push_back(Field{item.name, item.expr->result_type()});
+    fields.reserve(items.size());
+    for (const NamedExpression& item : items) {
+      fields.push_back(Field{item.name, item.expr->result_type()});
+    }
     return Schema(std::move(fields));
   }
   PhysicalPlanPtr child_;
@@ -177,9 +180,13 @@ class HashAggregateNode final : public PhysicalPlanNode {
   static Schema build_schema(const std::vector<NamedExpression>& group_by,
                              const std::vector<NamedExpression>& aggregates) {
     std::vector<Field> fields;
-    for (const NamedExpression& item : group_by) fields.push_back(Field{item.name, item.expr->result_type()});
-    for (const NamedExpression& item : aggregates)
+    fields.reserve(group_by.size() + aggregates.size());
+    for (const NamedExpression& item : group_by) {
       fields.push_back(Field{item.name, item.expr->result_type()});
+    }
+    for (const NamedExpression& item : aggregates) {
+      fields.push_back(Field{item.name, item.expr->result_type()});
+    }
     return Schema(std::move(fields));
   }
   PhysicalPlanPtr child_;
@@ -206,8 +213,10 @@ class ScalarAggregateNode final : public PhysicalPlanNode {
  private:
   static Schema build_schema(const std::vector<NamedExpression>& aggregates) {
     std::vector<Field> fields;
-    for (const NamedExpression& item : aggregates)
+    fields.reserve(aggregates.size());
+    for (const NamedExpression& item : aggregates) {
       fields.push_back(Field{item.name, item.expr->result_type()});
+    }
     return Schema(std::move(fields));
   }
   PhysicalPlanPtr child_;
@@ -228,7 +237,9 @@ class SortNode final : public PhysicalPlanNode {
   [[nodiscard]] std::vector<std::pair<std::string, std::string>> explain_attributes() const override {
     std::string rendered;
     for (std::size_t i = 0; i < keys_.size(); ++i) {
-      if (i > 0) rendered += ", ";
+      if (i > 0) {
+        rendered += ", ";
+      }
       rendered += keys_[i].expr->to_string() + (keys_[i].ascending ? " ASC" : " DESC");
     }
     return {{"order_by", rendered}};

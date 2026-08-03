@@ -35,7 +35,7 @@ namespace kernellake {
 // pretended to be.
 class KernelLakeFlightSqlServer : public arrow::flight::sql::FlightSqlServerBase {
  public:
-  explicit KernelLakeFlightSqlServer(EngineConfig config);
+  explicit KernelLakeFlightSqlServer(const EngineConfig& config);
   ~KernelLakeFlightSqlServer() override;
 
   arrow::Result<std::unique_ptr<arrow::flight::FlightInfo>> GetFlightInfoStatement(
