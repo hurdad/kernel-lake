@@ -43,16 +43,20 @@ void ensure_compute_initialized() {
 // this reads each fragment's selected row groups fully into memory, so this
 // backend's memory footprint scales with input size rather than being
 // bounded -- a real, documented MVP simplification for this phase.
-std::shared_ptr<arrow::Table> read_scan_table(const ParquetScanNode& scan) {
+std::shared_ptr<arrow::Table> read_scan_table(const ParquetScanNode& scan, ObjectStore& store) {
   const std::vector<std::string>& columns = scan.columns();
   std::vector<std::shared_ptr<arrow::RecordBatch>> all_batches;
   std::shared_ptr<arrow::Schema> table_schema;
 
   for (const PhysicalFileFragment& fragment : scan.fragments()) {
+    // store.open() itself already throws StorageError on failure to open;
+    // Open() below can still throw parquet::ParquetException separately for
+    // malformed/corrupt Parquet content once bytes are flowing, same as
+    // src/io/parquet_metadata.cpp's inspect_parquet_file().
     std::unique_ptr<parquet::ParquetFileReader> raw_reader;
     try {
-      raw_reader = parquet::ParquetFileReader::OpenFile(fragment.file.value());
-    } catch (const std::exception& e) {
+      raw_reader = parquet::ParquetFileReader::Open(store.open(fragment.file)->as_arrow_file());
+    } catch (const parquet::ParquetException& e) {
       throw StorageError("failed to open Parquet file '" + fragment.file.value() +
                          "' for CPU scan: " + e.what());
     }
@@ -175,15 +179,15 @@ arrow::compute::Aggregate translate_aggregate(const AggregateExpression& aggrega
   throw ExecutionError("unreachable: unknown AggregateFunction in CPU execution backend");
 }
 
-arrow::acero::Declaration translate(const PhysicalPlanPtr& node) {
+arrow::acero::Declaration translate(const PhysicalPlanPtr& node, ObjectStore& store) {
   if (const auto* scan = dynamic_cast<const ParquetScanNode*>(node.get())) {
     return arrow::acero::Declaration{"table_source",
-                                     arrow::acero::TableSourceNodeOptions{read_scan_table(*scan)}};
+                                     arrow::acero::TableSourceNodeOptions{read_scan_table(*scan, store)}};
   }
   if (const auto* filter = dynamic_cast<const FilterNode*>(node.get())) {
     return arrow::acero::Declaration{
         "filter",
-        {translate(filter->child())},
+        {translate(filter->child(), store)},
         arrow::acero::FilterNodeOptions{compile_expression_cpu(*filter->predicate())}};
   }
   if (const auto* projection = dynamic_cast<const ProjectionNode*>(node.get())) {
@@ -197,7 +201,7 @@ arrow::acero::Declaration translate(const PhysicalPlanPtr& node) {
     }
     return arrow::acero::Declaration{
         "project",
-        {translate(projection->child())},
+        {translate(projection->child(), store)},
         arrow::acero::ProjectNodeOptions{std::move(expressions), std::move(names)}};
   }
   if (const auto* hash_aggregate = dynamic_cast<const HashAggregateNode*>(node.get())) {
@@ -217,7 +221,7 @@ arrow::acero::Declaration translate(const PhysicalPlanPtr& node) {
     }
     return arrow::acero::Declaration{
         "aggregate",
-        {translate(hash_aggregate->child())},
+        {translate(hash_aggregate->child(), store)},
         arrow::acero::AggregateNodeOptions{std::move(aggregates), std::move(keys)}};
   }
   if (const auto* scalar_aggregate = dynamic_cast<const ScalarAggregateNode*>(node.get())) {
@@ -231,7 +235,7 @@ arrow::acero::Declaration translate(const PhysicalPlanPtr& node) {
       aggregates.push_back(translate_aggregate(*aggregate, item.name, /*grouped=*/false));
     }
     return arrow::acero::Declaration{"aggregate",
-                                     {translate(scalar_aggregate->child())},
+                                     {translate(scalar_aggregate->child(), store)},
                                      arrow::acero::AggregateNodeOptions{std::move(aggregates), {}}};
   }
   if (const auto* sort = dynamic_cast<const SortNode*>(node.get())) {
@@ -249,15 +253,16 @@ arrow::acero::Declaration translate(const PhysicalPlanPtr& node) {
     }
     return arrow::acero::Declaration{
         "order_by",
-        {translate(sort->child())},
+        {translate(sort->child(), store)},
         arrow::acero::OrderByNodeOptions{arrow::compute::Ordering{std::move(keys)}}};
   }
   if (const auto* limit = dynamic_cast<const LimitNode*>(node.get())) {
-    return arrow::acero::Declaration{
-        "fetch", {translate(limit->child())}, arrow::acero::FetchNodeOptions{/*offset=*/0, limit->limit()}};
+    return arrow::acero::Declaration{"fetch",
+                                     {translate(limit->child(), store)},
+                                     arrow::acero::FetchNodeOptions{/*offset=*/0, limit->limit()}};
   }
   if (const auto* arrow_result = dynamic_cast<const ArrowResultNode*>(node.get())) {
-    return translate(arrow_result->child());
+    return translate(arrow_result->child(), store);
   }
   throw PlanningError("physical plan node '" + std::string(node->node_name()) +
                       "' is not yet supported by the CPU execution backend (e.g. HashJoin isn't yet) -- see "
@@ -266,11 +271,11 @@ arrow::acero::Declaration translate(const PhysicalPlanPtr& node) {
 
 }  // namespace
 
-CpuQueryExecutionResult execute_physical_plan_cpu(const PhysicalPlanPtr& physical) {
+CpuQueryExecutionResult execute_physical_plan_cpu(const PhysicalPlanPtr& physical, ObjectStore& store) {
   ensure_compute_initialized();
   const auto start = std::chrono::steady_clock::now();
 
-  const arrow::acero::Declaration declaration = translate(physical);
+  const arrow::acero::Declaration declaration = translate(physical, store);
   const arrow::Result<std::shared_ptr<arrow::Table>> table_result =
       arrow::acero::DeclarationToTable(declaration);
   if (!table_result.ok()) {

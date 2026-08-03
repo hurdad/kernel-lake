@@ -11,7 +11,7 @@ namespace kernellake::cli {
 // the subcommand name itself) and returns a process exit code. Errors are
 // reported to stderr with a "kernellake <command>: " prefix; nothing is
 // printed to stdout on failure.
-int run_inspect_parquet(const std::vector<std::string_view>& args);
+int run_inspect_parquet(const std::vector<std::string_view>& args, const EngineConfig& config);
 
 int run_explain(const std::vector<std::string_view>& args, const EngineConfig& config);
 

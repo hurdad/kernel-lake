@@ -15,6 +15,7 @@ add_library(kernellake_execution STATIC
   sort_operator.cpp
   hash_join_operator.cpp
   operator_builder.cpp
+  object_store_datasource.cpp
 )
 
 target_include_directories(kernellake_execution PUBLIC
@@ -28,6 +29,7 @@ target_link_libraries(kernellake_execution PUBLIC
   kernellake_types
   kernellake_expression
   kernellake_planner
+  kernellake_storage
   CUDA::cudart
   rmm::rmm
   cudf::cudf

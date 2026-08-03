@@ -5,11 +5,16 @@
 
 #include "kernellake/execution/operator.hpp"
 #include "kernellake/planner/physical_plan.hpp"
+#include "kernellake/storage/object_store.hpp"
 
 namespace kernellake {
 
 // Converts an optimized PhysicalPlan into a tree of concrete
 // PhysicalOperator instances, ready for open()/next()/close().
+//
+// `store` resolves each ParquetScanNode's fragments to bytes (local, S3,
+// GCS, or Azure -- see ParquetScanOperator's own docs); it must outlive the
+// returned operator tree.
 //
 // `pass_read_limit_bytes` (0 = unlimited) is forwarded to
 // ParquetScanOperator to bound its per-pass decompression memory; see that
@@ -23,6 +28,7 @@ namespace kernellake {
 // ProfilingSection::nvtx) -- this is generic instrumentation, not something
 // any individual operator implements itself.
 [[nodiscard]] std::unique_ptr<PhysicalOperator> build_operator_tree(const PhysicalPlanPtr& plan,
+                                                                    ObjectStore& store,
                                                                     std::size_t pass_read_limit_bytes,
                                                                     bool nvtx_enabled = false);
 

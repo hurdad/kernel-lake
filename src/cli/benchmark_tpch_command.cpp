@@ -16,7 +16,7 @@
 #include "kernellake/api/query_engine.hpp"
 #include "kernellake/common/errors.hpp"
 #include "kernellake/storage/file_discovery.hpp"
-#include "kernellake/storage/local_object_store.hpp"
+#include "kernellake/storage/object_store_registry.hpp"
 
 namespace kernellake::cli {
 
@@ -144,7 +144,7 @@ int run_benchmark_tpch(const std::vector<std::string_view>& args, const EngineCo
   try {
     const std::string sql = strip_comments_and_substitute(read_file_or_throw(query_file), data);
 
-    LocalObjectStore store;
+    ObjectStoreRegistry store(config.storage);
     const std::vector<ObjectInfo> files = discover_parquet_files(store, {data});
     if (files.empty()) {
       std::fprintf(stderr, "kernellake benchmark tpch: no Parquet files matched '%s'\n", data.c_str());

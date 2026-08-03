@@ -1,5 +1,10 @@
 #pragma once
 
+#include <arrow/filesystem/azurefs.h>
+#include <arrow/filesystem/gcsfs.h>
+#include <arrow/filesystem/hdfs.h>
+#include <arrow/filesystem/s3fs.h>
+
 #include <cstdint>
 #include <string>
 
@@ -25,9 +30,96 @@ struct MemorySection {
   bool use_async_allocator = true;
 };
 
+// Each of these four sections embeds Arrow's own filesystem options struct
+// directly (arrow::fs::{S3,Gcs,Azure,Hdfs}Options) rather than hand-copying
+// its field list into a parallel kernellake type -- every plain-data field
+// (region, endpoint_override, scheme, timeouts, proxy_options, TLS paths,
+// bucket-creation toggles, background_writes, HDFS's connection_config,
+// etc.) is set directly on `options` and can never drift out of sync with
+// Arrow's own struct, since it *is* Arrow's own struct. A backend is never
+// "enabled" by a flag here -- ObjectStoreRegistry (src/storage) constructs
+// it lazily, the first time a query actually references a matching URI
+// scheme, and these sections only supply the settings used at that point.
+//
+// The one thing that can't be embedded this way is *credential* material:
+// Arrow deliberately keeps credential state behind private fields, settable
+// only through each Options type's own factory/Configure*() methods
+// (S3Options::Anonymous()/Defaults()/FromAccessKey()/FromAssumeRole()/
+// FromAssumeRoleWithWebIdentity(); GcsOptions::Anonymous()/FromAccessToken()/
+// FromServiceAccountCredentials(); AzureOptions::ConfigureAnonymousCredential()/
+// ConfigureAccountKeyCredential()/ConfigureSASCredential()/
+// ConfigureClientSecretCredential()/etc.) -- there is no `options.access_key`
+// field to just set. Each section below therefore keeps a small
+// `credentials_kind` selector plus the raw material for whichever kind it
+// names; the backend implementation (src/storage) calls the matching
+// factory/Configure*() method at construction time. HDFS has no such
+// split -- its connection_config (host/port/user/kerb_ticket/extra_conf) is
+// plain public data on Arrow's own struct, same as everything else.
+
+// arrow::fs::S3Options has no access-key/secret-key fields at all (by
+// design -- see credentials_kind below), so "explicit" mode reads
+// AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY/AWS_SESSION_TOKEN from the
+// environment at ObjectStore-construction time instead of from this config.
+struct S3Section {
+  arrow::fs::S3Options options;
+  // "anonymous" | "default" | "explicit" | "role" | "web_identity" (mirrors
+  // S3CredentialsKind). "role" uses options.role_arn/session_name/
+  // external_id/load_frequency (all plain fields on S3Options already);
+  // "web_identity" uses the AWS SDK's own AssumeRoleWithWebIdentity env
+  // vars (AWS_WEB_IDENTITY_TOKEN_FILE, etc.), nothing further to configure.
+  std::string credentials_kind = "default";
+};
+
+struct GcsSection {
+  arrow::fs::GcsOptions options;
+  // "anonymous" | "access_token" | "service_account_json" | "default".
+  std::string credentials_kind = "default";
+  std::string access_token;             // for "access_token"
+  std::string access_token_expiration;  // ISO-8601; pairs with access_token
+  std::string target_service_account;   // optional impersonation target
+  std::string json_credentials;         // inline JSON content, not a path; for "service_account_json"
+};
+
+struct AzureSection {
+  arrow::fs::AzureOptions options;
+  // "default" | "anonymous" | "storage_shared_key" | "sas_token" |
+  // "client_secret" | "managed_identity" | "cli" | "workload_identity" |
+  // "environment" (mirrors AzureCredentialKind).
+  std::string credentials_kind = "default";
+  std::string storage_shared_key;  // for "storage_shared_key"
+  std::string sas_token;           // for "sas_token"
+  std::string tenant_id;           // for "client_secret"
+  std::string client_id;           // for "client_secret" / "managed_identity" / "workload_identity"
+  std::string client_secret;       // for "client_secret"
+};
+
+// Config-schema-only in this pass: unlike S3/GCS/Azure, HDFS has no
+// lightweight single-container emulator for real end-to-end verification
+// (it needs a running namenode/datanode, i.e. an actual pseudo-distributed
+// Hadoop cluster) -- see docs/ROADMAP.md.
+struct HdfsSection {
+  // arrow::fs::HdfsOptions's default constructor leaves
+  // options.connection_config.port genuinely uninitialized -- unlike every
+  // other field on HdfsOptions/HdfsConnectionConfig, arrow::io::
+  // HdfsConnectionConfig::port has no default member initializer of its
+  // own (confirmed directly against /usr/include/arrow/io/hdfs.h), so a
+  // default-constructed HdfsOptions carries indeterminate value there.
+  // Fixed here so a default HdfsSection is never a source of read-
+  // uninitialized-memory (e.g. as parse_config()'s fallback default when
+  // storage.hdfs.connection_config.port isn't present in the YAML).
+  arrow::fs::HdfsOptions options{[] {
+    arrow::fs::HdfsOptions opts;
+    opts.connection_config.port = 0;
+    return opts;
+  }()};
+};
+
 struct StorageSection {
   std::string local_root = "/";
-  bool enable_s3 = false;
+  S3Section s3;
+  GcsSection gcs;
+  AzureSection azure;
+  HdfsSection hdfs;
 };
 
 struct LoggingSection {

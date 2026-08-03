@@ -1,3 +1,4 @@
+#include <arrow/filesystem/s3fs.h>
 #include <arrow/flight/server.h>
 #include <arrow/flight/types.h>
 #include <spdlog/spdlog.h>
@@ -71,6 +72,19 @@ int main(int argc, char** argv) {
   struct ObservabilityShutdownGuard {
     ~ObservabilityShutdownGuard() { kernellake::observability::shutdown(); }
   } observability_shutdown_guard;
+
+  // See src/cli/main.cpp's identical guard: S3ObjectStore lazily calls
+  // arrow::fs::EnsureS3Initialized() the first time an "s3://" URI is
+  // opened, and FinalizeS3() must run once before exit if that happened, or
+  // the AWS SDK segfaults at static-destruction time.
+  struct S3ShutdownGuard {
+    ~S3ShutdownGuard() {
+      if (arrow::fs::IsS3Initialized()) {
+        const arrow::Status status = arrow::fs::FinalizeS3();
+        if (!status.ok()) spdlog::warn("arrow::fs::FinalizeS3() failed: {}", status.ToString());
+      }
+    }
+  } s3_shutdown_guard;
 
   // Constructing the server (and, for backend == "gpu", the RmmEnvironment
   // it owns via GpuExecutionCoordinator) happens here rather than inside

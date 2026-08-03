@@ -18,3 +18,6 @@ target_link_libraries(kernellake PRIVATE
   Arrow::arrow_static
   nlohmann_json::nlohmann_json
 )
+
+# See cmake/LinkArrowBundledCloudDeps.cmake.
+kernellake_link_arrow_bundled_cloud_deps(kernellake)

@@ -9,6 +9,7 @@
 
 #include "kernellake/execution/parquet_scan_operator.hpp"
 #include "kernellake/memory/rmm_environment.hpp"
+#include "kernellake/storage/local_object_store.hpp"
 
 namespace kernellake {
 namespace {
@@ -70,7 +71,8 @@ TEST_F(ParquetScanOperatorTest, ReadsAllSelectedColumnsAndRowGroups) {
   std::vector<PhysicalFileFragment> fragments = {PhysicalFileFragment{Uri(path_), 10, 2, {0, 1}, {}, {}}};
   Schema schema({Field{"id", int64_type(false)}, Field{"amount", float64_type(false)}});
 
-  ParquetScanOperator scan(1, fragments, {"id", "amount"}, std::make_shared<const Schema>(schema));
+  LocalObjectStore store;
+  ParquetScanOperator scan(1, fragments, {"id", "amount"}, std::make_shared<const Schema>(schema), store);
   ExecutionContext context = make_context();
   scan.open(context);
 
@@ -96,7 +98,8 @@ TEST_F(ParquetScanOperatorTest, ReadsOnlySelectedRowGroup) {
       PhysicalFileFragment{Uri(path_), 10, 2, {1}, {0}, {"row_group 0 skipped: test"}}};
   Schema schema({Field{"id", int64_type(false)}});
 
-  ParquetScanOperator scan(1, fragments, {"id"}, std::make_shared<const Schema>(schema));
+  LocalObjectStore store;
+  ParquetScanOperator scan(1, fragments, {"id"}, std::make_shared<const Schema>(schema), store);
   ExecutionContext context = make_context();
   scan.open(context);
 
@@ -115,7 +118,8 @@ TEST_F(ParquetScanOperatorTest, ReadsOnlySelectedRowGroup) {
 TEST_F(ParquetScanOperatorTest, EmptyFragmentListProducesNoBatches) {
   RmmEnvironment env(default_config());
   Schema schema({Field{"id", int64_type(false)}});
-  ParquetScanOperator scan(1, {}, {"id"}, std::make_shared<const Schema>(schema));
+  LocalObjectStore store;
+  ParquetScanOperator scan(1, {}, {"id"}, std::make_shared<const Schema>(schema), store);
   ExecutionContext context = make_context();
   scan.open(context);
   EXPECT_FALSE(scan.next(context).has_value());

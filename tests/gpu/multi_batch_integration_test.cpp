@@ -118,7 +118,7 @@ TEST_F(MultiBatchIntegrationTest, ScanEmitsMultipleBatchesAcrossMismatchedFilesW
   // A few hundred bytes is far smaller than the ~550 rows' decompressed
   // size, forcing chunked_parquet_reader into many passes instead of one
   // per file.
-  ParquetScanOperator scan(1, fragments, {"region", "amount"}, std::make_shared<const Schema>(schema),
+  ParquetScanOperator scan(1, fragments, {"region", "amount"}, std::make_shared<const Schema>(schema), store,
                            /*pass_read_limit_bytes=*/256);
   ExecutionContext context = make_context();
   scan.open(context);
@@ -156,7 +156,8 @@ TEST_F(MultiBatchIntegrationTest, FullPipelineCorrectAcrossMultipleBatchesAndMis
   // this exercises the full Scan -> HashAggregate -> ArrowResult pipeline
   // (the same one QueryEngine::execute() builds) under genuine multi-batch
   // conditions instead of the common case of one batch per file.
-  const std::unique_ptr<PhysicalOperator> root = build_operator_tree(physical, /*pass_read_limit_bytes=*/256);
+  const std::unique_ptr<PhysicalOperator> root =
+      build_operator_tree(physical, store, /*pass_read_limit_bytes=*/256);
   root->open(context);
   std::map<std::string, std::pair<double, std::int64_t>> totals_by_region;
   std::int64_t rows_returned = 0;

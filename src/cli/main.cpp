@@ -1,3 +1,4 @@
+#include <arrow/filesystem/s3fs.h>
 #include <spdlog/spdlog.h>
 
 #include <cstdio>
@@ -95,6 +96,21 @@ int main(int argc, char** argv) {
     ~ObservabilityShutdownGuard() { kernellake::observability::shutdown(); }
   } observability_shutdown_guard;
 
+  // S3ObjectStore lazily calls arrow::fs::EnsureS3Initialized() (idempotent)
+  // the first time an "s3://" URI is actually opened; if that happened,
+  // arrow::fs::FinalizeS3() must run once before process exit or the AWS
+  // SDK segfaults at static-destruction time -- confirmed by an actual
+  // crash ("FinalizeS3 was not called... corrupted double-linked list")
+  // before this guard was added. A no-op if S3 was never used this run.
+  struct S3ShutdownGuard {
+    ~S3ShutdownGuard() {
+      if (arrow::fs::IsS3Initialized()) {
+        const arrow::Status status = arrow::fs::FinalizeS3();
+        if (!status.ok()) spdlog::warn("arrow::fs::FinalizeS3() failed: {}", status.ToString());
+      }
+    }
+  } s3_shutdown_guard;
+
   const std::string_view command = args[command_index];
   const std::vector<std::string_view> command_args(args.begin() + static_cast<long>(command_index) + 1,
                                                    args.end());
@@ -109,7 +125,7 @@ int main(int argc, char** argv) {
   // normal CLI error.
   try {
     if (command == "inspect-parquet") {
-      return kernellake::cli::run_inspect_parquet(command_args);
+      return kernellake::cli::run_inspect_parquet(command_args, config);
     }
     if (command == "explain") {
       return kernellake::cli::run_explain(command_args, config);

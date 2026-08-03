@@ -25,6 +25,7 @@ target_link_libraries(kernellake_execution_cpu PUBLIC
   kernellake_types
   kernellake_expression
   kernellake_planner
+  kernellake_storage
   Arrow::arrow_static
   ArrowCompute::arrow_compute_static
   ArrowAcero::arrow_acero_static

@@ -9,6 +9,7 @@ add_executable(kernellake_unit_tests
   logical_plan_test.cpp
   optimizer_test.cpp
   storage_test.cpp
+  object_store_registry_test.cpp
   parquet_metadata_test.cpp
   physical_planner_test.cpp
   query_engine_test.cpp
@@ -32,6 +33,11 @@ target_link_libraries(kernellake_unit_tests PRIVATE
   GTest::gtest
   GTest::gtest_main
 )
+
+# See cmake/LinkArrowBundledCloudDeps.cmake for why this is needed: config.hpp
+# unconditionally pulls in Arrow's GCS/Azure filesystem support, which needs
+# extra Abseil symbols plus libxml2/libuuid that a plain link can't resolve.
+kernellake_link_arrow_bundled_cloud_deps(kernellake_unit_tests)
 
 if(KERNELLAKE_BUILD_SERVER)
   # See src/server/CMakeLists.txt's comment on why this needs a raw

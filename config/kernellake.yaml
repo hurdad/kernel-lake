@@ -11,7 +11,37 @@ memory:
 
 storage:
   local_root: /
-  enable_s3: false
+  # A backend is never "enabled" by a flag -- it's constructed the first
+  # time a query references a matching URI scheme ("s3://", "gs://",
+  # "abfs://"). Every field below is optional; empty/unset means "use that
+  # provider's own default" (real AWS S3/GCS/Azure, default credential
+  # chain). See include/kernellake/common/config.hpp for full field docs --
+  # these sections mirror Arrow's own S3Options/GcsOptions/AzureOptions/
+  # HdfsOptions field-for-field.
+  s3:
+    credentials_kind: default  # anonymous | default | explicit | role | web_identity
+    region: ""
+    endpoint_override: ""      # e.g. "localhost:9000" for MinIO
+    scheme: https               # https | http -- MinIO w/o TLS needs http
+    tls_verify_certificates: true
+  gcs:
+    credentials_kind: default  # anonymous | default | access_token | service_account_json
+    endpoint_override: ""      # e.g. "localhost:4443" for fake-gcs-server
+    scheme: https               # https | http -- the emulator needs http
+  azure:
+    credentials_kind: default  # default | anonymous | storage_shared_key | sas_token |
+                                # client_secret | managed_identity | cli | workload_identity | environment
+    account_name: ""
+    blob_storage_authority: .blob.core.windows.net  # e.g. "127.0.0.1:10000" for Azurite
+    dfs_storage_authority: .dfs.core.windows.net    # e.g. "127.0.0.1:10001" for Azurite
+    blob_storage_scheme: https  # https | http -- Azurite needs http
+    dfs_storage_scheme: https
+  # HDFS: config schema only in this pass (no lightweight local emulator
+  # for real verification, see docs/ROADMAP.md).
+  hdfs:
+    connection_config:
+      host: ""
+      port: 0
 
 logging:
   level: info

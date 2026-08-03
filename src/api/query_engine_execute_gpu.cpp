@@ -78,7 +78,7 @@ QueryResult QueryEngine::execute(const PhysicalPlanPtr& physical, RmmEnvironment
   // projection/aggregation intermediates above the scan itself.
   const std::size_t pass_read_limit_bytes = config_.memory.pool_max_bytes / 2;
   const std::unique_ptr<PhysicalOperator> root =
-      build_operator_tree(physical, pass_read_limit_bytes, config_.profiling.nvtx);
+      build_operator_tree(physical, store_, pass_read_limit_bytes, config_.profiling.nvtx);
 
   QueryResult result;
   std::int64_t rows_returned = 0;

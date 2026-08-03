@@ -9,7 +9,7 @@
 #include "kernellake/common/config.hpp"
 #include "kernellake/planner/logical_plan.hpp"
 #include "kernellake/planner/physical_plan.hpp"
-#include "kernellake/storage/local_object_store.hpp"
+#include "kernellake/storage/object_store_registry.hpp"
 #include "kernellake/types/schema.hpp"
 
 namespace arrow {
@@ -122,7 +122,10 @@ class QueryEngine {
                                             double* metadata_inspection_seconds_out = nullptr) const;
 
   EngineConfig config_;
-  mutable LocalObjectStore store_;
+  // Declared after config_ (member init order follows declaration order):
+  // ObjectStoreRegistry keeps a reference to config_.storage, valid for
+  // QueryEngine's whole lifetime since both are members of the same object.
+  mutable ObjectStoreRegistry store_;
 };
 
 }  // namespace kernellake

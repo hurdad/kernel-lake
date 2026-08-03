@@ -725,29 +725,40 @@ produced correct, GPU-executed results (`gpu_execution_seconds` and
 local run).
 
 **Update, found during Phase 3 verification (see "Docker image and Helm
-chart" below): this no longer reproduces on the same RTX 5060 Ti.** A
-later `docker run --gpus all` smoke test on the same physical machine
-returned `0` rows for a real `COUNT(*)` against a real 5000-row Parquet
-file on the GPU backend -- silently wrong, not an error -- while the
-identical query against the identical file returned the correct `5000` on
-the CPU backend. Reproduced outside Docker too, against the plain local
-`build/gpu-dev/src/cli/kernellake` binary. Root cause: `nvcc --version`
-on this host is CUDA 12.4.131, and CUDA support for Blackwell/`sm_120`
-(this RTX 5060 Ti's real compute capability, confirmed via `nvidia-smi
---query-gpu=compute_cap`) wasn't added until CUDA 12.8 -- so neither
-native SASS nor a JIT-compilable PTX for this GPU's actual architecture
-exists in a CUDA-12.4-built binary, and whatever in the RMM/cudf/kernel-
-launch path hits that mismatch is failing silently rather than raising.
-Whether the "verified for real" claim above was accurate at the time (a
-different driver/toolkit combination, since updated) or the GPU test
-suite's assertions simply don't catch a silently-empty result the way an
-ADBC round trip against generated data does is not yet root-caused --
-tracked as its own open item, see `docs/ROADMAP.md`, "Not yet started".
-Not a regression introduced by Phase 3's own changes (Phase 3 touches
-neither `CMAKE_CUDA_ARCHITECTURES` nor any GPU execution code); found
-incidentally while smoke-testing the Phase 3 Docker/Helm work on real
-hardware, and left as a real, disclosed gap rather than silently patched
-over or ignored.
+chart" below), root-caused after an initial wrong guess.** A `docker run
+--gpus all` smoke test on this same RTX 5060 Ti returned `0` rows for a
+real `COUNT(*)` against a real 5000-row Parquet file on the GPU backend --
+silently wrong, not an error. The first hypothesis (a CUDA
+12.4-toolkit/Blackwell-`sm_120` architecture mismatch, since this GPU's
+real compute capability postdates what CUDA 12.4's `nvcc` can target) was
+tested directly and **ruled out**: `COUNT(order_id)`, `SUM(order_id)`, and
+a bare `SELECT order_id` all return correct results on the same GPU
+backend against the same file, which a genuine architecture/JIT failure
+would not allow. The actual root cause is unrelated to CUDA architecture
+at all -- it is column pruning. `SELECT COUNT(*) FROM read_parquet(...)`
+with no other column reference anywhere in the query (no `WHERE`, no
+`GROUP BY`, no join) legitimately produces an empty
+`LogicalScan::required_columns()` from `src/optimizer/optimizer.cpp`'s
+column-pruning pass -- correct in principle, since `COUNT(*)` needs no
+column data, only a row count. `ParquetScanOperator::next()`
+(`src/execution/parquet_scan_operator.cpp`) then gates on
+`result.tbl->num_rows() > 0`, but a `cudf::table` with zero columns
+selected has no column to derive a row count from, so `num_rows()` reads
+`0` regardless of how many rows the underlying row groups actually
+contain -- every chunk is treated as empty, and the scan silently
+produces no batches at all. The CPU/Acero backend does not have this bug:
+`arrow::RecordBatch` (`src/execution_cpu/acero_query_executor.cpp`)
+tracks row count independently of its columns, so an empty
+`column_indices` selection there still reports the correct row count.
+Confirmed this was never actually exercised by the existing GPU test
+suite: every `COUNT(*)` test case in `tests/gpu/` also references another
+column via a `GROUP BY`, `WHERE`, or join key, so `required_columns()`
+was never empty in any tested case -- a bare, columnless `COUNT(*)` is a
+genuinely untested query shape, not a regression in previously-verified
+behavior. Fix and further detail tracked in `docs/ROADMAP.md`, "Not yet
+started". Not caused by Phase 3's own changes (Phase 3 touches neither
+the optimizer nor `ParquetScanOperator`); found incidentally while
+smoke-testing the Phase 3 Docker/Helm work on real hardware.
 
 **`runtime` stage's shared-library closure.** `runtime-libs`'s `ldd`-based
 closure (used to avoid hard-coding vendored library names/paths that would
@@ -1077,9 +1088,11 @@ piping every numeric value (`batch_rows`, `result_batch_rows`,
   network and ran a real `COUNT(*)` (correct: `5000`) and a real `GROUP
   BY region` (correct per-region counts) through the actual Flight SQL
   server running inside the container. GPU backend was also smoke-tested
-  through the same container and returned incorrect results -- see the
-  update appended to "Ubuntu 26.04 baseline" above; a pre-existing,
-  unrelated bug, not caused by this phase's changes.
+  through the same container and returned an incorrect `COUNT(*)` -- see
+  the update appended to "Ubuntu 26.04 baseline" above for the real,
+  root-caused explanation (a column-pruning bug specific to bare,
+  columnless `COUNT(*)`, unrelated to CUDA/GPU architecture); a
+  pre-existing engine bug, not caused by this phase's changes.
 - `helm lint charts/kernellake` clean; `helm template` for all three
   meaningfully different value combinations (defaults/CPU, `--set
   backend=gpu`, `--set observability.enabled=true`) renders without error
@@ -1089,6 +1102,202 @@ piping every numeric value (`batch_rows`, `result_batch_rows`,
   require a live API server for resource-kind discovery even with
   `--validate=false`, so it wasn't usable here) reported `Valid: 3,
   Invalid: 0, Errors: 0`.
+
+### Cloud object storage (S3, GCS, Azure)
+
+Phase 4 of the Flight SQL/otel-cpp/Helm-chart/cloud-storage epic (Phases
+0-3, all above, done). `read_parquet(...)` previously only worked against
+local filesystem paths; it now also accepts `s3://`, `gs://`/`gcs://`, and
+`abfs://`/`abfss://`/`az://` URIs, dispatched by scheme, transparently to
+every existing call site (CLI `query`/`explain`/`inspect-parquet`/
+`benchmark tpch`, `kernellake-server`, both the GPU and CPU execution
+backends) -- no new flag or backend selection needed beyond the URI itself
+and the matching `storage.s3`/`.gcs`/`.azure` config section.
+
+**Design**: `include/kernellake/storage/object_store.hpp`'s existing
+`ObjectStore`/`Uri`/`RandomAccessObject` abstraction (already
+backend-agnostic; `LocalObjectStore` was its only implementation before
+this phase) gained three new implementations --
+`S3ObjectStore`/`GcsObjectStore`/`AzureObjectStore`
+(`src/storage/{s3,gcs,azure}_object_store.cpp`), each a thin wrapper around
+the matching `arrow::fs::{S3,Gcs,Azure}FileSystem` -- plus
+`ObjectStoreRegistry` (`src/storage/object_store_registry.cpp`), a
+scheme-dispatching composite that itself implements `ObjectStore` and owns
+a `LocalObjectStore` plus lazily-constructed cloud backends, keyed by
+`Uri::scheme()`. A backend is never "enabled" by a config flag -- it's
+constructed the first time a query actually references a matching scheme.
+`ObjectStoreRegistry` replaced `QueryEngine`'s previous concrete
+`LocalObjectStore store_` member with no interface change at any call
+site, since it satisfies the same `ObjectStore` interface.
+
+**Config** (`S3Section`/`GcsSection`/`AzureSection`/`HdfsSection` in
+`include/kernellake/common/config.hpp`) embeds Arrow's own filesystem
+options structs directly (`arrow::fs::S3Options`/`GcsOptions`/
+`AzureOptions`/`HdfsOptions`) as the `options` member, rather than
+hand-copying their field lists into a parallel type -- every plain-data
+field (region, endpoint_override, scheme, timeouts, proxy_options, TLS
+paths, HDFS's connection_config, etc.) is set directly on `options` and can
+never drift out of sync with Arrow's own struct, since it *is* Arrow's own
+struct. The one thing that can't be embedded this way is credential
+material: Arrow deliberately keeps it behind private fields, settable only
+through each Options type's own factory/`Configure*()` methods
+(`S3Options::Anonymous()`/`Defaults()`/`FromAccessKey()`/
+`FromAssumeRole()`/`FromAssumeRoleWithWebIdentity()`;
+`GcsOptions::Anonymous()`/`FromAccessToken()`/
+`FromServiceAccountCredentials()`; `AzureOptions::
+ConfigureAnonymousCredential()`/`ConfigureAccountKeyCredential()`/
+`ConfigureSASCredential()`/`ConfigureClientSecretCredential()`/etc.) -- so
+each section keeps a small `credentials_kind` selector (mirroring the
+S3CredentialsKind/AzureCredentialKind-style enums this config schema was
+modeled on) plus the raw material for whichever kind it names; the
+matching `*ObjectStore` constructor calls the right factory/`Configure*()`
+method. S3's `credentials_kind: explicit` deliberately has no raw key
+fields in config at all -- it reads `AWS_ACCESS_KEY_ID`/
+`AWS_SECRET_ACCESS_KEY`/`AWS_SESSION_TOKEN` from the environment instead,
+so secrets never need to live in a config file. `HdfsSection` is
+config-schema-only in this phase (see Non-goals below).
+
+**GPU scan path** (`ParquetScanOperator`, `src/execution/
+parquet_scan_operator.cpp`): local-scheme fragments keep cudf's own
+`source_info(file_paths)` local-path constructor completely unchanged (no
+added indirection for the common case). Any fragment with a non-local
+scheme routes through a new `ObjectStoreDatasource`
+(`src/execution/object_store_datasource.cpp`), a `cudf::io::datasource`
+subclass wrapping whatever `ObjectStore::open()` returned (local, S3, GCS,
+or Azure -- this class doesn't know or care which), implementing the 3
+required pure virtuals (`size()`, both `host_read()` overloads) via
+`arrow::io::RandomAccessFile::ReadAt()`. cudf's chunked reader is
+constructed via its owning-datasource overload
+(`chunked_parquet_reader(chunk_read_limit, pass_read_limit_bytes,
+std::vector<std::unique_ptr<datasource>>&&, ...)`) instead of the
+`source_info`-based one. This preserves the operator's own bounded-memory
+pass-budgeted streaming for cloud sources too -- `host_read()` is called by
+cudf in bounded pieces driven by `pass_read_limit_bytes`, so nothing
+pre-loads a whole S3/GCS/Azure object into host memory at once. `ObjectStore&`
+is threaded through `build_operator_tree()`/`ParquetScanOperator`'s
+constructor from `QueryEngine::store_`, the same registry instance used
+for planning.
+
+**CPU scan path** (`src/execution_cpu/acero_query_executor.cpp`): a
+drop-in fix -- `read_scan_table()`'s `parquet::ParquetFileReader::
+OpenFile(path)` (local-path-only) became `parquet::ParquetFileReader::
+Open(store.open(fragment.file)->as_arrow_file())`, the exact factory
+method `src/io/parquet_metadata.cpp`'s `inspect_parquet_file()` (Parquet
+metadata reads, unaffected by this phase since they already went through
+`ObjectStore`) already used. `ObjectStore&` threaded through `translate()`
+and `execute_physical_plan_cpu()`.
+
+**Real, non-obvious problems found while implementing this** (each
+confirmed by an actual compiler/linker/runtime failure or crash, not
+predicted):
+
+- **GCS support needs far more of Arrow's bundled dependency closet than
+  anything this project linked before.** `libarrow_bundled_dependencies.a`
+  statically bundles google-cloud-cpp (for GCS) and the Azure SDK C++ (for
+  Azure) inside the same apt-installed `libarrow-dev` package already used
+  everywhere in this project -- but nothing previously included
+  `<arrow/filesystem/gcsfs.h>`/`<arrow/filesystem/azurefs.h>`, so none of
+  that bundled code had ever actually needed linking before. Once
+  `config.hpp` did (to embed `GcsOptions`/`AzureOptions`), every executable
+  transitively linking `kernellake_common` failed to link with pages of
+  undefined references: many more Abseil symbols
+  (`absl::debian9::StrCat`/`StrAppend`/`crc_internal::*`/etc. -- "debian9"
+  is this Ubuntu 26.04 apt package's own inline-namespace name for Abseil,
+  an ABI-stability convention, not a version number) than gRPC alone
+  needed for Flight SQL, plus two genuinely new system dependencies this
+  project never needed before: **libxml2** (Azure SDK's bundled XML
+  request/response parsing) and **libuuid** (Azure SDK's request-ID
+  generation) -- both required a real `apt-get install libxml2-dev
+  uuid-dev`, invalidating this phase's own initial plan assumption of
+  "zero extra dependencies." Fixed with a new shared CMake helper,
+  `cmake/LinkArrowBundledCloudDeps.cmake`
+  (`kernellake_link_arrow_bundled_cloud_deps(<target>)`), applied to every
+  final executable (`kernellake`, `kernellake-server`,
+  `kernellake_unit_tests`, `kernellake_gpu_tests`): a `--start-group`/
+  `--end-group` wrap around `Arrow::arrow_static` and the ~20 needed
+  `absl::*` targets (same class of issue, same fix, as
+  ArrowFlight/ArrowFlightSql vs. `gRPC::grpc++` in
+  `src/server/CMakeLists.txt`, see "Ubuntu 26.04 baseline" above), plus
+  `LibXml2::LibXml2`/`PkgConfig::UUID` wrapped in `-Wl,--no-as-needed`/
+  `--as-needed` (without which the linker drops them at the point they're
+  declared, since nothing needs their symbols *yet* at that point in the
+  link line, and never revisits them once `libarrow_bundled_dependencies.a`
+  actually does, later). Confirmed the fix works by declaring the group
+  *inside* `kernellake_common`'s own `target_link_libraries` first --
+  which did not work, since `Arrow::arrow_static` is also linked plainly
+  by several other `kernellake_*` targets, and CMake's link-line
+  flattening placed the actual `libarrow.a` reference at whatever position
+  that whole-graph ordering picked, not necessarily inside a group
+  declared on one single target -- before moving the group to each final
+  executable instead, where it reliably worked.
+- **`arrow::io::HdfsConnectionConfig::port` has no default member
+  initializer**, unlike every other field on
+  `arrow::fs::HdfsOptions`/`HdfsConnectionConfig` -- confirmed directly
+  against the installed header (`/usr/include/arrow/io/hdfs.h`) after a
+  real compile error (`error: uninitialized 'const config'
+  [-fpermissive]`) writing a `const StorageSection` in a unit test. A
+  default-constructed `HdfsOptions` therefore carries a genuinely
+  indeterminate `port` value, which would have been read as
+  `parse_config()`'s own fallback default for `storage.hdfs.
+  connection_config.port` whenever the YAML didn't set it explicitly --
+  reading uninitialized memory, not just an unset int. Fixed by explicitly
+  zero-initializing it in `HdfsSection`'s own default member initializer
+  in `config.hpp`, rather than relying on `HdfsOptions`'s own (incomplete)
+  default construction.
+- **`arrow::fs::EnsureS3Initialized()`/`FinalizeS3()` is a real, mandatory
+  AWS-SDK-global lifecycle, not optional.** `S3ObjectStore` calls
+  `EnsureS3Initialized()` lazily (via `std::call_once`, only paying the
+  cost if an `s3://` URI is actually referenced) -- but without a matching
+  `FinalizeS3()` before process exit, the CLI **segfaulted on exit** after
+  a real, successful S3 query (confirmed by an actual crash: `"FinalizeS3
+  was not called even though S3 was initialized... corrupted double-linked
+  list"`, `Segmentation fault`). Fixed with an `S3ShutdownGuard` in
+  `src/cli/main.cpp`/`src/server/main.cpp`, the same shape as the existing
+  `ObservabilityShutdownGuard` from Phase 2, checking
+  `arrow::fs::IsS3Initialized()` first so it's a no-op when S3 was never
+  used that run.
+
+**Verified for real**: `dev` (148/148, +3 new
+`tests/unit/object_store_registry_test.cpp` cases -- lazy construction
+never throws, `"file"` scheme dispatch to the real `LocalObjectStore`
+behavior, an unrecognized scheme fails fast with `StorageError` -- all
+network-free by design, see that file's own comments on why cloud-scheme
+dispatch correctness is verified separately below, not via a mocked or
+live-network unit test), `gpu-dev` (217/217), `server-dev` (150/150), and
+`otel-dev` (151/151) all pass, confirming zero regressions across every
+preset combination. Real, end-to-end smoke tests against all three real
+backends, each a locally `docker run`'able emulator (MinIO for S3,
+`fsouza/fake-gcs-server` for GCS, Azurite for Azure), covering **both**
+execution backends against each: a real 5000-row Parquet file generated by
+`kernellake generate-data`, uploaded via each provider's own Python SDK
+(`boto3`/`google-cloud-storage`/`azure-storage-blob` -- independent
+clients, not code from this project), then a real `kernellake query
+--backend cpu` and `--backend gpu` against `s3://`/`gs://`/`abfs://` URIs
+producing a `GROUP BY region` (10 groups, exact counts matching the
+known-correct local-file baseline) and a `SUM(order_id)`
+(`12497500`, exact) on every combination -- 6 backend/execution
+combinations in total, all correct, all clean exit (no crash, confirming
+the `S3ShutdownGuard` fix). `kernellake inspect-parquet` against a real
+`abfs://` URI also verified separately (full schema + row-group stats,
+matching the local-file equivalent). Deliberately used `GROUP BY`/`SUM`
+rather than a bare `COUNT(*)` for the GPU-backend checks specifically, to
+avoid conflating this phase's own verification with the separate, already
+-tracked, pre-existing bare-`COUNT(*)`-on-GPU bug (see "Not yet started"
+in `docs/ROADMAP.md`) -- this phase's own scan-path changes are unrelated
+to that bug and don't fix or worsen it.
+
+**Explicit non-goals for this pass**: write support (`read_parquet` stays
+read-only for cloud backends too, matching local); **HDFS** (compiled into
+the same Arrow build and config-schema-complete, but deliberately not
+wired to a real `HdfsObjectStore` backend -- unlike S3/GCS/Azure, it has
+no lightweight single-container emulator for real end-to-end verification,
+needing an actual pseudo-distributed Hadoop cluster instead); credential
+rotation/STS assume-role/workload-identity *flows* beyond the
+`credentials_kind` selector already exposed (the underlying Arrow
+factory/`Configure*()` calls exist and work, just not exercised beyond
+what `credentials_kind` selects); CI automation of the emulator-based
+smoke tests (manual verification only in this pass, matching how Phase
+1/2's Flight SQL/OTel manual smoke tests were never wired into CI either).
 
 ## Future architecture (interfaces only, not yet implemented)
 

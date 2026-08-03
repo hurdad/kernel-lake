@@ -5,6 +5,7 @@
 #include <memory>
 
 #include "kernellake/planner/physical_plan.hpp"
+#include "kernellake/storage/object_store.hpp"
 
 namespace kernellake {
 
@@ -31,6 +32,10 @@ struct CpuQueryExecutionResult {
 // PlanningError/ExecutionError naming the unsupported node rather than
 // silently miscompiling. See docs/ARCHITECTURE.md for the full scope and
 // the reasoning behind it.
-[[nodiscard]] CpuQueryExecutionResult execute_physical_plan_cpu(const PhysicalPlanPtr& physical);
+// `store` resolves each ParquetScanNode's fragments to bytes (local, S3,
+// GCS, or Azure -- see the GPU path's ParquetScanOperator for the same
+// split); must outlive this call.
+[[nodiscard]] CpuQueryExecutionResult execute_physical_plan_cpu(const PhysicalPlanPtr& physical,
+                                                                ObjectStore& store);
 
 }  // namespace kernellake

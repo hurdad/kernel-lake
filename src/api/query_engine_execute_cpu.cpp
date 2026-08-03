@@ -30,7 +30,7 @@ const ParquetScanNode* find_parquet_scan(const PhysicalPlanNode& node) {
 QueryResult QueryEngine::execute_cpu(const PhysicalPlanPtr& physical) const {
   const auto wall_start = std::chrono::steady_clock::now();
 
-  const CpuQueryExecutionResult cpu_result = execute_physical_plan_cpu(physical);
+  const CpuQueryExecutionResult cpu_result = execute_physical_plan_cpu(physical, store_);
 
   QueryResult result;
   result.schema = cpu_result.table->schema();

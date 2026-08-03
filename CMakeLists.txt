@@ -6,7 +6,6 @@ cmake_minimum_required(VERSION 3.29)
 option(KERNELLAKE_WITH_CUDA "Enable CUDA and GPU execution (requires CUDA toolkit, libcudf, RMM)" OFF)
 option(KERNELLAKE_BUILD_TESTS "Build unit and integration tests" ON)
 option(KERNELLAKE_BUILD_BENCHMARKS "Build microbenchmarks and TPC-H benchmarks" ON)
-option(KERNELLAKE_ENABLE_S3 "Build the optional S3 object store implementation" OFF)
 # Requires libarrow-flight-dev, libarrow-flight-sql-dev, and gRPC (see
 # docs/ARCHITECTURE.md's "Ubuntu 26.04 baseline" section -- Arrow Flight SQL
 # does not link on Ubuntu 24.04's system Abseil).
@@ -50,6 +49,22 @@ find_package(Parquet REQUIRED)
 find_package(spdlog REQUIRED)
 find_package(yaml-cpp REQUIRED)
 find_package(nlohmann_json REQUIRED)
+# Needed by every executable linking kernellake_common (see
+# tests/unit/CMakeLists.txt's own comment) to resolve
+# libarrow_bundled_dependencies.a's bundled google-cloud-cpp (GCS) and Azure
+# SDK C++ (Azure) code -- pulled in as soon as anything includes
+# <arrow/filesystem/gcsfs.h>/<arrow/filesystem/azurefs.h>, which
+# config.hpp now does unconditionally. google-cloud-cpp needs many more
+# Abseil components than gRPC alone did; the Azure SDK's bundled XML
+# parsing (used for its REST API responses) needs libxml2, and its request-
+# ID generation needs libuuid -- neither was a dependency of this project
+# before. Confirmed for real via actual link failures, not assumed from
+# documentation.
+find_package(absl CONFIG REQUIRED)
+find_package(LibXml2 REQUIRED)
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(UUID REQUIRED IMPORTED_TARGET uuid)
+include(LinkArrowBundledCloudDeps)
 
 if(KERNELLAKE_BUILD_TESTS)
   find_package(GTest REQUIRED)

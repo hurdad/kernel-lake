@@ -8,7 +8,7 @@
 #include "kernellake/common/errors.hpp"
 #include "kernellake/io/parquet_metadata.hpp"
 #include "kernellake/storage/file_discovery.hpp"
-#include "kernellake/storage/local_object_store.hpp"
+#include "kernellake/storage/object_store_registry.hpp"
 
 namespace kernellake::cli {
 
@@ -99,7 +99,7 @@ nlohmann::json to_json(const FileMetadata& meta) {
 
 }  // namespace
 
-int run_inspect_parquet(const std::vector<std::string_view>& args) {
+int run_inspect_parquet(const std::vector<std::string_view>& args, const EngineConfig& config) {
   std::string path;
   std::string format = "text";
   for (std::size_t i = 0; i < args.size(); ++i) {
@@ -120,7 +120,7 @@ int run_inspect_parquet(const std::vector<std::string_view>& args) {
   }
 
   try {
-    LocalObjectStore store;
+    ObjectStoreRegistry store(config.storage);
     const std::vector<ObjectInfo> files = discover_parquet_files(store, {path});
     std::vector<FileMetadata> metadata;
     metadata.reserve(files.size());

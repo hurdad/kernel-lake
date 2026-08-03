@@ -12,6 +12,7 @@
 #include "kernellake/execution/parquet_scan_operator.hpp"
 #include "kernellake/execution/sort_operator.hpp"
 #include "kernellake/memory/rmm_environment.hpp"
+#include "kernellake/storage/local_object_store.hpp"
 
 namespace kernellake {
 namespace {
@@ -156,8 +157,9 @@ TEST_F(SortOperatorStringKeyTest, SortsPlainStringColumnReferenceWithoutHittingN
   RmmEnvironment env(default_config());
   Schema schema({Field{"region", string_type(false)}});
   std::vector<PhysicalFileFragment> fragments = {PhysicalFileFragment{Uri(path_), 3, 1, {0}, {}, {}}};
+  LocalObjectStore store;
   auto scan = std::make_unique<ParquetScanOperator>(1, fragments, std::vector<std::string>{"region"},
-                                                    std::make_shared<const Schema>(schema));
+                                                    std::make_shared<const Schema>(schema), store);
 
   auto key = std::make_shared<ColumnExpression>("region", 0, string_type(false));
   std::vector<LogicalSort::Key> keys = {LogicalSort::Key{key, /*ascending=*/true}};

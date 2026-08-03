@@ -32,5 +32,8 @@ target_link_libraries(kernellake_gpu_tests PRIVATE
   GTest::gtest_main
 )
 
+# See cmake/LinkArrowBundledCloudDeps.cmake.
+kernellake_link_arrow_bundled_cloud_deps(kernellake_gpu_tests)
+
 include(GoogleTest)
 gtest_discover_tests(kernellake_gpu_tests)

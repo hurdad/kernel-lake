@@ -362,38 +362,97 @@ and covered by passing tests -- not merely designed or stubbed.
   inside the `runtime` image (CPU backend) returned correct results;
   `helm lint`/`helm template` (three value combinations) piped through
   `kubeconform -strict` all passed with no schema errors. GPU backend was
-  also smoke-tested through the same container and returned incorrect
-  (silently empty) results -- a real, pre-existing bug unrelated to this
-  phase's own changes, see the new "GPU backend gives silently wrong
-  results on Blackwell/CUDA 12.4" item below.
+  also smoke-tested through the same container and returned an incorrect,
+  silently-empty `COUNT(*)` -- root-caused as a column-pruning bug (see
+  the new "Bare `COUNT(*)` returns 0 on the GPU backend" item below), not
+  a Docker/CUDA-architecture issue and not caused by this phase's changes.
+- **Cloud object storage (S3, GCS, Azure)** (Phase 4 of the Flight SQL/
+  otel-cpp/Helm-chart/cloud-storage epic -- Phases 0-3 all done above).
+  `read_parquet(...)` now accepts `s3://`, `gs://`/`gcs://`, and
+  `abfs://`/`abfss://`/`az://` URIs alongside local paths, dispatched by
+  scheme through a new `ObjectStoreRegistry` composite, transparently at
+  every existing call site (CLI, `kernellake-server`, both GPU and CPU
+  execution backends) -- see `docs/ARCHITECTURE.md`, "Cloud object storage
+  (S3, GCS, Azure)", for the full design (config sections embedding
+  Arrow's own `S3Options`/`GcsOptions`/`AzureOptions`/`HdfsOptions`
+  directly rather than hand-copied field lists; the GPU path's new
+  `ObjectStoreDatasource`, a `cudf::io::datasource` wrapper preserving
+  bounded-memory pass-budgeted streaming for cloud sources; the CPU path's
+  drop-in `ParquetFileReader::Open()` fix) and three real, non-obvious
+  problems found and fixed while implementing it: GCS/Azure support
+  needing far more of Arrow's bundled dependency closet than this project
+  had ever linked before (~20 additional Abseil targets plus two genuinely
+  new system dependencies, `libxml2-dev`/`uuid-dev`, fixed with a new
+  shared CMake helper, `cmake/LinkArrowBundledCloudDeps.cmake`);
+  `arrow::io::HdfsConnectionConfig::port` having no default member
+  initializer, unlike every other field in that struct, discovered via a
+  real `-fpermissive` compile error and fixed before it could read
+  uninitialized memory as a config fallback; and a real CLI segfault on
+  exit from a missing `arrow::fs::FinalizeS3()` shutdown call, fixed with
+  an `S3ShutdownGuard` mirroring Phase 2's `ObservabilityShutdownGuard`.
+  Verified for real: `dev` (148/148, +3 new tests), `gpu-dev` (217/217),
+  `server-dev` (150/150), `otel-dev` (151/151) all pass with zero
+  regressions; real end-to-end smoke tests against three real,
+  locally-`docker run`'able emulators (MinIO, `fsouza/fake-gcs-server`,
+  Azurite), each on both CPU and GPU execution backends (6 combinations
+  total) -- a real 5000-row Parquet file uploaded via each provider's own
+  independent Python SDK, then `kernellake query` producing a correct
+  `GROUP BY region` and `SUM(order_id)` (`12497500`, exact) on every
+  combination, all clean exit; `kernellake inspect-parquet` against a real
+  `abfs://` URI verified separately too. GPU-backend checks deliberately
+  used `GROUP BY`/`SUM` rather than bare `COUNT(*)`, to avoid conflating
+  this phase's own verification with the separate, already-tracked
+  bare-`COUNT(*)`-on-GPU bug below -- this phase's changes are unrelated
+  to that bug. **HDFS** is config-schema-complete
+  (`storage.hdfs.connection_config`, etc.) but has no real
+  `HdfsObjectStore` backend wired up yet -- deliberately deferred, no
+  lightweight single-container emulator exists for real verification the
+  way MinIO/fake-gcs-server/Azurite do (see "Not yet started" below).
 
 ## Not yet started
 
-- **GPU backend gives silently wrong results on Blackwell/CUDA 12.4**
-  (found incidentally while smoke-testing Phase 3's Docker/Helm work on
-  real hardware, not part of that phase's own scope). On this project's
-  own RTX 5060 Ti (Blackwell, compute capability 12.0 per `nvidia-smi
-  --query-gpu=compute_cap`) with the currently-installed CUDA 12.4.131
-  toolkit (`nvcc --version`), a real `COUNT(*)` against a real 5000-row
-  Parquet file returns `0` on the GPU backend -- silently wrong, no error
-  raised -- while the CPU backend returns the correct `5000` against the
-  identical file. Reproduces both through `docker run --gpus all` and
-  directly against the plain local `build/gpu-dev/src/cli/kernellake`
-  binary, so it is not Docker-specific. Root cause is believed to be that
-  CUDA support for Blackwell/`sm_120` wasn't added until CUDA 12.8 -- 12.4
-  can produce neither native SASS nor a JIT-compilable PTX for this GPU's
-  real architecture -- but where in the RMM/cudf/kernel-launch path the
-  resulting failure is being swallowed instead of raised is not yet
-  root-caused. `docs/ARCHITECTURE.md`'s "Ubuntu 26.04 baseline" section
-  previously documented this same GPU model producing correct GPU-executed
-  results; whether that was accurate at the time (a since-changed driver/
-  toolkit combination) or the GPU test suite's own assertions simply don't
-  catch a silently-empty result the way a real ADBC round trip does is
-  also not yet determined. Upgrading to CUDA 12.8+ (a bigger change than
-  it sounds -- see "Ubuntu 26.04 baseline"'s own note on why a CUDA major/
-  minor bump was previously avoided) is the likely fix but not yet
-  attempted.
+- **Bare `COUNT(*)` returns 0 on the GPU backend** (found incidentally
+  while smoke-testing Phase 3's Docker/Helm work on real hardware, not
+  part of that phase's own scope; initially misdiagnosed in this file and
+  in `docs/ARCHITECTURE.md` as a CUDA-12.4/Blackwell architecture mismatch
+  -- that hypothesis was tested directly and ruled out: `COUNT(<column>)`,
+  `SUM(<column>)`, and a bare `SELECT <column>` all return correct results
+  on the same GPU and the same file). Real root cause: `SELECT COUNT(*)
+  FROM read_parquet(...)` with no other column reference anywhere in the
+  query (no `WHERE`, no `GROUP BY`, no join) legitimately produces an
+  empty `LogicalScan::required_columns()` via `src/optimizer/optimizer.cpp`'s
+  column-pruning pass -- correct in principle, since `COUNT(*)` needs no
+  column data. `ParquetScanOperator::next()`
+  (`src/execution/parquet_scan_operator.cpp`) gates on `result.tbl->
+  num_rows() > 0`, but a `cudf::table` built with zero columns selected
+  has no column to derive a row count from, so `num_rows()` reads `0`
+  regardless of how many rows the underlying row groups actually contain
+  -- every chunk is treated as empty and the scan silently produces no
+  batches. CPU/Acero (`src/execution_cpu/acero_query_executor.cpp`) does
+  not have this bug: `arrow::RecordBatch` tracks row count independently
+  of its columns, so an empty column selection there still reports the
+  correct row count. Confirmed via `tests/gpu/` that this was never
+  actually exercised: every existing `COUNT(*)` test case also references
+  another column via `GROUP BY`/`WHERE`/a join key, so
+  `required_columns()` was never empty in any tested case -- a genuinely
+  untested query shape, not a regression in previously-verified behavior.
+  Likely fix: in the physical planner (`src/io/physical_planner.cpp`'s
+  `convert_scan()`) or `ParquetScanOperator` itself, when the narrowed
+  column list would be empty, request at least one arbitrary column (e.g.
+  the schema's first field) purely to preserve row-count fidelity through
+  `cudf::table`, without changing what's returned to the query above the
+  scan. Not yet implemented.
 
+- **HDFS object storage backend** (Phase 4 of the Flight SQL/otel-cpp/
+  Helm-chart/cloud-storage epic -- S3/GCS/Azure all done above, see "Cloud
+  object storage" in "Done"). Config schema (`storage.hdfs.*`, mirroring
+  `arrow::fs::HdfsOptions` field-for-field, same as the other three
+  backends) already exists; no `HdfsObjectStore` implementation yet.
+  Deliberately deferred: unlike S3/GCS/Azure, HDFS has no lightweight
+  single-container Docker emulator, needing an actual pseudo-distributed
+  Hadoop namenode/datanode cluster for the same real-verification bar
+  every other backend in this project meets -- a bigger lift than a
+  `docker run` away, and not attempted without one.
 - TPC-H `execution-only` benchmark mode (needs an operator-tree entry point
   that skips `ParquetScanOperator`); TPC-H at SF10+ scale (SF1 now verified,
   see "Done" above; SF10 untested); Q3/Q12/Q14 (need TPC-H's actual

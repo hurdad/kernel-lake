@@ -2,9 +2,11 @@
 
 #include <yaml-cpp/yaml.h>
 
+#include <algorithm>
 #include <array>
 #include <fstream>
 #include <sstream>
+#include <unordered_map>
 
 #include "kernellake/common/errors.hpp"
 
@@ -29,6 +31,22 @@ T read_or(const YAML::Node& node, const char* key, T fallback) {
 // lookups (observability.tracing, .tracing.batch, etc.) need this guard
 // explicitly since they index two levels deep.
 YAML::Node child(const YAML::Node& node, const char* key) { return node ? node[key] : YAML::Node(); }
+
+// Reads a YAML mapping into a string->string map -- used by
+// storage.hdfs.connection_config.extra_conf (arrow::io::HdfsConnectionConfig's
+// own field type, std::unordered_map<std::string, std::string>).
+std::unordered_map<std::string, std::string> read_string_map(const YAML::Node& node) {
+  std::unordered_map<std::string, std::string> result;
+  if (!node) return result;
+  for (const auto& entry : node) {
+    try {
+      result.emplace(entry.first.as<std::string>(), entry.second.as<std::string>());
+    } catch (const YAML::Exception& e) {
+      throw ConfigurationError(std::string("invalid string map entry: ") + e.what());
+    }
+  }
+  return result;
+}
 
 // Shared by observability.tracing.batch and observability.logs.batch, which
 // have an identical shape.
@@ -97,7 +115,104 @@ EngineConfig parse_config(const std::string& yaml_text) {
 
   const YAML::Node storage = root["storage"];
   config.storage.local_root = read_or(storage, "local_root", config.storage.local_root);
-  config.storage.enable_s3 = read_or(storage, "enable_s3", config.storage.enable_s3);
+
+  const YAML::Node s3 = child(storage, "s3");
+  config.storage.s3.credentials_kind = read_or(s3, "credentials_kind", config.storage.s3.credentials_kind);
+  arrow::fs::S3Options& s3_opts = config.storage.s3.options;
+  s3_opts.smart_defaults = read_or(s3, "smart_defaults", s3_opts.smart_defaults);
+  s3_opts.region = read_or(s3, "region", s3_opts.region);
+  s3_opts.connect_timeout = read_or(s3, "connect_timeout", s3_opts.connect_timeout);
+  s3_opts.request_timeout = read_or(s3, "request_timeout", s3_opts.request_timeout);
+  s3_opts.endpoint_override = read_or(s3, "endpoint_override", s3_opts.endpoint_override);
+  s3_opts.scheme = read_or(s3, "scheme", s3_opts.scheme);
+  s3_opts.role_arn = read_or(s3, "role_arn", s3_opts.role_arn);
+  s3_opts.session_name = read_or(s3, "session_name", s3_opts.session_name);
+  s3_opts.external_id = read_or(s3, "external_id", s3_opts.external_id);
+  s3_opts.load_frequency = read_or(s3, "load_frequency", s3_opts.load_frequency);
+  const YAML::Node s3_proxy = child(s3, "proxy_options");
+  s3_opts.proxy_options.scheme = read_or(s3_proxy, "scheme", s3_opts.proxy_options.scheme);
+  s3_opts.proxy_options.host = read_or(s3_proxy, "host", s3_opts.proxy_options.host);
+  s3_opts.proxy_options.port = read_or(s3_proxy, "port", s3_opts.proxy_options.port);
+  s3_opts.proxy_options.username = read_or(s3_proxy, "username", s3_opts.proxy_options.username);
+  s3_opts.proxy_options.password = read_or(s3_proxy, "password", s3_opts.proxy_options.password);
+  s3_opts.force_virtual_addressing =
+      read_or(s3, "force_virtual_addressing", s3_opts.force_virtual_addressing);
+  s3_opts.background_writes = read_or(s3, "background_writes", s3_opts.background_writes);
+  s3_opts.allow_bucket_creation = read_or(s3, "allow_bucket_creation", s3_opts.allow_bucket_creation);
+  s3_opts.allow_bucket_deletion = read_or(s3, "allow_bucket_deletion", s3_opts.allow_bucket_deletion);
+  s3_opts.check_directory_existence_before_creation = read_or(
+      s3, "check_directory_existence_before_creation", s3_opts.check_directory_existence_before_creation);
+  s3_opts.allow_delayed_open = read_or(s3, "allow_delayed_open", s3_opts.allow_delayed_open);
+  s3_opts.sse_customer_key = read_or(s3, "sse_customer_key", s3_opts.sse_customer_key);
+  s3_opts.tls_ca_file_path = read_or(s3, "tls_ca_file_path", s3_opts.tls_ca_file_path);
+  s3_opts.tls_ca_dir_path = read_or(s3, "tls_ca_dir_path", s3_opts.tls_ca_dir_path);
+  s3_opts.tls_verify_certificates =
+      read_or(s3, "tls_verify_certificates", s3_opts.tls_verify_certificates);
+
+  const YAML::Node gcs = child(storage, "gcs");
+  config.storage.gcs.credentials_kind = read_or(gcs, "credentials_kind", config.storage.gcs.credentials_kind);
+  config.storage.gcs.access_token = read_or(gcs, "access_token", config.storage.gcs.access_token);
+  config.storage.gcs.access_token_expiration =
+      read_or(gcs, "access_token_expiration", config.storage.gcs.access_token_expiration);
+  config.storage.gcs.target_service_account =
+      read_or(gcs, "target_service_account", config.storage.gcs.target_service_account);
+  config.storage.gcs.json_credentials =
+      read_or(gcs, "json_credentials", config.storage.gcs.json_credentials);
+  arrow::fs::GcsOptions& gcs_opts = config.storage.gcs.options;
+  gcs_opts.endpoint_override = read_or(gcs, "endpoint_override", gcs_opts.endpoint_override);
+  gcs_opts.scheme = read_or(gcs, "scheme", gcs_opts.scheme);
+  gcs_opts.default_bucket_location =
+      read_or(gcs, "default_bucket_location", gcs_opts.default_bucket_location);
+  // retry_limit_seconds/project_id are std::optional<> on GcsOptions --
+  // read_or's `.as<T>()` has no std::optional<T> specialization, so these
+  // need an explicit presence check instead.
+  if (gcs && gcs["retry_limit_seconds"]) {
+    try {
+      gcs_opts.retry_limit_seconds = gcs["retry_limit_seconds"].as<double>();
+    } catch (const YAML::Exception& e) {
+      throw ConfigurationError(std::string("invalid value for 'retry_limit_seconds': ") + e.what());
+    }
+  }
+  if (gcs && gcs["project_id"]) {
+    try {
+      gcs_opts.project_id = gcs["project_id"].as<std::string>();
+    } catch (const YAML::Exception& e) {
+      throw ConfigurationError(std::string("invalid value for 'project_id': ") + e.what());
+    }
+  }
+
+  const YAML::Node azure = child(storage, "azure");
+  config.storage.azure.credentials_kind =
+      read_or(azure, "credentials_kind", config.storage.azure.credentials_kind);
+  config.storage.azure.storage_shared_key =
+      read_or(azure, "storage_shared_key", config.storage.azure.storage_shared_key);
+  config.storage.azure.sas_token = read_or(azure, "sas_token", config.storage.azure.sas_token);
+  config.storage.azure.tenant_id = read_or(azure, "tenant_id", config.storage.azure.tenant_id);
+  config.storage.azure.client_id = read_or(azure, "client_id", config.storage.azure.client_id);
+  config.storage.azure.client_secret =
+      read_or(azure, "client_secret", config.storage.azure.client_secret);
+  arrow::fs::AzureOptions& azure_opts = config.storage.azure.options;
+  azure_opts.account_name = read_or(azure, "account_name", azure_opts.account_name);
+  azure_opts.blob_storage_authority =
+      read_or(azure, "blob_storage_authority", azure_opts.blob_storage_authority);
+  azure_opts.dfs_storage_authority =
+      read_or(azure, "dfs_storage_authority", azure_opts.dfs_storage_authority);
+  azure_opts.blob_storage_scheme = read_or(azure, "blob_storage_scheme", azure_opts.blob_storage_scheme);
+  azure_opts.dfs_storage_scheme = read_or(azure, "dfs_storage_scheme", azure_opts.dfs_storage_scheme);
+  azure_opts.background_writes = read_or(azure, "background_writes", azure_opts.background_writes);
+
+  const YAML::Node hdfs = child(storage, "hdfs");
+  const YAML::Node hdfs_conn = child(hdfs, "connection_config");
+  arrow::fs::HdfsOptions& hdfs_opts = config.storage.hdfs.options;
+  hdfs_opts.connection_config.host = read_or(hdfs_conn, "host", hdfs_opts.connection_config.host);
+  hdfs_opts.connection_config.port = read_or(hdfs_conn, "port", hdfs_opts.connection_config.port);
+  hdfs_opts.connection_config.user = read_or(hdfs_conn, "user", hdfs_opts.connection_config.user);
+  hdfs_opts.connection_config.kerb_ticket =
+      read_or(hdfs_conn, "kerb_ticket", hdfs_opts.connection_config.kerb_ticket);
+  hdfs_opts.connection_config.extra_conf = read_string_map(child(hdfs_conn, "extra_conf"));
+  hdfs_opts.buffer_size = read_or(hdfs, "buffer_size", hdfs_opts.buffer_size);
+  hdfs_opts.replication = read_or(hdfs, "replication", hdfs_opts.replication);
+  hdfs_opts.default_block_size = read_or(hdfs, "default_block_size", hdfs_opts.default_block_size);
 
   const YAML::Node logging = root["logging"];
   config.logging.level = read_or(logging, "level", config.logging.level);
@@ -192,6 +307,83 @@ void validate_config(const EngineConfig& config) {
     throw ConfigurationError("memory.pool_max_bytes (" + std::to_string(config.memory.pool_max_bytes) +
                              ") must be >= memory.pool_initial_bytes (" +
                              std::to_string(config.memory.pool_initial_bytes) + ")");
+  }
+
+  static constexpr std::array<const char*, 5> kS3CredentialsKinds = {"anonymous", "default", "explicit",
+                                                                      "role", "web_identity"};
+  if (std::find(kS3CredentialsKinds.begin(), kS3CredentialsKinds.end(), config.storage.s3.credentials_kind) ==
+      kS3CredentialsKinds.end()) {
+    throw ConfigurationError("storage.s3.credentials_kind '" + config.storage.s3.credentials_kind +
+                             "' is unsupported (expected 'anonymous', 'default', 'explicit', 'role', or "
+                             "'web_identity')");
+  }
+  if (config.storage.s3.credentials_kind == "role" && config.storage.s3.options.role_arn.empty()) {
+    throw ConfigurationError("storage.s3.options.role_arn must not be empty when "
+                             "storage.s3.credentials_kind is 'role'");
+  }
+  if (config.storage.s3.options.scheme != "https" && config.storage.s3.options.scheme != "http") {
+    throw ConfigurationError("storage.s3.scheme '" + config.storage.s3.options.scheme +
+                             "' is unsupported (expected 'https' or 'http')");
+  }
+
+  static constexpr std::array<const char*, 4> kGcsCredentialsKinds = {"anonymous", "default", "access_token",
+                                                                       "service_account_json"};
+  if (std::find(kGcsCredentialsKinds.begin(), kGcsCredentialsKinds.end(),
+                config.storage.gcs.credentials_kind) == kGcsCredentialsKinds.end()) {
+    throw ConfigurationError("storage.gcs.credentials_kind '" + config.storage.gcs.credentials_kind +
+                             "' is unsupported (expected 'anonymous', 'default', 'access_token', or "
+                             "'service_account_json')");
+  }
+  if (config.storage.gcs.credentials_kind == "access_token" && config.storage.gcs.access_token.empty()) {
+    throw ConfigurationError(
+        "storage.gcs.access_token must not be empty when storage.gcs.credentials_kind is 'access_token'");
+  }
+  if (config.storage.gcs.credentials_kind == "service_account_json" &&
+      config.storage.gcs.json_credentials.empty()) {
+    throw ConfigurationError("storage.gcs.json_credentials must not be empty when "
+                             "storage.gcs.credentials_kind is 'service_account_json'");
+  }
+  if (config.storage.gcs.options.scheme != "https" && config.storage.gcs.options.scheme != "http") {
+    throw ConfigurationError("storage.gcs.scheme '" + config.storage.gcs.options.scheme +
+                             "' is unsupported (expected 'https' or 'http')");
+  }
+
+  static constexpr std::array<const char*, 9> kAzureCredentialsKinds = {
+      "default",      "anonymous",          "storage_shared_key",  "sas_token", "client_secret",
+      "managed_identity", "cli", "workload_identity", "environment"};
+  if (std::find(kAzureCredentialsKinds.begin(), kAzureCredentialsKinds.end(),
+                config.storage.azure.credentials_kind) == kAzureCredentialsKinds.end()) {
+    throw ConfigurationError(
+        "storage.azure.credentials_kind '" + config.storage.azure.credentials_kind +
+        "' is unsupported (expected 'default', 'anonymous', 'storage_shared_key', 'sas_token', "
+        "'client_secret', 'managed_identity', 'cli', 'workload_identity', or 'environment')");
+  }
+  if (config.storage.azure.credentials_kind == "storage_shared_key" &&
+      config.storage.azure.storage_shared_key.empty()) {
+    throw ConfigurationError("storage.azure.storage_shared_key must not be empty when "
+                             "storage.azure.credentials_kind is 'storage_shared_key'");
+  }
+  if (config.storage.azure.credentials_kind == "sas_token" && config.storage.azure.sas_token.empty()) {
+    throw ConfigurationError(
+        "storage.azure.sas_token must not be empty when storage.azure.credentials_kind is 'sas_token'");
+  }
+  if (config.storage.azure.credentials_kind == "client_secret" &&
+      (config.storage.azure.tenant_id.empty() || config.storage.azure.client_id.empty() ||
+       config.storage.azure.client_secret.empty())) {
+    throw ConfigurationError("storage.azure.tenant_id, client_id, and client_secret must all be set when "
+                             "storage.azure.credentials_kind is 'client_secret'");
+  }
+  if (config.storage.azure.options.blob_storage_scheme != "https" &&
+      config.storage.azure.options.blob_storage_scheme != "http") {
+    throw ConfigurationError("storage.azure.blob_storage_scheme '" +
+                             config.storage.azure.options.blob_storage_scheme +
+                             "' is unsupported (expected 'https' or 'http')");
+  }
+  if (config.storage.azure.options.dfs_storage_scheme != "https" &&
+      config.storage.azure.options.dfs_storage_scheme != "http") {
+    throw ConfigurationError("storage.azure.dfs_storage_scheme '" +
+                             config.storage.azure.options.dfs_storage_scheme +
+                             "' is unsupported (expected 'https' or 'http')");
   }
 
   static constexpr std::array<const char*, 7> kLogLevels = {"trace",   "debug", "info",    "warn",

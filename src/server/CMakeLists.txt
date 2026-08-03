@@ -53,3 +53,6 @@ target_link_libraries(kernellake-server PRIVATE
   gRPC::grpc++
   -Wl,--end-group
 )
+
+# See cmake/LinkArrowBundledCloudDeps.cmake.
+kernellake_link_arrow_bundled_cloud_deps(kernellake-server)

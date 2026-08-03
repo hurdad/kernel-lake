@@ -12,7 +12,7 @@
 
 namespace kernellake {
 
-QueryEngine::QueryEngine(EngineConfig config) : config_(std::move(config)) {}
+QueryEngine::QueryEngine(EngineConfig config) : config_(std::move(config)), store_(config_.storage) {}
 
 namespace {
 Schema inspect_source_schema(ObjectStore& store, const std::vector<std::string>& paths,
