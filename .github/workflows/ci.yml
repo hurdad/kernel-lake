@@ -205,6 +205,17 @@ jobs:
     # baseline" section). Same container: ubuntu:26.04 approach as
     # server-build-test, for the same reason (no ubuntu-26.04 GitHub-hosted
     # runner label yet).
+    #
+    # Also needs gRPC explicitly: opentelemetry-cpp-dev's own apt Depends
+    # is just `opentelemetry-cpp (= ...)` -- no gRPC dependency declared at
+    # the package-manager level at all (confirmed via `apt-cache depends
+    # opentelemetry-cpp-dev`) -- but its exporters_otlp_grpc CMake
+    # component needs gRPC's own CMake config package (from libgrpc++-dev)
+    # to resolve find_package(opentelemetry-cpp ... COMPONENTS
+    # exporters_otlp_grpc ...) at all. The root CMakeLists.txt's own
+    # find_package(gRPC REQUIRED) is scoped to KERNELLAKE_BUILD_SERVER
+    # only, not KERNELLAKE_ENABLE_OTEL, so this job needs its own explicit
+    # install, same package as server-build-test's "Install gRPC" step.
     runs-on: ubuntu-24.04
     container: ubuntu:26.04
     needs: cpu-build-test
@@ -227,6 +238,8 @@ jobs:
           apt-get install -y --no-install-recommends libarrow-dev libparquet-dev libarrow-dataset-dev
       - name: Install opentelemetry-cpp
         run: apt-get install -y --no-install-recommends opentelemetry-cpp-dev
+      - name: Install gRPC
+        run: apt-get install -y --no-install-recommends libgrpc++-dev protobuf-compiler-grpc
       - name: Configure (otel-dev preset)
         run: cmake --preset otel-dev
       - name: Build
