@@ -161,5 +161,28 @@ TEST(SqlParser, RejectsOffset) {
   EXPECT_THROW((void)(parse_sql("SELECT a FROM read_parquet('/x.parquet') LIMIT 10 OFFSET 5")), SqlError);
 }
 
+// Regression test: the vendored hyrise/sql-parser (bison/flex, recursive
+// descent) recurses once per nesting level with no depth limit of its own
+// -- a query with many thousands of nested parens drove it into a C-stack
+// overflow (a process crash, not a catchable exception) before parse_sql()
+// added its own pre-scan. Both the too-long and too-deep limits must throw
+// a clean SqlError instead of ever reaching hsql at all.
+TEST(SqlParser, RejectsExcessivelyDeepExpressionNesting) {
+  const std::string deep_expr = std::string(600, '(') + "1" + std::string(600, ')');
+  EXPECT_THROW((void)(parse_sql("SELECT a FROM read_parquet('/x.parquet') WHERE a > " + deep_expr)),
+               SqlError);
+}
+
+TEST(SqlParser, AcceptsReasonablyDeepExpressionNesting) {
+  const std::string ok_expr = std::string(100, '(') + "1" + std::string(100, ')');
+  EXPECT_NO_THROW((void)(parse_sql("SELECT a FROM read_parquet('/x.parquet') WHERE a > " + ok_expr)));
+}
+
+TEST(SqlParser, RejectsExcessivelyLongSqlText) {
+  const std::string huge_sql =
+      "SELECT a FROM read_parquet('/x.parquet') WHERE a > 1 -- " + std::string(1 << 21, 'x');
+  EXPECT_THROW((void)(parse_sql(huge_sql)), SqlError);
+}
+
 }  // namespace
 }  // namespace kernellake::sql

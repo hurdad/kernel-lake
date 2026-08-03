@@ -97,6 +97,75 @@ TEST_F(LocalObjectStoreTest, FileDiscoveryRejectsEmptySourceList) {
   EXPECT_THROW((void)(discover_parquet_files(store_, {})), StorageError);
 }
 
+class LocalObjectStoreRootConfinementTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    root_ =
+        fs::temp_directory_path() /
+        fs::path("kernellake_root_confinement_test_" +
+                 std::to_string(::testing::UnitTest::GetInstance()->random_seed()) + "_" + test_info_name());
+    fs::create_directories(root_ / "allowed");
+    write_file(root_ / "allowed" / "a.parquet", "a");
+    write_file(outside_file(), "outside");
+  }
+
+  void TearDown() override {
+    fs::remove_all(root_);
+    fs::remove(outside_file());
+  }
+
+  static std::string test_info_name() {
+    return ::testing::UnitTest::GetInstance()->current_test_info()->name();
+  }
+
+  static void write_file(const fs::path& path, std::string_view content) {
+    std::ofstream out(path, std::ios::binary);
+    out << content;
+  }
+
+  // A sibling of root_, i.e. genuinely outside it -- not just a
+  // differently-named prefix (e.g. "root_2" vs "root_"), which a naive
+  // string-prefix check would wrongly treat as contained.
+  fs::path outside_file() const {
+    return root_.parent_path() / (root_.filename().string() + "_sibling.parquet");
+  }
+
+  fs::path root_;
+};
+
+TEST_F(LocalObjectStoreRootConfinementTest, OpenWithinRootSucceeds) {
+  LocalObjectStore store(root_.string());
+  const auto handle = store.open(Uri((root_ / "allowed" / "a.parquet").string()));
+  EXPECT_EQ(handle->size(), 1u);
+}
+
+TEST_F(LocalObjectStoreRootConfinementTest, OpenOutsideRootThrows) {
+  LocalObjectStore store(root_.string());
+  EXPECT_THROW((void)(store.open(Uri(outside_file().string()))), StorageError);
+}
+
+TEST_F(LocalObjectStoreRootConfinementTest, OpenViaDotDotEscapeThrows) {
+  LocalObjectStore store(root_.string());
+  const std::string escaped = (root_ / "allowed" / ".." / ".." / outside_file().filename()).string();
+  EXPECT_THROW((void)(store.open(Uri(escaped))), StorageError);
+}
+
+TEST_F(LocalObjectStoreRootConfinementTest, ListOutsideRootThrows) {
+  LocalObjectStore store(root_.string());
+  EXPECT_THROW((void)(store.list(Uri(outside_file().string()))), StorageError);
+}
+
+TEST_F(LocalObjectStoreRootConfinementTest, ListGlobOutsideRootThrows) {
+  LocalObjectStore store(root_.string());
+  EXPECT_THROW((void)(store.list(Uri((root_.parent_path() / "*.parquet").string()))), StorageError);
+}
+
+TEST_F(LocalObjectStoreRootConfinementTest, DefaultRootAllowsAnyAbsolutePath) {
+  LocalObjectStore store;  // default local_root == "/": no confinement, matches prior behavior
+  const auto handle = store.open(Uri(outside_file().string()));
+  EXPECT_EQ(handle->size(), 7u);
+}
+
 TEST(Uri, DefaultsToFileScheme) {
   EXPECT_EQ(Uri("/data/sales.parquet").scheme(), "file");
   EXPECT_EQ(Uri("s3://bucket/key.parquet").scheme(), "s3");

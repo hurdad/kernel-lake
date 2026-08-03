@@ -3,6 +3,7 @@
 #include <SQLParser.h>
 #include <fmt/format.h>
 
+#include <algorithm>
 #include <regex>
 #include <string>
 #include <vector>
@@ -13,6 +14,41 @@
 namespace kernellake::sql {
 
 namespace {
+
+// hyrise/sql-parser (bison/flex, recursive-descent) recurses once per
+// nesting level of a parenthesized expression, with no depth limit of its
+// own -- a query with many thousands of nested parens
+// ("SELECT (((((...1...))))) FROM ...") drives it into a C-stack overflow,
+// which crashes the process outright rather than raising a catchable
+// exception. This is a real concern for kernellake-server specifically:
+// its Flight SQL surface accepts arbitrary-length query text over the wire
+// with no prior validation. A cheap pre-scan here (well before any parsing
+// work, real or hsql's) rejects both pathologically long SQL text and
+// pathologically deep nesting with a clean SqlError instead. The limits
+// are generous relative to any real query (TPC-H's own queries, the
+// deepest in this project, nest nowhere close to either) specifically to
+// avoid false positives on legitimate SQL.
+constexpr std::size_t kMaxSqlBytes = 1 << 20;  // 1 MiB
+constexpr int kMaxParenDepth = 500;
+
+void check_sql_within_limits(std::string_view sql) {
+  if (sql.size() > kMaxSqlBytes) {
+    throw SqlError(fmt::format("SQL text is too long ({} bytes, max {})", sql.size(), kMaxSqlBytes));
+  }
+  int depth = 0;
+  int max_depth = 0;
+  for (const char c : sql) {
+    if (c == '(') {
+      max_depth = std::max(max_depth, ++depth);
+    } else if (c == ')' && depth > 0) {
+      --depth;
+    }
+  }
+  if (max_depth > kMaxParenDepth) {
+    throw SqlError(
+        fmt::format("SQL expression nesting is too deep ({} levels, max {})", max_depth, kMaxParenDepth));
+  }
+}
 
 struct PlaceholderSource {
   std::string placeholder;
@@ -362,6 +398,7 @@ AstExprPtr convert_expr(const hsql::Expr* e) {
 }  // namespace
 
 AstSelectStatement parse_sql(std::string_view sql_view) {
+  check_sql_within_limits(sql_view);
   const std::string sql(sql_view);
   Preprocessed preprocessed = preprocess_from_read_parquet(sql);
 

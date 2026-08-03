@@ -18,7 +18,7 @@ namespace kernellake {
 // eagerly at ObjectStoreRegistry construction time.
 class ObjectStoreRegistry final : public ObjectStore {
  public:
-  explicit ObjectStoreRegistry(const StorageSection& config) : config_(config) {}
+  explicit ObjectStoreRegistry(const StorageSection& config) : config_(config), local_(config_.local_root) {}
 
   [[nodiscard]] std::vector<ObjectInfo> list(const Uri& prefix) override {
     return backend_for(prefix.scheme()).list(prefix);

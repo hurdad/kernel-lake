@@ -1021,6 +1021,21 @@ service support. `dev` (145/145), `gpu-dev` (214/214), and `server-dev`
 
 ### Docker image and Helm chart (`docker/Dockerfile`, `charts/kernellake/`)
 
+Everything below was verified against `docker/Dockerfile`'s original
+two-target shape (`dev`/`runtime`, GPU-enabled, the only shape that existed
+during this Phase 3 session). A later session split that GPU path into
+`dev-gpu`/`runtime-gpu` and added a separate CPU-only `dev-cpu`/
+`runtime-cpu` path alongside it -- see README.md's "Docker" section and
+docs/ROADMAP.md for the current shape and what's published today (only the
+two `runtime-*` targets; the `dev-*` stages are intermediate-only). Every
+`dev`/`runtime`/`runtime-libs` reference below is exactly this section's
+own `dev-gpu`/`runtime-gpu`/`runtime-libs-gpu`, renamed with no change to
+their own build steps, so the facts and verification results below still
+apply to them unchanged; the specific `docker build --target dev`/
+`--target runtime` commands quoted below need `-gpu` appended to still
+work against the current Dockerfile (or `-cpu` for the equivalent CPU-only
+path, not covered by this session's own verification).
+
 Phase 3 of the Flight SQL/otel-cpp/Helm-chart epic (Phase 0, Phase 1
 `kernellake-server`, and Phase 2 OpenTelemetry, all above). Closes the
 blocker Phase 2 left open: `docker/Dockerfile`'s `dev`/`runtime` images

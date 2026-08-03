@@ -150,6 +150,16 @@ struct BenchmarkSection {
 struct ServerSection {
   std::string host = "0.0.0.0";
   std::uint16_t port = 31337;
+  // KernelLakeFlightSqlServer executes a statement eagerly in
+  // GetFlightInfoStatement and buffers the whole result in results_ until
+  // DoGetStatement fetches it (see that class's own doc comment for why).
+  // A client that calls GetFlightInfoStatement repeatedly without ever
+  // fetching (or that just disconnects after getting the ticket) would
+  // otherwise grow results_ without bound -- this caps how many buffered,
+  // not-yet-fetched results the server holds at once; GetFlightInfoStatement
+  // rejects new statements past this cap with ExecutionError rather than
+  // buffering unboundedly.
+  std::uint32_t max_pending_results = 1024;
 };
 
 // Batch export tuning shared by the trace and log OTLP/gRPC processors

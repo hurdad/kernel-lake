@@ -24,6 +24,8 @@ does not extend to them.
 | yaml-cpp | MIT-style ("X11") | github.com/jbeder/yaml-cpp | System package (`libyaml-cpp-dev`) |
 | nlohmann/json | MIT ("Expat") | github.com/nlohmann/json | System package (`nlohmann-json3-dev`) |
 | hyrise/sql-parser | MIT | github.com/hyrise/sql-parser, pinned commit | Vendored via CMake `FetchContent` (`cmake/ThirdPartySqlParser.cmake`); KernelLake wraps it with a `read_parquet(...)` syntax adapter and its own AST -- see `docs/ARCHITECTURE.md` |
+| {fmt} | MIT ("Expat") | github.com/fmtlib/fmt | System package (`libfmt-dev`, pulled in transitively by `libspdlog-dev`); `find_package(fmt REQUIRED)` in the root `CMakeLists.txt` makes it a direct dependency too -- every `kernellake_*` error-message/log call site formats via `fmt::format` |
+| Abseil | Apache-2.0 | github.com/abseil/abseil-cpp | System package, needed by every build (not just `KERNELLAKE_BUILD_SERVER`/`KERNELLAKE_ENABLE_OTEL`) once cloud object storage support started unconditionally including `<arrow/filesystem/{gcs,azure}fs.h>` -- see `docs/ARCHITECTURE.md`'s "Cloud object storage" and "Ubuntu 26.04 baseline" sections |
 | libxml2 | MIT-style ("MIT-1") | xmlsoft.org | System package (`libxml2-dev`), needed by `libarrow-dev`'s bundled Azure SDK C++ code (XML request/response parsing) -- see below and `docs/ARCHITECTURE.md`'s "Cloud object storage" section |
 | libuuid (util-linux) | BSD-3-Clause | kernel.org/pub/linux/utils/util-linux | System package (`uuid-dev`), needed by `libarrow-dev`'s bundled Azure SDK C++ code (request-ID generation) |
 | google-cloud-cpp | Apache-2.0 | github.com/googleapis/google-cloud-cpp | Bundled *inside* `libarrow-dev`'s `libarrow_bundled_dependencies.a` (Arrow's own vendored copy, used by `arrow::fs::GcsFileSystem`) -- license taken from the upstream project directly; unlike every other entry in this file, not independently verified against a local installed `/usr/share/doc/<pkg>/copyright` file, since it isn't its own apt package |
@@ -60,7 +62,7 @@ relying on this summary.
 ## Linked into `kernellake-server` (`KERNELLAKE_BUILD_SERVER=ON`) / OpenTelemetry export (`KERNELLAKE_ENABLE_OTEL=ON`) only
 
 Both default `OFF` in the local `dev`/`gpu-dev` presets, but the published
-`docker/Dockerfile` `runtime` image turns both on (see
+`docker/Dockerfile` `runtime-cpu`/`runtime-gpu` images turn both on (see
 `docs/ARCHITECTURE.md`'s "Docker image: kernellake-server + OpenTelemetry"
 section) -- these are genuinely shipped in the default distributed
 artifact, verified against each package's own installed
@@ -70,7 +72,6 @@ artifact, verified against each package's own installed
 | --- | --- | --- | --- |
 | Apache Arrow Flight / Flight SQL C++ | Apache-2.0 | Same Apache Arrow release as the base Arrow entry above | System package (`libarrow-flight-dev`, `libarrow-flight-sql-dev`, official Apache Arrow apt repo) |
 | gRPC | Apache-2.0 | github.com/grpc/grpc | System package (`libgrpc++-dev`, `protobuf-compiler-grpc`) |
-| Abseil | Apache-2.0 | github.com/abseil/abseil-cpp | System package, transitive dependency of gRPC and (on Ubuntu 26.04) Arrow itself -- see `docs/ARCHITECTURE.md`'s "Ubuntu 26.04 baseline" section |
 | Protocol Buffers | BSD-3-Clause | github.com/protocolbuffers/protobuf | System package (`libprotobuf-dev`), transitive dependency of gRPC and Arrow Flight |
 | opentelemetry-cpp | Apache-2.0 | github.com/open-telemetry/opentelemetry-cpp | System package (`opentelemetry-cpp-dev`, apt-native on Ubuntu 26.04 only -- see `docs/ARCHITECTURE.md`) |
 

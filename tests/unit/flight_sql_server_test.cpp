@@ -29,11 +29,12 @@ namespace fs = std::filesystem;
 namespace flight = arrow::flight;
 namespace flight_sql = arrow::flight::sql;
 
-EngineConfig cpu_backend_server_config() {
+EngineConfig cpu_backend_server_config(std::uint32_t max_pending_results = 1024) {
   EngineConfig config = default_config();
   config.engine.backend = "cpu";
   config.server.host = "127.0.0.1";
   config.server.port = 0;  // OS-assigned ephemeral port, read back after Init().
+  config.server.max_pending_results = max_pending_results;
   return config;
 }
 
@@ -134,6 +135,60 @@ TEST_F(FlightSqlServerTest, InvalidSqlReturnsInvalidStatusNotACrash) {
   auto info = client_->Execute(call_options, "SELECT this is not valid sql");
   ASSERT_FALSE(info.ok());
   EXPECT_TRUE(info.status().IsInvalid()) << info.status().ToString();
+}
+
+// Regression test for the unbounded results_ registry: a client that calls
+// Execute() repeatedly without ever draining via DoGet() (simulated here by
+// simply never calling it) must eventually be rejected, not buffer results
+// forever. Uses its own tiny server/fixture (rather than FlightSqlServerTest
+// above) so it can configure max_pending_results down to 1.
+TEST(FlightSqlServerPendingResultsCapTest, RejectsNewStatementsOncePendingResultsCapIsReached) {
+  const fs::path dir = fs::temp_directory_path() / "kernellake_pending_results_cap_test";
+  fs::create_directories(dir);
+  const std::string path = (dir / "sales.parquet").string();
+
+  arrow::Int64Builder id_builder;
+  ASSERT_TRUE(id_builder.Append(1).ok());
+  std::shared_ptr<arrow::Array> id_array;
+  ASSERT_TRUE(id_builder.Finish(&id_array).ok());
+  const auto schema = arrow::schema({arrow::field("id", arrow::int64(), false)});
+  const auto table = arrow::Table::Make(schema, {id_array});
+  auto sink = arrow::io::FileOutputStream::Open(path).ValueOrDie();
+  ASSERT_TRUE(parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), sink, /*chunk_size=*/1).ok());
+
+  auto server =
+      std::make_unique<KernelLakeFlightSqlServer>(cpu_backend_server_config(/*max_pending_results=*/1));
+  auto location = flight::Location::ForGrpcTcp("127.0.0.1", 0);
+  ASSERT_TRUE(location.ok()) << location.status().ToString();
+  const flight::FlightServerOptions options(*location);
+  ASSERT_TRUE(server->Init(options).ok());
+
+  std::thread serve_thread([&server] {
+    const arrow::Status status = server->Serve();
+    EXPECT_TRUE(status.ok() || status.IsCancelled()) << status.ToString();
+  });
+
+  auto client_location = flight::Location::ForGrpcTcp("127.0.0.1", server->port());
+  ASSERT_TRUE(client_location.ok()) << client_location.status().ToString();
+  auto flight_client = flight::FlightClient::Connect(*client_location);
+  ASSERT_TRUE(flight_client.ok()) << flight_client.status().ToString();
+  flight_sql::FlightSqlClient client(std::move(*flight_client));
+
+  const flight::FlightCallOptions call_options;
+  const std::string sql = "SELECT id FROM read_parquet('" + path + "')";
+
+  // First call fills the cap (1 buffered result, never fetched via DoGet).
+  auto first = client.Execute(call_options, sql);
+  ASSERT_TRUE(first.ok()) << first.status().ToString();
+
+  // Second call must be rejected -- the cap is already full.
+  auto second = client.Execute(call_options, sql);
+  ASSERT_FALSE(second.ok());
+  EXPECT_TRUE(second.status().IsOutOfMemory()) << second.status().ToString();
+
+  ASSERT_TRUE(server->Shutdown().ok());
+  serve_thread.join();
+  fs::remove_all(dir);
 }
 
 }  // namespace

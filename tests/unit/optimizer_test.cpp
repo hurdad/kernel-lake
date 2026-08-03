@@ -61,6 +61,55 @@ TEST(Optimizer, ConstantFoldsArithmetic) {
   EXPECT_EQ(real_filter->predicate()->to_string(), "(a > 3)");
 }
 
+// Regression test: constant folding used to round-trip int64 literals
+// through double, which silently loses precision past 2^53 -- this literal
+// pair (both well past 2^53 but their sum still fits in int64) would fold
+// to the wrong value under the old double-based path.
+TEST(Optimizer, ConstantFoldsLargeInt64ArithmeticExactly) {
+  auto plan = plan_for("SELECT a FROM read_parquet('/x.parquet') WHERE a > 4611686018427387904 + 1",
+                       two_column_schema());
+  plan = optimize(std::move(plan));
+
+  const auto* projection = dynamic_cast<const LogicalProjection*>(plan.get());
+  ASSERT_NE(projection, nullptr);
+  const auto* real_filter = dynamic_cast<const LogicalFilter*>(projection->children()[0].get());
+  ASSERT_NE(real_filter, nullptr);
+  EXPECT_EQ(real_filter->predicate()->to_string(), "(a > 4611686018427387905)");
+}
+
+// Regression test: static_cast<int64_t>(double) on a magnitude past
+// INT64_MAX/MIN is undefined behavior -- the old double-based folding path
+// had no overflow check at all before that cast. An overflowing int64 sum
+// must be left unfolded (evaluated at runtime instead), not crash or fold
+// to a wrapped/garbage value.
+TEST(Optimizer, DoesNotFoldOverflowingInt64Arithmetic) {
+  auto plan = plan_for("SELECT a FROM read_parquet('/x.parquet') WHERE a > 9223372036854775807 + 1",
+                       two_column_schema());
+  plan = optimize(std::move(plan));
+
+  const auto* projection = dynamic_cast<const LogicalProjection*>(plan.get());
+  ASSERT_NE(projection, nullptr);
+  const auto* real_filter = dynamic_cast<const LogicalFilter*>(projection->children()[0].get());
+  ASSERT_NE(real_filter, nullptr);
+  EXPECT_EQ(real_filter->predicate()->to_string(), "(a > (9223372036854775807 + 1))");
+}
+
+// Regression test: constant folding used to skip CASE branches entirely
+// (simplify_expression had no case for CaseExpression, falling through to
+// its default "nothing to simplify" branch) -- a foldable THEN/ELSE
+// expression must still be folded.
+TEST(Optimizer, ConstantFoldsInsideCaseBranches) {
+  auto plan =
+      plan_for("SELECT CASE WHEN a > 1 THEN 1 + 2 ELSE 3 + 4 END AS bucket FROM read_parquet('/x.parquet')",
+               two_column_schema());
+  plan = optimize(std::move(plan));
+
+  const auto* projection = dynamic_cast<const LogicalProjection*>(plan.get());
+  ASSERT_NE(projection, nullptr);
+  ASSERT_EQ(projection->items().size(), 1u);
+  EXPECT_EQ(projection->items()[0].expr->to_string(), "CASE WHEN (a > 1) THEN 3 ELSE 7 END");
+}
+
 TEST(Optimizer, RemovesFilterThatFoldsToTrue) {
   auto plan = plan_for("SELECT a FROM read_parquet('/x.parquet') WHERE 1 = 1", two_column_schema());
   plan = optimize(std::move(plan));

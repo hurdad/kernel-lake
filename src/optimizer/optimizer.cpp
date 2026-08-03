@@ -1,6 +1,7 @@
 #include "kernellake/optimizer/optimizer.hpp"
 
 #include <algorithm>
+#include <limits>
 #include <optional>
 #include <unordered_set>
 
@@ -45,6 +46,61 @@ std::optional<double> fold_arithmetic(BinaryOperator op, double left, double rig
 }
 
 std::optional<bool> fold_numeric_comparison(BinaryOperator op, double left, double right) {
+  switch (op) {
+    case BinaryOperator::Equal:
+      return left == right;
+    case BinaryOperator::NotEqual:
+      return left != right;
+    case BinaryOperator::Less:
+      return left < right;
+    case BinaryOperator::LessEqual:
+      return left <= right;
+    case BinaryOperator::Greater:
+      return left > right;
+    case BinaryOperator::GreaterEqual:
+      return left >= right;
+    default:
+      return std::nullopt;
+  }
+}
+
+// Exact-integer counterparts of fold_arithmetic/fold_numeric_comparison
+// above, used only when both literals are int64 (see simplify_expression):
+// round-tripping an int64 through double loses precision past 2^53 and,
+// worse, static_cast<int64_t>(double) is undefined behavior once the
+// double's magnitude exceeds INT64_MAX/MIN -- both are real risks for
+// int64, whose whole range is far wider than a double's 53-bit mantissa.
+// Returns nullopt on overflow (checked via __builtin_*_overflow, supported
+// by both GCC and Clang, this project's only two compilers) rather than
+// folding to a wrapped/UB result -- the expression is simply left
+// unfolded and evaluated at runtime instead, same as the existing
+// divide-by-zero behavior above.
+std::optional<std::int64_t> fold_arithmetic_int64(BinaryOperator op, std::int64_t left, std::int64_t right) {
+  std::int64_t result = 0;
+  switch (op) {
+    case BinaryOperator::Add:
+      return __builtin_add_overflow(left, right, &result) ? std::nullopt
+                                                          : std::optional<std::int64_t>(result);
+    case BinaryOperator::Subtract:
+      return __builtin_sub_overflow(left, right, &result) ? std::nullopt
+                                                          : std::optional<std::int64_t>(result);
+    case BinaryOperator::Multiply:
+      return __builtin_mul_overflow(left, right, &result) ? std::nullopt
+                                                          : std::optional<std::int64_t>(result);
+    case BinaryOperator::Divide:
+      // INT64_MIN / -1 overflows (magnitude exceeds INT64_MAX) and is UB
+      // for the raw '/' operator -- skip folding that case too, same as
+      // divide-by-zero.
+      if (right == 0 || (left == std::numeric_limits<std::int64_t>::min() && right == -1)) {
+        return std::nullopt;
+      }
+      return left / right;
+    default:
+      return std::nullopt;
+  }
+}
+
+std::optional<bool> fold_integer_comparison(BinaryOperator op, std::int64_t left, std::int64_t right) {
   switch (op) {
     case BinaryOperator::Equal:
       return left == right;
@@ -119,6 +175,27 @@ ExpressionPtr simplify_expression(const ExpressionPtr& expr) {
         return op == BinaryOperator::And ? (rv ? left : make_bool_literal(false))
                                          : (rv ? make_bool_literal(true) : left);
       }
+    } else if (left_lit != nullptr && right_lit != nullptr && !left_lit->is_null() && !right_lit->is_null() &&
+               std::holds_alternative<std::int64_t>(left_lit->value()) &&
+               std::holds_alternative<std::int64_t>(right_lit->value())) {
+      // Both operands are int64: fold with exact integer arithmetic rather
+      // than the double round-trip below (see fold_arithmetic_int64's own
+      // comment for why -- precision loss past 2^53, UB past INT64_MAX/MIN).
+      const std::int64_t lv = std::get<std::int64_t>(left_lit->value());
+      const std::int64_t rv = std::get<std::int64_t>(right_lit->value());
+      if (is_arithmetic(op)) {
+        if (const std::optional<std::int64_t> result = fold_arithmetic_int64(op, lv, rv)) {
+          const bool as_float =
+              binary->result_type().id == TypeId::Float64 || binary->result_type().id == TypeId::Float32;
+          return as_float ? std::make_shared<LiteralExpression>(
+                                LiteralExpression::make_float64(static_cast<double>(*result)))
+                          : std::make_shared<LiteralExpression>(LiteralExpression::make_int64(*result));
+        }
+      } else if (is_comparison(op)) {
+        if (const std::optional<bool> result = fold_integer_comparison(op, lv, rv)) {
+          return make_bool_literal(*result);
+        }
+      }
     } else if (left_lit != nullptr && right_lit != nullptr) {
       const std::optional<double> lv = literal_as_double(*left_lit);
       const std::optional<double> rv = literal_as_double(*right_lit);
@@ -161,6 +238,32 @@ ExpressionPtr simplify_expression(const ExpressionPtr& expr) {
     }
     return std::make_shared<AggregateExpression>(aggregate->function(), std::move(argument),
                                                  aggregate->result_type());
+  }
+  if (const auto* like = dynamic_cast<const LikeExpression*>(expr.get())) {
+    ExpressionPtr value = simplify_expression(like->value());
+    if (value.get() == like->value().get()) {
+      return expr;
+    }
+    return std::make_shared<LikeExpression>(std::move(value), like->pattern(), like->negated());
+  }
+  if (const auto* case_expr = dynamic_cast<const CaseExpression*>(expr.get())) {
+    bool changed = false;
+    std::vector<CaseExpression::WhenThen> when_then;
+    when_then.reserve(case_expr->when_then().size());
+    for (const CaseExpression::WhenThen& branch : case_expr->when_then()) {
+      ExpressionPtr condition = simplify_expression(branch.condition);
+      ExpressionPtr result = simplify_expression(branch.result);
+      changed = changed || condition.get() != branch.condition.get() || result.get() != branch.result.get();
+      when_then.push_back(CaseExpression::WhenThen{std::move(condition), std::move(result)});
+    }
+    ExpressionPtr else_branch =
+        case_expr->else_branch() != nullptr ? simplify_expression(case_expr->else_branch()) : nullptr;
+    changed = changed || else_branch.get() != case_expr->else_branch().get();
+    if (!changed) {
+      return expr;
+    }
+    return std::make_shared<CaseExpression>(std::move(when_then), std::move(else_branch),
+                                            case_expr->result_type());
   }
   return expr;  // ColumnExpression, LiteralExpression: nothing to simplify.
 }

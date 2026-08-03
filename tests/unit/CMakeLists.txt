@@ -11,6 +11,7 @@ add_executable(kernellake_unit_tests
   storage_test.cpp
   object_store_registry_test.cpp
   parquet_metadata_test.cpp
+  parquet_pruning_test.cpp
   physical_planner_test.cpp
   query_engine_test.cpp
   query_engine_execute_cpu_test.cpp

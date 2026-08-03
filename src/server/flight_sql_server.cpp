@@ -5,6 +5,7 @@
 #include <arrow/result.h>
 #include <arrow/status.h>
 #include <arrow/type.h>
+#include <fmt/format.h>
 
 #include <utility>
 
@@ -66,6 +67,19 @@ arrow::Result<std::unique_ptr<flight::FlightInfo>> KernelLakeFlightSqlServer::Ge
   observability::QuerySpan span =
       observability::start_query_span("kernellake.flight_sql.get_flight_info_statement");
   try {
+    // Reject before doing any work if the buffered-but-unfetched result
+    // registry is already full (see ServerSection::max_pending_results'
+    // own comment) -- a client that never calls DoGetStatement to drain it
+    // must not be able to grow this map without bound.
+    {
+      const std::lock_guard<std::mutex> lock(results_mutex_);
+      if (results_.size() >= config_.server.max_pending_results) {
+        throw OutOfMemoryError(fmt::format(
+            "too many buffered query results awaiting fetch (limit: {}); fetch or abandon existing "
+            "results before issuing more statements",
+            config_.server.max_pending_results));
+      }
+    }
     const PhysicalPlanPtr physical = engine_.explain(command.query);
     result = config_.engine.backend == "cpu" ? engine_.execute_cpu(physical)
                                              : gpu_coordinator_->execute(engine_, physical);

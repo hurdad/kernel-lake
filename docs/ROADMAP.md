@@ -492,7 +492,7 @@ and covered by passing tests -- not merely designed or stubbed.
   copied both binaries' full `ldd` closure with no missing entries; a real
   `kernellake generate-data` + `kernellake query --backend cpu` for a bare
   `COUNT(*)` through the actual `runtime` container returned the correct
-  row count. `dev` (148/148), `gpu-dev` (218/218), `server-dev` (150/150),
+  row count. `dev` (148/148), `gpu-dev` (217/217), `server-dev` (150/150),
   and `otel-dev` (151/151) all reconfirmed unaffected.
 - **Bare `COUNT(*)` returning 0 on the GPU backend, fixed** (found
   incidentally while smoke-testing Phase 3's Docker/Helm work on real

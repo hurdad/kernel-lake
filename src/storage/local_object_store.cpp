@@ -50,6 +50,28 @@ bool has_glob_chars(std::string_view text) {
       fmt::format("path does not exist: '{}' (check the path and that KernelLake has read access)", path));
 }
 
+// Confines `path` to `local_root`: both are resolved via weakly_canonical
+// (follows symlinks and ".."-segments for whatever prefix actually exists on
+// disk, lexically normalizes the rest) before comparing path components, so
+// a string-prefix check can't be fooled by e.g. "/dataX" vs. root "/data" or
+// by a symlink inside the tree pointing back out. Throws StorageError
+// (without echoing local_root itself, since that's operator configuration,
+// not something the caller supplied) rather than silently truncating or
+// rewriting the path.
+void check_within_root(const fs::path& path, const std::string& local_root, const std::string& original) {
+  std::error_code ec;
+  const fs::path resolved_root = fs::weakly_canonical(local_root, ec);
+  const fs::path root = ec ? fs::path(local_root).lexically_normal() : resolved_root;
+  const fs::path resolved = fs::weakly_canonical(path, ec);
+  const fs::path candidate = ec ? path.lexically_normal() : resolved;
+
+  const auto [root_end, candidate_end] =
+      std::mismatch(root.begin(), root.end(), candidate.begin(), candidate.end());
+  if (root_end != root.end()) {
+    throw StorageError(fmt::format("path '{}' is outside the configured storage root", original));
+  }
+}
+
 std::vector<ObjectInfo> list_directory_matching(const fs::path& dir, std::string_view pattern) {
   std::vector<ObjectInfo> results;
   for (const auto& entry : fs::directory_iterator(dir)) {
@@ -92,6 +114,7 @@ std::vector<ObjectInfo> LocalObjectStore::list(const Uri& prefix) {
 
   if (has_glob_chars(path.filename().string())) {
     const fs::path dir = path.parent_path().empty() ? fs::path(".") : path.parent_path();
+    check_within_root(dir, local_root_, prefix.value());
     if (!fs::exists(dir) || !fs::is_directory(dir)) {
       fail_missing(prefix.value());
     }
@@ -101,6 +124,8 @@ std::vector<ObjectInfo> LocalObjectStore::list(const Uri& prefix) {
     }
     return results;
   }
+
+  check_within_root(path, local_root_, prefix.value());
 
   std::error_code ec;
   const bool exists = fs::exists(path, ec);
@@ -120,6 +145,7 @@ std::vector<ObjectInfo> LocalObjectStore::list(const Uri& prefix) {
 }
 
 std::unique_ptr<RandomAccessObject> LocalObjectStore::open(const Uri& uri) {
+  check_within_root(fs::path(uri.value()), local_root_, uri.value());
   arrow::Result<std::shared_ptr<arrow::io::ReadableFile>> result = arrow::io::ReadableFile::Open(uri.value());
   if (!result.ok()) {
     throw StorageError(fmt::format("failed to open '{}': {}", uri.value(), result.status().ToString()));

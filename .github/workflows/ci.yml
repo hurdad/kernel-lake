@@ -1,11 +1,13 @@
 # KernelLake CI. One workflow, seven jobs, in dependency order:
 #
 #   format-check ------------------+
-#   clang-tidy ---------------------+
 #                                   +--> docker-publish (push to main only)
 #   cpu-build-test --+--> tpch-tooling-smoke --+
-#                     +--> server-build-test --+
-#                     +--> otel-build-test -----+
+#                     +--> server-build-test
+#                     +--> otel-build-test
+#
+#   clang-tidy (standalone lint job -- no `needs:` of its own, and not in
+#               docker-publish's `needs:` list either; see below)
 #
 # docker-publish only starts once format-check, cpu-build-test, AND
 # tpch-tooling-smoke have all succeeded (via `needs:`) -- a broken build or

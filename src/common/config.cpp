@@ -239,6 +239,8 @@ EngineConfig parse_config(const std::string& yaml_text) {
   const YAML::Node server = root["server"];
   config.server.host = read_or(server, "host", config.server.host);
   config.server.port = read_or(server, "port", config.server.port);
+  config.server.max_pending_results =
+      read_or(server, "max_pending_results", config.server.max_pending_results);
 
   const YAML::Node observability = root["observability"];
   config.observability.enabled = read_or(observability, "enabled", config.observability.enabled);
@@ -434,6 +436,9 @@ void validate_config(const EngineConfig& config) {
 
   if (config.server.port == 0) {
     throw ConfigurationError("server.port must be > 0");
+  }
+  if (config.server.max_pending_results == 0) {
+    throw ConfigurationError("server.max_pending_results must be > 0");
   }
 
   if (config.observability.otlp_protocol != "grpc" && config.observability.otlp_protocol != "http") {
