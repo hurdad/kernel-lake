@@ -38,7 +38,7 @@ TEST(ArrowAdapter, SchemaRoundTripPreservesFieldOrder) {
 
 TEST(ArrowAdapter, UnsupportedArrowTypeThrows) {
   auto list_type = arrow::list(arrow::int32());
-  EXPECT_THROW({ auto ignored = from_arrow_type(list_type, true); }, PlanningError);
+  EXPECT_THROW((void)({ auto ignored = from_arrow_type(list_type, true); }), PlanningError);
 }
 
 }  // namespace

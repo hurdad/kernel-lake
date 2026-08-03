@@ -12,7 +12,7 @@ TEST(Config, DefaultsMatchSpec) {
   EXPECT_EQ(config.engine.batch_rows, 1'000'000u);
   EXPECT_EQ(config.memory.pool_max_bytes, 8ULL * 1024 * 1024 * 1024);
   EXPECT_EQ(config.benchmark.baseline, "duckdb");
-  EXPECT_NO_THROW(validate_config(config));
+  EXPECT_NO_THROW((void)(validate_config(config)));
 }
 
 TEST(Config, ParsesOverrides) {
@@ -39,38 +39,38 @@ benchmark:
 TEST(Config, RejectsZeroBatchRows) {
   EngineConfig config = default_config();
   config.engine.batch_rows = 0;
-  EXPECT_THROW(validate_config(config), ConfigurationError);
+  EXPECT_THROW((void)(validate_config(config)), ConfigurationError);
 }
 
 TEST(Config, RejectsContradictoryMemoryPool) {
   EngineConfig config = default_config();
   config.memory.pool_initial_bytes = 100;
   config.memory.pool_max_bytes = 10;
-  EXPECT_THROW(validate_config(config), ConfigurationError);
+  EXPECT_THROW((void)(validate_config(config)), ConfigurationError);
 }
 
 TEST(Config, RejectsUnknownLogLevel) {
   EngineConfig config = default_config();
   config.logging.level = "verbose";
-  EXPECT_THROW(validate_config(config), ConfigurationError);
+  EXPECT_THROW((void)(validate_config(config)), ConfigurationError);
 }
 
 TEST(Config, RejectsUnsupportedBenchmarkMode) {
   EngineConfig config = default_config();
   config.benchmark.output_format = "xml";
-  EXPECT_THROW(validate_config(config), ConfigurationError);
+  EXPECT_THROW((void)(validate_config(config)), ConfigurationError);
 
   config = default_config();
   config.benchmark.baseline = "clickhouse-but-not-really";
-  EXPECT_THROW(validate_config(config), ConfigurationError);
+  EXPECT_THROW((void)(validate_config(config)), ConfigurationError);
 }
 
 TEST(Config, RejectsMalformedYaml) {
-  EXPECT_THROW(parse_config("engine: [this is not a map"), ConfigurationError);
+  EXPECT_THROW((void)(parse_config("engine: [this is not a map")), ConfigurationError);
 }
 
 TEST(Config, LoadConfigFileRejectsMissingPath) {
-  EXPECT_THROW(load_config_file("/nonexistent/kernellake.yaml"), ConfigurationError);
+  EXPECT_THROW((void)(load_config_file("/nonexistent/kernellake.yaml")), ConfigurationError);
 }
 
 }  // namespace

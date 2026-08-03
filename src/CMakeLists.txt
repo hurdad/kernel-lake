@@ -13,7 +13,7 @@ add_subdirectory(observability)
 
 if(KERNELLAKE_WITH_CUDA)
   add_subdirectory(memory)
-  add_subdirectory(execution)
+  add_subdirectory(execution_gpu)
 endif()
 
 add_subdirectory(cli)

@@ -112,6 +112,28 @@ TEST_F(QueryEngineExecuteTest, ScalarAggregateWithNoGroupByMatchesExpectedTotal)
   EXPECT_DOUBLE_EQ(total_column->Value(0), 145.0);  // 10+20+5+100+7+3
 }
 
+// Regression test for a real bug: a bare `COUNT(*)` with no other column
+// referenced anywhere in the query (no WHERE/GROUP BY/join) legitimately
+// produces an empty required_columns() from the optimizer's column-pruning
+// pass, but a cudf::table built from zero selected columns has no column
+// to derive num_rows() from -- every chunk was silently treated as empty
+// and this returned 0 instead of the real row count. Every pre-existing
+// COUNT(*) test in this file references another column via GROUP BY/WHERE/
+// a join key, so this exact shape had no test coverage before. See
+// docs/ARCHITECTURE.md's "Ubuntu 26.04 baseline" section and
+// docs/ROADMAP.md for the full root-cause writeup; fixed in
+// src/io/physical_planner.cpp's convert_scan().
+TEST_F(QueryEngineExecuteTest, BareCountStarWithNoOtherColumnReferenceMatchesRealRowCount) {
+  const QueryResult result = engine_.execute("SELECT COUNT(*) AS n FROM read_parquet('" + path_ + "')");
+
+  ASSERT_EQ(result.rows_returned, 1);
+  ASSERT_EQ(result.batches.size(), 1u);
+  const auto n_column =
+      std::static_pointer_cast<arrow::Int64Array>(result.batches.front()->GetColumnByName("n"));
+  ASSERT_NE(n_column, nullptr);
+  EXPECT_EQ(n_column->Value(0), 6);
+}
+
 TEST_F(QueryEngineExecuteTest, PlainProjectionReturnsAllRows) {
   const QueryResult result = engine_.execute("SELECT region FROM read_parquet('" + path_ + "')");
   EXPECT_EQ(result.rows_returned, 6);

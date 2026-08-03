@@ -4,7 +4,7 @@
 #include <cudf/filling.hpp>
 #include <cudf/scalar/scalar_factories.hpp>
 
-#include "kernellake/execution/limit_operator.hpp"
+#include "kernellake/execution_gpu/limit_operator.hpp"
 #include "kernellake/memory/rmm_environment.hpp"
 
 namespace kernellake {

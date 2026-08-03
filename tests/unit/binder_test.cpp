@@ -88,39 +88,39 @@ TEST(Binder, BindsTpchQ6ArithmeticOnGpuShape) {
 
 TEST(Binder, RejectsUnknownColumn) {
   const auto stmt = sql::parse_sql("SELECT nonexistent FROM read_parquet('/x.parquet')");
-  EXPECT_THROW(bind_query(stmt, sales_schema()), BindingError);
+  EXPECT_THROW((void)(bind_query(stmt, sales_schema())), BindingError);
 }
 
 TEST(Binder, RejectsUngroupedColumnInAggregateQuery) {
   const auto stmt =
       sql::parse_sql("SELECT region, amount, SUM(amount) FROM read_parquet('/x.parquet') GROUP BY region");
-  EXPECT_THROW(bind_query(stmt, sales_schema()), BindingError);
+  EXPECT_THROW((void)(bind_query(stmt, sales_schema())), BindingError);
 }
 
 TEST(Binder, AllowsGroupedColumnInAggregateQuery) {
   const auto stmt =
       sql::parse_sql("SELECT region, SUM(amount) FROM read_parquet('/x.parquet') GROUP BY region");
-  EXPECT_NO_THROW(bind_query(stmt, sales_schema()));
+  EXPECT_NO_THROW((void)(bind_query(stmt, sales_schema())));
 }
 
 TEST(Binder, RejectsIncompatibleComparison) {
   const auto stmt = sql::parse_sql("SELECT region FROM read_parquet('/x.parquet') WHERE region > 5");
-  EXPECT_THROW(bind_query(stmt, sales_schema()), BindingError);
+  EXPECT_THROW((void)(bind_query(stmt, sales_schema())), BindingError);
 }
 
 TEST(Binder, RejectsNonBooleanWhere) {
   const auto stmt = sql::parse_sql("SELECT region FROM read_parquet('/x.parquet') WHERE amount");
-  EXPECT_THROW(bind_query(stmt, sales_schema()), BindingError);
+  EXPECT_THROW((void)(bind_query(stmt, sales_schema())), BindingError);
 }
 
 TEST(Binder, RejectsDuplicateOutputNames) {
   const auto stmt = sql::parse_sql("SELECT region AS x, amount AS x FROM read_parquet('/x.parquet')");
-  EXPECT_THROW(bind_query(stmt, sales_schema()), BindingError);
+  EXPECT_THROW((void)(bind_query(stmt, sales_schema())), BindingError);
 }
 
 TEST(Binder, RejectsAggregateInWhere) {
   const auto stmt = sql::parse_sql("SELECT region FROM read_parquet('/x.parquet') WHERE SUM(amount) > 0");
-  EXPECT_THROW(bind_query(stmt, sales_schema()), BindingError);
+  EXPECT_THROW((void)(bind_query(stmt, sales_schema())), BindingError);
 }
 
 TEST(Binder, ExpandsStar) {
@@ -141,7 +141,7 @@ TEST(Binder, InsertsSafeNumericCastForComparison) {
 
 TEST(Binder, NullLiteralComparisonBindsWithoutError) {
   const auto stmt = sql::parse_sql("SELECT region FROM read_parquet('/x.parquet') WHERE amount = NULL");
-  EXPECT_NO_THROW(bind_query(stmt, sales_schema()));
+  EXPECT_NO_THROW((void)(bind_query(stmt, sales_schema())));
 }
 
 TEST(Binder, LikeRequiresStringOperandAndLiteralPattern) {
@@ -162,7 +162,7 @@ TEST(Binder, LikeRequiresStringOperandAndLiteralPattern) {
 
   const auto numeric_stmt =
       sql::parse_sql("SELECT region FROM read_parquet('/x.parquet') WHERE amount LIKE 'A%'");
-  EXPECT_THROW(bind_query(numeric_stmt, sales_schema()), BindingError);
+  EXPECT_THROW((void)(bind_query(numeric_stmt, sales_schema())), BindingError);
 }
 
 TEST(Binder, InDesugarsIntoOrChainOfEqualityComparisons) {
@@ -213,11 +213,11 @@ TEST(Binder, CaseRequiresBooleanConditionsAndUnifiesResultTypes) {
 
   const auto non_boolean_condition_stmt =
       sql::parse_sql("SELECT CASE WHEN amount THEN 1 ELSE 0 END AS bucket FROM read_parquet('/x.parquet')");
-  EXPECT_THROW(bind_query(non_boolean_condition_stmt, sales_schema()), BindingError);
+  EXPECT_THROW((void)(bind_query(non_boolean_condition_stmt, sales_schema())), BindingError);
 
   const auto incompatible_branches_stmt = sql::parse_sql(
       "SELECT CASE WHEN amount > 500 THEN 'high' ELSE 0 END AS bucket FROM read_parquet('/x.parquet')");
-  EXPECT_THROW(bind_query(incompatible_branches_stmt, sales_schema()), BindingError);
+  EXPECT_THROW((void)(bind_query(incompatible_branches_stmt, sales_schema())), BindingError);
 }
 
 TEST(Binder, CastMapsSqlTypeNamesToDataTypes) {
@@ -240,7 +240,7 @@ TEST(Binder, CastMapsSqlTypeNamesToDataTypes) {
 
   const auto decimal_stmt =
       sql::parse_sql("SELECT CAST(amount AS DECIMAL) AS x FROM read_parquet('/x.parquet')");
-  EXPECT_THROW(bind_query(decimal_stmt, sales_schema()), BindingError);
+  EXPECT_THROW((void)(bind_query(decimal_stmt, sales_schema())), BindingError);
 }
 
 TEST(Binder, GroupByResolvesSelectListAliasForComputedExpressions) {
@@ -256,7 +256,7 @@ TEST(Binder, GroupByResolvesSelectListAliasForComputedExpressions) {
 
   const auto unknown_alias_stmt = sql::parse_sql(
       "SELECT region, COUNT(*) AS n FROM read_parquet('/x.parquet') GROUP BY nonexistent_alias");
-  EXPECT_THROW(bind_query(unknown_alias_stmt, sales_schema()), BindingError);
+  EXPECT_THROW((void)(bind_query(unknown_alias_stmt, sales_schema())), BindingError);
 }
 
 TEST(Binder, CastToDecimalRequiresExplicitPrecisionAndScale) {
@@ -272,13 +272,13 @@ TEST(Binder, CastToDecimalRequiresExplicitPrecisionAndScale) {
   // Precision > 38 (cudf's fixed_point ceiling) is rejected.
   const auto too_wide_stmt =
       sql::parse_sql("SELECT CAST(amount AS DECIMAL(39, 2)) AS x FROM read_parquet('/x.parquet')");
-  EXPECT_THROW(bind_query(too_wide_stmt, sales_schema()), BindingError);
+  EXPECT_THROW((void)(bind_query(too_wide_stmt, sales_schema())), BindingError);
 
   // Scale > precision is nonsensical (more digits after the point than
   // total digits) and rejected.
   const auto bad_scale_stmt =
       sql::parse_sql("SELECT CAST(amount AS DECIMAL(5, 10)) AS x FROM read_parquet('/x.parquet')");
-  EXPECT_THROW(bind_query(bad_scale_stmt, sales_schema()), BindingError);
+  EXPECT_THROW((void)(bind_query(bad_scale_stmt, sales_schema())), BindingError);
 }
 
 TEST(Binder, DecimalColumnComparedAgainstLiteralCoercesTheLiteral) {
@@ -286,7 +286,7 @@ TEST(Binder, DecimalColumnComparedAgainstLiteralCoercesTheLiteral) {
   // literal by hsql) must be retyped to match rather than rejected -- see
   // cast_if_needed in binder.cpp.
   const auto stmt = sql::parse_sql("SELECT price FROM read_parquet('/x.parquet') WHERE price > 19.99");
-  EXPECT_NO_THROW(bind_query(stmt, priced_sales_schema()));
+  EXPECT_NO_THROW((void)(bind_query(stmt, priced_sales_schema())));
 }
 
 TEST(Binder, DecimalColumnComparedAgainstNonLiteralColumnIsRejected) {
@@ -295,13 +295,13 @@ TEST(Binder, DecimalColumnComparedAgainstNonLiteralColumnIsRejected) {
   // so this must fail cleanly at bind time rather than silently
   // misevaluating.
   const auto stmt = sql::parse_sql("SELECT price FROM read_parquet('/x.parquet') WHERE price > amount");
-  EXPECT_THROW(bind_query(stmt, priced_sales_schema()), BindingError);
+  EXPECT_THROW((void)(bind_query(stmt, priced_sales_schema())), BindingError);
 }
 
 TEST(Binder, MixingTwoDifferentDecimalTypesIsRejected) {
   const auto stmt = sql::parse_sql(
       "SELECT price FROM read_parquet('/x.parquet') WHERE price > CAST(amount AS DECIMAL(12, 4))");
-  EXPECT_THROW(bind_query(stmt, priced_sales_schema()), BindingError);
+  EXPECT_THROW((void)(bind_query(stmt, priced_sales_schema())), BindingError);
 }
 
 TEST(Binder, SumOverDecimalPreservesPrecisionAndScale) {
@@ -327,7 +327,7 @@ TEST(Binder, MinMaxOverDecimalPreservePrecisionAndScale) {
 
 TEST(Binder, AvgOverDecimalIsRejected) {
   const auto stmt = sql::parse_sql("SELECT AVG(price) AS avg_price FROM read_parquet('/x.parquet')");
-  EXPECT_THROW(bind_query(stmt, priced_sales_schema()), BindingError);
+  EXPECT_THROW((void)(bind_query(stmt, priced_sales_schema())), BindingError);
 }
 
 TEST(Binder, GroupByPrefersBaseColumnOverSameNamedAlias) {
@@ -375,28 +375,28 @@ TEST(Binder, JoinRejectsAmbiguousUnqualifiedColumn) {
   const auto stmt = sql::parse_sql(
       "SELECT customer_id FROM read_parquet('/o.parquet') AS o "
       "JOIN read_parquet('/c.parquet') AS c ON o.customer_id = c.customer_id");
-  EXPECT_THROW(bind_query(stmt, orders_schema(), customers_schema()), BindingError);
+  EXPECT_THROW((void)(bind_query(stmt, orders_schema(), customers_schema())), BindingError);
 }
 
 TEST(Binder, JoinRejectsUnknownTableQualifier) {
   const auto stmt = sql::parse_sql(
       "SELECT z.order_id FROM read_parquet('/o.parquet') AS o "
       "JOIN read_parquet('/c.parquet') AS c ON o.customer_id = c.customer_id");
-  EXPECT_THROW(bind_query(stmt, orders_schema(), customers_schema()), BindingError);
+  EXPECT_THROW((void)(bind_query(stmt, orders_schema(), customers_schema())), BindingError);
 }
 
 TEST(Binder, JoinRejectsNonEqualityCondition) {
   const auto stmt = sql::parse_sql(
       "SELECT o.order_id FROM read_parquet('/o.parquet') AS o "
       "JOIN read_parquet('/c.parquet') AS c ON o.customer_id > c.customer_id");
-  EXPECT_THROW(bind_query(stmt, orders_schema(), customers_schema()), BindingError);
+  EXPECT_THROW((void)(bind_query(stmt, orders_schema(), customers_schema())), BindingError);
 }
 
 TEST(Binder, JoinRejectsConditionComparingTwoColumnsFromTheSameSide) {
   const auto stmt = sql::parse_sql(
       "SELECT o.order_id FROM read_parquet('/o.parquet') AS o "
       "JOIN read_parquet('/c.parquet') AS c ON o.customer_id = o.order_id");
-  EXPECT_THROW(bind_query(stmt, orders_schema(), customers_schema()), BindingError);
+  EXPECT_THROW((void)(bind_query(stmt, orders_schema(), customers_schema())), BindingError);
 }
 
 TEST(Binder, JoinRejectsMismatchedKeyTypes) {
@@ -407,7 +407,7 @@ TEST(Binder, JoinRejectsMismatchedKeyTypes) {
   const auto stmt = sql::parse_sql(
       "SELECT o.order_id FROM read_parquet('/o.parquet') AS o "
       "JOIN read_parquet('/c.parquet') AS c ON o.customer_id = c.name");
-  EXPECT_THROW(bind_query(stmt, orders_schema(), customers_schema()), BindingError);
+  EXPECT_THROW((void)(bind_query(stmt, orders_schema(), customers_schema())), BindingError);
 }
 
 TEST(Binder, JoinStarExpandsBothSidesInOrder) {
@@ -433,7 +433,7 @@ TEST(Binder, JoinStarWithCollidingColumnNamesIsRejected) {
   const auto stmt = sql::parse_sql(
       "SELECT * FROM read_parquet('/o.parquet') AS o "
       "JOIN read_parquet('/c.parquet') AS c ON o.customer_id = c.customer_id");
-  EXPECT_THROW(bind_query(stmt, orders_schema(), customers_schema()), BindingError);
+  EXPECT_THROW((void)(bind_query(stmt, orders_schema(), customers_schema())), BindingError);
 }
 
 }  // namespace

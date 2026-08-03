@@ -755,10 +755,23 @@ suite: every `COUNT(*)` test case in `tests/gpu/` also references another
 column via a `GROUP BY`, `WHERE`, or join key, so `required_columns()`
 was never empty in any tested case -- a bare, columnless `COUNT(*)` is a
 genuinely untested query shape, not a regression in previously-verified
-behavior. Fix and further detail tracked in `docs/ROADMAP.md`, "Not yet
-started". Not caused by Phase 3's own changes (Phase 3 touches neither
+behavior. Not caused by Phase 3's own changes (Phase 3 touches neither
 the optimizer nor `ParquetScanOperator`); found incidentally while
 smoke-testing the Phase 3 Docker/Helm work on real hardware.
+
+**Fixed** in `src/io/physical_planner.cpp`'s `convert_scan()`: when the
+narrowed column list would be empty, one arbitrary real column (the
+schema's first field) is kept selected purely to preserve row-count
+fidelity through `cudf::table` -- inert for every consumer except row
+counting, since nothing above the scan references it (that's exactly why
+`required_columns()` was empty in the first place). Verified for real: a
+new regression test (`QueryEngineExecuteTest.
+BareCountStarWithNoOtherColumnReferenceMatchesRealRowCount`,
+`tests/gpu/query_engine_execute_test.cpp`) covering the exact previously-
+untested query shape; a real `kernellake query --backend gpu` for a bare
+`COUNT(*)` against a real 5000-row file now returns `5000` (was `0`);
+`dev`/`gpu-dev`/`server-dev`/`otel-dev` all reconfirmed with zero
+regressions (see "Cloud object storage" below for the exact counts).
 
 **`runtime` stage's shared-library closure.** `runtime-libs`'s `ldd`-based
 closure (used to avoid hard-coding vendored library names/paths that would
@@ -1229,7 +1242,69 @@ predicted):
   flattening placed the actual `libarrow.a` reference at whatever position
   that whole-graph ordering picked, not necessarily inside a group
   declared on one single target -- before moving the group to each final
-  executable instead, where it reliably worked.
+  executable instead, where it reliably worked **for every preset tested
+  individually**. This turned out to be incomplete -- see the next item
+  below, found only once `KERNELLAKE_BUILD_SERVER` and
+  `KERNELLAKE_ENABLE_OTEL` were turned on *together*.
+- **The per-library `--start-group`/`--no-as-needed` wraps above were not
+  reliable enough, and were replaced with a single project-wide fix.** A
+  real `docker build` combining `KERNELLAKE_BUILD_SERVER=ON` and
+  `KERNELLAKE_ENABLE_OTEL=ON` -- a combination no local CMake preset tests
+  on its own, since `server-dev` and `otel-dev` each only turn one on --
+  failed with `libgrpc.so: undefined reference to symbol
+  '_ZN4absl7debian914ascii_internal13kPropertyBitsE'`, even though the
+  defining library (`absl::strings`) was already in
+  `cmake/LinkArrowBundledCloudDeps.cmake`'s group. The next attempt (wrapping
+  that specific set of libraries in `-Wl,--no-as-needed`/`--as-needed`
+  instead of a group) failed differently on the *next* Docker build:
+  `libabsl_strings.so: error adding symbols: DSO missing from command
+  line`. Both failures trace back to the same underlying cause: when a
+  library is requested by several different `kernellake_*` targets across
+  the whole dependency graph (which Abseil now is -- via gRPC, Arrow
+  itself, opentelemetry-cpp, and the GCS/Azure bundled code, all at once),
+  CMake's link-line assembly computes *that library's* actual position
+  from the whole graph's topological order, independently of where a raw
+  `-Wl,...` flag string was textually placed in any one target's own
+  `target_link_libraries()` call -- so a flag wrap that looks adjacent to
+  the right library in the CMake source doesn't reliably end up adjacent
+  in the generated link command, and each fix for one symbol just
+  relocated the problem to the next one. Fixed for real with a single
+  project-wide `add_link_options(-Wl,--no-as-needed)` in the root
+  `CMakeLists.txt` (see its own comment there) -- with no closing
+  `--as-needed`, every library on every final executable's link line
+  stays available for symbol resolution regardless of where CMake's
+  topological sort places it, sidestepping the whole class of problem
+  instead of chasing it symbol-by-symbol. The only cost is a larger
+  `DT_NEEDED` list per binary, which has no real downside here: this
+  project ships application binaries, not libraries other projects link
+  against, and the `runtime` Docker image's own shared-library closure is
+  already computed from actual `ldd` output (`docker/Dockerfile`'s
+  `runtime-libs` stage), not a minimal `DT_NEEDED` list, either way.
+  `cmake/LinkArrowBundledCloudDeps.cmake` was simplified back down to a
+  plain, ungrouped, unwrapped library list once this landed.
+- **A real `HdfsObjectStore` was added after all**, wrapping
+  `arrow::fs::HadoopFileSystem` the same way the other three backends wrap
+  their own Arrow filesystem (`src/storage/hdfs_object_store.cpp`) --
+  originally scoped out of this phase (see the non-goals note this
+  replaces, below), added once it became clear the C++ side costs nothing
+  extra: `HadoopFileSystem` `dlopen()`s `libhdfs.so` lazily at runtime,
+  not a build-time link dependency, so `HdfsObjectStore` compiles and
+  links cleanly with no Hadoop or JVM installed at all, confirmed by a
+  real `kernellake inspect-parquet --path 'hdfs://...'` invocation in this
+  sandbox (no JDK) failing cleanly with a `StorageError` naming exactly
+  why (`"Unable to load libjvm"`, every path it tried listed), not a
+  crash. `hdfs://host:port/path` URIs have their `host:port` authority
+  stripped before being passed to Arrow's `FileSystem` calls (unlike
+  S3/GCS/Azure's `scheme://bucket/key`, where the first path component
+  *is* the addressed resource, HDFS's authority names a namenode
+  connection `HadoopFileSystem` already has from
+  `storage.hdfs.connection_config` in config) -- see
+  `hdfs_object_store.cpp`'s own `strip_authority()`. What remains
+  genuinely unverified: real connectivity and read-correctness against an
+  actual Hadoop namenode/datanode, since this project has no lightweight
+  single-container emulator for HDFS the way it does for the other three,
+  and this development sandbox has no JDK/Hadoop installation to stand
+  one up against even manually -- disclosed here, not silently assumed.
 - **`arrow::io::HdfsConnectionConfig::port` has no default member
   initializer**, unlike every other field on
   `arrow::fs::HdfsOptions`/`HdfsConnectionConfig` -- confirmed directly
@@ -1281,18 +1356,35 @@ the `S3ShutdownGuard` fix). `kernellake inspect-parquet` against a real
 `abfs://` URI also verified separately (full schema + row-group stats,
 matching the local-file equivalent). Deliberately used `GROUP BY`/`SUM`
 rather than a bare `COUNT(*)` for the GPU-backend checks specifically, to
-avoid conflating this phase's own verification with the separate, already
--tracked, pre-existing bare-`COUNT(*)`-on-GPU bug (see "Not yet started"
-in `docs/ROADMAP.md`) -- this phase's own scan-path changes are unrelated
-to that bug and don't fix or worsen it.
+avoid conflating this phase's own verification with the separate,
+pre-existing bare-`COUNT(*)`-on-GPU bug (root-caused above, in "Ubuntu
+26.04 baseline", and since fixed -- see `docs/ROADMAP.md`'s "Done"
+section) -- this phase's own scan-path changes are unrelated
+to that bug and don't fix or worsen it. A real `docker build --target dev`
+with `KERNELLAKE_BUILD_SERVER=ON`/`KERNELLAKE_ENABLE_OTEL=ON` (matching
+`docker/Dockerfile`'s own `gpu-dev` build exactly) also completed
+successfully after the project-wide `--no-as-needed` fix above, linking
+all four binaries (`kernellake`, `kernellake-server`,
+`kernellake_unit_tests`, `kernellake_gpu_tests`) -- this combination had
+not been exercised by any local preset before, and is what actually
+surfaced the `absl::ascii_internal` gap. `docker build --target runtime`
+completed too, `ldd`-closure-copying both binaries' full transitive
+shared-library set (including `libxml2.so`, `libuuid.so`, and the ~90
+Abseil `.so`s now needed) with no missing entries; a real end-to-end
+smoke test through the `runtime` container -- `kernellake generate-data`
+into a mounted volume, then `kernellake query --backend cpu` for a bare
+`COUNT(*)` against the real 2000-row file it wrote -- returned the
+correct `2000`, confirming both this phase's own container plumbing and
+the separate bare-`COUNT(*)` fix above work together inside the actual
+published image, not just in local builds.
 
 **Explicit non-goals for this pass**: write support (`read_parquet` stays
-read-only for cloud backends too, matching local); **HDFS** (compiled into
-the same Arrow build and config-schema-complete, but deliberately not
-wired to a real `HdfsObjectStore` backend -- unlike S3/GCS/Azure, it has
-no lightweight single-container emulator for real end-to-end verification,
-needing an actual pseudo-distributed Hadoop cluster instead); credential
-rotation/STS assume-role/workload-identity *flows* beyond the
+read-only for cloud backends too, matching local); real Hadoop cluster
+connectivity/read-correctness for the HDFS backend (implemented, see
+above, but genuinely unverified beyond "compiles, links, and fails
+cleanly without a JVM" -- no lightweight emulator exists the way it does
+for the other three, and this sandbox has no JDK/Hadoop installation);
+credential rotation/STS assume-role/workload-identity *flows* beyond the
 `credentials_kind` selector already exposed (the underlying Arrow
 factory/`Configure*()` calls exist and work, just not exercised beyond
 what `credentials_kind` selects); CI automation of the emulator-based

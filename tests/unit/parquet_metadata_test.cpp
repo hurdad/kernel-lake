@@ -100,13 +100,13 @@ TEST_F(ParquetMetadataTest, ReadsMinMaxStatisticsPerRowGroup) {
 }
 
 TEST_F(ParquetMetadataTest, ThrowsOnMissingFile) {
-  EXPECT_THROW(inspect_parquet_file(store_, Uri((dir_ / "missing.parquet").string())), StorageError);
+  EXPECT_THROW((void)(inspect_parquet_file(store_, Uri((dir_ / "missing.parquet").string()))), StorageError);
 }
 
 TEST_F(ParquetMetadataTest, ValidateSchemaCompatibilityAcceptsIdenticalSchemas) {
   const FileMetadata a = inspect_parquet_file(store_, Uri(path_));
   const FileMetadata b = inspect_parquet_file(store_, Uri(path_));
-  EXPECT_NO_THROW(validate_schema_compatibility({a, b}));
+  EXPECT_NO_THROW((void)(validate_schema_compatibility({a, b})));
 }
 
 TEST_F(ParquetMetadataTest, ValidateSchemaCompatibilityRejectsMismatch) {
@@ -123,7 +123,7 @@ TEST_F(ParquetMetadataTest, ValidateSchemaCompatibilityRejectsMismatch) {
 
   const FileMetadata a = inspect_parquet_file(store_, Uri(path_));
   const FileMetadata b = inspect_parquet_file(store_, Uri(other_path));
-  EXPECT_THROW(validate_schema_compatibility({a, b}), StorageError);
+  EXPECT_THROW((void)(validate_schema_compatibility({a, b})), StorageError);
 }
 
 TEST_F(ParquetMetadataTest, PruningSkipsRowGroupProvenByEquality) {

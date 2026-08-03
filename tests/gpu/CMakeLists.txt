@@ -25,7 +25,7 @@ target_link_libraries(kernellake_gpu_tests PRIVATE
   kernellake_common
   kernellake_types
   kernellake_memory
-  kernellake_execution
+  kernellake_execution_gpu
   kernellake_api
   Parquet::parquet_static
   GTest::gtest

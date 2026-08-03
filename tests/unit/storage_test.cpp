@@ -62,15 +62,15 @@ TEST_F(LocalObjectStoreTest, ListsDirectoryPickingOnlyParquetFiles) {
 }
 
 TEST_F(LocalObjectStoreTest, ThrowsOnMissingPath) {
-  EXPECT_THROW(store_.list(Uri((dir_ / "nonexistent.parquet").string())), StorageError);
+  EXPECT_THROW((void)(store_.list(Uri((dir_ / "nonexistent.parquet").string()))), StorageError);
 }
 
 TEST_F(LocalObjectStoreTest, ThrowsWhenGlobMatchesNothing) {
-  EXPECT_THROW(store_.list(Uri((dir_ / "*.csv").string())), StorageError);
+  EXPECT_THROW((void)(store_.list(Uri((dir_ / "*.csv").string()))), StorageError);
 }
 
 TEST_F(LocalObjectStoreTest, ThrowsOnMissingDirectoryForGlob) {
-  EXPECT_THROW(store_.list(Uri((dir_ / "nonexistent_dir" / "*.parquet").string())), StorageError);
+  EXPECT_THROW((void)(store_.list(Uri((dir_ / "nonexistent_dir" / "*.parquet").string()))), StorageError);
 }
 
 TEST_F(LocalObjectStoreTest, OpenReadsBackContent) {
@@ -80,11 +80,11 @@ TEST_F(LocalObjectStoreTest, OpenReadsBackContent) {
 }
 
 TEST_F(LocalObjectStoreTest, OpenThrowsOnMissingFile) {
-  EXPECT_THROW(store_.open(Uri((dir_ / "nonexistent.parquet").string())), StorageError);
+  EXPECT_THROW((void)(store_.open(Uri((dir_ / "nonexistent.parquet").string()))), StorageError);
 }
 
 TEST_F(LocalObjectStoreTest, FileDiscoveryRejectsNonParquetFile) {
-  EXPECT_THROW(discover_parquet_files(store_, {(dir_ / "c.txt").string()}), StorageError);
+  EXPECT_THROW((void)(discover_parquet_files(store_, {(dir_ / "c.txt").string()})), StorageError);
 }
 
 TEST_F(LocalObjectStoreTest, FileDiscoveryMergesAndDedupsMultipleSources) {
@@ -94,7 +94,7 @@ TEST_F(LocalObjectStoreTest, FileDiscoveryMergesAndDedupsMultipleSources) {
 }
 
 TEST_F(LocalObjectStoreTest, FileDiscoveryRejectsEmptySourceList) {
-  EXPECT_THROW(discover_parquet_files(store_, {}), StorageError);
+  EXPECT_THROW((void)(discover_parquet_files(store_, {})), StorageError);
 }
 
 TEST(Uri, DefaultsToFileScheme) {

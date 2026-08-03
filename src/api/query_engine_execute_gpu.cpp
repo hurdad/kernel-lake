@@ -6,10 +6,10 @@
 #include <chrono>
 
 #include "kernellake/api/query_engine.hpp"
-#include "kernellake/execution/arrow_bridge.hpp"
-#include "kernellake/execution/cuda_utils.hpp"
-#include "kernellake/execution/execution_context.hpp"
-#include "kernellake/execution/operator_builder.hpp"
+#include "kernellake/execution_gpu/arrow_bridge.hpp"
+#include "kernellake/execution_gpu/cuda_utils.hpp"
+#include "kernellake/execution_gpu/execution_context.hpp"
+#include "kernellake/execution_gpu/operator_builder.hpp"
 #include "kernellake/io/physical_planner.hpp"
 #include "kernellake/memory/rmm_environment.hpp"
 #include "kernellake/planner/physical_plan.hpp"

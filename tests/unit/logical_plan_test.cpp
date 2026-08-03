@@ -135,7 +135,7 @@ TEST(LogicalPlanner, RejectsAggregateOrderByOnNonOutputExpression) {
   // "amount" is not a SELECT-list output name (only "region" and "total"
   // are) -- ORDER BY after GROUP BY is scoped to output names, not
   // arbitrary re-derived expressions (see binder.cpp).
-  EXPECT_THROW(bind_query(stmt, schema), BindingError);
+  EXPECT_THROW((void)(bind_query(stmt, schema)), BindingError);
 }
 
 TEST(LogicalPlanner, NonAggregateOrderByPlacedBeforeProjection) {

@@ -133,15 +133,15 @@ TEST_F(SampleDataGeneratorTest, RejectsInvalidOptions) {
   SampleDataGeneratorOptions options;
   options.output_dir = dir_.string();
   options.rows = 0;
-  EXPECT_THROW(generate_sample_data(options), ConfigurationError);
+  EXPECT_THROW((void)(generate_sample_data(options)), ConfigurationError);
 
   options.rows = 10;
   options.files = 0;
-  EXPECT_THROW(generate_sample_data(options), ConfigurationError);
+  EXPECT_THROW((void)(generate_sample_data(options)), ConfigurationError);
 
   options.files = 1;
   options.null_rate = 1.5;
-  EXPECT_THROW(generate_sample_data(options), ConfigurationError);
+  EXPECT_THROW((void)(generate_sample_data(options)), ConfigurationError);
 }
 
 }  // namespace

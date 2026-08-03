@@ -192,14 +192,14 @@ TEST_F(QueryEngineExecuteCpuTest, PopulatesCpuTimingAndScanStats) {
 }
 
 TEST_F(QueryEngineExecuteCpuTest, LikeIsNotYetSupportedByCpuBackend) {
-  EXPECT_THROW(engine_.execute("SELECT region FROM read_parquet('" + path_ + "') WHERE region LIKE 'A%'"),
+  EXPECT_THROW((void)(engine_.execute("SELECT region FROM read_parquet('" + path_ + "') WHERE region LIKE 'A%'")),
                ExecutionError);
 }
 
 TEST_F(QueryEngineExecuteCpuTest, CaseIsNotYetSupportedByCpuBackend) {
-  EXPECT_THROW(engine_.execute("SELECT CASE WHEN amount > 15 THEN 'high' ELSE 'low' END AS bucket "
+  EXPECT_THROW((void)(engine_.execute("SELECT CASE WHEN amount > 15 THEN 'high' ELSE 'low' END AS bucket "
                                "FROM read_parquet('" +
-                               path_ + "')"),
+                               path_ + "')")),
                ExecutionError);
 }
 

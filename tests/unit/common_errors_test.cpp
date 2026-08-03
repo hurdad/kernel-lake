@@ -11,7 +11,7 @@ TEST(ErrorHierarchy, DerivesFromKernelLakeError) {
   static_assert(std::is_base_of_v<KernelLakeError, SqlError>);
   static_assert(std::is_base_of_v<KernelLakeError, BindingError>);
 
-  EXPECT_THROW([]() { throw StorageError("missing file"); }(), KernelLakeError);
+  EXPECT_THROW((void)([]() { throw StorageError("missing file"); }()), KernelLakeError);
 }
 
 TEST(ErrorHierarchy, PreservesMessage) {

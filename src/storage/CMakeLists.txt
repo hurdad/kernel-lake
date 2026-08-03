@@ -5,6 +5,7 @@ add_library(kernellake_storage STATIC
   s3_object_store.cpp
   gcs_object_store.cpp
   azure_object_store.cpp
+  hdfs_object_store.cpp
   object_store_registry.cpp
 )
 

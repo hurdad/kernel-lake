@@ -141,6 +141,26 @@ PhysicalPlanPtr convert_scan(const LogicalScan& scan, ObjectStore& store) {
     }
   }
 
+  // A bare `COUNT(*)` (no other column referenced anywhere in the query --
+  // no WHERE/GROUP BY/join) legitimately produces an empty required_columns()
+  // here: COUNT(*) needs no column data, only a row count. But cudf::table
+  // has no way to represent "N rows, 0 columns" (unlike arrow::RecordBatch,
+  // which tracks row count independently of its columns) -- a cudf::table
+  // built from zero selected columns reports num_rows() == 0 regardless of
+  // how many rows the underlying row groups actually contain, so the GPU
+  // scan operator would silently produce no batches at all. Keeping one
+  // arbitrary real column (the schema's first field) selected in this case
+  // preserves row-count fidelity through cudf::table; nothing above the
+  // scan references it (that's exactly why required_columns() was empty),
+  // so it's inert for every consumer except row counting. Real Parquet
+  // files always have at least one column, so the guard below is only for
+  // a pathological zero-field schema, not the common case.
+  if (narrowed_columns.empty() && !scan.output_schema().fields().empty()) {
+    const Field& fallback = scan.output_schema().fields().front();
+    narrowed_fields.push_back(fallback);
+    narrowed_columns.push_back(fallback.name);
+  }
+
   return std::make_shared<ParquetScanNode>(std::move(fragments), std::move(narrowed_columns),
                                            Schema(std::move(narrowed_fields)),
                                            static_cast<int>(metadata.size()));

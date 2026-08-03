@@ -3,6 +3,7 @@
 #include "kernellake/common/errors.hpp"
 #include "kernellake/storage/azure_object_store.hpp"
 #include "kernellake/storage/gcs_object_store.hpp"
+#include "kernellake/storage/hdfs_object_store.hpp"
 #include "kernellake/storage/s3_object_store.hpp"
 
 namespace kernellake {
@@ -21,9 +22,13 @@ ObjectStore& ObjectStoreRegistry::backend_for(std::string_view scheme) {
     if (!azure_) azure_ = std::make_unique<AzureObjectStore>(config_.azure);
     return *azure_;
   }
+  if (scheme == "hdfs") {
+    if (!hdfs_) hdfs_ = std::make_unique<HdfsObjectStore>(config_.hdfs);
+    return *hdfs_;
+  }
   throw StorageError("unsupported URI scheme '" + std::string(scheme) +
-                     "' (expected a local path, or 's3://', 'gs://'/'gcs://', or "
-                     "'abfs://'/'abfss://'/'az://')");
+                     "' (expected a local path, or 's3://', 'gs://'/'gcs://', "
+                     "'abfs://'/'abfss://'/'az://', or 'hdfs://')");
 }
 
 }  // namespace kernellake

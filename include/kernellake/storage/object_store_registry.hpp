@@ -9,8 +9,8 @@
 namespace kernellake {
 
 // A scheme-dispatching ObjectStore: owns a LocalObjectStore plus lazily-
-// constructed S3/GCS/AzureObjectStore backends, keyed by Uri::scheme(), and
-// implements ObjectStore itself so it's a drop-in replacement for
+// constructed S3/GCS/Azure/HdfsObjectStore backends, keyed by Uri::scheme(),
+// and implements ObjectStore itself so it's a drop-in replacement for
 // LocalObjectStore at every existing call site (QueryEngine's `store_`
 // member, the CLI's standalone uses). A backend is constructed on the first
 // call whose Uri names its scheme; construction failures (bad credentials,
@@ -36,6 +36,7 @@ class ObjectStoreRegistry final : public ObjectStore {
   std::unique_ptr<ObjectStore> s3_;
   std::unique_ptr<ObjectStore> gcs_;
   std::unique_ptr<ObjectStore> azure_;
+  std::unique_ptr<ObjectStore> hdfs_;
 };
 
 }  // namespace kernellake

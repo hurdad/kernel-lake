@@ -1,17 +1,17 @@
 #include <gtest/gtest.h>
 
 #include "kernellake/common/errors.hpp"
-#include "kernellake/execution/cuda_utils.hpp"
+#include "kernellake/execution_gpu/cuda_utils.hpp"
 
 namespace kernellake {
 namespace {
 
 TEST(CudaUtils, CheckCudaPassesOnSuccess) {
-  EXPECT_NO_THROW(check_cuda(cudaSuccess, "noop"));
+  EXPECT_NO_THROW((void)(check_cuda(cudaSuccess, "noop")));
 }
 
 TEST(CudaUtils, CheckCudaThrowsOnFailure) {
-  EXPECT_THROW(check_cuda(cudaErrorInvalidValue, "bad_call"), CudaError);
+  EXPECT_THROW((void)(check_cuda(cudaErrorInvalidValue, "bad_call")), CudaError);
 }
 
 TEST(CudaUtils, DeviceGuardRestoresPreviousDevice) {
@@ -31,7 +31,7 @@ TEST(CudaUtils, DeviceGuardRestoresPreviousDevice) {
 TEST(CudaUtils, StreamIsUsableAndSynchronizable) {
   CudaStream stream;
   ASSERT_NE(stream.get(), nullptr);
-  EXPECT_NO_THROW(check_cuda(cudaStreamSynchronize(stream.get()), "cudaStreamSynchronize"));
+  EXPECT_NO_THROW((void)(check_cuda(cudaStreamSynchronize(stream.get()), "cudaStreamSynchronize")));
 }
 
 TEST(CudaUtils, StreamMoveTransfersOwnership) {

@@ -3,7 +3,7 @@
 #include <cudf/column/column_factories.hpp>
 
 #include "kernellake/common/errors.hpp"
-#include "kernellake/execution/device_batch.hpp"
+#include "kernellake/execution_gpu/device_batch.hpp"
 
 namespace kernellake {
 namespace {
@@ -35,12 +35,12 @@ TEST(DeviceBatch, ExposesSchema) {
 }
 
 TEST(DeviceBatch, RejectsColumnSchemaMismatch) {
-  EXPECT_THROW(DeviceBatch(make_table(1, 10), std::make_shared<const Schema>(two_column_schema())),
+  EXPECT_THROW((void)(DeviceBatch(make_table(1, 10), std::make_shared<const Schema>(two_column_schema()))),
                ExecutionError);
 }
 
 TEST(DeviceBatch, RejectsNullTable) {
-  EXPECT_THROW(DeviceBatch(nullptr, std::make_shared<const Schema>(two_column_schema())), ExecutionError);
+  EXPECT_THROW((void)(DeviceBatch(nullptr, std::make_shared<const Schema>(two_column_schema()))), ExecutionError);
 }
 
 TEST(DeviceBatch, IsMoveOnly) {

@@ -9,8 +9,8 @@
 
 #include <filesystem>
 
-#include "kernellake/execution/parquet_scan_operator.hpp"
-#include "kernellake/execution/sort_operator.hpp"
+#include "kernellake/execution_gpu/parquet_scan_operator.hpp"
+#include "kernellake/execution_gpu/sort_operator.hpp"
 #include "kernellake/memory/rmm_environment.hpp"
 #include "kernellake/storage/local_object_store.hpp"
 

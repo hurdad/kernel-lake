@@ -56,6 +56,20 @@ RUN wget -O /tmp/arrow-apt-source.deb \
     && apt-get install -y --no-install-recommends libarrow-dev libparquet-dev libarrow-dataset-dev \
     && rm -rf /var/lib/apt/lists/* /tmp/arrow-apt-source.deb
 
+# Phase 4 (docs/ROADMAP.md): cloud object storage (S3/GCS/Azure, see
+# docs/ARCHITECTURE.md's "Cloud object storage" section). config.hpp
+# unconditionally includes <arrow/filesystem/{s3,gcs,azure,hdfs}fs.h>, so
+# every build (not just KERNELLAKE_BUILD_SERVER/KERNELLAKE_ENABLE_OTEL)
+# now needs libarrow_bundled_dependencies.a's bundled google-cloud-cpp
+# (GCS) and Azure SDK C++ (Azure) code to actually link -- which pulls in
+# two genuinely new system dependencies this project never needed before:
+# libxml2 (Azure SDK's bundled XML request/response parsing) and libuuid
+# (Azure SDK's request-ID generation). Confirmed by a real link failure
+# without these two packages installed.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      libxml2-dev uuid-dev \
+    && rm -rf /var/lib/apt/lists/*
+
 # CUDA toolkit + GPUDirect Storage headers, both from Ubuntu's own apt
 # repos. libcufile-dev is not pulled in by nvidia-cuda-toolkit itself but is
 # required by kvikio (a libcudf dependency) -- confirmed by a real

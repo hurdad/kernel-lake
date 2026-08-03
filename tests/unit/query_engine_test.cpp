@@ -76,7 +76,7 @@ TEST_F(QueryEngineTest, ExplainProducesFullPhysicalPlanWithPruning) {
 }
 
 TEST_F(QueryEngineTest, ExplainRejectsUnknownColumnWithBindingError) {
-  EXPECT_THROW(engine_.explain_logical("SELECT nonexistent FROM read_parquet('" + path_ + "')"),
+  EXPECT_THROW((void)(engine_.explain_logical("SELECT nonexistent FROM read_parquet('" + path_ + "')")),
                BindingError);
 }
 
@@ -92,7 +92,7 @@ TEST_F(QueryEngineTest, ExecuteReturnsRowsOnGpuBuild) {
 // CPU-only build: no GPU execution layer is linked in, so execute() must
 // say so clearly rather than silently doing nothing or crashing.
 TEST_F(QueryEngineTest, ExecuteThrowsClearExecutionError) {
-  EXPECT_THROW(engine_.execute("SELECT id FROM read_parquet('" + path_ + "')"), ExecutionError);
+  EXPECT_THROW((void)(engine_.execute("SELECT id FROM read_parquet('" + path_ + "')")), ExecutionError);
 }
 #endif
 

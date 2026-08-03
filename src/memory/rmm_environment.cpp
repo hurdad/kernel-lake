@@ -8,7 +8,7 @@
 #include <rmm/mr/statistics_resource_adaptor.hpp>
 
 #include "kernellake/common/errors.hpp"
-#include "kernellake/execution/cuda_utils.hpp"
+#include "kernellake/execution_gpu/cuda_utils.hpp"
 
 namespace kernellake {
 

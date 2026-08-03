@@ -6,8 +6,8 @@
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/scalar/scalar_factories.hpp>
 
-#include "kernellake/execution/arrow_bridge.hpp"
-#include "kernellake/execution/device_batch.hpp"
+#include "kernellake/execution_gpu/arrow_bridge.hpp"
+#include "kernellake/execution_gpu/device_batch.hpp"
 
 namespace kernellake {
 namespace {

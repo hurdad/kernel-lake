@@ -24,6 +24,10 @@ does not extend to them.
 | yaml-cpp | MIT-style ("X11") | github.com/jbeder/yaml-cpp | System package (`libyaml-cpp-dev`) |
 | nlohmann/json | MIT ("Expat") | github.com/nlohmann/json | System package (`nlohmann-json3-dev`) |
 | hyrise/sql-parser | MIT | github.com/hyrise/sql-parser, pinned commit | Vendored via CMake `FetchContent` (`cmake/ThirdPartySqlParser.cmake`); KernelLake wraps it with a `read_parquet(...)` syntax adapter and its own AST -- see `docs/ARCHITECTURE.md` |
+| libxml2 | MIT-style ("MIT-1") | xmlsoft.org | System package (`libxml2-dev`), needed by `libarrow-dev`'s bundled Azure SDK C++ code (XML request/response parsing) -- see below and `docs/ARCHITECTURE.md`'s "Cloud object storage" section |
+| libuuid (util-linux) | BSD-3-Clause | kernel.org/pub/linux/utils/util-linux | System package (`uuid-dev`), needed by `libarrow-dev`'s bundled Azure SDK C++ code (request-ID generation) |
+| google-cloud-cpp | Apache-2.0 | github.com/googleapis/google-cloud-cpp | Bundled *inside* `libarrow-dev`'s `libarrow_bundled_dependencies.a` (Arrow's own vendored copy, used by `arrow::fs::GcsFileSystem`) -- license taken from the upstream project directly; unlike every other entry in this file, not independently verified against a local installed `/usr/share/doc/<pkg>/copyright` file, since it isn't its own apt package |
+| Azure SDK for C++ | MIT ("Expat") | github.com/Azure/azure-sdk-for-cpp | Bundled *inside* `libarrow-dev`'s `libarrow_bundled_dependencies.a` (used by `arrow::fs::AzureFileSystem`) -- same caveat as google-cloud-cpp above |
 
 ## Linked into the `kernellake` binary (`gpu-dev` / `KERNELLAKE_WITH_CUDA=ON` only)
 

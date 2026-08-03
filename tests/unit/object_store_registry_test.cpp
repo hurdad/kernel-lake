@@ -38,7 +38,7 @@ class ObjectStoreRegistryTest : public ::testing::Test {
 // wrapped, since nothing has referenced a matching URI scheme yet.
 TEST_F(ObjectStoreRegistryTest, ConstructionIsLazyAndNeverThrows) {
   const StorageSection config;
-  EXPECT_NO_THROW({ ObjectStoreRegistry registry(config); });
+  EXPECT_NO_THROW((void)({ ObjectStoreRegistry registry(config); }));
 }
 
 // "file" (the default/no-scheme case) dispatches to the same LocalObjectStore
@@ -66,8 +66,8 @@ TEST_F(ObjectStoreRegistryTest, UnsupportedSchemeThrowsImmediately) {
   const StorageSection config;
   ObjectStoreRegistry registry(config);
 
-  EXPECT_THROW(registry.list(Uri("ftp://example.com/file.parquet")), StorageError);
-  EXPECT_THROW(registry.open(Uri("ftp://example.com/file.parquet")), StorageError);
+  EXPECT_THROW((void)(registry.list(Uri("ftp://example.com/file.parquet"))), StorageError);
+  EXPECT_THROW((void)(registry.open(Uri("ftp://example.com/file.parquet"))), StorageError);
 }
 
 }  // namespace

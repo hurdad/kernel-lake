@@ -38,6 +38,35 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING "Build type" FORCE)
 endif()
 
+# Ubuntu/Debian's gcc frontend enables --as-needed by default (upstream ld
+# itself defaults to --no-as-needed), which drops a shared library from a
+# target's final link the moment nothing has referenced its symbols *yet*
+# at that exact position in the assembled command line -- and never
+# revisits it once something needs it later. This bit real executables in
+# this project repeatedly (confirmed by actual link failures, each
+# initially "fixed" by wrapping specific libraries in
+# -Wl,--no-as-needed/--as-needed around where target_link_libraries()
+# placed them, only for the *next* one to fail the same way): once a
+# shared library (e.g. Abseil, needed transitively by gRPC, Arrow's own
+# GCS/Azure-bundled google-cloud-cpp/Azure-SDK code, and opentelemetry-cpp
+# all at once) is requested by several different kernellake_* targets
+# across the whole dependency graph, CMake's link-line assembly computes
+# each *library's* actual position from the whole graph's topological
+# order, independently of where a raw -Wl,... flag string was textually
+# placed in one target's own target_link_libraries() call -- so a flag
+# wrap that looks adjacent to the right library in source doesn't
+# reliably end up adjacent in the generated link command. A single
+# project-wide --no-as-needed, with no matching --as-needed to re-enable
+# it, sidesteps the whole class of problem: every library on every final
+# executable's link line stays available for symbol resolution regardless
+# of position. This project ships application binaries (not libraries
+# other projects link against), and the `runtime` Docker image's own
+# shared-library closure is computed from actual `ldd` output rather than
+# trusting a minimal DT_NEEDED list either way (see docker/Dockerfile's
+# runtime-libs stage) -- so the larger DT_NEEDED lists this produces have
+# no real downside here.
+add_link_options(-Wl,--no-as-needed)
+
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
 include(CTest)

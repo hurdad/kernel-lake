@@ -5,7 +5,7 @@
 #include <cudf/scalar/scalar_factories.hpp>
 #include <cudf/transform.hpp>
 
-#include "kernellake/execution/expression_compiler.hpp"
+#include "kernellake/execution_gpu/expression_compiler.hpp"
 
 namespace kernellake {
 namespace {

@@ -24,5 +24,5 @@ target_link_libraries(kernellake_api PUBLIC
 )
 
 if(KERNELLAKE_WITH_CUDA)
-  target_link_libraries(kernellake_api PUBLIC kernellake_execution kernellake_memory)
+  target_link_libraries(kernellake_api PUBLIC kernellake_execution_gpu kernellake_memory)
 endif()

@@ -402,57 +402,80 @@ and covered by passing tests -- not merely designed or stubbed.
   `abfs://` URI verified separately too. GPU-backend checks deliberately
   used `GROUP BY`/`SUM` rather than bare `COUNT(*)`, to avoid conflating
   this phase's own verification with the separate, already-tracked
-  bare-`COUNT(*)`-on-GPU bug below -- this phase's changes are unrelated
-  to that bug. **HDFS** is config-schema-complete
-  (`storage.hdfs.connection_config`, etc.) but has no real
-  `HdfsObjectStore` backend wired up yet -- deliberately deferred, no
-  lightweight single-container emulator exists for real verification the
-  way MinIO/fake-gcs-server/Azurite do (see "Not yet started" below).
+  bare-`COUNT(*)`-on-GPU bug (see the item just below) -- this phase's
+  changes are unrelated to that bug. **HDFS** also has a real
+  `HdfsObjectStore` (`src/storage/hdfs_object_store.cpp`), wrapping
+  `arrow::fs::HadoopFileSystem` the same way the other three backends
+  wrap their own Arrow filesystem -- it compiles and links cleanly with no
+  Hadoop installed at all (`HadoopFileSystem` `dlopen()`s `libhdfs.so`
+  lazily at runtime, not a build-time link dependency), confirmed by a
+  real `hdfs://` CLI invocation failing cleanly with a clear, non-crashing
+  `StorageError` ("Unable to load libjvm") rather than any crash. What
+  this project genuinely cannot do is verify it against a *real* Hadoop
+  cluster: unlike MinIO/fake-gcs-server/Azurite, there is no lightweight
+  single-container emulator, and this development sandbox has no
+  JDK/Hadoop installation either -- real connectivity/read-correctness
+  against an actual namenode is untested, disclosed here rather than
+  silently assumed.
+- **Project-wide `-Wl,--no-as-needed`, added while verifying the above**
+  (real, found by an actual Docker build combining
+  `KERNELLAKE_BUILD_SERVER=ON` and `KERNELLAKE_ENABLE_OTEL=ON` together --
+  a combination no local CMake preset tests on its own, since `server-dev`
+  and `otel-dev` each only turn one on). `libgrpc.so` itself needs an
+  Abseil symbol (`absl::debian9::ascii_internal::kPropertyBits`) that no
+  CMake target declares as a dependency, same class of gap as
+  ArrowFlight/ArrowFlightSql not declaring `gRPC::grpc++`. Wrapping the
+  specific libraries involved in `-Wl,--no-as-needed`/`--as-needed`
+  (tried first, matching the pattern already used for libxml2/libuuid)
+  was **not reliable**: confirmed by two further real Docker build
+  failures, each "fixing" one undefined symbol only for CMake's own
+  link-line flattening to place the *next* one wrong too, because a
+  library requested by several different `kernellake_*` targets across
+  the whole dependency graph gets positioned by CMake's global
+  topological sort, independent of where a raw linker flag was textually
+  placed in any one target's own `target_link_libraries()` call. Fixed
+  with a single project-wide `add_link_options(-Wl,--no-as-needed)` in
+  the root `CMakeLists.txt` instead (see its own comment) -- this
+  sidesteps the positional problem entirely, at the cost of a larger
+  `DT_NEEDED` list, which has no real downside for this project's
+  application binaries (the `runtime` Docker image's own shared-library
+  closure is already computed from actual `ldd` output, not a minimal
+  `DT_NEEDED` list, either way). Verified for real: a real `docker build
+  --target dev` with both flags on (matching `docker/Dockerfile`'s own
+  build exactly) linked all four binaries; `docker build --target runtime`
+  copied both binaries' full `ldd` closure with no missing entries; a real
+  `kernellake generate-data` + `kernellake query --backend cpu` for a bare
+  `COUNT(*)` through the actual `runtime` container returned the correct
+  row count. `dev` (148/148), `gpu-dev` (218/218), `server-dev` (150/150),
+  and `otel-dev` (151/151) all reconfirmed unaffected.
+- **Bare `COUNT(*)` returning 0 on the GPU backend, fixed** (found
+  incidentally while smoke-testing Phase 3's Docker/Helm work on real
+  hardware; root-caused, after an initial wrong CUDA-architecture
+  hypothesis was tested and ruled out, as a column-pruning bug -- see
+  `docs/ARCHITECTURE.md`'s "Ubuntu 26.04 baseline" section for the full
+  root-cause writeup, and its "Cloud object storage" section for how it
+  was confirmed as a pre-existing, unrelated issue while verifying Phase
+  4). `SELECT COUNT(*) FROM read_parquet(...)` with no other column
+  reference anywhere in the query legitimately produces an empty
+  `LogicalScan::required_columns()` -- correct in principle, since
+  `COUNT(*)` needs no column data -- but a `cudf::table` built from zero
+  selected columns has no column to derive `num_rows()` from, unlike
+  `arrow::RecordBatch` (which is why the CPU backend never had this bug).
+  Fixed in `src/io/physical_planner.cpp`'s `convert_scan()`: when the
+  narrowed column list would be empty, one arbitrary real column (the
+  schema's first field) is kept selected purely to preserve row-count
+  fidelity through `cudf::table` -- inert for every consumer except row
+  counting, since nothing above the scan references it (that's exactly
+  why `required_columns()` was empty). Verified for real: a new regression
+  test, `QueryEngineExecuteTest.BareCountStarWithNoOtherColumnReferenceMatchesRealRowCount`
+  in `tests/gpu/query_engine_execute_test.cpp` (the exact query shape no
+  prior test covered); a real `kernellake query --backend gpu` for a bare
+  `COUNT(*)` against a real 5000-row file now returns `5000` (was `0`);
+  `dev` (148/148), `gpu-dev` (218/218, +1 new test), `server-dev`
+  (150/150), and `otel-dev` (151/151) all pass with zero regressions.
 
 ## Not yet started
 
-- **Bare `COUNT(*)` returns 0 on the GPU backend** (found incidentally
-  while smoke-testing Phase 3's Docker/Helm work on real hardware, not
-  part of that phase's own scope; initially misdiagnosed in this file and
-  in `docs/ARCHITECTURE.md` as a CUDA-12.4/Blackwell architecture mismatch
-  -- that hypothesis was tested directly and ruled out: `COUNT(<column>)`,
-  `SUM(<column>)`, and a bare `SELECT <column>` all return correct results
-  on the same GPU and the same file). Real root cause: `SELECT COUNT(*)
-  FROM read_parquet(...)` with no other column reference anywhere in the
-  query (no `WHERE`, no `GROUP BY`, no join) legitimately produces an
-  empty `LogicalScan::required_columns()` via `src/optimizer/optimizer.cpp`'s
-  column-pruning pass -- correct in principle, since `COUNT(*)` needs no
-  column data. `ParquetScanOperator::next()`
-  (`src/execution/parquet_scan_operator.cpp`) gates on `result.tbl->
-  num_rows() > 0`, but a `cudf::table` built with zero columns selected
-  has no column to derive a row count from, so `num_rows()` reads `0`
-  regardless of how many rows the underlying row groups actually contain
-  -- every chunk is treated as empty and the scan silently produces no
-  batches. CPU/Acero (`src/execution_cpu/acero_query_executor.cpp`) does
-  not have this bug: `arrow::RecordBatch` tracks row count independently
-  of its columns, so an empty column selection there still reports the
-  correct row count. Confirmed via `tests/gpu/` that this was never
-  actually exercised: every existing `COUNT(*)` test case also references
-  another column via `GROUP BY`/`WHERE`/a join key, so
-  `required_columns()` was never empty in any tested case -- a genuinely
-  untested query shape, not a regression in previously-verified behavior.
-  Likely fix: in the physical planner (`src/io/physical_planner.cpp`'s
-  `convert_scan()`) or `ParquetScanOperator` itself, when the narrowed
-  column list would be empty, request at least one arbitrary column (e.g.
-  the schema's first field) purely to preserve row-count fidelity through
-  `cudf::table`, without changing what's returned to the query above the
-  scan. Not yet implemented.
-
-- **HDFS object storage backend** (Phase 4 of the Flight SQL/otel-cpp/
-  Helm-chart/cloud-storage epic -- S3/GCS/Azure all done above, see "Cloud
-  object storage" in "Done"). Config schema (`storage.hdfs.*`, mirroring
-  `arrow::fs::HdfsOptions` field-for-field, same as the other three
-  backends) already exists; no `HdfsObjectStore` implementation yet.
-  Deliberately deferred: unlike S3/GCS/Azure, HDFS has no lightweight
-  single-container Docker emulator, needing an actual pseudo-distributed
-  Hadoop namenode/datanode cluster for the same real-verification bar
-  every other backend in this project meets -- a bigger lift than a
-  `docker run` away, and not attempted without one.
 - TPC-H `execution-only` benchmark mode (needs an operator-tree entry point
   that skips `ParquetScanOperator`); TPC-H at SF10+ scale (SF1 now verified,
   see "Done" above; SF10 untested); Q3/Q12/Q14 (need TPC-H's actual

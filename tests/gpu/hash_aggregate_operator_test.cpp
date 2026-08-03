@@ -2,7 +2,7 @@
 
 #include <map>
 
-#include "kernellake/execution/hash_aggregate_operator.hpp"
+#include "kernellake/execution_gpu/hash_aggregate_operator.hpp"
 #include "kernellake/memory/rmm_environment.hpp"
 
 namespace kernellake {

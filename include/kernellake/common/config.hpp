@@ -93,10 +93,14 @@ struct AzureSection {
   std::string client_secret;       // for "client_secret"
 };
 
-// Config-schema-only in this pass: unlike S3/GCS/Azure, HDFS has no
-// lightweight single-container emulator for real end-to-end verification
-// (it needs a running namenode/datanode, i.e. an actual pseudo-distributed
-// Hadoop cluster) -- see docs/ROADMAP.md.
+// HdfsObjectStore (src/storage/hdfs_object_store.cpp) compiles and links
+// cleanly with no Hadoop installed at all -- arrow::fs::HadoopFileSystem
+// dlopen()s libhdfs.so lazily at runtime, not a build-time link dependency
+// -- but unlike S3/GCS/Azure, this project has no way to *run* it against
+// a real cluster: there's no lightweight single-container emulator the
+// way MinIO/fake-gcs-server/Azurite give the other three backends, and
+// this project's own development sandbox has no JDK/Hadoop installation
+// either. See docs/ARCHITECTURE.md's "Cloud object storage" section.
 struct HdfsSection {
   // arrow::fs::HdfsOptions's default constructor leaves
   // options.connection_config.port genuinely uninitialized -- unlike every

@@ -11,7 +11,7 @@ namespace {
 
 TEST(RmmEnvironment, ConstructsAndInstallsCurrentDeviceResource) {
   EngineConfig config = default_config();
-  EXPECT_NO_THROW({ RmmEnvironment env(config); });
+  EXPECT_NO_THROW((void)({ RmmEnvironment env(config); }));
 }
 
 TEST(RmmEnvironment, TracksBytesAllocatedDuringQuery) {
@@ -35,10 +35,10 @@ TEST(RmmEnvironment, RespectsConfiguredQueryMemoryLimit) {
   config.engine.query_memory_limit_bytes = 1024;  // Deliberately tiny.
   RmmEnvironment env(config);
 
-  EXPECT_THROW(
+  EXPECT_THROW((void)(
       {
         rmm::device_buffer buffer(64 * 1024 * 1024, rmm::cuda_stream_view{});  // 64 MiB > limit
-      },
+      }),
       std::exception);
 }
 

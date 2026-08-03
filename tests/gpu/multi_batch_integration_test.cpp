@@ -16,9 +16,9 @@
 #include <map>
 #include <numeric>
 
-#include "kernellake/execution/cuda_utils.hpp"
-#include "kernellake/execution/operator_builder.hpp"
-#include "kernellake/execution/parquet_scan_operator.hpp"
+#include "kernellake/execution_gpu/cuda_utils.hpp"
+#include "kernellake/execution_gpu/operator_builder.hpp"
+#include "kernellake/execution_gpu/parquet_scan_operator.hpp"
 #include "kernellake/io/physical_planner.hpp"
 #include "kernellake/memory/rmm_environment.hpp"
 #include "kernellake/optimizer/optimizer.hpp"

@@ -86,13 +86,13 @@ TEST(SqlParser, ParsesBooleanLiterals) {
 }
 
 TEST(SqlParser, RejectsMissingReadParquetSource) {
-  EXPECT_THROW(parse_sql("SELECT a FROM sales"), SqlError);
+  EXPECT_THROW((void)(parse_sql("SELECT a FROM sales")), SqlError);
 }
 
 TEST(SqlParser, RejectsJoinsWithoutAliases) {
   // Both sides of a JOIN must be aliased -- unqualified column references
   // like `a.order_id` would otherwise have no way to pick a side.
-  EXPECT_THROW(parse_sql("SELECT a FROM read_parquet('/x.parquet') JOIN read_parquet('/y.parquet') ON true"),
+  EXPECT_THROW((void)(parse_sql("SELECT a FROM read_parquet('/x.parquet') JOIN read_parquet('/y.parquet') ON true")),
                SqlError);
 }
 
@@ -124,38 +124,38 @@ TEST(SqlParser, ParsesTwoTableInnerJoin) {
 }
 
 TEST(SqlParser, RejectsNonInnerJoin) {
-  EXPECT_THROW(parse_sql("SELECT a.x FROM read_parquet('/x.parquet') AS a "
-                         "LEFT JOIN read_parquet('/y.parquet') AS b ON a.order_id = b.order_id"),
+  EXPECT_THROW((void)(parse_sql("SELECT a.x FROM read_parquet('/x.parquet') AS a "
+                         "LEFT JOIN read_parquet('/y.parquet') AS b ON a.order_id = b.order_id")),
                SqlError);
 }
 
 TEST(SqlParser, RejectsCommaStyleJoin) {
-  EXPECT_THROW(parse_sql("SELECT a.x FROM read_parquet('/x.parquet') AS a, read_parquet('/y.parquet') AS b "
-                         "WHERE a.order_id = b.order_id"),
+  EXPECT_THROW((void)(parse_sql("SELECT a.x FROM read_parquet('/x.parquet') AS a, read_parquet('/y.parquet') AS b "
+                         "WHERE a.order_id = b.order_id")),
                SqlError);
 }
 
 TEST(SqlParser, RejectsThreeReadParquetSources) {
-  EXPECT_THROW(parse_sql("SELECT a.x FROM read_parquet('/x.parquet') AS a "
+  EXPECT_THROW((void)(parse_sql("SELECT a.x FROM read_parquet('/x.parquet') AS a "
                          "JOIN read_parquet('/y.parquet') AS b ON a.order_id = b.order_id "
-                         "JOIN read_parquet('/z.parquet') AS c ON b.order_id = c.order_id"),
+                         "JOIN read_parquet('/z.parquet') AS c ON b.order_id = c.order_id")),
                SqlError);
 }
 
 TEST(SqlParser, RejectsUnsupportedFunction) {
-  EXPECT_THROW(parse_sql("SELECT UPPER(a) FROM read_parquet('/x.parquet')"), SqlError);
+  EXPECT_THROW((void)(parse_sql("SELECT UPPER(a) FROM read_parquet('/x.parquet')")), SqlError);
 }
 
 TEST(SqlParser, RejectsMalformedSql) {
-  EXPECT_THROW(parse_sql("SELECT FROM read_parquet('/x.parquet') WHERE"), SqlError);
+  EXPECT_THROW((void)(parse_sql("SELECT FROM read_parquet('/x.parquet') WHERE")), SqlError);
 }
 
 TEST(SqlParser, RejectsInvalidDateLiteral) {
-  EXPECT_THROW(parse_sql("SELECT a FROM read_parquet('/x.parquet') WHERE d >= DATE '2026-13-40'"), SqlError);
+  EXPECT_THROW((void)(parse_sql("SELECT a FROM read_parquet('/x.parquet') WHERE d >= DATE '2026-13-40'")), SqlError);
 }
 
 TEST(SqlParser, RejectsOffset) {
-  EXPECT_THROW(parse_sql("SELECT a FROM read_parquet('/x.parquet') LIMIT 10 OFFSET 5"), SqlError);
+  EXPECT_THROW((void)(parse_sql("SELECT a FROM read_parquet('/x.parquet') LIMIT 10 OFFSET 5")), SqlError);
 }
 
 }  // namespace

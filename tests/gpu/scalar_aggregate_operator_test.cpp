@@ -4,9 +4,9 @@
 #include <cudf/filling.hpp>
 #include <cudf/scalar/scalar_factories.hpp>
 
-#include "kernellake/execution/filter_operator.hpp"
-#include "kernellake/execution/projection_operator.hpp"
-#include "kernellake/execution/scalar_aggregate_operator.hpp"
+#include "kernellake/execution_gpu/filter_operator.hpp"
+#include "kernellake/execution_gpu/projection_operator.hpp"
+#include "kernellake/execution_gpu/scalar_aggregate_operator.hpp"
 #include "kernellake/memory/rmm_environment.hpp"
 
 namespace kernellake {
