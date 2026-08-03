@@ -58,10 +58,8 @@ void ParquetScanOperator::open(ExecutionContext& context) {
         sources.push_back(std::make_unique<ObjectStoreDatasource>(store_.open(fragment.file)));
       }
 
-      cudf::io::parquet_reader_options options = cudf::io::parquet_reader_options::builder()
-                                                     .column_names(columns_)
-                                                     .row_groups(row_groups)
-                                                     .build();
+      cudf::io::parquet_reader_options options =
+          cudf::io::parquet_reader_options::builder().column_names(columns_).row_groups(row_groups).build();
       reader_ = std::make_unique<cudf::io::chunked_parquet_reader>(
           /*chunk_read_limit=*/0, pass_read_limit_bytes_, std::move(sources),
           /*parquet_metadatas=*/std::vector<cudf::io::parquet::FileMetaData>{}, options, context.stream,

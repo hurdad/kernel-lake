@@ -53,7 +53,8 @@ std::shared_ptr<arrow::fs::FileSystem> make_s3_filesystem(const S3Section& confi
     options.ConfigureDefaultCredentials();
   }
 
-  const arrow::Result<std::shared_ptr<arrow::fs::S3FileSystem>> result = arrow::fs::S3FileSystem::Make(options);
+  const arrow::Result<std::shared_ptr<arrow::fs::S3FileSystem>> result =
+      arrow::fs::S3FileSystem::Make(options);
   if (!result.ok()) {
     throw StorageError("s3: failed to construct filesystem: " + result.status().ToString());
   }

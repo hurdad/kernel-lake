@@ -35,7 +35,7 @@ namespace kernellake::detail {
 // constructed FileSystem and a human-readable backend label (used in
 // StorageError messages, e.g. "s3", "gcs", "azure").
 [[nodiscard]] std::vector<ObjectInfo> generic_fs_list(const std::shared_ptr<arrow::fs::FileSystem>& fs,
-                                                       std::string_view backend_label, const Uri& prefix);
+                                                      std::string_view backend_label, const Uri& prefix);
 
 [[nodiscard]] std::unique_ptr<RandomAccessObject> generic_fs_open(
     const std::shared_ptr<arrow::fs::FileSystem>& fs, std::string_view backend_label, const Uri& uri);

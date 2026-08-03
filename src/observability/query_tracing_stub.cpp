@@ -31,7 +31,9 @@ void init(const ObservabilitySection& config) {
 
 void shutdown() {}
 
-QuerySpan start_query_span(std::string_view /*operation_name*/) { return QuerySpan(); }
+QuerySpan start_query_span(std::string_view /*operation_name*/) {
+  return QuerySpan();
+}
 
 void QuerySpan::finish(const QueryResult& /*result*/, std::string_view /*sql*/,
                        std::string_view /*backend*/) {}

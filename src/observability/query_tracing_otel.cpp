@@ -48,7 +48,8 @@
 
 namespace kernellake::observability {
 
-using namespace detail;  // NOLINT(google-build-using-namespace) -- private impl namespace, one file pair only.
+using namespace detail;  // NOLINT(google-build-using-namespace) -- private impl namespace, one file pair
+                         // only.
 
 namespace {
 
@@ -57,8 +58,8 @@ namespace {
 // living in the shared internal.hpp.
 namespace otlp = opentelemetry::exporter::otlp;
 
-std::unique_ptr<trace_sdk::SpanProcessor> build_span_processor(const TraceExportConfig& config,
-                                                               std::unique_ptr<trace_sdk::SpanExporter> exporter) {
+std::unique_ptr<trace_sdk::SpanProcessor> build_span_processor(
+    const TraceExportConfig& config, std::unique_ptr<trace_sdk::SpanExporter> exporter) {
   if (config.processor == "simple") {
     return trace_sdk::SimpleSpanProcessorFactory::Create(std::move(exporter));
   }
@@ -109,7 +110,8 @@ otlp::OtlpGrpcClientOptions build_grpc_client_options(const ObservabilitySection
 // shared `otlp_endpoint` (the base) rather than three separate per-signal
 // endpoint fields.
 template <class HttpOptions>
-void fill_http_options(HttpOptions& options, const ObservabilitySection& config, std::string_view path_suffix) {
+void fill_http_options(HttpOptions& options, const ObservabilitySection& config,
+                       std::string_view path_suffix) {
   options.url = config.otlp_endpoint + std::string(path_suffix);
   options.ssl_ca_cert_path = config.tls_ca_cert_path;
   options.ssl_client_cert_path = config.tls_client_cert_path;
@@ -178,7 +180,8 @@ void init(const ObservabilitySection& config) {
     auto exporter = build_trace_exporter(config);
     auto processor = build_span_processor(config.tracing, std::move(exporter));
     auto sampler = build_sampler(config.tracing.sampler);
-    auto provider = trace_sdk::TracerProviderFactory::Create(std::move(processor), resource, std::move(sampler));
+    auto provider =
+        trace_sdk::TracerProviderFactory::Create(std::move(processor), resource, std::move(sampler));
     trace_api::Provider::SetTracerProvider(to_provider<trace_api::TracerProvider>(std::move(provider)));
   }
 
@@ -189,15 +192,16 @@ void init(const ObservabilitySection& config) {
     metrics_sdk::PeriodicExportingMetricReaderOptions reader_options;
     reader_options.export_interval_millis = std::chrono::milliseconds(config.metrics.export_interval_ms);
     reader_options.export_timeout_millis = std::chrono::milliseconds(config.metrics.export_timeout_ms);
-    auto reader = metrics_sdk::PeriodicExportingMetricReaderFactory::Create(std::move(exporter), reader_options);
+    auto reader =
+        metrics_sdk::PeriodicExportingMetricReaderFactory::Create(std::move(exporter), reader_options);
 
     auto provider = metrics_sdk::MeterProviderFactory::Create();
     provider->AddMetricReader(std::shared_ptr<metrics_sdk::MetricReader>(std::move(reader)));
     metrics_api::Provider::SetMeterProvider(to_provider<metrics_api::MeterProvider>(std::move(provider)));
 
     auto meter = metrics_api::Provider::GetMeterProvider()->GetMeter(config.service_name);
-    g_query_duration_histogram =
-        meter->CreateDoubleHistogram("kernellake.query.duration_seconds", "whole-query execution duration", "s");
+    g_query_duration_histogram = meter->CreateDoubleHistogram("kernellake.query.duration_seconds",
+                                                              "whole-query execution duration", "s");
   }
 
   // Logs.
@@ -218,7 +222,8 @@ void init(const ObservabilitySection& config) {
 void shutdown() {
   if (!g_enabled) return;
 
-  if (auto* provider = dynamic_cast<trace_sdk::TracerProvider*>(trace_api::Provider::GetTracerProvider().get())) {
+  if (auto* provider =
+          dynamic_cast<trace_sdk::TracerProvider*>(trace_api::Provider::GetTracerProvider().get())) {
     provider->ForceFlush();
     provider->Shutdown();
   }
@@ -227,7 +232,8 @@ void shutdown() {
     provider->ForceFlush();
     provider->Shutdown();
   }
-  if (auto* provider = dynamic_cast<logs_sdk::LoggerProvider*>(logs_api::Provider::GetLoggerProvider().get())) {
+  if (auto* provider =
+          dynamic_cast<logs_sdk::LoggerProvider*>(logs_api::Provider::GetLoggerProvider().get())) {
     provider->ForceFlush();
     provider->Shutdown();
   }
@@ -251,8 +257,8 @@ QuerySpan start_query_span(std::string_view operation_name) {
 
   QuerySpan span;
   span.impl_ = std::make_unique<QuerySpan::Impl>();
-  span.impl_->span = trace_api::Provider::GetTracerProvider()->GetTracer(g_tracer_name)->StartSpan(
-      to_otel(operation_name));
+  span.impl_->span =
+      trace_api::Provider::GetTracerProvider()->GetTracer(g_tracer_name)->StartSpan(to_otel(operation_name));
   return span;
 }
 
@@ -280,7 +286,8 @@ void QuerySpan::finish(const QueryResult& result, std::string_view sql, std::str
   if (result.files_scanned) span.SetAttribute("kernellake.files_scanned", *result.files_scanned);
   if (result.row_groups_considered)
     span.SetAttribute("kernellake.row_groups_considered", *result.row_groups_considered);
-  if (result.row_groups_scanned) span.SetAttribute("kernellake.row_groups_scanned", *result.row_groups_scanned);
+  if (result.row_groups_scanned)
+    span.SetAttribute("kernellake.row_groups_scanned", *result.row_groups_scanned);
   if (result.compressed_bytes_read)
     span.SetAttribute("kernellake.compressed_bytes_read", *result.compressed_bytes_read);
   if (result.parquet_decoding_seconds)
@@ -295,7 +302,8 @@ void QuerySpan::finish(const QueryResult& result, std::string_view sql, std::str
     span.SetAttribute("kernellake.device_to_host_seconds", *result.device_to_host_seconds);
   if (result.peak_gpu_memory_bytes)
     span.SetAttribute("kernellake.peak_gpu_memory_bytes", *result.peak_gpu_memory_bytes);
-  if (result.elapsed_wall_seconds) span.SetAttribute("kernellake.elapsed_wall_seconds", *result.elapsed_wall_seconds);
+  if (result.elapsed_wall_seconds)
+    span.SetAttribute("kernellake.elapsed_wall_seconds", *result.elapsed_wall_seconds);
 
   span.SetStatus(trace_api::StatusCode::kOk);
   span.End();

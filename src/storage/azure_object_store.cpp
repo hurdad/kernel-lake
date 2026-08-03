@@ -21,8 +21,9 @@ std::shared_ptr<arrow::fs::FileSystem> make_azure_filesystem(const AzureSection&
     status = options.ConfigureAnonymousCredential();
   } else if (config.credentials_kind == "storage_shared_key") {
     if (config.storage_shared_key.empty()) {
-      throw StorageError("azure: storage.azure.credentials_kind is 'storage_shared_key' but "
-                         "storage.azure.storage_shared_key is empty");
+      throw StorageError(
+          "azure: storage.azure.credentials_kind is 'storage_shared_key' but "
+          "storage.azure.storage_shared_key is empty");
     }
     status = options.ConfigureAccountKeyCredential(config.storage_shared_key);
   } else if (config.credentials_kind == "sas_token") {
@@ -32,7 +33,8 @@ std::shared_ptr<arrow::fs::FileSystem> make_azure_filesystem(const AzureSection&
     }
     status = options.ConfigureSASCredential(config.sas_token);
   } else if (config.credentials_kind == "client_secret") {
-    status = options.ConfigureClientSecretCredential(config.tenant_id, config.client_id, config.client_secret);
+    status =
+        options.ConfigureClientSecretCredential(config.tenant_id, config.client_id, config.client_secret);
   } else if (config.credentials_kind == "managed_identity") {
     status = options.ConfigureManagedIdentityCredential(config.client_id);
   } else if (config.credentials_kind == "cli") {

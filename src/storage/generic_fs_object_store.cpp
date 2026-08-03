@@ -142,7 +142,7 @@ std::vector<ObjectInfo> generic_fs_list(const std::shared_ptr<arrow::fs::FileSys
 }
 
 std::unique_ptr<RandomAccessObject> generic_fs_open(const std::shared_ptr<arrow::fs::FileSystem>& fs,
-                                                     std::string_view backend_label, const Uri& uri) {
+                                                    std::string_view backend_label, const Uri& uri) {
   const std::string path = strip_scheme(uri);
   const arrow::Result<std::shared_ptr<arrow::io::RandomAccessFile>> result = fs->OpenInputFile(path);
   if (!result.ok()) {

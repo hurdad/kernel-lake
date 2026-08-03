@@ -28,7 +28,8 @@ arrow::fs::TimePoint parse_iso8601_utc(const std::string& text) {
                        "'2026-01-01T00:00:00Z')");
   }
   const std::time_t time = timegm(&tm);
-  return std::chrono::time_point_cast<arrow::fs::TimePoint::duration>(std::chrono::system_clock::from_time_t(time));
+  return std::chrono::time_point_cast<arrow::fs::TimePoint::duration>(
+      std::chrono::system_clock::from_time_t(time));
 }
 
 // GcsOptions' credential-selecting factories (Defaults()/Anonymous()/
@@ -47,11 +48,12 @@ arrow::fs::GcsOptions build_options(const GcsSection& config) {
           "gcs: storage.gcs.credentials_kind is 'access_token' but storage.gcs.access_token is empty");
     }
     options = arrow::fs::GcsOptions::FromAccessToken(config.access_token,
-                                                      parse_iso8601_utc(config.access_token_expiration));
+                                                     parse_iso8601_utc(config.access_token_expiration));
   } else if (config.credentials_kind == "service_account_json") {
     if (config.json_credentials.empty()) {
-      throw StorageError("gcs: storage.gcs.credentials_kind is 'service_account_json' but "
-                         "storage.gcs.json_credentials is empty");
+      throw StorageError(
+          "gcs: storage.gcs.credentials_kind is 'service_account_json' but "
+          "storage.gcs.json_credentials is empty");
     }
     options = arrow::fs::GcsOptions::FromServiceAccountCredentials(config.json_credentials);
   } else {

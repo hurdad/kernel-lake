@@ -67,7 +67,8 @@ class OtelSpdlogSink : public spdlog::sinks::base_sink<std::mutex> {
   void sink_it_(const spdlog::details::log_msg& msg) override {
     logs_api::Provider::GetLoggerProvider()
         ->GetLogger(logger_name_)
-        ->EmitLogRecord(to_severity(msg.level), to_otel(std::string_view(msg.payload.data(), msg.payload.size())),
+        ->EmitLogRecord(to_severity(msg.level),
+                        to_otel(std::string_view(msg.payload.data(), msg.payload.size())),
                         opentelemetry::common::SystemTimestamp(msg.time));
   }
 

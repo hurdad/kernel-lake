@@ -190,8 +190,9 @@ TEST_F(DecimalQueryTest, MixingDecimalWithNonLiteralColumnIsRejected) {
   // non-DECIMAL column: not yet supported (see cast_if_needed in
   // binder.cpp) -- must fail cleanly at bind time, not silently
   // misevaluate.
-  EXPECT_THROW((void)(engine_.execute("SELECT price FROM read_parquet('" + path_ + "') WHERE price > quantity")),
-               BindingError);
+  EXPECT_THROW(
+      (void)(engine_.execute("SELECT price FROM read_parquet('" + path_ + "') WHERE price > quantity")),
+      BindingError);
 }
 
 }  // namespace

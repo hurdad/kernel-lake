@@ -27,8 +27,8 @@ class TestLogRecordExporter : public opentelemetry::sdk::logs::LogRecordExporter
  public:
   std::unique_ptr<opentelemetry::sdk::logs::Recordable> MakeRecordable() noexcept override;
   opentelemetry::sdk::common::ExportResult Export(
-      const opentelemetry::nostd::span<std::unique_ptr<opentelemetry::sdk::logs::Recordable>>& records) noexcept
-      override;
+      const opentelemetry::nostd::span<std::unique_ptr<opentelemetry::sdk::logs::Recordable>>&
+          records) noexcept override;
   bool ForceFlush(std::chrono::microseconds timeout) noexcept override;
   bool Shutdown(std::chrono::microseconds timeout) noexcept override;
 
@@ -42,9 +42,10 @@ class TestLogRecordExporter : public opentelemetry::sdk::logs::LogRecordExporter
 // ones. `metrics` uses SimpleAggregateInMemoryMetricData. `log_exporter` is
 // a non-owning pointer into the LoggerProvider's own processor chain, valid
 // for the process lifetime (test-only, never torn down mid-test).
-void init_for_testing(const std::string& service_name,
-                      std::shared_ptr<opentelemetry::exporter::memory::InMemorySpanData>& spans,
-                      std::shared_ptr<opentelemetry::exporter::memory::SimpleAggregateInMemoryMetricData>& metrics,
-                      TestLogRecordExporter*& log_exporter);
+void init_for_testing(
+    const std::string& service_name,
+    std::shared_ptr<opentelemetry::exporter::memory::InMemorySpanData>& spans,
+    std::shared_ptr<opentelemetry::exporter::memory::SimpleAggregateInMemoryMetricData>& metrics,
+    TestLogRecordExporter*& log_exporter);
 
 }  // namespace kernellake::observability

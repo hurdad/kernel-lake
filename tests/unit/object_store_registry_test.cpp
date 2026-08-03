@@ -15,9 +15,10 @@ namespace fs = std::filesystem;
 class ObjectStoreRegistryTest : public ::testing::Test {
  protected:
   void SetUp() override {
-    dir_ = fs::temp_directory_path() /
-           fs::path("kernellake_object_store_registry_test_" +
-                    std::to_string(::testing::UnitTest::GetInstance()->random_seed()) + "_" + test_info_name());
+    dir_ =
+        fs::temp_directory_path() /
+        fs::path("kernellake_object_store_registry_test_" +
+                 std::to_string(::testing::UnitTest::GetInstance()->random_seed()) + "_" + test_info_name());
     fs::create_directories(dir_);
     std::ofstream out(dir_ / "a.parquet", std::ios::binary);
     out << "a";

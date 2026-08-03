@@ -40,7 +40,8 @@ TEST(DeviceBatch, RejectsColumnSchemaMismatch) {
 }
 
 TEST(DeviceBatch, RejectsNullTable) {
-  EXPECT_THROW((void)(DeviceBatch(nullptr, std::make_shared<const Schema>(two_column_schema()))), ExecutionError);
+  EXPECT_THROW((void)(DeviceBatch(nullptr, std::make_shared<const Schema>(two_column_schema()))),
+               ExecutionError);
 }
 
 TEST(DeviceBatch, IsMoveOnly) {

@@ -30,7 +30,9 @@ T read_or(const YAML::Node& node, const char* key, T fallback) {
 // via its own `!node ||` short-circuit for a single level. Nested section
 // lookups (observability.tracing, .tracing.batch, etc.) need this guard
 // explicitly since they index two levels deep.
-YAML::Node child(const YAML::Node& node, const char* key) { return node ? node[key] : YAML::Node(); }
+YAML::Node child(const YAML::Node& node, const char* key) {
+  return node ? node[key] : YAML::Node();
+}
 
 // Reads a YAML mapping into a string->string map -- used by
 // storage.hdfs.connection_config.extra_conf (arrow::io::HdfsConnectionConfig's
@@ -146,8 +148,7 @@ EngineConfig parse_config(const std::string& yaml_text) {
   s3_opts.sse_customer_key = read_or(s3, "sse_customer_key", s3_opts.sse_customer_key);
   s3_opts.tls_ca_file_path = read_or(s3, "tls_ca_file_path", s3_opts.tls_ca_file_path);
   s3_opts.tls_ca_dir_path = read_or(s3, "tls_ca_dir_path", s3_opts.tls_ca_dir_path);
-  s3_opts.tls_verify_certificates =
-      read_or(s3, "tls_verify_certificates", s3_opts.tls_verify_certificates);
+  s3_opts.tls_verify_certificates = read_or(s3, "tls_verify_certificates", s3_opts.tls_verify_certificates);
 
   const YAML::Node gcs = child(storage, "gcs");
   config.storage.gcs.credentials_kind = read_or(gcs, "credentials_kind", config.storage.gcs.credentials_kind);
@@ -156,8 +157,7 @@ EngineConfig parse_config(const std::string& yaml_text) {
       read_or(gcs, "access_token_expiration", config.storage.gcs.access_token_expiration);
   config.storage.gcs.target_service_account =
       read_or(gcs, "target_service_account", config.storage.gcs.target_service_account);
-  config.storage.gcs.json_credentials =
-      read_or(gcs, "json_credentials", config.storage.gcs.json_credentials);
+  config.storage.gcs.json_credentials = read_or(gcs, "json_credentials", config.storage.gcs.json_credentials);
   arrow::fs::GcsOptions& gcs_opts = config.storage.gcs.options;
   gcs_opts.endpoint_override = read_or(gcs, "endpoint_override", gcs_opts.endpoint_override);
   gcs_opts.scheme = read_or(gcs, "scheme", gcs_opts.scheme);
@@ -189,8 +189,7 @@ EngineConfig parse_config(const std::string& yaml_text) {
   config.storage.azure.sas_token = read_or(azure, "sas_token", config.storage.azure.sas_token);
   config.storage.azure.tenant_id = read_or(azure, "tenant_id", config.storage.azure.tenant_id);
   config.storage.azure.client_id = read_or(azure, "client_id", config.storage.azure.client_id);
-  config.storage.azure.client_secret =
-      read_or(azure, "client_secret", config.storage.azure.client_secret);
+  config.storage.azure.client_secret = read_or(azure, "client_secret", config.storage.azure.client_secret);
   arrow::fs::AzureOptions& azure_opts = config.storage.azure.options;
   azure_opts.account_name = read_or(azure, "account_name", azure_opts.account_name);
   azure_opts.blob_storage_authority =
@@ -253,9 +252,9 @@ EngineConfig parse_config(const std::string& yaml_text) {
       read_or(observability, "tls_client_key_path", config.observability.tls_client_key_path);
 
   const YAML::Node tracing = child(observability, "tracing");
-  config.observability.tracing.processor = read_or(tracing, "processor", config.observability.tracing.processor);
-  config.observability.tracing.batch =
-      read_batch_export_config(tracing, config.observability.tracing.batch);
+  config.observability.tracing.processor =
+      read_or(tracing, "processor", config.observability.tracing.processor);
+  config.observability.tracing.batch = read_batch_export_config(tracing, config.observability.tracing.batch);
   config.observability.tracing.sampler = read_or(tracing, "sampler", config.observability.tracing.sampler);
 
   const YAML::Node metrics = child(observability, "metrics");
@@ -310,7 +309,7 @@ void validate_config(const EngineConfig& config) {
   }
 
   static constexpr std::array<const char*, 5> kS3CredentialsKinds = {"anonymous", "default", "explicit",
-                                                                      "role", "web_identity"};
+                                                                     "role", "web_identity"};
   if (std::find(kS3CredentialsKinds.begin(), kS3CredentialsKinds.end(), config.storage.s3.credentials_kind) ==
       kS3CredentialsKinds.end()) {
     throw ConfigurationError("storage.s3.credentials_kind '" + config.storage.s3.credentials_kind +
@@ -318,8 +317,9 @@ void validate_config(const EngineConfig& config) {
                              "'web_identity')");
   }
   if (config.storage.s3.credentials_kind == "role" && config.storage.s3.options.role_arn.empty()) {
-    throw ConfigurationError("storage.s3.options.role_arn must not be empty when "
-                             "storage.s3.credentials_kind is 'role'");
+    throw ConfigurationError(
+        "storage.s3.options.role_arn must not be empty when "
+        "storage.s3.credentials_kind is 'role'");
   }
   if (config.storage.s3.options.scheme != "https" && config.storage.s3.options.scheme != "http") {
     throw ConfigurationError("storage.s3.scheme '" + config.storage.s3.options.scheme +
@@ -327,7 +327,7 @@ void validate_config(const EngineConfig& config) {
   }
 
   static constexpr std::array<const char*, 4> kGcsCredentialsKinds = {"anonymous", "default", "access_token",
-                                                                       "service_account_json"};
+                                                                      "service_account_json"};
   if (std::find(kGcsCredentialsKinds.begin(), kGcsCredentialsKinds.end(),
                 config.storage.gcs.credentials_kind) == kGcsCredentialsKinds.end()) {
     throw ConfigurationError("storage.gcs.credentials_kind '" + config.storage.gcs.credentials_kind +
@@ -340,8 +340,9 @@ void validate_config(const EngineConfig& config) {
   }
   if (config.storage.gcs.credentials_kind == "service_account_json" &&
       config.storage.gcs.json_credentials.empty()) {
-    throw ConfigurationError("storage.gcs.json_credentials must not be empty when "
-                             "storage.gcs.credentials_kind is 'service_account_json'");
+    throw ConfigurationError(
+        "storage.gcs.json_credentials must not be empty when "
+        "storage.gcs.credentials_kind is 'service_account_json'");
   }
   if (config.storage.gcs.options.scheme != "https" && config.storage.gcs.options.scheme != "http") {
     throw ConfigurationError("storage.gcs.scheme '" + config.storage.gcs.options.scheme +
@@ -349,8 +350,8 @@ void validate_config(const EngineConfig& config) {
   }
 
   static constexpr std::array<const char*, 9> kAzureCredentialsKinds = {
-      "default",      "anonymous",          "storage_shared_key",  "sas_token", "client_secret",
-      "managed_identity", "cli", "workload_identity", "environment"};
+      "default",          "anonymous", "storage_shared_key", "sas_token",  "client_secret",
+      "managed_identity", "cli",       "workload_identity",  "environment"};
   if (std::find(kAzureCredentialsKinds.begin(), kAzureCredentialsKinds.end(),
                 config.storage.azure.credentials_kind) == kAzureCredentialsKinds.end()) {
     throw ConfigurationError(
@@ -360,8 +361,9 @@ void validate_config(const EngineConfig& config) {
   }
   if (config.storage.azure.credentials_kind == "storage_shared_key" &&
       config.storage.azure.storage_shared_key.empty()) {
-    throw ConfigurationError("storage.azure.storage_shared_key must not be empty when "
-                             "storage.azure.credentials_kind is 'storage_shared_key'");
+    throw ConfigurationError(
+        "storage.azure.storage_shared_key must not be empty when "
+        "storage.azure.credentials_kind is 'storage_shared_key'");
   }
   if (config.storage.azure.credentials_kind == "sas_token" && config.storage.azure.sas_token.empty()) {
     throw ConfigurationError(
@@ -370,8 +372,9 @@ void validate_config(const EngineConfig& config) {
   if (config.storage.azure.credentials_kind == "client_secret" &&
       (config.storage.azure.tenant_id.empty() || config.storage.azure.client_id.empty() ||
        config.storage.azure.client_secret.empty())) {
-    throw ConfigurationError("storage.azure.tenant_id, client_id, and client_secret must all be set when "
-                             "storage.azure.credentials_kind is 'client_secret'");
+    throw ConfigurationError(
+        "storage.azure.tenant_id, client_id, and client_secret must all be set when "
+        "storage.azure.credentials_kind is 'client_secret'");
   }
   if (config.storage.azure.options.blob_storage_scheme != "https" &&
       config.storage.azure.options.blob_storage_scheme != "http") {

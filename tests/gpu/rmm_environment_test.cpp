@@ -35,11 +35,10 @@ TEST(RmmEnvironment, RespectsConfiguredQueryMemoryLimit) {
   config.engine.query_memory_limit_bytes = 1024;  // Deliberately tiny.
   RmmEnvironment env(config);
 
-  EXPECT_THROW((void)(
-      {
-        rmm::device_buffer buffer(64 * 1024 * 1024, rmm::cuda_stream_view{});  // 64 MiB > limit
-      }),
-      std::exception);
+  EXPECT_THROW((void)({
+                 rmm::device_buffer buffer(64 * 1024 * 1024, rmm::cuda_stream_view{});  // 64 MiB > limit
+               }),
+               std::exception);
 }
 
 }  // namespace

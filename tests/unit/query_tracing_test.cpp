@@ -49,7 +49,8 @@ TEST_F(QueryTracingTest, FinishRecordsSpanAndHistogram) {
   const auto& points = metrics_->Get("kernellake-test", "kernellake.query.duration_seconds");
   ASSERT_FALSE(points.empty());
   const auto& point_type = points.begin()->second;
-  const auto& histogram = opentelemetry::nostd::get<opentelemetry::sdk::metrics::HistogramPointData>(point_type);
+  const auto& histogram =
+      opentelemetry::nostd::get<opentelemetry::sdk::metrics::HistogramPointData>(point_type);
   EXPECT_EQ(histogram.count_, 1u);
   EXPECT_DOUBLE_EQ(opentelemetry::nostd::get<double>(histogram.sum_), 0.125);
 }

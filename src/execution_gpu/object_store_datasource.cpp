@@ -28,7 +28,9 @@ class ArrowBufferDatasourceBuffer final : public cudf::io::datasource::buffer {
 ObjectStoreDatasource::ObjectStoreDatasource(std::unique_ptr<RandomAccessObject> object)
     : object_(std::move(object)) {}
 
-std::size_t ObjectStoreDatasource::size() const { return static_cast<std::size_t>(object_->size()); }
+std::size_t ObjectStoreDatasource::size() const {
+  return static_cast<std::size_t>(object_->size());
+}
 
 std::unique_ptr<cudf::io::datasource::buffer> ObjectStoreDatasource::host_read(std::size_t offset,
                                                                                std::size_t size) {

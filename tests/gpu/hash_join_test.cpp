@@ -184,8 +184,8 @@ TEST_F(HashJoinQueryTest, ScalarCountOverJoinMatchesExpectedRowCount) {
 
 TEST_F(HashJoinQueryTest, RejectsLeftJoinAtParseTime) {
   EXPECT_THROW((void)(engine_.execute("SELECT o.order_id FROM read_parquet('" + orders_path_ +
-                               "') AS o LEFT JOIN read_parquet('" + customers_path_ +
-                               "') AS c ON o.customer_id = c.customer_id")),
+                                      "') AS o LEFT JOIN read_parquet('" + customers_path_ +
+                                      "') AS c ON o.customer_id = c.customer_id")),
                SqlError);
 }
 
