@@ -39,14 +39,31 @@ void evict_from_page_cache(const std::string& path) {
   ::close(fd);
 }
 
-std::string strip_comments_and_substitute(const std::string& text, const std::string& data_glob) {
+std::string substitute_placeholder(std::string text, const std::string& placeholder,
+                                   const std::string& value) {
+  std::size_t pos = 0;
+  while ((pos = text.find(placeholder, pos)) != std::string::npos) {
+    text.replace(pos, placeholder.size(), value);
+    pos += value.size();
+  }
+  return text;
+}
+
+// `part_data`/`orders_data` are only substituted (via a second `{part_data}`
+// or `{orders_data}` placeholder) for queries needing a second table --
+// e.g. Q19's `lineitem`/`part` join, Q12's `orders`/`lineitem` join -- and
+// are empty for every query with no such placeholder to begin with.
+std::string strip_comments_and_substitute(const std::string& text, const std::string& data_glob,
+                                          const std::string& part_data_glob,
+                                          const std::string& orders_data_glob) {
   static const std::regex comment_line(R"(--[^\n]*\n)");
   std::string stripped = std::regex_replace(text, comment_line, "\n");
-  const std::string placeholder = "{data}";
-  std::size_t pos = 0;
-  while ((pos = stripped.find(placeholder, pos)) != std::string::npos) {
-    stripped.replace(pos, placeholder.size(), data_glob);
-    pos += data_glob.size();
+  stripped = substitute_placeholder(std::move(stripped), "{data}", data_glob);
+  if (!part_data_glob.empty()) {
+    stripped = substitute_placeholder(std::move(stripped), "{part_data}", part_data_glob);
+  }
+  if (!orders_data_glob.empty()) {
+    stripped = substitute_placeholder(std::move(stripped), "{orders_data}", orders_data_glob);
   }
   return stripped;
 }
@@ -95,6 +112,8 @@ double stddev_of(const std::vector<double>& values, double mean) {
 
 int run_benchmark_tpch(const std::vector<std::string_view>& args, const EngineConfig& config) {
   std::string data;
+  std::string part_data;
+  std::string orders_data;
   std::string query_file_override;
   std::optional<double> scale_factor;
   int query_number = -1;
@@ -106,6 +125,10 @@ int run_benchmark_tpch(const std::vector<std::string_view>& args, const EngineCo
   for (std::size_t i = 0; i < args.size(); ++i) {
     if (args[i] == "--data" && i + 1 < args.size()) {
       data = args[++i];
+    } else if (args[i] == "--part-data" && i + 1 < args.size()) {
+      part_data = args[++i];
+    } else if (args[i] == "--orders-data" && i + 1 < args.size()) {
+      orders_data = args[++i];
     } else if (args[i] == "--query-file" && i + 1 < args.size()) {
       query_file_override = args[++i];
     } else if (args[i] == "--scale-factor" && i + 1 < args.size()) {
@@ -153,13 +176,31 @@ int run_benchmark_tpch(const std::vector<std::string_view>& args, const EngineCo
   const std::string query_file = query_file_override.empty() ? default_query_file : query_file_override;
 
   try {
-    const std::string sql = strip_comments_and_substitute(read_file_or_throw(query_file), data);
+    const std::string sql =
+        strip_comments_and_substitute(read_file_or_throw(query_file), data, part_data, orders_data);
 
     ObjectStoreRegistry store(config.storage);
-    const std::vector<ObjectInfo> files = discover_parquet_files(store, {data});
+    std::vector<ObjectInfo> files = discover_parquet_files(store, {data});
     if (files.empty()) {
       std::fprintf(stderr, "kernellake benchmark tpch: no Parquet files matched '%s'\n", data.c_str());
       return 1;
+    }
+    if (!part_data.empty()) {
+      const std::vector<ObjectInfo> part_files = discover_parquet_files(store, {part_data});
+      if (part_files.empty()) {
+        std::fprintf(stderr, "kernellake benchmark tpch: no Parquet files matched '%s'\n", part_data.c_str());
+        return 1;
+      }
+      files.insert(files.end(), part_files.begin(), part_files.end());
+    }
+    if (!orders_data.empty()) {
+      const std::vector<ObjectInfo> orders_files = discover_parquet_files(store, {orders_data});
+      if (orders_files.empty()) {
+        std::fprintf(stderr, "kernellake benchmark tpch: no Parquet files matched '%s'\n",
+                     orders_data.c_str());
+        return 1;
+      }
+      files.insert(files.end(), orders_files.begin(), orders_files.end());
     }
 
     QueryEngine engine(config);
@@ -200,6 +241,12 @@ int run_benchmark_tpch(const std::vector<std::string_view>& args, const EngineCo
     report["query_file"] = query_file;
     report["mode"] = mode;
     report["data"] = data;
+    if (!part_data.empty()) {
+      report["part_data"] = part_data;
+    }
+    if (!orders_data.empty()) {
+      report["orders_data"] = orders_data;
+    }
     if (scale_factor) {
       report["scale_factor"] = *scale_factor;
     }

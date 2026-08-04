@@ -14,8 +14,16 @@ failure and excluded from the timing table, never silently timed anyway.
 Usage:
     python3 tools/benchmark_three_way.py \
         --kernellake build/gpu-dev/src/cli/kernellake \
-        --data '/tmp/kernellake-tpch/*.parquet' \
+        --data '/tmp/kernellake-tpch/lineitem-*.parquet' \
         --query all --iterations 5
+
+    # Q19 needs a second table (--query all only runs it if --part-data is
+    # given -- see the --query all handling in main()):
+    python3 tools/benchmark_three_way.py \
+        --kernellake build/gpu-dev/src/cli/kernellake \
+        --data '/tmp/kernellake-tpch/lineitem-*.parquet' \
+        --part-data '/tmp/kernellake-tpch/part-*.parquet' \
+        --query 19 --iterations 5
 
 Requires: pyspark (+ a JVM on PATH), pyarrow. Not part of this project's
 own CPU-only dev environment's dependency set -- see docker/Dockerfile's
@@ -142,42 +150,81 @@ def load_query_text(query_number: int) -> str:
     return re.sub(r"--[^\n]*\n", "\n", path.read_text())
 
 
-def kernellake_sql(query_number: int, data_glob: str) -> str:
-    return load_query_text(query_number).replace("{data}", data_glob).strip()
+def kernellake_sql(
+    query_number: int, data_glob: str, part_data_glob: str | None = None, orders_data_glob: str | None = None
+) -> str:
+    text = load_query_text(query_number)
+    if "{part_data}" in text and not part_data_glob:
+        raise ValueError(f"Q{query_number} needs a second table -- pass --part-data")
+    if "{orders_data}" in text and not orders_data_glob:
+        raise ValueError(f"Q{query_number} needs a second table -- pass --orders-data")
+    text = text.replace("{data}", data_glob)
+    if part_data_glob:
+        text = text.replace("{part_data}", part_data_glob)
+    if orders_data_glob:
+        text = text.replace("{orders_data}", orders_data_glob)
+    return text.strip()
 
 
 def spark_sql(query_number: int) -> str:
     # The query files' only KernelLake-specific syntax is the
-    # read_parquet('{data}') table-valued-function FROM clause (see each
-    # query file's own "Deviations" comment) -- Spark SQL has no such
-    # function, so this is rewritten to a plain table reference against a
-    # temp view the caller registers via spark.read.parquet(...) instead.
-    # Everything else in these query files is already plain ANSI SQL both
-    # engines understand identically.
+    # read_parquet('{data}')/read_parquet('{part_data}')/
+    # read_parquet('{orders_data}') table-valued-function FROM clauses (see
+    # each query file's own "Deviations" comment) -- Spark SQL has no such
+    # function, so these are rewritten to plain table references against
+    # temp views the caller registers via spark.read.parquet(...) instead
+    # ("lineitem"/"part"/"orders"). Everything else in these query files is
+    # already plain ANSI SQL both engines understand identically.
+    # {part_data}/{orders_data} are only present for queries needing that
+    # second table (e.g. Q19/Q12); their regexes simply find no match
+    # otherwise.
     text = load_query_text(query_number)
     rewritten = re.sub(r"read_parquet\(\s*'\{data\}'\s*\)", "lineitem", text)
     if rewritten == text:
         raise ValueError(f"Q{query_number}: no read_parquet('{{data}}') found to rewrite for Spark SQL")
+    rewritten = re.sub(r"read_parquet\(\s*'\{part_data\}'\s*\)", "part", rewritten)
+    rewritten = re.sub(r"read_parquet\(\s*'\{orders_data\}'\s*\)", "orders", rewritten)
     return rewritten.strip()
 
 
 def run_kernellake_backend(
-    kernellake_bin: str, query_number: int, data_glob: str, backend: str, cold: bool = False
+    kernellake_bin: str,
+    query_number: int,
+    data_glob: str,
+    backend: str,
+    part_data_glob: str | None = None,
+    orders_data_glob: str | None = None,
+    cold: bool = False,
 ):
     if cold:
         evict_data_files(data_glob)
-    sql = kernellake_sql(query_number, data_glob)
+        if part_data_glob:
+            evict_data_files(part_data_glob)
+        if orders_data_glob:
+            evict_data_files(orders_data_glob)
+    sql = kernellake_sql(query_number, data_glob, part_data_glob, orders_data_glob)
     start = time.perf_counter()
     table = run_kernellake(kernellake_bin, sql, backend=backend)
     elapsed = time.perf_counter() - start
     return table, elapsed
 
 
-def run_pyspark_query(spark, query_number: int, data_glob: str, cold: bool = False):
+def run_pyspark_query(
+    spark,
+    query_number: int,
+    data_glob: str,
+    part_data_glob: str | None = None,
+    orders_data_glob: str | None = None,
+    cold: bool = False,
+):
     import pyarrow as pa
 
     if cold:
         evict_data_files(data_glob)
+        if part_data_glob:
+            evict_data_files(part_data_glob)
+        if orders_data_glob:
+            evict_data_files(orders_data_glob)
     sql = spark_sql(query_number)
     start = time.perf_counter()
     # Spark SQL is lazy -- toPandas() is what actually triggers execution
@@ -201,7 +248,14 @@ def median_stats(samples):
 
 
 def benchmark_one_query(
-    kernellake_bin: str, spark, query_number: int, data_glob: str, iterations: int, modes: tuple
+    kernellake_bin: str,
+    spark,
+    query_number: int,
+    data_glob: str,
+    part_data_glob: str | None,
+    orders_data_glob: str | None,
+    iterations: int,
+    modes: tuple,
 ) -> dict:
     print(f"=== Q{query_number} ===")
 
@@ -209,9 +263,13 @@ def benchmark_one_query(
     # pairwise before any timing is trusted. Cache state doesn't affect
     # correctness, so this never evicts.
     try:
-        cpu_table, _ = run_kernellake_backend(kernellake_bin, query_number, data_glob, "cpu")
-        gpu_table, _ = run_kernellake_backend(kernellake_bin, query_number, data_glob, "gpu")
-        spark_table, _ = run_pyspark_query(spark, query_number, data_glob)
+        cpu_table, _ = run_kernellake_backend(
+            kernellake_bin, query_number, data_glob, "cpu", part_data_glob, orders_data_glob
+        )
+        gpu_table, _ = run_kernellake_backend(
+            kernellake_bin, query_number, data_glob, "gpu", part_data_glob, orders_data_glob
+        )
+        spark_table, _ = run_pyspark_query(spark, query_number, data_glob, part_data_glob, orders_data_glob)
     except Exception as exc:  # noqa: BLE001 -- reported as a validation failure, not a crash
         print(f"    ERROR during correctness check: {exc}")
         return {"query": query_number, "validated": False, "error": str(exc)}
@@ -245,11 +303,17 @@ def benchmark_one_query(
         # same iteration, making its own "cold" measurement actually warm.
         timings = {engine: [] for engine in ENGINES}
         for i in range(iterations):
-            _, t = run_kernellake_backend(kernellake_bin, query_number, data_glob, "cpu", cold=cold)
+            _, t = run_kernellake_backend(
+                kernellake_bin, query_number, data_glob, "cpu", part_data_glob, orders_data_glob, cold=cold
+            )
             timings["kernellake-cpu"].append(t)
-            _, t = run_kernellake_backend(kernellake_bin, query_number, data_glob, "gpu", cold=cold)
+            _, t = run_kernellake_backend(
+                kernellake_bin, query_number, data_glob, "gpu", part_data_glob, orders_data_glob, cold=cold
+            )
             timings["kernellake-gpu"].append(t)
-            _, t = run_pyspark_query(spark, query_number, data_glob, cold=cold)
+            _, t = run_pyspark_query(
+                spark, query_number, data_glob, part_data_glob, orders_data_glob, cold=cold
+            )
             timings["pyspark"].append(t)
             print(f"    [{mode}] iteration {i + 1}/{iterations} done")
         result[mode] = {engine: median_stats(timings[engine]) for engine in ENGINES}
@@ -284,8 +348,16 @@ def print_summary_table(results: list, modes: tuple) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--kernellake", required=True, help="Path to the kernellake CLI binary (gpu-dev build)")
-    parser.add_argument("--data", required=True, help="Glob pattern over generate_tpch.py's Parquet output")
-    parser.add_argument("--query", required=True, help="Query number (1, 6) or 'all'")
+    parser.add_argument("--data", required=True, help="Glob pattern over generate_tpch.py's lineitem Parquet output")
+    parser.add_argument(
+        "--part-data", default=None, help="Glob pattern over generate_tpch.py's part Parquet output (Q19 needs this)"
+    )
+    parser.add_argument(
+        "--orders-data",
+        default=None,
+        help="Glob pattern over generate_tpch.py's orders Parquet output (Q12 needs this)",
+    )
+    parser.add_argument("--query", required=True, help="Query number (1, 6, 12, 19) or 'all'")
     parser.add_argument("--iterations", type=int, default=5, help="Timed iterations per engine per query per mode")
     parser.add_argument(
         "--mode",
@@ -309,7 +381,11 @@ def main() -> int:
     args = parser.parse_args()
 
     if args.query == "all":
-        query_numbers = [1, 6]
+        # Q19 needs --part-data, Q12 needs --orders-data; each is silently
+        # omitted from "all" without its flag (not attempted-and-failed,
+        # since that's a missing argument, not a cross-engine disagreement)
+        # -- pass --query 19/12 explicitly to see that error.
+        query_numbers = [1, 6] + ([19] if args.part_data else []) + ([12] if args.orders_data else [])
     else:
         query_numbers = [int(args.query)]
 
@@ -340,12 +416,25 @@ def main() -> int:
     )
     spark.sparkContext.setLogLevel("WARN")
     spark.read.parquet(args.data).createOrReplaceTempView("lineitem")
+    if args.part_data:
+        spark.read.parquet(args.part_data).createOrReplaceTempView("part")
+    if args.orders_data:
+        spark.read.parquet(args.orders_data).createOrReplaceTempView("orders")
 
     results = []
     try:
         for query_number in query_numbers:
             results.append(
-                benchmark_one_query(args.kernellake, spark, query_number, args.data, args.iterations, modes)
+                benchmark_one_query(
+                    args.kernellake,
+                    spark,
+                    query_number,
+                    args.data,
+                    args.part_data,
+                    args.orders_data,
+                    args.iterations,
+                    modes,
+                )
             )
     finally:
         spark.stop()
@@ -358,6 +447,8 @@ def main() -> int:
             "disclaimer": "Unofficial TPC-H-derived benchmark. Not a certified TPC result.",
             "scale_factor": args.scale_factor,
             "data": args.data,
+            "part_data": args.part_data,
+            "orders_data": args.orders_data,
             "modes": list(modes),
             "system": system_stats,
             "results": results,

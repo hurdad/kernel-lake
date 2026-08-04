@@ -237,6 +237,21 @@ arrow::acero::Declaration translate(const PhysicalPlanPtr& node, ObjectStore& st
     return arrow::acero::Declaration{"table_source",
                                      arrow::acero::TableSourceNodeOptions{read_scan_table(*scan, store)}};
   }
+  // Acero's own "hashjoin" node (HashJoinNodeOptions) implements exactly the
+  // two-table INNER equi-join HashJoinNode describes; output_all defaults to
+  // true (all columns from both sides, left fields then right), matching
+  // HashJoinNode::build_schema()'s convention exactly, so no left_output/
+  // right_output list needs to be built here.
+  if (const auto* hash_join = dynamic_cast<const HashJoinNode*>(node.get())) {
+    const std::string& left_key = hash_join->left()->output_schema().field(hash_join->left_key_index()).name;
+    const std::string& right_key =
+        hash_join->right()->output_schema().field(hash_join->right_key_index()).name;
+    return arrow::acero::Declaration{
+        "hashjoin",
+        {translate(hash_join->left(), store), translate(hash_join->right(), store)},
+        arrow::acero::HashJoinNodeOptions{
+            arrow::acero::JoinType::INNER, {arrow::FieldRef(left_key)}, {arrow::FieldRef(right_key)}}};
+  }
   if (const auto* filter = dynamic_cast<const FilterNode*>(node.get())) {
     return arrow::acero::Declaration{
         "filter",
@@ -338,11 +353,9 @@ arrow::acero::Declaration translate(const PhysicalPlanPtr& node, ObjectStore& st
   if (const auto* arrow_result = dynamic_cast<const ArrowResultNode*>(node.get())) {
     return translate(arrow_result->child(), store);
   }
-  throw PlanningError(
-      fmt::format("physical plan node '{}' is not yet supported by the CPU execution backend (e.g. HashJoin "
-                  "isn't yet) -- "
-                  "see docs/ARCHITECTURE.md",
-                  node->node_name()));
+  throw PlanningError(fmt::format(
+      "physical plan node '{}' is not yet supported by the CPU execution backend -- see docs/ARCHITECTURE.md",
+      node->node_name()));
 }
 
 }  // namespace

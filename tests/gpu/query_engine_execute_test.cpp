@@ -229,6 +229,29 @@ TEST_F(QueryEngineExecuteTest, CaseWithGroupByAliasBucketsRows) {
   EXPECT_EQ(counts_by_bucket.at("low"), 4);
 }
 
+// Regression test: ScalarAggregateOperator (the no-GROUP-BY aggregate path)
+// used to compile a non-plain-column aggregate argument via the plain
+// cudf::ast ExpressionCompiler directly, which has no CASE support at all
+// ("unrecognized expression type in GPU expression compiler") -- unlike
+// HashAggregateOperator (the GROUP-BY path, exercised by
+// CaseWithGroupByAliasBucketsRows above), which already had the CASE-aware
+// compile_expr()/materialize() machinery. This is exactly TPC-H Q14's
+// shape (a scalar SUM(CASE WHEN ... THEN ... ELSE ... END), no GROUP BY).
+// Fixed by giving ScalarAggregateOperator the identical CompiledExpr/
+// CompiledCase machinery HashAggregateOperator and ProjectionOperator
+// already have. Note this does NOT cover CASE inside WHERE -- confirmed
+// still unsupported by FilterOperator (a separate, still-open gap; neither
+// Q12 nor Q14's own WHERE clause needs it, so it's out of scope here).
+TEST_F(QueryEngineExecuteTest, CaseInScalarAggregateMatchesExpectedTotal) {
+  const QueryResult result = engine_.execute(
+      "SELECT SUM(CASE WHEN amount > 15 THEN 1 ELSE 0 END) AS high_count FROM read_parquet('" + path_ + "')");
+  ASSERT_EQ(result.batches.size(), 1u);
+  const auto high_count_column =
+      std::static_pointer_cast<arrow::Int64Array>(result.batches.front()->GetColumnByName("high_count"));
+  ASSERT_NE(high_count_column, nullptr);
+  EXPECT_EQ(high_count_column->Value(0), 2);  // 20.0 and 100.0
+}
+
 TEST_F(QueryEngineExecuteTest, CastConvertsAmountToInteger) {
   // Every amount in SetUp is already a whole number, so truncate-vs-round
   // ambiguity (our CAST truncates; see docs/ARCHITECTURE.md for why this

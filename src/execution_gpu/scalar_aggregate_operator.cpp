@@ -3,9 +3,11 @@
 #include <cudf/aggregation.hpp>
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
+#include <cudf/copying.hpp>
 #include <cudf/reduction.hpp>
 #include <cudf/scalar/scalar_factories.hpp>
 #include <cudf/transform.hpp>
+#include <cudf/unary.hpp>
 #include <fmt/format.h>
 
 #include "kernellake/common/errors.hpp"
@@ -32,6 +34,93 @@ ScalarAggregateOperator::ScalarAggregateOperator(OperatorId id, std::unique_ptr<
       aggregates_(std::move(aggregates)),
       output_schema_(build_output_schema(aggregates_)) {}
 
+// Mirrors HashAggregateOperator::compile_expr exactly -- see that
+// function's own comments for why each fast path exists.
+ScalarAggregateOperator::CompiledExpr ScalarAggregateOperator::compile_expr(const Expression& expr) {
+  if (const auto* column_ref = dynamic_cast<const ColumnExpression*>(&expr)) {
+    CompiledExpr compiled;
+    compiled.source_column_index = static_cast<cudf::size_type>(column_ref->column_index());
+    return compiled;
+  }
+  if (const auto* literal = dynamic_cast<const LiteralExpression*>(&expr)) {
+    CompiledExpr compiled;
+    compiled.literal_scalar = literal_to_scalar(*literal);
+    return compiled;
+  }
+  if (const auto* case_expr = dynamic_cast<const CaseExpression*>(&expr)) {
+    auto compiled_case = std::make_shared<CompiledCase>();
+    compiled_case->result_type = case_expr->result_type();
+    compiled_case->branches.reserve(case_expr->when_then().size());
+    for (const CaseExpression::WhenThen& branch : case_expr->when_then()) {
+      compiled_case->branches.push_back(
+          CompiledCaseBranch{compile_expr(*branch.condition), compile_expr(*branch.result)});
+    }
+    if (case_expr->else_branch() != nullptr) {
+      compiled_case->else_value = compile_expr(*case_expr->else_branch());
+    }
+    CompiledExpr compiled;
+    compiled.case_expr = std::move(compiled_case);
+    return compiled;
+  }
+  if (const auto* cast_expr = dynamic_cast<const CastExpression*>(&expr);
+      cast_expr != nullptr && cast_expr->result_type().id == TypeId::Decimal) {
+    auto decimal_cast = std::make_shared<CompiledDecimalCast>();
+    decimal_cast->operand = compile_expr(*cast_expr->operand());
+    decimal_cast->target_type = cast_expr->result_type();
+    CompiledExpr compiled;
+    compiled.decimal_cast = std::move(decimal_cast);
+    return compiled;
+  }
+  CompiledExpr compiled;
+  compiled.expr = &compiler_.compile(expr);
+  return compiled;
+}
+
+std::unique_ptr<cudf::column> ScalarAggregateOperator::materialize(const CompiledExpr& compiled,
+                                                                   const DeviceBatch& batch,
+                                                                   ExecutionContext& context) {
+  if (compiled.case_expr != nullptr) return materialize_case(*compiled.case_expr, batch, context);
+  if (compiled.decimal_cast != nullptr) {
+    const std::unique_ptr<cudf::column> operand = materialize(compiled.decimal_cast->operand, batch, context);
+    return cudf::cast(operand->view(), to_cudf_type(compiled.decimal_cast->target_type), context.stream,
+                      context.memory_resource);
+  }
+  if (compiled.source_column_index.has_value()) {
+    return std::make_unique<cudf::column>(batch.view().column(*compiled.source_column_index), context.stream,
+                                          context.memory_resource);
+  }
+  if (compiled.literal_scalar != nullptr) {
+    return cudf::make_column_from_scalar(*compiled.literal_scalar,
+                                         static_cast<cudf::size_type>(batch.row_count()), context.stream,
+                                         context.memory_resource);
+  }
+  return cudf::compute_column(batch.view(), *compiled.expr, context.stream, context.memory_resource);
+}
+
+// Mirrors HashAggregateOperator::materialize_case exactly -- see that
+// function's own comment for the fold-from-the-last-branch-backward
+// algorithm.
+std::unique_ptr<cudf::column> ScalarAggregateOperator::materialize_case(const CompiledCase& case_expr,
+                                                                        const DeviceBatch& batch,
+                                                                        ExecutionContext& context) {
+  std::unique_ptr<cudf::column> result;
+  if (case_expr.else_value.has_value()) {
+    result = materialize(*case_expr.else_value, batch, context);
+  } else {
+    const std::unique_ptr<cudf::scalar> null_scalar = cudf::make_default_constructed_scalar(
+        to_cudf_type(case_expr.result_type), context.stream, context.memory_resource);
+    result = cudf::make_column_from_scalar(*null_scalar, static_cast<cudf::size_type>(batch.row_count()),
+                                           context.stream, context.memory_resource);
+  }
+  for (auto it = case_expr.branches.rbegin(); it != case_expr.branches.rend(); ++it) {
+    std::unique_ptr<cudf::column> condition = materialize(it->condition, batch, context);
+    std::unique_ptr<cudf::column> branch_result = materialize(it->result, batch, context);
+    result = cudf::copy_if_else(branch_result->view(), result->view(), condition->view(), context.stream,
+                                context.memory_resource);
+  }
+  return result;
+}
+
 void ScalarAggregateOperator::open(ExecutionContext& context) {
   child_->open(context);
   states_.reserve(aggregates_.size());
@@ -43,14 +132,9 @@ void ScalarAggregateOperator::open(ExecutionContext& context) {
     }
     Accumulator state;
     state.function = aggregate->function();
-    state.argument = aggregate->argument();
     state.result_type = aggregate->result_type();
-    if (state.argument != nullptr) {
-      if (const auto* column_ref = dynamic_cast<const ColumnExpression*>(state.argument.get())) {
-        state.argument_column_index = static_cast<cudf::size_type>(column_ref->column_index());
-      } else {
-        state.compiled_argument = &compiler_.compile(*state.argument);
-      }
+    if (aggregate->argument() != nullptr) {
+      state.compiled_argument = compile_expr(*aggregate->argument());
     }
     states_.push_back(std::move(state));
   }
@@ -59,12 +143,7 @@ void ScalarAggregateOperator::open(ExecutionContext& context) {
 std::unique_ptr<cudf::column> ScalarAggregateOperator::materialize_argument(Accumulator& state,
                                                                             const DeviceBatch& batch,
                                                                             ExecutionContext& context) {
-  if (state.argument_column_index.has_value()) {
-    return std::make_unique<cudf::column>(batch.view().column(*state.argument_column_index), context.stream,
-                                          context.memory_resource);
-  }
-  return cudf::compute_column(batch.view(), *state.compiled_argument, context.stream,
-                              context.memory_resource);
+  return materialize(state.compiled_argument, batch, context);
 }
 
 void ScalarAggregateOperator::process_batch(Accumulator& state, const DeviceBatch& batch,

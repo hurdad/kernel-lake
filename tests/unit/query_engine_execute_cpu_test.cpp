@@ -70,12 +70,31 @@ class QueryEngineExecuteCpuTest : public ::testing::Test {
     const arrow::Status status =
         parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), sink, /*chunk_size=*/3);
     ASSERT_TRUE(status.ok()) << status.ToString();
+
+    regions_path_ = (dir_ / "regions.parquet").string();
+    arrow::StringBuilder region_key_builder;
+    arrow::StringBuilder region_name_builder;
+    ASSERT_TRUE(region_key_builder.Append("A").ok());
+    ASSERT_TRUE(region_name_builder.Append("Alpha").ok());
+    ASSERT_TRUE(region_key_builder.Append("B").ok());
+    ASSERT_TRUE(region_name_builder.Append("Beta").ok());
+    std::shared_ptr<arrow::Array> region_key_array, region_name_array;
+    ASSERT_TRUE(region_key_builder.Finish(&region_key_array).ok());
+    ASSERT_TRUE(region_name_builder.Finish(&region_name_array).ok());
+    const auto regions_schema = arrow::schema(
+        {arrow::field("region", arrow::utf8(), false), arrow::field("region_name", arrow::utf8(), false)});
+    const auto regions_table = arrow::Table::Make(regions_schema, {region_key_array, region_name_array});
+    auto regions_sink = arrow::io::FileOutputStream::Open(regions_path_).ValueOrDie();
+    const arrow::Status regions_status = parquet::arrow::WriteTable(
+        *regions_table, arrow::default_memory_pool(), regions_sink, /*chunk_size=*/2);
+    ASSERT_TRUE(regions_status.ok()) << regions_status.ToString();
   }
 
   void TearDown() override { fs::remove_all(dir_); }
 
   fs::path dir_;
   std::string path_;
+  std::string regions_path_;
   QueryEngine engine_{cpu_backend_config()};
 };
 
@@ -236,11 +255,90 @@ TEST_F(QueryEngineExecuteCpuTest, LikeIsNotYetSupportedByCpuBackend) {
       ExecutionError);
 }
 
-TEST_F(QueryEngineExecuteCpuTest, CaseIsNotYetSupportedByCpuBackend) {
-  EXPECT_THROW((void)(engine_.execute("SELECT CASE WHEN amount > 15 THEN 'high' ELSE 'low' END AS bucket "
-                                      "FROM read_parquet('" +
-                                      path_ + "')")),
-               ExecutionError);
+// Regression test: the CPU execution backend used to reject CASE
+// expressions everywhere ("unrecognized expression type in CPU expression
+// compiler (LIKE/IN/CASE/DECIMAL are not yet supported...)"), even though
+// the GPU backend already supported CASE inside a grouped aggregate
+// argument (just not inside a *scalar* one -- a separate, still-open GPU
+// gap -- or inside WHERE). Fixed by mapping CaseExpression to Arrow
+// Compute's own "case_when" kernel (a struct of per-branch boolean
+// conditions built via "make_struct", followed by one value expression per
+// condition and an optional trailing ELSE value) in
+// compile_expression_cpu() -- the one function shared by every context
+// (WHERE, SELECT list, grouped and scalar aggregate arguments), so all of
+// them work as soon as this one function does, unlike the GPU backend's
+// split between an eager cudf-materializing path and a separate lazy
+// cudf::ast path.
+TEST_F(QueryEngineExecuteCpuTest, CaseInGroupedAggregateWhereAndScalarAggregateMatchesExpectedTotals) {
+  const QueryResult grouped = engine_.execute(
+      "SELECT region, SUM(CASE WHEN amount > 15 THEN 1 ELSE 0 END) AS high_count FROM read_parquet('" +
+      path_ + "') GROUP BY region");
+  ASSERT_EQ(grouped.rows_returned, 2);
+  const std::shared_ptr<arrow::RecordBatch>& grouped_batch = grouped.batches.front();
+  const auto region_column =
+      std::static_pointer_cast<arrow::StringArray>(grouped_batch->GetColumnByName("region"));
+  const auto high_count_column =
+      std::static_pointer_cast<arrow::Int64Array>(grouped_batch->GetColumnByName("high_count"));
+  ASSERT_NE(region_column, nullptr);
+  ASSERT_NE(high_count_column, nullptr);
+  std::map<std::string, std::int64_t> high_count_by_region;
+  for (std::int64_t i = 0; i < grouped_batch->num_rows(); ++i) {
+    high_count_by_region[region_column->GetString(i)] = high_count_column->Value(i);
+  }
+  ASSERT_EQ(high_count_by_region.size(), 2u);
+  EXPECT_EQ(high_count_by_region.at("A"), 1);  // only 20.0 > 15
+  EXPECT_EQ(high_count_by_region.at("B"), 1);  // only 100.0 > 15
+
+  const QueryResult scalar = engine_.execute(
+      "SELECT SUM(CASE WHEN amount > 15 THEN 1 ELSE 0 END) AS high_count FROM read_parquet('" + path_ + "')");
+  ASSERT_EQ(scalar.rows_returned, 1);
+  const auto scalar_column =
+      std::static_pointer_cast<arrow::Int64Array>(scalar.batches.front()->GetColumnByName("high_count"));
+  ASSERT_NE(scalar_column, nullptr);
+  EXPECT_EQ(scalar_column->Value(0), 2);  // 20.0 and 100.0
+
+  const QueryResult where_result = engine_.execute("SELECT COUNT(*) AS n FROM read_parquet('" + path_ +
+                                                   "') WHERE (CASE WHEN amount > 15 THEN 1 ELSE 0 END) = 1");
+  ASSERT_EQ(where_result.rows_returned, 1);
+  const auto n_column =
+      std::static_pointer_cast<arrow::Int64Array>(where_result.batches.front()->GetColumnByName("n"));
+  ASSERT_NE(n_column, nullptr);
+  EXPECT_EQ(n_column->Value(0), 2);
+}
+
+// Regression test: the CPU execution backend used to reject every
+// HashJoinNode outright ("physical plan node 'HashJoin' is not yet
+// supported by the CPU execution backend"), even though the parser/binder
+// already accepted two-table INNER JOIN ... ON queries and the GPU backend
+// already executed them correctly -- a real asymmetry found while scoping
+// which TPC-H queries beyond Q1/Q6 could run through
+// tools/benchmark_three_way.py. Fixed by translating HashJoinNode to
+// Acero's own "hashjoin" node (arrow::acero::HashJoinNodeOptions), which
+// implements the same two-table INNER equi-join natively.
+TEST_F(QueryEngineExecuteCpuTest, TwoTableInnerJoinMatchesExpectedTotals) {
+  const QueryResult result =
+      engine_.execute("SELECT r.region_name, SUM(s.amount) AS total FROM read_parquet('" + path_ +
+                      "') AS s JOIN read_parquet('" + regions_path_ +
+                      "') AS r ON s.region = r.region GROUP BY r.region_name");
+
+  ASSERT_EQ(result.rows_returned, 2);
+  ASSERT_EQ(result.batches.size(), 1u);
+  const std::shared_ptr<arrow::RecordBatch>& batch = result.batches.front();
+  ASSERT_EQ(batch->num_rows(), 2);
+
+  const auto name_column =
+      std::static_pointer_cast<arrow::StringArray>(batch->GetColumnByName("region_name"));
+  const auto total_column = std::static_pointer_cast<arrow::DoubleArray>(batch->GetColumnByName("total"));
+  ASSERT_NE(name_column, nullptr);
+  ASSERT_NE(total_column, nullptr);
+
+  std::map<std::string, double> totals_by_name;
+  for (std::int64_t i = 0; i < batch->num_rows(); ++i) {
+    totals_by_name[name_column->GetString(i)] = total_column->Value(i);
+  }
+  ASSERT_EQ(totals_by_name.size(), 2u);
+  EXPECT_DOUBLE_EQ(totals_by_name.at("Alpha"), 35.0);  // 10+20+5
+  EXPECT_DOUBLE_EQ(totals_by_name.at("Beta"), 110.0);  // 100+7+3
 }
 
 }  // namespace

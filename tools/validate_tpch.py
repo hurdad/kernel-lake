@@ -15,6 +15,12 @@ Usage:
         --data '/tmp/kernellake-tpch-sf1/*.parquet' \
         --query 6
     python3 tools/validate_tpch.py --kernellake ... --data ... --query all
+    # Q19 needs a second table:
+    python3 tools/validate_tpch.py --kernellake ... --data '.../lineitem-*.parquet' \
+        --part-data '.../part-*.parquet' --query 19
+    # Q12 needs a second table too (orders, not part):
+    python3 tools/validate_tpch.py --kernellake ... --data '.../lineitem-*.parquet' \
+        --orders-data '.../orders-*.parquet' --query 12
 """
 
 import argparse
@@ -27,23 +33,41 @@ from duckdb_compare import normalize, rows_match, run_duckdb, run_kernellake
 QUERIES_DIR = Path(__file__).resolve().parent.parent / "benchmarks" / "tpch" / "queries"
 
 
-def load_query(query_number: int, data_glob: str) -> str:
+def load_query(
+    query_number: int, data_glob: str, part_data_glob: str | None, orders_data_glob: str | None
+) -> str:
     path = QUERIES_DIR / f"q{query_number:02d}.sql"
     if not path.exists():
         raise FileNotFoundError(f"no query file for Q{query_number}: {path}")
     text = path.read_text()
     text = re.sub(r"--[^\n]*\n", "\n", text)  # strip line comments
-    return text.replace("{data}", data_glob).strip()
+    if "{part_data}" in text and not part_data_glob:
+        raise ValueError(f"Q{query_number} needs a second table -- pass --part-data")
+    if "{orders_data}" in text and not orders_data_glob:
+        raise ValueError(f"Q{query_number} needs a second table -- pass --orders-data")
+    text = text.replace("{data}", data_glob)
+    if part_data_glob:
+        text = text.replace("{part_data}", part_data_glob)
+    if orders_data_glob:
+        text = text.replace("{orders_data}", orders_data_glob)
+    return text.strip()
 
 
-def validate_one(kernellake_bin: str, query_number: int, data_glob: str) -> bool:
-    sql = load_query(query_number, data_glob)
-    print(f"--- Q{query_number}: {sql.splitlines()[0]}...")
+def validate_one(
+    kernellake_bin: str,
+    query_number: int,
+    data_glob: str,
+    part_data_glob: str | None,
+    orders_data_glob: str | None,
+    backend: str | None,
+) -> bool:
     try:
-        kernellake_rows = normalize(run_kernellake(kernellake_bin, sql))
+        sql = load_query(query_number, data_glob, part_data_glob, orders_data_glob)
+        print(f"--- Q{query_number}: {sql.splitlines()[0]}...")
+        kernellake_rows = normalize(run_kernellake(kernellake_bin, sql, backend))
         duckdb_rows = normalize(run_duckdb(sql))
     except Exception as exc:  # noqa: BLE001 -- report and let the caller count it as a failure
-        print(f"    ERROR: {exc}")
+        print(f"--- Q{query_number}: ERROR: {exc}")
         return False
 
     if rows_match(kernellake_rows, duckdb_rows):
@@ -60,9 +84,13 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--kernellake", required=True, help="Path to the kernellake CLI binary")
     parser.add_argument("--data", required=True, help="Parquet glob passed to read_parquet(...)")
+    parser.add_argument("--part-data", default=None, help="Parquet glob for the 'part' table (Q19 needs this)")
+    parser.add_argument("--orders-data", default=None, help="Parquet glob for the 'orders' table (Q12 needs this)")
     parser.add_argument("--scale-factor", type=float, default=None, help="Informational only, for the report")
     parser.add_argument("--query", required=True, help="Query number (e.g. 6) or 'all'")
     parser.add_argument("--baseline", default="duckdb", choices=["duckdb"])
+    parser.add_argument("--backend", default=None, choices=["cpu", "gpu"],
+                       help="kernellake --backend; omit to use the binary's own default")
     args = parser.parse_args()
 
     available = sorted(int(p.stem[1:]) for p in QUERIES_DIR.glob("q*.sql"))
@@ -75,7 +103,9 @@ def main() -> int:
 
     failures = 0
     for query_number in query_numbers:
-        if not validate_one(args.kernellake, query_number, args.data):
+        if not validate_one(
+            args.kernellake, query_number, args.data, args.part_data, args.orders_data, args.backend
+        ):
             failures += 1
 
     print()

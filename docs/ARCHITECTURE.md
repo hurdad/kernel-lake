@@ -85,14 +85,22 @@ SELECT <items> FROM read_parquet(...) AS a JOIN read_parquet(...) AS b ON <a.col
 - Arithmetic (`+ - * /`), comparisons, `AND`/`OR`/`NOT`, `BETWEEN`,
   `IS [NOT] NULL`
 - `LIKE`/`NOT LIKE` (SQL `%`/`_` wildcards; scoped to top-level `WHERE`
-  AND-conjuncts -- not inside `OR`, the `SELECT` list, or aggregate
-  arguments)
+  AND-conjuncts -- not inside `OR`, the `SELECT` list, a `CASE` branch, or
+  an aggregate argument -- on the GPU backend; **not yet supported at all**
+  on the CPU backend, in any context)
 - `IN (literal, ...)`/`NOT IN (...)` (desugared at bind time into an
   equivalent `OR`/`AND` chain of equality comparisons -- no new GPU
   execution support needed, and no scalar-subquery form `IN (SELECT ...)`)
 - `CASE WHEN ... THEN ... [WHEN ...] [ELSE ...] END`, both simple
-  (`CASE x WHEN ...`) and searched forms (scoped to the `SELECT` list and
-  `GROUP BY` keys -- not `WHERE` or aggregate arguments)
+  (`CASE x WHEN ...`) and searched forms. Scope differs by backend: the CPU
+  backend supports it everywhere (`WHERE`, `SELECT` list, `GROUP BY` keys,
+  and both grouped and scalar aggregate arguments), via Arrow Compute's own
+  `case_when` kernel -- one shared expression compiler for every context,
+  so all of them work as soon as it does. The GPU backend supports it in
+  the `SELECT` list, `GROUP BY` keys, and both grouped and scalar aggregate
+  arguments (e.g. `SUM(CASE WHEN ... THEN ... ELSE ... END)`, TPC-H Q12/
+  Q14's shape) -- but **not yet in `WHERE`** (a separate, still-open
+  `FilterOperator` gap; see "CASE expression implementation notes" below)
 - `CAST(expr AS type)` (`INT`/`BIGINT`/`DOUBLE`/`VARCHAR(n)`/`DECIMAL(p, s)`;
   see "LIKE/IN/CASE/CAST implementation notes" below for the
   truncate-vs-round caveat on numeric-to-integer casts, and "DECIMAL
@@ -106,9 +114,10 @@ SELECT <items> FROM read_parquet(...) AS a JOIN read_parquet(...) AS b ON <a.col
 Not yet supported (fails clearly rather than being silently reinterpreted):
 `DISTINCT`, `HAVING`, set operations (`UNION`/etc.), `WITH`/CTEs,
 subqueries, `OFFSET`, window functions, `LIKE` outside a top-level `WHERE`
-AND-conjunct, `CASE` in `WHERE`/aggregate arguments, any function other than
-the five aggregates above, comma-style joins, `LEFT`/`RIGHT`/`FULL`/`CROSS`
-JOIN, multi-key or non-equality join conditions, and 3+-table joins.
+AND-conjunct (GPU) or in any context (CPU), `CASE` in `WHERE` (GPU only --
+see above), any function other than the five aggregates above, comma-style
+joins, `LEFT`/`RIGHT`/`FULL`/`CROSS` JOIN, multi-key or non-equality join
+conditions, and 3+-table joins.
 
 `GROUP BY <name>` resolves `<name>` against the base-table schema first,
 then falls back to matching a `SELECT`-list output alias -- this is what
@@ -356,17 +365,92 @@ cpu`), not a build-time one, and it works even on the CPU-only `dev` build,
 which cannot run the GPU path at all.
 
 **Scope for this phase**, matching the GPU engine's own original MVP order:
-`ParquetScan` -> `Filter` -> `Projection` (arithmetic/comparisons/`BETWEEN`/
-numeric `CAST` only) -> `ScalarAggregate`/`HashAggregate` (`SUM`/`COUNT`/
-`MIN`/`MAX`/`AVG`, grouping only by a plain column) -> `Sort` (by a plain
-column only) -> `Limit`. `LIKE`/`IN`/`CASE`/`CAST`-to-`DECIMAL`-or-`STRING`/
-`HashJoin` are not yet supported here -- `compile_expression_cpu()` and
-`acero_query_executor.cpp`'s `translate()` throw `ExecutionError`/
-`PlanningError` naming the specific unsupported construct rather than
-silently miscompiling. Arrow Compute's function registry is actually more
-complete than `cudf::ast` turned out to be for some of these (no "cannot
-output STRING" restriction, for instance), so extending this list later is
-likely less work than the GPU equivalents were -- just not free.
+`ParquetScan` -> `HashJoin` (two-table `INNER JOIN`, single equality key) ->
+`Filter` -> `Projection` (arithmetic/comparisons/`BETWEEN`/`CASE` only) ->
+`ScalarAggregate`/`HashAggregate` (`SUM`/`COUNT`/`MIN`/`MAX`/`AVG`, grouping
+only by a plain column) -> `Sort` (by a plain column only) -> `Limit`.
+`LIKE`/`IN`/`CAST`-to-`DECIMAL`-or-`STRING` are not yet supported here --
+`compile_expression_cpu()` throws `ExecutionError` naming the specific
+unsupported construct rather than silently miscompiling. Arrow Compute's
+function registry is actually more complete than `cudf::ast` turned out to
+be for some of these (no "cannot output STRING" restriction, for
+instance), so extending this list later is likely less work than the GPU
+equivalents were -- just not free.
+
+**`CaseExpression` -> Arrow Compute's own `"case_when"` kernel, fixed.**
+This backend used to reject `CASE` everywhere ("unrecognized expression
+type in CPU expression compiler (LIKE/IN/CASE/DECIMAL are not yet
+supported...)"), even though the GPU backend already supported it in a
+grouped aggregate argument (just not a *scalar* one -- see the GPU-side fix
+just below -- or `WHERE`) -- found while scoping TPC-H Q12/Q14, both of
+which need `SUM(CASE WHEN ... THEN ... ELSE ... END)`. Fixed in
+`compile_expression_cpu()` by mapping `CaseExpression` to `"case_when"`: a
+struct of per-branch boolean conditions (built via `"make_struct"`) as the
+first argument, followed by one value expression per condition and an
+optional trailing value for `CaseExpression::else_branch()` -- a row
+matching no condition and no `ELSE` emits `NULL`, exactly `CaseExpression`'s
+own documented semantics, so no extra handling was needed for that case.
+Since `compile_expression_cpu()` is the one function shared by every
+context on this backend (`WHERE`, `SELECT` list, and both grouped and
+scalar aggregate arguments), all of them work as soon as this one function
+does -- unlike the GPU backend, which is split between an eager
+cudf-materializing path (`HashAggregateOperator`/`ScalarAggregateOperator`/
+`ProjectionOperator`, each with their own `CASE`-aware `compile_expr()`/
+`materialize()`) and a separate lazy `cudf::ast` path (`FilterOperator`,
+still not `CASE`-aware). Verified for real: matches DuckDB exactly for
+`CASE` in a grouped aggregate, a scalar aggregate, and `WHERE`, all against
+real data; a new regression test,
+`QueryEngineExecuteCpuTest.CaseInGroupedAggregateWhereAndScalarAggregateMatchesExpectedTotals`;
+`dev` (172/172), `server-dev` (175/175), `otel-dev` (175/175) all pass with
+zero regressions.
+
+**`ScalarAggregateOperator` gains the same `CASE`-aware compiled-expression
+machinery `HashAggregateOperator` already had, fixed (GPU).**
+`ScalarAggregateOperator` (the no-`GROUP BY` aggregate path) used to
+compile a non-plain-column aggregate argument via the plain `cudf::ast`
+`ExpressionCompiler` directly, which has no `CASE` support at all
+("unrecognized expression type in GPU expression compiler") -- unlike
+`HashAggregateOperator` (the `GROUP BY` path), which already had the
+`CASE`-aware `compile_expr()`/`materialize()`/`materialize_case()` fast
+paths (see "CASE expression implementation notes" below). This is exactly
+TPC-H Q14's shape: a *scalar* `SUM(CASE WHEN ... THEN ... ELSE ... END)`,
+no `GROUP BY`. Fixed by giving `ScalarAggregateOperator` the identical
+`CompiledExpr`/`CompiledCase`/`CompiledDecimalCast` structs and
+`compile_expr()`/`materialize()`/`materialize_case()` methods
+`HashAggregateOperator` already has (duplicated rather than shared, matching
+this codebase's existing convention of each GPU operator owning its own
+compiled-expression machinery -- see `ProjectionOperator`, which already
+duplicated the same pattern independently). This does **not** cover `CASE`
+inside `WHERE` (`FilterOperator`'s own, still-open gap; confirmed still
+failing after this fix) -- out of scope here since neither Q12 nor Q14's
+own `WHERE` clause needs it. Verified for real: matches DuckDB exactly for
+a scalar `SUM(CASE ...)`; a new regression test,
+`QueryEngineExecuteTest.CaseInScalarAggregateMatchesExpectedTotal`; all 250
+`gpu-dev` tests pass (was 249) with zero regressions.
+
+**`HashJoinNode` -> Acero's own `"hashjoin"` node, fixed.** This backend
+used to reject every `HashJoinNode` outright ("physical plan node
+'HashJoin' is not yet supported by the CPU execution backend"), even
+though the parser/binder already accepted two-table `INNER JOIN ... ON`
+queries and the GPU backend already executed them correctly -- a real
+CPU/GPU asymmetry found while scoping which TPC-H queries beyond Q1/Q6
+could run through `tools/benchmark_three_way.py` (every join-based TPC-H
+query needs this on *both* backends to be benchmarkable at all, per this
+project's own cross-engine validation rule). Fixed in
+`acero_query_executor.cpp`'s `translate()` by mapping `HashJoinNode` to
+`arrow::acero::HashJoinNodeOptions{JoinType::INNER, {left_key},
+{right_key}}` -- Acero's own native hash-join node, which already
+implements exactly this two-table INNER equi-join shape.
+`HashJoinNodeOptions`'s default `output_all = true` (every column from both
+sides, left fields then right) matches `HashJoinNode::build_schema()`'s
+convention exactly, so no `left_output`/`right_output` field list needs to
+be built by hand. Verified for real: a new regression test,
+`QueryEngineExecuteCpuTest.TwoTableInnerJoinMatchesExpectedTotals`; a real
+2-table join query (`lineitem` join a synthetic `part`-shaped table, `OR`
+of `AND`s with `BETWEEN`, matching TPC-H Q19's WHERE shape) matches DuckDB
+exactly on both the CPU and GPU backends; `dev` (172/172, +1 new test),
+`server-dev` (175/175), `otel-dev` (175/175) all pass with zero
+regressions.
 
 **No index-based column remapping.** Acero resolves every `FieldRef` by
 name against real Arrow schemas at each stage of its `Declaration` tree, so
@@ -436,9 +520,10 @@ would fail on an implementation detail unrelated to correctness.
   root/output. This surfaces most visibly with `CASE` branches that are
   string literals (e.g. `CASE WHEN ... THEN 'high' ELSE 'low' END`):
   routing that through the AST compiler aborts with cudf's "Invalid,
-  non-fixed-width type" error. `ProjectionOperator` and
-  `HashAggregateOperator` both detect a plain `LiteralExpression` and
-  materialize it directly via `cudf::make_column_from_scalar`
+  non-fixed-width type" error. `ProjectionOperator`,
+  `HashAggregateOperator`, and `ScalarAggregateOperator` all detect a plain
+  `LiteralExpression` and materialize it directly via
+  `cudf::make_column_from_scalar`
   (`cudf_adapter.hpp`'s `literal_to_scalar()`), bypassing the AST compiler
   entirely, mirroring the existing plain-column-reference fast path
   described above.

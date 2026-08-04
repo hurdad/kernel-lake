@@ -712,17 +712,179 @@ and covered by passing tests -- not merely designed or stubbed.
   bar chart per query across modes) rendered as `benchmark-results/
   sf100-report.pdf` via `tools/generate_benchmark_report.py`; raw JSON and
   PDF are gitignored local artifacts, not committed.
+- **CPU execution backend's `HashJoin`, fixed** (Phase 3 of the
+  CPU-backend/benchmark epic -- scoping out which TPC-H queries beyond
+  Q1/Q6 could be added next). The CPU backend rejected every join query
+  outright ("physical plan node 'HashJoin' is not yet supported by the CPU
+  execution backend"), a real CPU/GPU asymmetry: the parser/binder already
+  accepted two-table `INNER JOIN ... ON` queries, and the GPU backend
+  already executed them correctly (confirmed against DuckDB on a synthetic
+  `lineitem` join `part`-shaped-table query matching TPC-H Q19's WHERE
+  shape -- exact match). Fixed by mapping `HashJoinNode` to Arrow Acero's
+  own `"hashjoin"` node (`HashJoinNodeOptions{JoinType::INNER, ...}`),
+  which already implements the same two-table INNER equi-join; its default
+  `output_all = true` (left columns then right) matches
+  `HashJoinNode::build_schema()`'s convention exactly, needing no extra
+  output-list bookkeeping. Verified for real: same Q19-shaped join query
+  now matches DuckDB exactly on *both* backends; a new regression test,
+  `QueryEngineExecuteCpuTest.TwoTableInnerJoinMatchesExpectedTotals`;
+  `dev` (172/172, +1), `server-dev` (175/175), `otel-dev` (175/175) all
+  pass with zero regressions. See `docs/ARCHITECTURE.md`'s "CPU execution
+  backend" section for the full write-up.
+
+  This also surfaced two real, separate gaps while checking what else the
+  current grammar allows in a join query: `CASE` expressions are only
+  supported in the `SELECT` list/`GROUP BY` keys, not inside `WHERE` or an
+  aggregate argument (`SUM(CASE WHEN ... THEN 1 ELSE 0 END)`, needed by
+  TPC-H Q12/Q14 and several others) -- confirmed on *both* backends via a
+  real query against real data ("unrecognized expression type in
+  {CPU,GPU} expression compiler"), not just inferred from the docs. Column-
+  to-column comparisons (`WHERE l_commitdate < l_shipdate`, no `CASE`
+  involved) already work correctly on both backends. **Update: the
+  aggregate-argument half of this gap is fixed -- see the later "`CASE` in
+  an aggregate argument, fixed on both backends" entry below; `CASE` in
+  `WHERE` is still open on GPU only (CPU already supports it there too, as
+  a side effect of that same fix).** See `docs/TPCH.md` for the current,
+  up-to-date scope this leaves for TPC-H specifically.
+- **TPC-H Q19 added** (2-table `lineitem`/`part` join, `OR` of `AND`s with
+  `BETWEEN`, no `CASE` -- the one TPC-H query shape the current grammar and
+  both execution backends already supported after the `HashJoin` fix
+  above). `tools/generate_tpch.py` now also generates a real `part` table
+  (`PART_ROWS_PER_SF = 200_000`, scaling directly with SF per TPC-H's own
+  convention, unlike `lineitem`'s order-count-derived scaling); `l_partkey`
+  is drawn from `[1, total_part_rows]` so every join finds a real `part`
+  row, no dangling foreign keys. Added `benchmarks/tpch/queries/q19.sql`
+  (the shared join key factored into the `JOIN ... ON` clause, common to
+  all three `OR`-ed branches in canonical Q19; `p_container` narrowed to
+  one representative value per branch, matching the generator's
+  representative `CONTAINERS` subset rather than TPC-H's full domain).
+  `tools/validate_tpch.py` and `kernellake benchmark tpch` both gained
+  `--part-data` for this second table (substituting a `{part_data}`
+  placeholder alongside the existing `{data}`), and `validate_tpch.py`
+  gained `--backend cpu`/`--backend gpu` (previously always used the
+  binary's own default, silently skipping the CPU backend entirely).
+  Verified for real: Q19 matches DuckDB exactly at SF0.01 on *both*
+  backends; Q1/Q6 still match DuckDB exactly after the generator change
+  (the only change affecting them, `l_partkey`'s range, isn't referenced by
+  either query); `dev` (172/172), `server-dev` (175/175), `otel-dev`
+  (175/175), and a real `gpu-dev` Docker rebuild (249/249) all pass.
+  Wiring Q19 into `tools/benchmark_three_way.py`'s three-way performance
+  comparison is done separately -- see the next "Done" entry below.
+- **TPC-H Q19 wired into the three-way performance benchmark.**
+  `tools/benchmark_three_way.py` gained `--part-data` (mirroring
+  `kernellake benchmark tpch`'s own flag from the entry above):
+  `kernellake_sql()` substitutes `{part_data}` alongside `{data}`;
+  `spark_sql()` rewrites `read_parquet('{part_data}')` to a second `part`
+  temp view (`spark.read.parquet(args.part_data)`, registered once in
+  `main()` alongside the existing `lineitem` view); both `run_kernellake_backend()`
+  and `run_pyspark_query()` evict the `part` file(s) too in cold mode, not
+  just `lineitem`. `--query all` only includes Q19 when `--part-data` is
+  actually given -- omitted silently rather than attempted and reported as
+  a validation failure, since a missing argument isn't a cross-engine
+  disagreement (pass `--query 19` explicitly, without `--part-data`, to see
+  that error instead). Verified for real on GPU hardware in a fresh
+  `benchmark-gpu` Docker rebuild: Q19 validates `true` (all three engines
+  agree) at SF0.01, with real median timings (KernelLake-CPU/GPU/PySpark:
+  0.069s / 0.400s / 0.237s, warm) reported alongside Q1/Q6; `--query all`
+  without `--part-data` still runs only Q1/Q6 exactly as before, confirming
+  no regression to the existing single-table path.
+- **`CASE` in an aggregate argument, fixed on both backends -- unblocking
+  TPC-H Q12.** The CPU backend rejected `CASE` in *every* context
+  ("unrecognized expression type in CPU expression compiler
+  (LIKE/IN/CASE/DECIMAL are not yet supported...)"); the GPU backend
+  already supported it in a *grouped* aggregate argument
+  (`HashAggregateOperator` already had `CASE`-aware `compile_expr()`/
+  `materialize()`) but not a *scalar* one (`ScalarAggregateOperator`
+  compiled non-column arguments via the plain `cudf::ast`
+  `ExpressionCompiler` directly, which has no `CASE` support at all).
+  Fixed CPU by mapping `CaseExpression` to Arrow Compute's own
+  `"case_when"` kernel in `compile_expression_cpu()` -- the one function
+  shared by every context on this backend, so `WHERE`, `SELECT` list, and
+  both grouped and scalar aggregate arguments all work as soon as it does.
+  Fixed GPU by giving `ScalarAggregateOperator` the identical
+  `CompiledExpr`/`CompiledCase`/`CompiledDecimalCast` machinery
+  `HashAggregateOperator` already had (duplicated per-operator, matching
+  this codebase's existing convention -- see `docs/ARCHITECTURE.md`'s
+  "CASE expression implementation notes"). `CASE` inside `WHERE` on the GPU
+  backend remains unsupported (`FilterOperator`'s own, separate gap;
+  confirmed still failing after this fix) -- out of scope since neither
+  Q12 nor Q14's `WHERE` clause needs it.
+
+  Added TPC-H Q12 (2-table `orders`/`lineitem` join, `CASE` inside a
+  grouped `SUM`) as the next query this unblocks. `tools/generate_tpch.py`
+  now also generates an `orders` table (one row per distinct `l_orderkey`,
+  per TPC-H's 1:N orders:lineitem relationship). `tools/validate_tpch.py`
+  and `kernellake benchmark tpch` both gained `--orders-data` (mirroring
+  `--part-data`'s existing pattern). Verified for real: new regression
+  tests (`QueryEngineExecuteCpuTest.CaseInGroupedAggregateWhereAndScalarAggregateMatchesExpectedTotals`,
+  `QueryEngineExecuteTest.CaseInScalarAggregateMatchesExpectedTotal`); Q12
+  matches DuckDB exactly on both backends at SF0.01; Q1/Q6/Q19 still match
+  after the generator change; `dev` (172/172), `server-dev` (175/175),
+  `otel-dev` (175/175), and a real `gpu-dev` Docker rebuild (250/250) all
+  pass with zero regressions.
+
+  Q14 remains blocked: it needs `LIKE` inside a `CASE` branch
+  (`SUM(CASE WHEN p_type LIKE 'PROMO%' THEN ... ELSE ... END)`), which
+  neither backend supports yet -- a separate, still-open gap from this
+  session's `CASE`-in-aggregate fix (see "Not yet started" below).
+- **TPC-H Q12 wired into the three-way performance benchmark**, the same
+  way Q19 already is. `tools/benchmark_three_way.py` gained
+  `--orders-data` (mirroring `--part-data`): `kernellake_sql()` substitutes
+  `{orders_data}` alongside `{data}`/`{part_data}`; `spark_sql()` rewrites
+  `read_parquet('{orders_data}')` to a third `orders` Spark temp view;
+  cold-mode eviction covers the `orders` file(s) too. `--query all` only
+  includes Q12 when `--orders-data` is given, same rationale as Q19's
+  `--part-data` handling. Verified for real on GPU hardware in a fresh
+  `benchmark-gpu` Docker rebuild: Q12 validates `true` at SF0.01 with real
+  median timings (KernelLake-CPU/GPU/PySpark: 0.077s / 0.446s / 0.271s,
+  warm); `--query all` with both `--part-data` and `--orders-data` given
+  runs and validates all four queries (Q1, Q6, Q19, Q12) together.
 
 ## Not yet started
 
 - TPC-H `execution-only` benchmark mode (needs an operator-tree entry point
   that skips `ParquetScanOperator`); TPC-H beyond SF10 (SF0.01/0.1/1/10 all
-  verified, see "Done" above); Q3/Q12/Q14 (need TPC-H's actual
-  multi-way join schema wired up against hash joins' current two-table
-  scope) -- also the only way to test whether GPU vs. PySpark's crossover
-  point (see "Done" above -- PySpark stays fastest through SF10 on the
-  current Q1/Q6-only subset) looks different for a heavier, multi-table
-  query shape
+  verified, see "Done" above)
+- Re-running the three-way benchmark's full cold/warm x SF0.01-SF10 sweep
+  (see the earlier "Confirmed on real GPU hardware" entry above) with Q19
+  and Q12 included, now that both are wired in -- the only way to test
+  whether GPU vs. PySpark's crossover point (PySpark stays fastest through
+  SF10 on the Q1/Q6-only sweep already run) looks different for a
+  join-shaped query; not yet done at any scale factor beyond the SF0.01
+  spot-checks above
+- `LIKE` inside a `CASE` branch or an aggregate argument, on either
+  backend -- confirmed not yet supported (see "Done" above); needed for
+  TPC-H Q14 (`SUM(CASE WHEN p_type LIKE 'PROMO%' THEN ... ELSE ... END)`)
+- `CASE` inside `WHERE` on the GPU backend (`FilterOperator`'s own gap,
+  separate from the aggregate-argument fix above; the CPU backend already
+  supports this via its one shared expression compiler) -- not needed by
+  any TPC-H query added so far, so not yet prioritized
+- Q3 and most of the rest of the TPC-H suite (need a 3+-table join, beyond
+  the current two-table-only scope) -- a real investigation into this
+  found the underlying `hsql` SQL parser library already parses `A JOIN B
+  JOIN C ON ...` correctly into a left-deep nested tree
+  (`(A JOIN B) JOIN C`, the outer join's `left` being itself a
+  `kTableJoin`, not a `kTableName`); `src/sql/parser.cpp`'s own AST
+  conversion is what explicitly rejects that shape today ("JOIN sides must
+  each be a single read_parquet(...) source, not a subquery or nested
+  join"). Supporting it end to end would mean generalizing `AstJoinClause`
+  (currently exactly two `AstParquetSource` sides) to a chain, and -- the
+  larger piece -- generalizing `Binder`'s dual-mode design
+  (`input_schema_` for single-table, hardcoded `left_schema_`/
+  `right_schema_` for exactly-two-table join mode) to resolve column
+  references against a list of N (alias, schema) pairs instead. The
+  physical planner and execution layers (`HashJoinNode`/`HashJoinOperator`
+  on GPU, Acero's `"hashjoin"` on CPU) likely need **no changes at all**:
+  both already recurse on arbitrary `PhysicalPlanPtr` children, so a
+  left-deep chain of two `HashJoinNode`s should execute correctly once the
+  logical plan builds that shape -- unconfirmed since the parser/binder
+  work wasn't attempted this session, but this is where the real
+  complexity is, not in the already-generic execution operators. This is a
+  substantially bigger change than any single-query addition so far (Q1/
+  Q6/Q12/Q19 combined) -- explicitly deferred as its own follow-up rather
+  than started opportunistically, since it touches the parser, binder, and
+  logical-plan construction all at once and deserves dedicated review
+  rather than being folded into a query-by-query session.
 - A self-hosted GPU CI runner (would enable a `gpu-dev` build/test/
   benchmark/validate workflow to actually run in CI, rather than only
   locally) -- explicitly deferred; `hurdad/kernel-lake` is a public repo,

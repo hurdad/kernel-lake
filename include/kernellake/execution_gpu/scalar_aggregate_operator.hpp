@@ -38,21 +38,58 @@ class ScalarAggregateOperator final : public PhysicalOperator {
   [[nodiscard]] OperatorId id() const noexcept override { return id_; }
 
  private:
+  struct CompiledCase;         // defined below; forward-declared so CompiledExpr can hold a shared_ptr to it.
+  struct CompiledDecimalCast;  // ditto.
+
+  // Mirrors HashAggregateOperator::CompiledExpr exactly (same rationale for
+  // each fast path -- see that class's own comments): a plain column
+  // reference or literal is materialized directly rather than routed
+  // through cudf::ast::compute_column (which can only produce fixed-width
+  // output), `case_expr`/`decimal_cast` handle a CASE or CAST-to-DECIMAL
+  // aggregate argument (e.g. `SUM(CASE WHEN ... THEN ... ELSE ... END)`,
+  // TPC-H Q14's shape) the same way ProjectionOperator and
+  // HashAggregateOperator already do, and `expr` is the ordinary
+  // cudf::ast-compiled path for everything else (e.g. `SUM(price *
+  // discount)`).
+  struct CompiledExpr {
+    std::optional<cudf::size_type> source_column_index;
+    std::shared_ptr<cudf::scalar> literal_scalar;
+    const cudf::ast::expression* expr = nullptr;
+    std::shared_ptr<CompiledCase> case_expr;
+    std::shared_ptr<CompiledDecimalCast> decimal_cast;
+  };
+
+  struct CompiledCaseBranch {
+    CompiledExpr condition;
+    CompiledExpr result;
+  };
+
+  struct CompiledCase {
+    std::vector<CompiledCaseBranch> branches;
+    std::optional<CompiledExpr> else_value;  // nullopt: NULL when no branch matches
+    DataType result_type{TypeId::Boolean};
+  };
+
+  struct CompiledDecimalCast {
+    CompiledExpr operand;
+    DataType target_type;
+  };
+
   struct Accumulator {
     AggregateFunction function;
-    ExpressionPtr argument;  // null only for CountStar
     DataType result_type;
-    // A plain column reference (e.g. `MIN(region)`) is copied directly
-    // instead of routed through cudf::ast::compute_column: cudf's AST
-    // evaluator can only materialize fixed-width output columns, so a
-    // STRING argument column would abort with "Invalid, non-fixed-width
-    // type" even though no actual computation was requested.
-    std::optional<cudf::size_type> argument_column_index;
-    const cudf::ast::expression* compiled_argument = nullptr;
+    CompiledExpr compiled_argument;               // unused for CountStar (no argument column)
     std::unique_ptr<cudf::scalar> running_value;  // Sum/Min/Max/Avg's running sum
     std::int64_t running_count = 0;               // Count/CountStar/Avg's denominator
   };
 
+  [[nodiscard]] CompiledExpr compile_expr(const Expression& expr);
+  [[nodiscard]] std::unique_ptr<cudf::column> materialize(const CompiledExpr& compiled,
+                                                          const DeviceBatch& batch,
+                                                          ExecutionContext& context);
+  [[nodiscard]] std::unique_ptr<cudf::column> materialize_case(const CompiledCase& case_expr,
+                                                               const DeviceBatch& batch,
+                                                               ExecutionContext& context);
   [[nodiscard]] std::unique_ptr<cudf::column> materialize_argument(Accumulator& state,
                                                                    const DeviceBatch& batch,
                                                                    ExecutionContext& context);

@@ -151,10 +151,39 @@ arrow::compute::Expression compile_expression_cpu(const Expression& expr) {
     options.to_type = to_arrow_type(cast->result_type());
     return arrow::compute::call("cast", {compile_expression_cpu(*cast->operand())}, options);
   }
+  // Arrow Compute's "case_when" kernel takes a struct of per-branch boolean
+  // conditions (built via "make_struct") as its first argument, followed by
+  // one value expression per condition in the same order, with an optional
+  // trailing value for CaseExpression::else_branch() (a row matching no
+  // condition and no ELSE emits null -- exactly CaseExpression's own
+  // documented semantics, so no extra handling is needed here for that
+  // case). MakeStructOptions's field names are never observed by
+  // "case_when" itself (positional, not named, lookup) -- placeholder
+  // names only exist because MakeStructOptions requires one per field.
+  if (const auto* case_expr = dynamic_cast<const CaseExpression*>(&expr)) {
+    std::vector<arrow::compute::Expression> conditions;
+    std::vector<std::string> condition_names;
+    std::vector<arrow::compute::Expression> args;
+    conditions.reserve(case_expr->when_then().size());
+    condition_names.reserve(case_expr->when_then().size());
+    args.reserve(case_expr->when_then().size() + 2);
+    for (const CaseExpression::WhenThen& branch : case_expr->when_then()) {
+      conditions.push_back(compile_expression_cpu(*branch.condition));
+      condition_names.push_back(fmt::format("cond_{}", condition_names.size()));
+    }
+    args.push_back(
+        arrow::compute::call("make_struct", conditions, arrow::compute::MakeStructOptions(condition_names)));
+    for (const CaseExpression::WhenThen& branch : case_expr->when_then()) {
+      args.push_back(compile_expression_cpu(*branch.result));
+    }
+    if (case_expr->else_branch() != nullptr) {
+      args.push_back(compile_expression_cpu(*case_expr->else_branch()));
+    }
+    return arrow::compute::call("case_when", std::move(args));
+  }
   throw ExecutionError(
-      "unrecognized expression type in CPU expression compiler (LIKE/IN/CASE/DECIMAL are not yet supported "
-      "by "
-      "the CPU execution backend -- see docs/ARCHITECTURE.md)");
+      "unrecognized expression type in CPU expression compiler (LIKE/IN/DECIMAL are not yet supported "
+      "by the CPU execution backend -- see docs/ARCHITECTURE.md)");
 }
 
 }  // namespace kernellake
