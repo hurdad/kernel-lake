@@ -1039,6 +1039,40 @@ and covered by passing tests -- not merely designed or stubbed.
   -- not attempted. If a future session has access to actual
   Tesla/Quadro-class hardware, this would be worth reopening; on this
   machine it's a dead end.
+- **Q6's remaining GPU-vs-PySpark gap isn't explained by cuFile I/O thread
+  count either, and the actual cause is still open.** Follow-up to the
+  compat-mode finding above: tried raising `execution.max_io_threads`
+  (cuFile's host-thread-per-GPU count for parallel I/O in compat mode)
+  from its default of 4 to 16 via a custom `cufile.json` bind-mounted into
+  the container. No effect -- 45.76s vs. the 45.84-45.95s baseline, within
+  run-to-run noise. `mpstat` sampled during a real cold-cache scan explains
+  why: of 20 logical cores, only ~4-5 show any activity at all (matching
+  the default thread count), and those show substantial `%iowait`
+  (up to ~53%) rather than `%usr`/`%sys` -- i.e. those threads are mostly
+  blocked waiting on the disk, not CPU-bound on decompression, so adding
+  more threads had nothing to parallelize against. Consistent with this: a
+  raw `dd iflag=direct` sequential read of the same files tops out around
+  1.8-1.9 GB/s regardless of parallelism (1-way vs. 8-way concurrent `dd`
+  processes made almost no difference either), while cuFile's actual
+  cold-scan throughput is ~2.3 GB/s -- already *faster* than the naive
+  baseline, suggesting kernellake's cold-mode scan is close to a real
+  hardware/access-pattern ceiling for this NVMe, not something more
+  threads or config tuning fixes.
+
+  Open puzzle, not yet root-caused: PySpark's cold read of the same data
+  hits ~3.5 GB/s -- faster than *both* kernellake's cuFile scan (2.3 GB/s)
+  *and* the raw `dd` baseline (1.9 GB/s) on the identical disk. Thread
+  count and a hardware ceiling don't explain this, since PySpark exceeds
+  what raw sequential `dd` reads achieve on the same hardware. Leading
+  candidate: an access-pattern difference, not a parallelism one -- cudf's
+  chunked Parquet reader reads specific column-chunk byte ranges (likely a
+  more scattered read pattern within each file even though it reads less
+  total data per row group), whereas PySpark's reader may read more
+  contiguously per file. Confirming this would need syscall-level I/O
+  tracing (comparing actual `read()` offsets/sizes between the two
+  engines' access to the same files) -- not done this session. Like the
+  GDS finding above, this increasingly looks like it may not have a fix
+  within kernellake's own code either way, but that isn't confirmed yet.
 - TPC-H `execution-only` benchmark mode (needs an operator-tree entry point
   that skips `ParquetScanOperator`); TPC-H beyond SF10 (SF0.01/0.1/1/10 all
   verified, see "Done" above)
