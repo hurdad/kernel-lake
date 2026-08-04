@@ -707,23 +707,37 @@ and covered by passing tests -- not merely designed or stubbed.
   either query); `dev` (172/172), `server-dev` (175/175), `otel-dev`
   (175/175), and a real `gpu-dev` Docker rebuild (249/249) all pass.
   Wiring Q19 into `tools/benchmark_three_way.py`'s three-way performance
-  comparison (which currently assumes one single-table glob per engine,
-  not a multi-table mount) is separate, not-yet-done work -- see "Not yet
-  started" below.
+  comparison is done separately -- see the next "Done" entry below.
+- **TPC-H Q19 wired into the three-way performance benchmark.**
+  `tools/benchmark_three_way.py` gained `--part-data` (mirroring
+  `kernellake benchmark tpch`'s own flag from the entry above):
+  `kernellake_sql()` substitutes `{part_data}` alongside `{data}`;
+  `spark_sql()` rewrites `read_parquet('{part_data}')` to a second `part`
+  temp view (`spark.read.parquet(args.part_data)`, registered once in
+  `main()` alongside the existing `lineitem` view); both `run_kernellake_backend()`
+  and `run_pyspark_query()` evict the `part` file(s) too in cold mode, not
+  just `lineitem`. `--query all` only includes Q19 when `--part-data` is
+  actually given -- omitted silently rather than attempted and reported as
+  a validation failure, since a missing argument isn't a cross-engine
+  disagreement (pass `--query 19` explicitly, without `--part-data`, to see
+  that error instead). Verified for real on GPU hardware in a fresh
+  `benchmark-gpu` Docker rebuild: Q19 validates `true` (all three engines
+  agree) at SF0.01, with real median timings (KernelLake-CPU/GPU/PySpark:
+  0.069s / 0.400s / 0.237s, warm) reported alongside Q1/Q6; `--query all`
+  without `--part-data` still runs only Q1/Q6 exactly as before, confirming
+  no regression to the existing single-table path.
 
 ## Not yet started
 
 - TPC-H `execution-only` benchmark mode (needs an operator-tree entry point
   that skips `ParquetScanOperator`); TPC-H beyond SF10 (SF0.01/0.1/1/10 all
   verified, see "Done" above)
-- Wiring TPC-H Q19 (see "Done" above) into
-  `tools/benchmark_three_way.py`'s three-way performance comparison, which
-  currently assumes one single-table `lineitem` glob per engine -- needs a
-  second `--part-data`-equivalent mount for all three engines (KernelLake
-  CPU/GPU and PySpark). This is also the only way to test whether GPU vs.
+- Re-running the three-way benchmark's full cold/warm x SF0.01-SF10 sweep
+  (see the earlier "Confirmed on real GPU hardware" entry above) with Q19
+  included, now that it's wired in -- the only way to test whether GPU vs.
   PySpark's crossover point (PySpark stays fastest through SF10 on the
-  current Q1/Q6-only subset -- see "Done" above) looks different for a
-  join-shaped query
+  Q1/Q6-only sweep already run) looks different for a join-shaped query;
+  not yet done at any scale factor beyond the SF0.01 spot-check above
 - TPC-H Q12/Q14 (2-table joins, but need `CASE` inside an aggregate
   argument, e.g. `SUM(CASE WHEN ... THEN 1 ELSE 0 END)` -- confirmed not
   yet supported by either execution backend's expression compiler, not
