@@ -9,6 +9,7 @@
 #include <parquet/arrow/writer.h>
 
 #include <algorithm>
+#include <array>
 #include <filesystem>
 #include <map>
 
@@ -381,6 +382,133 @@ TEST_F(QueryEngineExecuteTest, SplitExecutionPathLeavesMetadataInspectionSeconds
   EXPECT_FALSE(result.metadata_inspection_seconds.has_value());
   ASSERT_TRUE(result.gpu_execution_seconds.has_value());
   EXPECT_GE(*result.gpu_execution_seconds, 0.0);
+}
+
+// Coverage for query_engine_execute_gpu.cpp's pass-sizing heuristic, which
+// a real SF100 TPC-H-derived Q1 run (docs/ROADMAP.md) found had two real
+// bugs: it read the wrong config field (memory.pool_max_bytes, dead
+// whenever memory.use_async_allocator is true -- the default -- since it
+// only sizes rmm::mr::pool_memory_resource, never constructed in that
+// case; see rmm_environment.cpp's build_base_resource()) instead of the
+// value RmmEnvironment's limiting_resource_adaptor actually enforces
+// (engine.query_memory_limit_bytes); and it left too little headroom
+// (`/ 2`) for queries materializing extra derived columns per pass beyond
+// what's actually scanned (Q1 computes SUM(extendedprice*(1-discount)) and
+// SUM(extendedprice*(1-discount)*(1+tax)), two extra DOUBLE columns per
+// pass on top of the 7 scanned ones). Both were confirmed for real:
+// against the *actual* SF100 dataset (600M rows) and Q1 query, the pre-fix
+// binary threw `std::bad_alloc: ... Exceeded memory limit` at both a 6.04
+// GiB and a 3 GiB engine.query_memory_limit_bytes (consistently needing
+// ~1.2x the configured ceiling), and the post-fix binary (`/ 4` against
+// engine.query_memory_limit_bytes) completed it correctly.
+//
+// That exact scale is impractical for a unit test (minutes, gigabytes), and
+// the pass/fail boundary itself doesn't scale down cleanly: below roughly 1
+// GiB, cudf's chunked Parquet reader has its own fixed per-pass working-set
+// floor (empirically ~76 MiB here, independent of pass_read_limit_bytes or
+// row count) that dominates, and at the smaller scale a unit test can
+// afford, *both* the pre-fix and post-fix formulas still comfortably fit a
+// single pass under a multi-GiB-vs-multi-hundred-MiB ceiling either way --
+// confirmed directly by running this exact query shape against both
+// binaries at several limits (4 MiB to 2 GiB) and dataset sizes (200K to
+// 20M rows) without ever reproducing the failure below GiB scale. So this
+// is not a differential regression test -- the pre-fix/post-fix evidence
+// above is what actually demonstrates the fix. What this test covers
+// instead is correctness: that GROUP BY with derived-column aggregates
+// still produces the right answer once a tight-but-real
+// engine.query_memory_limit_bytes forces genuine multi-pass scanning
+// (20,000,000 rows, ~740 MiB of required-column data, against a 2 GiB
+// ceiling -- 512 MiB passes, several of them), unlike every fixture above
+// (a handful of rows, always a single pass).
+TEST(QueryEngineExecuteGpuMemoryTest, GroupByWithDerivedAggregatesSucceedsUnderTightMemoryLimit) {
+  const fs::path dir = fs::temp_directory_path() / "kernellake_gpu_memory_pass_sizing_test";
+  fs::create_directories(dir);
+  const std::string path = (dir / "lineitem_like.parquet").string();
+
+  constexpr int kRowCount = 20'000'000;
+  arrow::StringBuilder flag_builder;
+  arrow::DoubleBuilder quantity_builder;
+  arrow::DoubleBuilder extendedprice_builder;
+  arrow::DoubleBuilder discount_builder;
+  arrow::DoubleBuilder tax_builder;
+  for (int i = 0; i < kRowCount; ++i) {
+    ASSERT_TRUE(flag_builder.Append(i % 2 == 0 ? "A" : "B").ok());
+    ASSERT_TRUE(quantity_builder.Append(2.0).ok());
+    ASSERT_TRUE(extendedprice_builder.Append(100.0).ok());
+    ASSERT_TRUE(discount_builder.Append(0.1).ok());
+    ASSERT_TRUE(tax_builder.Append(0.08).ok());
+  }
+  std::shared_ptr<arrow::Array> flag_array, quantity_array, extendedprice_array, discount_array, tax_array;
+  ASSERT_TRUE(flag_builder.Finish(&flag_array).ok());
+  ASSERT_TRUE(quantity_builder.Finish(&quantity_array).ok());
+  ASSERT_TRUE(extendedprice_builder.Finish(&extendedprice_array).ok());
+  ASSERT_TRUE(discount_builder.Finish(&discount_array).ok());
+  ASSERT_TRUE(tax_builder.Finish(&tax_array).ok());
+
+  const auto schema = arrow::schema({arrow::field("flag", arrow::utf8(), false),
+                                     arrow::field("quantity", arrow::float64(), false),
+                                     arrow::field("extendedprice", arrow::float64(), false),
+                                     arrow::field("discount", arrow::float64(), false),
+                                     arrow::field("tax", arrow::float64(), false)});
+  const auto table =
+      arrow::Table::Make(schema, {flag_array, quantity_array, extendedprice_array, discount_array, tax_array});
+  auto sink = arrow::io::FileOutputStream::Open(path).ValueOrDie();
+  const arrow::Status status =
+      parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), sink, /*chunk_size=*/1'000'000);
+  ASSERT_TRUE(status.ok()) << status.ToString();
+
+  EngineConfig config = default_config();
+  // 2 GiB: forces query_engine_execute_gpu.cpp's pass size
+  // (engine.query_memory_limit_bytes / 4 = 512 MiB) below this file's ~740
+  // MiB of required-column data, so the scan genuinely splits into
+  // multiple passes -- the common case elsewhere in this file (a handful
+  // of rows) never exercises that at all.
+  config.engine.query_memory_limit_bytes = 2ULL * 1024 * 1024 * 1024;
+  const QueryEngine engine(config);
+
+  const QueryResult result = engine.execute(
+      "SELECT flag, SUM(extendedprice * (1 - discount)) AS sum_disc_price, "
+      "SUM(extendedprice * (1 - discount) * (1 + tax)) AS sum_charge, SUM(quantity) AS sum_qty "
+      "FROM read_parquet('" +
+      path + "') GROUP BY flag");
+
+  // Every row is identical apart from `flag`, so each group's expected
+  // totals: 10,000,000 rows/group * 100.0*(1-0.1) = 900,000,000.0; that
+  // discounted price * (1+0.08) = 972,000,000.0; 10,000,000 * 2.0 =
+  // 20,000,000.0. EXPECT_NEAR, not EXPECT_DOUBLE_EQ: 0.1/0.08 aren't
+  // exactly representable in binary floating point, and summing 10 million
+  // rows' worth of that per-row error doesn't cancel out to bit-exact
+  // (observed ~0.17 absolute drift on sum_charge in a real run) -- an
+  // expected property of the computation itself, not a bug.
+  std::map<std::string, std::array<double, 3>> totals_by_flag;
+  std::int64_t rows_returned = 0;
+  for (const std::shared_ptr<arrow::RecordBatch>& batch : result.batches) {
+    const auto flag_column = std::static_pointer_cast<arrow::StringArray>(batch->GetColumnByName("flag"));
+    const auto disc_price_column =
+        std::static_pointer_cast<arrow::DoubleArray>(batch->GetColumnByName("sum_disc_price"));
+    const auto charge_column = std::static_pointer_cast<arrow::DoubleArray>(batch->GetColumnByName("sum_charge"));
+    const auto qty_column = std::static_pointer_cast<arrow::DoubleArray>(batch->GetColumnByName("sum_qty"));
+    ASSERT_NE(flag_column, nullptr);
+    ASSERT_NE(disc_price_column, nullptr);
+    ASSERT_NE(charge_column, nullptr);
+    ASSERT_NE(qty_column, nullptr);
+    for (std::int64_t i = 0; i < batch->num_rows(); ++i) {
+      totals_by_flag[flag_column->GetString(i)] = {disc_price_column->Value(i), charge_column->Value(i),
+                                                    qty_column->Value(i)};
+    }
+    rows_returned += batch->num_rows();
+  }
+
+  EXPECT_EQ(rows_returned, 2);
+  ASSERT_EQ(totals_by_flag.size(), 2u);
+  for (const char* flag : {"A", "B"}) {
+    const std::array<double, 3>& totals = totals_by_flag.at(flag);
+    EXPECT_NEAR(totals[0], 900'000'000.0, 100.0) << "flag=" << flag;
+    EXPECT_NEAR(totals[1], 972'000'000.0, 100.0) << "flag=" << flag;
+    EXPECT_DOUBLE_EQ(totals[2], 20'000'000.0) << "flag=" << flag;
+  }
+
+  fs::remove_all(dir);
 }
 
 }  // namespace

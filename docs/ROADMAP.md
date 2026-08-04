@@ -654,6 +654,64 @@ and covered by passing tests -- not merely designed or stubbed.
   Single-machine, single-run (5 iterations, median reported) result, not a
   statistically-controlled study, per this project's own rule of reporting
   real numbers rather than a general performance claim.
+- **Three-way benchmark extended to SF100 (600M rows), with a real GPU
+  pass-sizing bug found and fixed.** `query_engine_execute_gpu.cpp`'s
+  `pass_read_limit_bytes` (bounds how much a single Parquet-scan pass may
+  read before `ParquetScanOperator` splits into another one) had two real
+  bugs, both surfaced by the very first SF100 attempt at Q1 (GROUP BY
+  `returnflag`/`linestatus` over an almost-unfiltered scan of the full
+  table -- unlike Q6, whose date/discount/quantity filters keep its actual
+  working set small at every scale factor tried so far): it read
+  `memory.pool_max_bytes`, which is dead config whenever
+  `memory.use_async_allocator` is `true` (the default -- see
+  `rmm_environment.cpp`'s `build_base_resource()`; that field only sizes
+  `rmm::mr::pool_memory_resource`, never constructed in the async-allocator
+  case) instead of `engine.query_memory_limit_bytes`, the value
+  `RmmEnvironment`'s `limiting_resource_adaptor` actually enforces; and its
+  divisor (`/ 2`) left too little headroom for a query like Q1 that
+  materializes two extra derived `DOUBLE` columns per pass
+  (`SUM(extendedprice*(1-discount))`, `SUM(extendedprice*(1-discount)*
+  (1+tax))`) on top of the 7 columns actually scanned. On this development
+  session's real hardware (RTX 3070, 8 GiB VRAM -- smaller than the RTX
+  5060 Ti used for the SF0.01-SF1 runs and the unspecified card used for
+  SF10), Q1 threw a real `std::bad_alloc: ... RMM ... Exceeded memory
+  limit` at both a 6.04 GiB and (retested smaller, to isolate whether it
+  was a simple "raise the limit" fix like SF10's) a 3 GiB
+  `engine.query_memory_limit_bytes` -- consistently needing about 1.2x the
+  configured ceiling at both sizes, confirming this was the divisor, not
+  the absolute value. Fixed by reading the correct field and lowering the
+  divisor to `/ 4`; reverified against the real SF100 dataset and Q1 query
+  with the fix, which completed correctly. Regression coverage: a new
+  `QueryEngineExecuteGpuMemoryTest.GroupByWithDerivedAggregatesSucceedsUnderTightMemoryLimit`
+  in `tests/gpu/query_engine_execute_test.cpp` -- see that test's own
+  comment for why the real bug's exact scale (600M rows) isn't reproducible
+  at unit-test speed, and why the pre-fix/post-fix *difference* is only
+  demonstrated at the real SF100 scale above, not by this test in
+  isolation (below roughly 1 GiB, cudf's chunked Parquet reader has its own
+  fixed per-pass overhead, empirically ~76 MiB here, that dominates and
+  masks the effect the divisor is meant to control). All 249 `gpu-dev`
+  tests pass with zero regressions.
+
+  **Confirmed on real GPU hardware**: both queries x both modes, all
+  `validated: true`. Median wall-clock seconds (KernelLake-CPU /
+  KernelLake-GPU / PySpark local[*]): Q1 cold 42.0526/10.2696/9.0160, warm
+  40.1890/9.5549/7.9632; Q6 cold 10.2655/2.7019/3.2189, warm
+  8.5967/1.9393/3.0081. Notable real pattern: the GPU backend now beats
+  PySpark outright on Q6 at both modes (a reversal from SF0.01-SF10, where
+  PySpark stayed fastest of all three engines at every scale factor tried)
+  -- but PySpark still edges out GPU on Q1, though by a much smaller margin
+  than at SF10. `--mode both`'s cold-vs-warm gap is modest for every engine
+  at this scale (e.g. GPU Q1 10.27s cold vs. 9.55s warm), unlike smaller
+  scale factors where it was closer to negligible -- consistent with disk
+  I/O becoming a real, if still secondary, cost component once the working
+  set (~11 GiB compressed, more decompressed) stops comfortably fitting in
+  page cache. Single-machine, single-run (5 iterations, median reported)
+  result on this project's Q1/Q6-only TPC-H subset, not a
+  statistically-controlled study or a general performance claim, per this
+  project's own reporting rule. Report (system stats, summary table, a
+  bar chart per query across modes) rendered as `benchmark-results/
+  sf100-report.pdf` via `tools/generate_benchmark_report.py`; raw JSON and
+  PDF are gitignored local artifacts, not committed.
 
 ## Not yet started
 

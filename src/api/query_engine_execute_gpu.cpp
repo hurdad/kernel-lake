@@ -74,9 +74,29 @@ QueryResult QueryEngine::execute(const PhysicalPlanPtr& physical, RmmEnvironment
                            nullptr,         &metrics,
                            nullptr};
 
-  // Half the configured pool ceiling, leaving headroom for filter/
-  // projection/aggregation intermediates above the scan itself.
-  const std::size_t pass_read_limit_bytes = config_.memory.pool_max_bytes / 2;
+  // A quarter of the *actually enforced* memory ceiling
+  // (engine.query_memory_limit_bytes, via RmmEnvironment's
+  // limiting_resource_adaptor -- not memory.pool_max_bytes, which is dead
+  // config whenever memory.use_async_allocator is true, the default: it
+  // only sizes rmm::mr::pool_memory_resource, never constructed in that
+  // case; see rmm_environment.cpp's build_base_resource()). Using
+  // pool_max_bytes here was a real, distinct bug from the divisor below --
+  // silent unless a caller happens to set both fields to the same value.
+  //
+  // A real SF100 run (600M-row lineitem, TPC-H-derived Q1: GROUP BY
+  // returnflag/linestatus over an almost-unfiltered scan, materializing two
+  // extra derived DOUBLE columns per pass for
+  // SUM(extendedprice*(1-discount)) and SUM(extendedprice*(1-discount)*
+  // (1+tax)) on top of the 7 scanned columns) hit a genuine RMM OOM under
+  // the previous `/ 2` divisor: measured peak need was a consistent ~1.196x
+  // the configured ceiling at two different ceiling sizes (6.04 GiB ->
+  // needed +1.18 GiB; 3 GiB -> needed +0.59 GiB) -- i.e. ~2.4x
+  // pass_read_limit_bytes, not the ~2x of headroom `/ 2` provides. `/ 4`
+  // leaves about 40% margin above that measured ratio, for the retained
+  // original columns, the derived projection columns, and hash-aggregate
+  // working state all live at once within one pass -- not just the scan
+  // itself.
+  const std::size_t pass_read_limit_bytes = config_.engine.query_memory_limit_bytes / 4;
   const std::unique_ptr<PhysicalOperator> root =
       build_operator_tree(physical, store_, pass_read_limit_bytes, config_.profiling.nvtx);
 
