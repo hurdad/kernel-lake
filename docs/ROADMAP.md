@@ -987,6 +987,58 @@ and covered by passing tests -- not merely designed or stubbed.
 
 ## Not yet started
 
+- **GPU Parquet scan's cold-vs-warm gap is explained by cuFile running in
+  compatibility mode on this dev machine, not a kernellake code issue.**
+  Following up the `HashAggregateOperator` redesign above, `Not yet
+  started`'s to-do to profile the scan path: `parquet_decoding_seconds` is
+  now the dominant cost for both Q1 (58% of GPU total) and Q6 (96%), so it
+  was next up. Controlled measurement (evicting page cache via
+  `posix_fadvise DONTNEED`, same technique `benchmark_three_way.py` already
+  uses for "cold"): a real SF1000 Q6 scan (107GiB compressed `lineitem`)
+  takes 45.8s cold (~2.3 GB/s) vs. 26.7s immediately after, warm (~4.0
+  GB/s) -- a real, repeatable 72% gap, not noise (earlier `--stats` numbers
+  quoted elsewhere in this file weren't cache-controlled and shouldn't be
+  compared against each other for this reason). A naive parallel `dd
+  iflag=direct` read of the same files only reached ~1.9 GB/s, so cuFile's
+  cold-path read is already *faster* than a naive raw-I/O baseline --
+  ruling out "kernellake/cuFile isn't parallelizing reads enough" as the
+  explanation.
+
+  Root cause: `/usr/local/cuda-12.6/gds/tools/gdscheck -p` on this machine
+  reports `properties.use_compat_mode : true` and `NVMe : Unsupported`
+  under `DRIVER CONFIGURATION` -- the `nvidia-fs` kernel module (required
+  for true GPU-Direct Storage, DMA straight from NVMe to GPU memory,
+  bypassing the host entirely) isn't loaded (`lsmod | grep nvidia_fs`:
+  empty), so every cuFile read on this box goes disk -> host page cache ->
+  cuFile's internal POSIX bounce-buffer pool -> GPU, not a direct path.
+  That's exactly why warm (page cache already populated) is so much faster
+  than cold (forces a real disk read) -- and it's an environment/driver gap
+  on this specific dev machine, not something fixable in kernellake's own
+  source.
+
+  Investigated what installing `nvidia-fs` would take, and explicitly
+  decided not to attempt it -- three independent reasons, not just one:
+  (1) NVIDIA's own official GDS support matrix requires a Tesla- or
+  Quadro-class GPU (Pascal/Volta/Turing/Ampere); this machine's RTX 3070 is
+  Ampere but GeForce (consumer), not Tesla/Quadro, so it's outside official
+  support regardless of driver/module versions. (2) `gdscheck`'s own
+  driver-compatibility line says the installed GPU driver (610.57.04) only
+  supports `nvidia-fs` <= 2.17.4, but every version available via the
+  already-configured CUDA apt repo is >= 2.20.6 -- no version this system
+  can actually install is one `gdscheck` itself claims is compatible.
+  (3) `gdscheck` separately warns GDS "is not guaranteed to work
+  functionally or in a performant way" under this system's current IOMMU
+  passthrough setting. (Mechanically, an install attempt would likely at
+  least *build*: matching kernel headers for the running `7.0.0-28-generic`
+  are installed, DKMS already works here -- the NVIDIA driver itself is
+  DKMS-built for this exact kernel -- and Secure Boot is disabled, so no
+  signing blocker. That just means it probably wouldn't fail loudly, not
+  that it would fix anything.) Net: real root/kernel-module risk on a
+  shared dev machine, stacked against three separate signals that it
+  likely wouldn't resolve the compat-mode gap even if it installed cleanly
+  -- not attempted. If a future session has access to actual
+  Tesla/Quadro-class hardware, this would be worth reopening; on this
+  machine it's a dead end.
 - TPC-H `execution-only` benchmark mode (needs an operator-tree entry point
   that skips `ParquetScanOperator`); TPC-H beyond SF10 (SF0.01/0.1/1/10 all
   verified, see "Done" above)
