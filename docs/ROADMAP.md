@@ -682,8 +682,12 @@ and covered by passing tests -- not merely designed or stubbed.
   real query against real data ("unrecognized expression type in
   {CPU,GPU} expression compiler"), not just inferred from the docs. Column-
   to-column comparisons (`WHERE l_commitdate < l_shipdate`, no `CASE`
-  involved) already work correctly on both backends. See `docs/TPCH.md`
-  for the updated scope this leaves for TPC-H specifically.
+  involved) already work correctly on both backends. **Update: the
+  aggregate-argument half of this gap is fixed -- see the later "`CASE` in
+  an aggregate argument, fixed on both backends" entry below; `CASE` in
+  `WHERE` is still open on GPU only (CPU already supports it there too, as
+  a side effect of that same fix).** See `docs/TPCH.md` for the current,
+  up-to-date scope this leaves for TPC-H specifically.
 - **TPC-H Q19 added** (2-table `lineitem`/`part` join, `OR` of `AND`s with
   `BETWEEN`, no `CASE` -- the one TPC-H query shape the current grammar and
   both execution backends already supported after the `HashJoin` fix
@@ -726,6 +730,45 @@ and covered by passing tests -- not merely designed or stubbed.
   0.069s / 0.400s / 0.237s, warm) reported alongside Q1/Q6; `--query all`
   without `--part-data` still runs only Q1/Q6 exactly as before, confirming
   no regression to the existing single-table path.
+- **`CASE` in an aggregate argument, fixed on both backends -- unblocking
+  TPC-H Q12.** The CPU backend rejected `CASE` in *every* context
+  ("unrecognized expression type in CPU expression compiler
+  (LIKE/IN/CASE/DECIMAL are not yet supported...)"); the GPU backend
+  already supported it in a *grouped* aggregate argument
+  (`HashAggregateOperator` already had `CASE`-aware `compile_expr()`/
+  `materialize()`) but not a *scalar* one (`ScalarAggregateOperator`
+  compiled non-column arguments via the plain `cudf::ast`
+  `ExpressionCompiler` directly, which has no `CASE` support at all).
+  Fixed CPU by mapping `CaseExpression` to Arrow Compute's own
+  `"case_when"` kernel in `compile_expression_cpu()` -- the one function
+  shared by every context on this backend, so `WHERE`, `SELECT` list, and
+  both grouped and scalar aggregate arguments all work as soon as it does.
+  Fixed GPU by giving `ScalarAggregateOperator` the identical
+  `CompiledExpr`/`CompiledCase`/`CompiledDecimalCast` machinery
+  `HashAggregateOperator` already had (duplicated per-operator, matching
+  this codebase's existing convention -- see `docs/ARCHITECTURE.md`'s
+  "CASE expression implementation notes"). `CASE` inside `WHERE` on the GPU
+  backend remains unsupported (`FilterOperator`'s own, separate gap;
+  confirmed still failing after this fix) -- out of scope since neither
+  Q12 nor Q14's `WHERE` clause needs it.
+
+  Added TPC-H Q12 (2-table `orders`/`lineitem` join, `CASE` inside a
+  grouped `SUM`) as the next query this unblocks. `tools/generate_tpch.py`
+  now also generates an `orders` table (one row per distinct `l_orderkey`,
+  per TPC-H's 1:N orders:lineitem relationship). `tools/validate_tpch.py`
+  and `kernellake benchmark tpch` both gained `--orders-data` (mirroring
+  `--part-data`'s existing pattern). Verified for real: new regression
+  tests (`QueryEngineExecuteCpuTest.CaseInGroupedAggregateWhereAndScalarAggregateMatchesExpectedTotals`,
+  `QueryEngineExecuteTest.CaseInScalarAggregateMatchesExpectedTotal`); Q12
+  matches DuckDB exactly on both backends at SF0.01; Q1/Q6/Q19 still match
+  after the generator change; `dev` (172/172), `server-dev` (175/175),
+  `otel-dev` (175/175), and a real `gpu-dev` Docker rebuild (250/250) all
+  pass with zero regressions.
+
+  Q14 remains blocked: it needs `LIKE` inside a `CASE` branch
+  (`SUM(CASE WHEN p_type LIKE 'PROMO%' THEN ... ELSE ... END)`), which
+  neither backend supports yet -- a separate, still-open gap from this
+  session's `CASE`-in-aggregate fix (see "Not yet started" below).
 
 ## Not yet started
 
@@ -734,15 +777,22 @@ and covered by passing tests -- not merely designed or stubbed.
   verified, see "Done" above)
 - Re-running the three-way benchmark's full cold/warm x SF0.01-SF10 sweep
   (see the earlier "Confirmed on real GPU hardware" entry above) with Q19
-  included, now that it's wired in -- the only way to test whether GPU vs.
-  PySpark's crossover point (PySpark stays fastest through SF10 on the
-  Q1/Q6-only sweep already run) looks different for a join-shaped query;
-  not yet done at any scale factor beyond the SF0.01 spot-check above
-- TPC-H Q12/Q14 (2-table joins, but need `CASE` inside an aggregate
-  argument, e.g. `SUM(CASE WHEN ... THEN 1 ELSE 0 END)` -- confirmed not
-  yet supported by either execution backend's expression compiler, not
-  just a grammar gap; see "Done" above) and Q3 (needs a 3-table join,
-  beyond the current two-table-only scope)
+  (and, once wired in, Q12) included, now that Q19 is wired in -- the only
+  way to test whether GPU vs. PySpark's crossover point (PySpark stays
+  fastest through SF10 on the Q1/Q6-only sweep already run) looks different
+  for a join-shaped query; not yet done at any scale factor beyond the
+  SF0.01 spot-checks above
+- Wiring TPC-H Q12 into `tools/benchmark_three_way.py`'s three-way
+  performance comparison, the same way Q19 already is (see "Done" above) --
+  not yet done
+- `LIKE` inside a `CASE` branch or an aggregate argument, on either
+  backend -- confirmed not yet supported (see "Done" above); needed for
+  TPC-H Q14 (`SUM(CASE WHEN p_type LIKE 'PROMO%' THEN ... ELSE ... END)`)
+- `CASE` inside `WHERE` on the GPU backend (`FilterOperator`'s own gap,
+  separate from the aggregate-argument fix above; the CPU backend already
+  supports this via its one shared expression compiler) -- not needed by
+  any TPC-H query added so far, so not yet prioritized
+- Q3 (needs a 3-table join, beyond the current two-table-only scope)
 - A self-hosted GPU CI runner (would enable a `gpu-dev` build/test/
   benchmark/validate workflow to actually run in CI, rather than only
   locally) -- explicitly deferred; `hurdad/kernel-lake` is a public repo,

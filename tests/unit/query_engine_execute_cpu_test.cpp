@@ -255,11 +255,55 @@ TEST_F(QueryEngineExecuteCpuTest, LikeIsNotYetSupportedByCpuBackend) {
       ExecutionError);
 }
 
-TEST_F(QueryEngineExecuteCpuTest, CaseIsNotYetSupportedByCpuBackend) {
-  EXPECT_THROW((void)(engine_.execute("SELECT CASE WHEN amount > 15 THEN 'high' ELSE 'low' END AS bucket "
-                                      "FROM read_parquet('" +
-                                      path_ + "')")),
-               ExecutionError);
+// Regression test: the CPU execution backend used to reject CASE
+// expressions everywhere ("unrecognized expression type in CPU expression
+// compiler (LIKE/IN/CASE/DECIMAL are not yet supported...)"), even though
+// the GPU backend already supported CASE inside a grouped aggregate
+// argument (just not inside a *scalar* one -- a separate, still-open GPU
+// gap -- or inside WHERE). Fixed by mapping CaseExpression to Arrow
+// Compute's own "case_when" kernel (a struct of per-branch boolean
+// conditions built via "make_struct", followed by one value expression per
+// condition and an optional trailing ELSE value) in
+// compile_expression_cpu() -- the one function shared by every context
+// (WHERE, SELECT list, grouped and scalar aggregate arguments), so all of
+// them work as soon as this one function does, unlike the GPU backend's
+// split between an eager cudf-materializing path and a separate lazy
+// cudf::ast path.
+TEST_F(QueryEngineExecuteCpuTest, CaseInGroupedAggregateWhereAndScalarAggregateMatchesExpectedTotals) {
+  const QueryResult grouped = engine_.execute(
+      "SELECT region, SUM(CASE WHEN amount > 15 THEN 1 ELSE 0 END) AS high_count FROM read_parquet('" +
+      path_ + "') GROUP BY region");
+  ASSERT_EQ(grouped.rows_returned, 2);
+  const std::shared_ptr<arrow::RecordBatch>& grouped_batch = grouped.batches.front();
+  const auto region_column =
+      std::static_pointer_cast<arrow::StringArray>(grouped_batch->GetColumnByName("region"));
+  const auto high_count_column =
+      std::static_pointer_cast<arrow::Int64Array>(grouped_batch->GetColumnByName("high_count"));
+  ASSERT_NE(region_column, nullptr);
+  ASSERT_NE(high_count_column, nullptr);
+  std::map<std::string, std::int64_t> high_count_by_region;
+  for (std::int64_t i = 0; i < grouped_batch->num_rows(); ++i) {
+    high_count_by_region[region_column->GetString(i)] = high_count_column->Value(i);
+  }
+  ASSERT_EQ(high_count_by_region.size(), 2u);
+  EXPECT_EQ(high_count_by_region.at("A"), 1);  // only 20.0 > 15
+  EXPECT_EQ(high_count_by_region.at("B"), 1);  // only 100.0 > 15
+
+  const QueryResult scalar = engine_.execute(
+      "SELECT SUM(CASE WHEN amount > 15 THEN 1 ELSE 0 END) AS high_count FROM read_parquet('" + path_ + "')");
+  ASSERT_EQ(scalar.rows_returned, 1);
+  const auto scalar_column =
+      std::static_pointer_cast<arrow::Int64Array>(scalar.batches.front()->GetColumnByName("high_count"));
+  ASSERT_NE(scalar_column, nullptr);
+  EXPECT_EQ(scalar_column->Value(0), 2);  // 20.0 and 100.0
+
+  const QueryResult where_result = engine_.execute("SELECT COUNT(*) AS n FROM read_parquet('" + path_ +
+                                                   "') WHERE (CASE WHEN amount > 15 THEN 1 ELSE 0 END) = 1");
+  ASSERT_EQ(where_result.rows_returned, 1);
+  const auto n_column =
+      std::static_pointer_cast<arrow::Int64Array>(where_result.batches.front()->GetColumnByName("n"));
+  ASSERT_NE(n_column, nullptr);
+  EXPECT_EQ(n_column->Value(0), 2);
 }
 
 // Regression test: the CPU execution backend used to reject every
