@@ -519,6 +519,72 @@ and covered by passing tests -- not merely designed or stubbed.
   `COUNT(*)` against a real 5000-row file now returns `5000` (was `0`);
   `dev` (148/148), `gpu-dev` (218/218, +1 new test), `server-dev`
   (150/150), and `otel-dev` (151/151) all pass with zero regressions.
+- **Three-way benchmark: KernelLake-CPU vs. KernelLake-GPU vs. PySpark**
+  (Phase 2 of the CPU-backend/benchmark epic; Phase 1, the CPU backend
+  itself, was already done). `tools/benchmark_three_way.py` reuses
+  `tools/generate_tpch.py`'s dataset for all three engines and validates
+  pairwise agreement across all three *before* trusting any timing number
+  (this project's existing rule from `tools/validate_tpch.py`, now applying
+  to three engines instead of two) -- a query whose engines disagree is
+  reported as a validation failure and excluded from timing, never silently
+  timed anyway. Runs inside a new `docker/Dockerfile` stage,
+  `benchmark-gpu` (`dev-gpu` + OpenJDK 21 + `pyspark`/`pyarrow`/`pandas`/
+  `matplotlib`, never published), so it exercises a real
+  `KERNELLAKE_WITH_CUDA=ON` build's `--backend gpu` alongside `--backend
+  cpu` from the same binary. `tools/generate_benchmark_report.py` renders
+  the `--output` JSON from one or more scale-factor runs into a PDF
+  (system-stats page, summary table, a bar chart per query across scale
+  factors) via matplotlib's `PdfPages`.
+
+  A real, blocking bug surfaced by the first attempt to run Q1/Q6 through
+  this: the CPU execution backend rejected *every* aggregate over a
+  computed expression outright ("aggregating by a computed expression is
+  not yet supported by the CPU execution backend") -- both TPC-H queries
+  need exactly that (`SUM(l_extendedprice * l_discount)`,
+  `SUM(l_extendedprice * (1 - l_discount))`, ...), so neither could run via
+  `--backend cpu` at all before this. Root cause: Arrow Acero's
+  `AggregateNodeOptions` can only target an already-existing column by
+  `FieldRef`, unlike GROUP BY/ORDER BY keys (which really are always meant
+  to be a plain column in this engine's own grammar) -- it has no way to
+  evaluate an arbitrary expression itself. Fixed in
+  `src/execution_cpu/acero_query_executor.cpp` by inserting an implicit
+  "project" Declaration between the aggregate's child and the aggregate
+  node itself, computing any non-plain-column aggregate argument under a
+  synthetic column name first (pass-through, no new projection inserted,
+  for the already-common all-plain-column case, e.g. bare `COUNT(*)`).
+  Verified for real: matches DuckDB exactly for both Q1 and Q6 via
+  `--backend cpu` (`tools/duckdb_compare.py`); two new regression tests in
+  `tests/unit/query_engine_execute_cpu_test.cpp`; `dev` (171/171),
+  `server-dev` (174/174), `otel-dev` (174/174) all pass with zero
+  regressions.
+
+  **Confirmed on real GPU hardware in this development session**: a real
+  RTX 5060 Ti + i7-12700K + 15.49 GiB RAM, `docker run --gpus all` against
+  a real `benchmark-gpu` image, three
+  real TPC-H-derived datasets generated once on the host via
+  `tools/generate_tpch.py` (SF0.01: 60K rows, SF0.1: 600K rows, SF1: 6M
+  rows in 31s) and volume-mounted in (not regenerated per run). All three
+  engines agreed on both Q1 and Q6's actual computed values at all three
+  scale factors (`validated: true` for all 6 query/scale-factor
+  combinations, not just a superficial pass/fail flag). Median wall-clock
+  seconds (KernelLake-CPU / KernelLake-GPU / PySpark local[*]): SF0.01 Q1
+  0.0545/0.3498/0.1607, Q6 0.0466/0.2962/0.0762; SF0.1 Q1
+  0.0996/0.3640/0.1919, Q6 0.0623/0.3159/0.1005; SF1 Q1
+  0.5604/0.4422/0.2849, Q6 0.1579/0.3317/0.1456. Notable real pattern, not
+  smoothed over: the GPU backend is *slower* than both CPU and PySpark at
+  SF0.01/SF0.1 (fixed CUDA kernel-launch/host-device-transfer overhead
+  dominates at this data size) but its own cost stays roughly flat across
+  scale factors while the CPU backend's grows with input size -- GPU
+  overtakes CPU on Q1 by SF1. This is a single-machine, single-run
+  (5 iterations, median reported) result on two trivial single-table scans,
+  not a rigorous statistically-controlled study -- reported here as real,
+  unsmoothed numbers per this project's own rule, not as a general
+  CPU-vs-GPU-vs-Spark performance claim. Full report (system stats, summary
+  table, per-query charts across all three scale factors) generated as a
+  real PDF via `tools/generate_benchmark_report.py`; raw
+  `benchmark_three_way.py --output` JSON and the rendered PDF are gitignored
+  local artifacts (hardware-specific, point-in-time), not committed --
+  the tooling that produces them is what's committed.
 
 ## Not yet started
 
@@ -544,16 +610,6 @@ and covered by passing tests -- not merely designed or stubbed.
   `src/api/query_engine_execute_gpu.cpp` -- needs a real `gpu-dev` build
   (libcudf/RMM), not available in this environment; every other
   CPU/server/otel-buildable file is now covered (see "Done" above)
-- **A three-way benchmark: KernelLake-CPU vs. KernelLake-GPU vs. PySpark**
-  (Phase 2 of the CPU-backend epic; Phase 1, the CPU backend itself, is
-  done -- see "Done" above). PySpark is not yet installed (`pip install
-  pyspark`; Java 21 is already present, local mode needs no cluster). Design
-  (`tools/benchmark_three_way.py`, not yet written): reuse the exact same
-  Parquet dataset for all three engines via the existing
-  `tools/generate_tpch.py`; validate correctness across all three *before*
-  trusting any timing number (this project's existing rule from
-  `tools/validate_tpch.py`, now applying to three engines instead of two);
-  report a clearly-labeled "unofficial, not a certified benchmark" table.
 - Delta Lake read support (`read_delta(...)` alongside `read_parquet(...)`)
   -- explicitly deferred as its own follow-up plan, not forgotten. Reading
   `_delta_log/*.json` plus checkpoint Parquet files is required to

@@ -115,6 +115,45 @@ TEST_F(QueryEngineExecuteCpuTest, ScalarAggregateWithNoGroupByMatchesExpectedTot
   EXPECT_DOUBLE_EQ(total_column->Value(0), 145.0);  // 10+20+5+100+7+3
 }
 
+// Regression test: Acero's AggregateNodeOptions can only target an
+// already-existing column by FieldRef, not evaluate an expression itself
+// -- SUM/AVG/etc. over a computed expression (not a plain column
+// reference) used to throw "aggregating by a computed expression is not
+// yet supported by the CPU execution backend" unconditionally. This is
+// exactly the shape TPC-H Q1/Q6 both need (SUM(l_extendedprice *
+// l_discount), SUM(l_extendedprice * (1 - l_discount)), ...), found by
+// running the real tools/benchmark_three_way.py three-way comparison.
+TEST_F(QueryEngineExecuteCpuTest, GroupedAggregateOverComputedExpressionMatchesExpectedTotals) {
+  const QueryResult result = engine_.execute("SELECT region, SUM(amount * 2) AS total FROM read_parquet('" +
+                                             path_ + "') GROUP BY region");
+
+  ASSERT_EQ(result.rows_returned, 2);
+  const std::shared_ptr<arrow::RecordBatch>& batch = result.batches.front();
+  const auto region_column = std::static_pointer_cast<arrow::StringArray>(batch->GetColumnByName("region"));
+  const auto total_column = std::static_pointer_cast<arrow::DoubleArray>(batch->GetColumnByName("total"));
+  ASSERT_NE(region_column, nullptr);
+  ASSERT_NE(total_column, nullptr);
+
+  std::map<std::string, double> totals_by_region;
+  for (std::int64_t i = 0; i < batch->num_rows(); ++i) {
+    totals_by_region[region_column->GetString(i)] = total_column->Value(i);
+  }
+  ASSERT_EQ(totals_by_region.size(), 2u);
+  EXPECT_DOUBLE_EQ(totals_by_region.at("A"), 70.0);   // (10.0 + 20.0 + 5.0) * 2
+  EXPECT_DOUBLE_EQ(totals_by_region.at("B"), 220.0);  // (100.0 + 7.0 + 3.0) * 2
+}
+
+TEST_F(QueryEngineExecuteCpuTest, ScalarAggregateOverComputedExpressionMatchesExpectedTotal) {
+  const QueryResult result =
+      engine_.execute("SELECT SUM(amount * 2) AS total FROM read_parquet('" + path_ + "')");
+
+  ASSERT_EQ(result.rows_returned, 1);
+  const auto total_column =
+      std::static_pointer_cast<arrow::DoubleArray>(result.batches.front()->GetColumnByName("total"));
+  ASSERT_NE(total_column, nullptr);
+  EXPECT_DOUBLE_EQ(total_column->Value(0), 290.0);  // (10+20+5+100+7+3) * 2
+}
+
 TEST_F(QueryEngineExecuteCpuTest, PlainProjectionReturnsAllRows) {
   const QueryResult result = engine_.execute("SELECT region FROM read_parquet('" + path_ + "')");
   EXPECT_EQ(result.rows_returned, 6);

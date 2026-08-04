@@ -9,20 +9,18 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-import duckdb
 import pyarrow as pa
 import pyarrow.ipc as ipc
 
 
-def run_kernellake(kernellake_bin: str, sql: str) -> pa.Table:
+def run_kernellake(kernellake_bin: str, sql: str, backend: str | None = None) -> pa.Table:
     with tempfile.NamedTemporaryFile(suffix=".arrow", delete=False) as tmp:
         output_path = tmp.name
     try:
-        result = subprocess.run(
-            [kernellake_bin, "query", "--sql", sql, "--format", "arrow", "--output", output_path],
-            capture_output=True,
-            text=True,
-        )
+        command = [kernellake_bin, "query", "--sql", sql, "--format", "arrow", "--output", output_path]
+        if backend is not None:
+            command += ["--backend", backend]
+        result = subprocess.run(command, capture_output=True, text=True)
         if result.returncode != 0:
             raise RuntimeError(f"kernellake query failed: {result.stderr}")
         with pa.memory_map(output_path, "rb") as source:
@@ -32,6 +30,12 @@ def run_kernellake(kernellake_bin: str, sql: str) -> pa.Table:
 
 
 def run_duckdb(sql: str) -> pa.Table:
+    # Imported lazily: callers that only need normalize()/rows_match()/
+    # run_kernellake() (e.g. tools/benchmark_three_way.py, which compares
+    # KernelLake against PySpark, not DuckDB) shouldn't need duckdb
+    # installed just to import this module.
+    import duckdb
+
     return duckdb.sql(sql).arrow().read_all()
 
 

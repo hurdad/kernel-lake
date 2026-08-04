@@ -6,6 +6,7 @@
 #include <fmt/format.h>
 #include <parquet/arrow/reader.h>
 
+#include <algorithm>
 #include <chrono>
 #include <mutex>
 
@@ -154,17 +155,56 @@ std::shared_ptr<arrow::compute::FunctionOptions> count_options() {
   return std::make_shared<arrow::compute::CountOptions>(arrow::compute::CountOptions::ONLY_VALID);
 }
 
+// Acero's AggregateNodeOptions can only target an already-existing column
+// by FieldRef -- it has no way to evaluate an arbitrary expression itself
+// (unlike GROUP BY/ORDER BY keys, which really are always meant to be a
+// plain column in this engine's own grammar). A computed aggregate
+// argument (e.g. `SUM(l_extendedprice * l_discount)`, both of TPC-H's own
+// Q1/Q6) therefore needs a real column computed for it *before* the
+// aggregate node -- via an implicit "project" Declaration inserted between
+// the aggregate's child and the aggregate node itself, gathering every
+// GROUP BY key (pass-through) and aggregate argument (pass-through if
+// already a plain column, computed under a synthetic name otherwise) that
+// the aggregate node will need to reference afterward. `project_names`
+// staying empty means nothing needs it (e.g. bare COUNT(*), which has no
+// argument() column at all) -- callers skip inserting the projection node
+// entirely in that case, unchanged from before this existed.
+struct AggregateInputPlan {
+  std::vector<arrow::compute::Expression> project_expressions;
+  std::vector<std::string> project_names;
+  int next_synthetic_id = 0;
+};
+
+void ensure_column_projected(AggregateInputPlan& plan, const std::string& name) {
+  if (std::find(plan.project_names.begin(), plan.project_names.end(), name) != plan.project_names.end()) {
+    return;
+  }
+  plan.project_expressions.push_back(arrow::compute::field_ref(name));
+  plan.project_names.push_back(name);
+}
+
+std::string resolve_aggregate_target(AggregateInputPlan& plan, const ExpressionPtr& expr) {
+  if (const auto* column = dynamic_cast<const ColumnExpression*>(expr.get())) {
+    ensure_column_projected(plan, column->name());
+    return column->name();
+  }
+  const std::string synthetic_name = fmt::format("__kernellake_agg_arg_{}", plan.next_synthetic_id++);
+  plan.project_expressions.push_back(compile_expression_cpu(*expr));
+  plan.project_names.push_back(synthetic_name);
+  return synthetic_name;
+}
+
 // `grouped` selects the "hash_"-prefixed Arrow Compute aggregate functions
 // (used when there is a non-empty `keys` list) vs. the plain scalar
 // versions (used for a whole-input, no-GROUP-BY aggregate) -- Acero
 // requires this distinction explicitly (AggregateNodeOptions's own docs:
 // "If keys is non-empty then each aggregate must be a HashAggregate
 // function").
-arrow::compute::Aggregate translate_aggregate(const AggregateExpression& aggregate,
+arrow::compute::Aggregate translate_aggregate(AggregateInputPlan& plan, const AggregateExpression& aggregate,
                                               const std::string& output_name, bool grouped) {
   std::vector<arrow::FieldRef> target;
   if (aggregate.argument() != nullptr) {
-    target.emplace_back(require_plain_column_name(aggregate.argument(), "aggregating"));
+    target.emplace_back(resolve_aggregate_target(plan, aggregate.argument()));
   }
   switch (aggregate.function()) {
     case AggregateFunction::Sum:
@@ -218,10 +258,13 @@ arrow::acero::Declaration translate(const PhysicalPlanPtr& node, ObjectStore& st
         arrow::acero::ProjectNodeOptions{std::move(expressions), std::move(names)}};
   }
   if (const auto* hash_aggregate = dynamic_cast<const HashAggregateNode*>(node.get())) {
+    AggregateInputPlan plan;
     std::vector<arrow::FieldRef> keys;
     keys.reserve(hash_aggregate->group_by().size());
     for (const NamedExpression& item : hash_aggregate->group_by()) {
-      keys.emplace_back(require_plain_column_name(item.expr, "GROUP BY"));
+      const std::string& key_name = require_plain_column_name(item.expr, "GROUP BY");
+      ensure_column_projected(plan, key_name);
+      keys.emplace_back(key_name);
     }
     std::vector<arrow::compute::Aggregate> aggregates;
     aggregates.reserve(hash_aggregate->aggregates().size());
@@ -231,14 +274,23 @@ arrow::acero::Declaration translate(const PhysicalPlanPtr& node, ObjectStore& st
         throw ExecutionError(
             fmt::format("HashAggregateNode item '{}' is not an AggregateExpression", item.name));
       }
-      aggregates.push_back(translate_aggregate(*aggregate, item.name, /*grouped=*/true));
+      aggregates.push_back(translate_aggregate(plan, *aggregate, item.name, /*grouped=*/true));
     }
+    arrow::acero::Declaration child = translate(hash_aggregate->child(), store);
+    arrow::acero::Declaration input =
+        plan.project_names.empty()
+            ? std::move(child)
+            : arrow::acero::Declaration{"project",
+                                        {std::move(child)},
+                                        arrow::acero::ProjectNodeOptions{std::move(plan.project_expressions),
+                                                                         std::move(plan.project_names)}};
     return arrow::acero::Declaration{
         "aggregate",
-        {translate(hash_aggregate->child(), store)},
+        {std::move(input)},
         arrow::acero::AggregateNodeOptions{std::move(aggregates), std::move(keys)}};
   }
   if (const auto* scalar_aggregate = dynamic_cast<const ScalarAggregateNode*>(node.get())) {
+    AggregateInputPlan plan;
     std::vector<arrow::compute::Aggregate> aggregates;
     aggregates.reserve(scalar_aggregate->aggregates().size());
     for (const NamedExpression& item : scalar_aggregate->aggregates()) {
@@ -247,11 +299,18 @@ arrow::acero::Declaration translate(const PhysicalPlanPtr& node, ObjectStore& st
         throw ExecutionError(
             fmt::format("ScalarAggregateNode item '{}' is not an AggregateExpression", item.name));
       }
-      aggregates.push_back(translate_aggregate(*aggregate, item.name, /*grouped=*/false));
+      aggregates.push_back(translate_aggregate(plan, *aggregate, item.name, /*grouped=*/false));
     }
-    return arrow::acero::Declaration{"aggregate",
-                                     {translate(scalar_aggregate->child(), store)},
-                                     arrow::acero::AggregateNodeOptions{std::move(aggregates), {}}};
+    arrow::acero::Declaration child = translate(scalar_aggregate->child(), store);
+    arrow::acero::Declaration input =
+        plan.project_names.empty()
+            ? std::move(child)
+            : arrow::acero::Declaration{"project",
+                                        {std::move(child)},
+                                        arrow::acero::ProjectNodeOptions{std::move(plan.project_expressions),
+                                                                         std::move(plan.project_names)}};
+    return arrow::acero::Declaration{
+        "aggregate", {std::move(input)}, arrow::acero::AggregateNodeOptions{std::move(aggregates), {}}};
   }
   if (const auto* sort = dynamic_cast<const SortNode*>(node.get())) {
     std::vector<arrow::compute::SortKey> keys;

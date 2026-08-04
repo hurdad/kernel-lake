@@ -76,3 +76,8 @@ Testing/
 # Python
 __pycache__/
 *.pyc
+
+# tools/benchmark_three_way.py / tools/generate_benchmark_report.py output:
+# hardware-specific, point-in-time generated artifacts, not source -- the
+# tooling that produces them is what's committed (see docs/ROADMAP.md).
+benchmark-results/

@@ -9,16 +9,19 @@
 # tagged/pushed on their own -- only `--target runtime-cpu`/`runtime-gpu`
 # are published (see .github/workflows/ci.yml's docker-publish job); build
 # either dev stage directly with --target if you want a full build
-# environment to iterate in.
+# environment to iterate in. A third, also-never-published stage,
+# `benchmark-gpu`, adds PySpark on top of `dev-gpu` for
+# tools/benchmark_three_way.py's ad-hoc KernelLake-CPU vs. KernelLake-GPU
+# vs. PySpark comparison -- see that stage's own comment below.
 #
-# Currently linux/amd64 only. arm64 is a planned follow-up (see
-# docs/ROADMAP.md) -- runtime-cpu's dependency list is all plain apt
-# packages so it's likely straightforward on arm64 (Ubuntu 26.04 ships
-# arm64 builds of every package used here); runtime-gpu needs NVIDIA's
-# arm64 CUDA support (Jetson/Grace-class hardware) verified separately
-# before publishing an arm64 variant of it. The eventual goal is one
-# multi-arch manifest per tag (`docker buildx build --platform
-# linux/amd64,linux/arm64 ...`), not a separate arch-suffixed tag.
+# runtime-cpu already publishes as a real multi-arch (linux/amd64+
+# linux/arm64) manifest -- see .github/workflows/ci.yml's docker-publish
+# job (docker buildx + docker/setup-qemu-action) and docs/ROADMAP.md for
+# how that was verified. runtime-gpu stays linux/amd64-only: NVIDIA's arm64
+# CUDA support (Jetson/Grace-class hardware) hasn't been verified, and
+# unlike runtime-cpu a build-only smoke test can't catch a real
+# GPU-execution regression -- that needs real arm64 GPU hardware, not
+# available yet (see docs/ROADMAP.md's "Not yet started" section).
 #
 #   docker build --target dev-cpu     -f docker/Dockerfile -t kernellake/kernellake:dev-cpu .
 #   docker build --target dev-gpu     -f docker/Dockerfile -t kernellake/kernellake:dev-gpu .
@@ -34,6 +37,19 @@
 # The CPU image needs no --gpus flag and defaults to the CPU backend:
 #   docker run --rm -v /tmp/kernellake-sales:/data:ro \
 #     kernellake/kernellake:runtime-cpu query --sql "SELECT region, SUM(amount) FROM read_parquet('/data/*.parquet') GROUP BY region"
+#
+# benchmark-gpu (needs --gpus all -- it exercises the real GPU backend as
+# one of the three engines compared). Mount a directory already populated
+# by tools/generate_tpch.py (run once on the host, outside the container)
+# rather than regenerating the dataset on every benchmark run:
+#   docker build --target benchmark-gpu -f docker/Dockerfile -t kernellake/kernellake:benchmark-gpu .
+#   docker run --rm --gpus all -v /tmp/kernellake-tpch:/data:ro \
+#     kernellake/kernellake:benchmark-gpu --kernellake build/gpu-dev/src/cli/kernellake \
+#       --data '/data/*.parquet' --query all --iterations 5 --output /data/report.json
+#   docker run --rm -v /tmp/kernellake-tpch:/data --entrypoint python3 \
+#     kernellake/kernellake:benchmark-gpu tools/generate_benchmark_report.py \
+#       --input /data/sf0.01/report.json /data/sf0.1/report.json /data/sf1/report.json \
+#       --output /data/benchmark_report.pdf
 #
 # Base: plain `ubuntu:26.04`, with CUDA (runtime-gpu only) installed via
 # Ubuntu's own apt `nvidia-cuda-toolkit` package (12.4.1) rather than
@@ -192,6 +208,42 @@ RUN cmake --preset gpu-dev \
 
 ENTRYPOINT ["/workspace/build/gpu-dev/src/cli/kernellake"]
 CMD ["--help"]
+
+# ---------------------------------------------------------------------------
+# benchmark-gpu: dev-gpu plus a JVM and PySpark, for
+# tools/benchmark_three_way.py's unofficial KernelLake-CPU vs.
+# KernelLake-GPU vs. PySpark comparison (see docs/ROADMAP.md). Not a
+# published image (never built with --target by CI) -- an ad-hoc local
+# tool for comparing all three engines against the same generated dataset
+# on the same hardware inside one container (`docker run --gpus all`), not
+# a deployment artifact. Built from dev-gpu specifically (not dev-cpu)
+# because it needs a real KERNELLAKE_WITH_CUDA=ON build to exercise
+# `kernellake query --backend gpu` -- the CPU-backend comparison point
+# comes from the same binary's `--backend cpu` flag, not a separate build.
+# ---------------------------------------------------------------------------
+FROM dev-gpu AS benchmark-gpu
+
+# openjdk-21-jdk-headless: PySpark needs a real JVM on PATH, not vendored by
+# the pyspark pip package itself. -headless (no X11/desktop deps) since this
+# only ever runs inside a container.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      openjdk-21-jdk-headless \
+    && rm -rf /var/lib/apt/lists/*
+
+# --break-system-packages: this stage is a standalone benchmarking tool
+# image, not a Python-development environment other tooling shares with
+# apt-managed Python packages -- there is no conflicting apt-installed
+# package for pyspark/pyarrow/pandas/matplotlib to clash with here.
+# pandas: PySpark's own DataFrame.toPandas() (used to bridge a Spark SQL
+# result into a pa.Table for cross-engine comparison) requires it directly
+# -- confirmed by a real "[PACKAGE_NOT_INSTALLED] Pandas >= 2.2.0 must be
+# installed" failure before this was added. matplotlib is for
+# tools/generate_benchmark_report.py (renders the multi-scale-factor PDF
+# report from benchmark_three_way.py's --output JSON files), not the
+# benchmark script itself.
+RUN pip install --break-system-packages --no-cache-dir pyspark pyarrow pandas matplotlib
+
+ENTRYPOINT ["python3", "tools/benchmark_three_way.py"]
 
 # ---------------------------------------------------------------------------
 # runtime-libs-{cpu,gpu}: not published images (never built with --target
