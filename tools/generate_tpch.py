@@ -65,6 +65,12 @@ LINEITEM_ROWS_PER_SF = 6_000_000
 # order-count-derived scaling above).
 PART_ROWS_PER_SF = 200_000
 
+# generate_orders_batch materializes one batch's rows as Python lists before
+# handing them to Arrow -- unbounded batch size means unbounded memory (this
+# OOM-killed a full SF1000 run, which has ~1.5B orders rows, after 127GB
+# RSS). Batch it the same way the --files loop already batches lineitem.
+ORDERS_BATCH_ROWS = 5_000_000
+
 # A representative subset of TPC-H's own p_container domain (dbgen draws
 # from a larger cross product of size/container-type words) -- covers every
 # size class Q19 filters on (SM/MED/LG).
@@ -253,12 +259,14 @@ def generate_part_table(rng: random.Random, row_count: int) -> pa.Table:
     )
 
 
-def generate_orders_table(rng: random.Random, max_orderkey: int) -> pa.Table:
+def generate_orders_batch(rng: random.Random, first_orderkey: int, row_count: int) -> pa.Table:
     # One row per distinct l_orderkey generate_lineitem_batch produced --
     # TPC-H's own 1:N orders:lineitem relationship -- so every lineitem row
     # has a real order to join against (no dangling foreign keys), same
-    # rationale as generate_part_table's l_partkey range.
-    orderkey = list(range(1, max_orderkey + 1))
+    # rationale as generate_part_table's l_partkey range. Batched (see
+    # ORDERS_BATCH_ROWS) rather than building all of `orders` at once, since
+    # at large scale factors max_orderkey is itself in the billions.
+    orderkey = list(range(first_orderkey, first_orderkey + row_count))
     custkey = [rng.randint(1, 150_000) for _ in orderkey]
     orderstatus = [rng.choice(ORDER_STATUSES) for _ in orderkey]
     totalprice = [round(rng.uniform(1000.0, 500_000.0), 2) for _ in orderkey]
@@ -348,10 +356,20 @@ def main() -> int:
         print(f"wrote {rows_this_file} rows to {file_path}")
 
     max_orderkey = next_orderkey - 1
-    orders_table = generate_orders_table(rng, max_orderkey)
-    orders_path = output_dir / "orders-00000.parquet"
-    pq.write_table(orders_table, orders_path, compression=compression, row_group_size=args.row_group_rows)
-    print(f"wrote {max_orderkey} rows to {orders_path}")
+    orders_file_paths = []
+    orders_written = 0
+    next_orders_start = 1
+    orders_file_index = 0
+    while next_orders_start <= max_orderkey:
+        batch_rows = min(ORDERS_BATCH_ROWS, max_orderkey - next_orders_start + 1)
+        orders_table = generate_orders_batch(rng, next_orders_start, batch_rows)
+        orders_path = output_dir / f"orders-{orders_file_index:05d}.parquet"
+        pq.write_table(orders_table, orders_path, compression=compression, row_group_size=args.row_group_rows)
+        orders_file_paths.append(str(orders_path))
+        orders_written += batch_rows
+        print(f"wrote {batch_rows} rows to {orders_path}")
+        next_orders_start += batch_rows
+        orders_file_index += 1
 
     manifest = {
         "benchmark": "tpch",
@@ -374,8 +392,8 @@ def main() -> int:
                 "rows": total_part_rows,
             },
             "orders": {
-                "files": [str(orders_path)],
-                "rows": max_orderkey,
+                "files": orders_file_paths,
+                "rows": orders_written,
             },
         },
     }
@@ -383,7 +401,8 @@ def main() -> int:
         json.dump(manifest, manifest_file, indent=2)
 
     print(f"wrote {rows_written} lineitem rows across {len(file_paths)} file(s), "
-          f"{total_part_rows} part rows, {max_orderkey} orders rows, to {output_dir}")
+          f"{total_part_rows} part rows, {orders_written} orders rows across "
+          f"{len(orders_file_paths)} file(s), to {output_dir}")
     print(f"manifest: {output_dir / 'manifest.json'}")
     return 0
 

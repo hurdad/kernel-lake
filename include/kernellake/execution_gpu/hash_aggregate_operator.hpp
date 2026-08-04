@@ -53,8 +53,8 @@ class HashAggregateOperator final : public PhysicalOperator {
   // reachable as a group-by key via `GROUP BY <alias>` resolving to a CASE
   // in the SELECT list (see binder.cpp), since a CASE has no column name of
   // its own to write directly in GROUP BY. `case_expr` is a shared_ptr, not
-  // unique_ptr, so CompiledExpr stays copyable -- CountStar's argument
-  // below is a copy of compiled_group_by_.front().
+  // unique_ptr, so CompiledExpr stays copyable -- Avg's sum and count slots
+  // below share one copy of the same compiled argument.
   //
   // `decimal_cast` is the same idea for `GROUP BY <alias>` resolving to a
   // `CAST(... AS DECIMAL(p,s))` in the SELECT list: cudf::ast has no
@@ -85,6 +85,35 @@ class HashAggregateOperator final : public PhysicalOperator {
     DataType target_type;
   };
 
+  // How to materialize a physical aggregate-request's value column (one
+  // entry per `requests`/`compiled_aggregate_args_` slot -- Avg contributes
+  // two of these per logical aggregate, see AggregateOutputKind below).
+  //   Expression: the aggregate's own argument, as compiled by compile_expr
+  //     (used for SUM/MIN/MAX, and for Avg's sum-side slot).
+  //   CountStarOnes: an all-valid INT64 column of 1s, sized to the batch --
+  //     COUNT(*) counts every row regardless of any column's nulls.
+  //   CountColumnOnes: an INT64 column of 1s carrying the *argument*
+  //     column's null mask -- summing it gives COUNT(argument)'s
+  //     null-excluding semantics. Also used for Avg's count-side slot.
+  enum class ValueColumnKind { Expression, CountStarOnes, CountColumnOnes };
+
+  // How finalize() turns a logical aggregate's physical result column(s)
+  // back into exactly one output column.
+  //   Direct: SUM/MIN/MAX, or the COUNT-like SUM-of-ones trick above --
+  //     either way, a single physical result column, used as-is (already
+  //     the right type -- no int32->int64 cast needed, since ValueColumnKind
+  //     above already picked an INT64 input column for COUNT-like cases).
+  //   Average: two physical result columns (sum, then count -- both from
+  //     the SUM-of-ones trick, not cudf's native MEAN aggregation) that
+  //     finalize() divides itself. See the comment on AggregateFunction::Avg
+  //     in open() for why: cudf's own grouped/streaming MEAN divides by an
+  //     internal COUNT_VALID that is *also* a 32-bit cudf::size_type
+  //     accumulator, so it silently wraps around under the exact same
+  //     large-single-group-cardinality condition as COUNT -- confirmed by a
+  //     real SF1000 TPC-H Q1 run producing a negative avg_disc alongside
+  //     count_order's own wraparound (see docs/ROADMAP.md).
+  enum class AggregateOutputKind { Direct, Average };
+
   [[nodiscard]] CompiledExpr compile_expr(const Expression& expr);
   [[nodiscard]] std::unique_ptr<cudf::column> materialize(const CompiledExpr& compiled,
                                                           const DeviceBatch& batch,
@@ -92,6 +121,10 @@ class HashAggregateOperator final : public PhysicalOperator {
   [[nodiscard]] std::unique_ptr<cudf::column> materialize_case(const CompiledCase& case_expr,
                                                                const DeviceBatch& batch,
                                                                ExecutionContext& context);
+  [[nodiscard]] std::unique_ptr<cudf::column> materialize_value_column(ValueColumnKind kind,
+                                                                       const CompiledExpr& compiled,
+                                                                       const DeviceBatch& batch,
+                                                                       ExecutionContext& context);
   void process_batch(const DeviceBatch& batch, ExecutionContext& context);
   [[nodiscard]] std::unique_ptr<cudf::table> build_combined_columns(const DeviceBatch& batch,
                                                                     ExecutionContext& context);
@@ -105,17 +138,16 @@ class HashAggregateOperator final : public PhysicalOperator {
 
   ExpressionCompiler compiler_;
   std::vector<CompiledExpr> compiled_group_by_;
-  // CountStar entries are a copy of compiled_group_by_.front() (reused, not
-  // aliased) so every aggregate still gets its own materialized column at
-  // its own table slot -- see the comment in open().
+  // One entry per physical aggregate-request slot (see ValueColumnKind) --
+  // Avg contributes two consecutive entries, everything else contributes
+  // one, so this can be longer than `aggregates_`.
   std::vector<CompiledExpr> compiled_aggregate_args_;
+  std::vector<ValueColumnKind> value_column_kind_;
 
-  // cudf::groupby's COUNT aggregations always produce cudf::size_type
-  // (INT32) output regardless of requested type, but KernelLake's binder
-  // declares COUNT/COUNT(*) results as INT64 -- entries here mark which
-  // result columns need an explicit int32->int64 cast after finalize() so
-  // the output DeviceBatch's actual column types match output_schema_.
-  std::vector<bool> result_is_count_;
+  // One entry per logical aggregate (parallel to `aggregates_`), telling
+  // finalize() how many consecutive physical result columns that aggregate
+  // consumed and how to combine them into its single output column.
+  std::vector<AggregateOutputKind> aggregate_output_kind_;
 
   std::unique_ptr<cudf::groupby::streaming_groupby> streaming_;
   bool any_batch_seen_ = false;

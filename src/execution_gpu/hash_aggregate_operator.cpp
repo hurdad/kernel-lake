@@ -1,9 +1,11 @@
 #include "kernellake/execution_gpu/hash_aggregate_operator.hpp"
 
 #include <cudf/aggregation.hpp>
+#include <cudf/binaryop.hpp>
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/copying.hpp>
+#include <cudf/null_mask.hpp>
 #include <cudf/scalar/scalar_factories.hpp>
 #include <cudf/transform.hpp>
 #include <cudf/unary.hpp>
@@ -29,6 +31,13 @@ std::shared_ptr<const Schema> build_output_schema(const std::vector<NamedExpress
   return std::make_shared<const Schema>(Schema(std::move(fields)));
 }
 
+// SUM/MIN/MAX only -- Count/CountStar/Avg are built from this same SUM
+// aggregation applied to a synthesized INT64 value column instead (see
+// ValueColumnKind and open()), never from cudf's own COUNT/MEAN
+// aggregations, both of which accumulate through a 32-bit cudf::size_type
+// internally and silently wrap around once a single group's row count
+// exceeds INT32_MAX -- confirmed by a real SF1000 TPC-H Q1 run (see
+// docs/ROADMAP.md).
 std::unique_ptr<cudf::groupby_aggregation> to_streaming_aggregation(AggregateFunction function) {
   switch (function) {
     case AggregateFunction::Sum:
@@ -38,11 +47,9 @@ std::unique_ptr<cudf::groupby_aggregation> to_streaming_aggregation(AggregateFun
     case AggregateFunction::Max:
       return cudf::make_max_aggregation<cudf::groupby_aggregation>();
     case AggregateFunction::Count:
-      return cudf::make_count_aggregation<cudf::groupby_aggregation>(cudf::null_policy::EXCLUDE);
     case AggregateFunction::CountStar:
-      return cudf::make_count_aggregation<cudf::groupby_aggregation>(cudf::null_policy::INCLUDE);
     case AggregateFunction::Avg:
-      return cudf::make_mean_aggregation<cudf::groupby_aggregation>();
+      throw ExecutionError("unreachable: Count/CountStar/Avg are built from SUM-of-ones, not this function");
   }
   throw ExecutionError("unreachable: unknown AggregateFunction");
 }
@@ -148,6 +155,30 @@ std::unique_ptr<cudf::column> HashAggregateOperator::materialize_case(const Comp
   return result;
 }
 
+std::unique_ptr<cudf::column> HashAggregateOperator::materialize_value_column(ValueColumnKind kind,
+                                                                              const CompiledExpr& compiled,
+                                                                              const DeviceBatch& batch,
+                                                                              ExecutionContext& context) {
+  if (kind == ValueColumnKind::Expression) return materialize(compiled, batch, context);
+
+  const std::unique_ptr<cudf::scalar> one =
+      cudf::make_fixed_width_scalar<std::int64_t>(1, context.stream, context.memory_resource);
+  std::unique_ptr<cudf::column> ones = cudf::make_column_from_scalar(
+      *one, static_cast<cudf::size_type>(batch.row_count()), context.stream, context.memory_resource);
+  if (kind == ValueColumnKind::CountStarOnes) return ones;
+
+  // CountColumnOnes: COUNT(argument) excludes nulls, so the ones column
+  // needs argument's own null mask -- summing it then gives exactly
+  // argument's non-null row count per group.
+  const std::unique_ptr<cudf::column> argument = materialize(compiled, batch, context);
+  if (argument->nullable()) {
+    rmm::device_buffer mask = cudf::copy_bitmask(argument->view(), context.stream, context.memory_resource);
+    const cudf::size_type null_count = argument->null_count();
+    ones->set_null_mask(std::move(mask), null_count);
+  }
+  return ones;
+}
+
 void HashAggregateOperator::open(ExecutionContext& context) {
   child_->open(context);
 
@@ -157,6 +188,8 @@ void HashAggregateOperator::open(ExecutionContext& context) {
   std::vector<cudf::groupby::streaming_aggregation_request> requests;
   requests.reserve(aggregates_.size());
   compiled_aggregate_args_.reserve(aggregates_.size());
+  value_column_kind_.reserve(aggregates_.size());
+  aggregate_output_kind_.reserve(aggregates_.size());
   cudf::size_type next_index = static_cast<cudf::size_type>(group_by_.size());
 
   for (const NamedExpression& item : aggregates_) {
@@ -165,22 +198,64 @@ void HashAggregateOperator::open(ExecutionContext& context) {
       throw ExecutionError(
           fmt::format("HashAggregateOperator item '{}' is not an AggregateExpression", item.name));
     }
-    // COUNT(*) has no natural argument column; reuse group_by[0]'s compiled
-    // form (materialized at its own dedicated table slot below, via
-    // null_policy::INCLUDE so nulls in that column don't suppress the
-    // count). Note: referencing an *existing* key column's index directly,
-    // instead of materializing a fresh copy at its own index, silently
-    // produced all-zero counts in testing -- streaming_groupby apparently
-    // doesn't support a value column index that aliases a key index.
-    const CompiledExpr compiled_argument = aggregate->function() == AggregateFunction::CountStar
-                                               ? compiled_group_by_.front()
-                                               : compile_expr(*aggregate->argument());
-    compiled_aggregate_args_.push_back(compiled_argument);
-    result_is_count_.push_back(aggregate->function() == AggregateFunction::Count ||
-                               aggregate->function() == AggregateFunction::CountStar);
-    requests.push_back(cudf::groupby::streaming_aggregation_request{
-        next_index, to_streaming_aggregation(aggregate->function())});
-    ++next_index;
+
+    switch (aggregate->function()) {
+      case AggregateFunction::Sum:
+      case AggregateFunction::Min:
+      case AggregateFunction::Max:
+        compiled_aggregate_args_.push_back(compile_expr(*aggregate->argument()));
+        value_column_kind_.push_back(ValueColumnKind::Expression);
+        requests.push_back(cudf::groupby::streaming_aggregation_request{
+            next_index, to_streaming_aggregation(aggregate->function())});
+        ++next_index;
+        aggregate_output_kind_.push_back(AggregateOutputKind::Direct);
+        break;
+
+      case AggregateFunction::CountStar:
+        // No natural argument column -- materialize_value_column synthesizes
+        // an all-valid INT64 ones column straight from the batch's row
+        // count, no compiled expression needed.
+        compiled_aggregate_args_.push_back(CompiledExpr{});
+        value_column_kind_.push_back(ValueColumnKind::CountStarOnes);
+        requests.push_back(cudf::groupby::streaming_aggregation_request{
+            next_index, cudf::make_sum_aggregation<cudf::groupby_aggregation>()});
+        ++next_index;
+        aggregate_output_kind_.push_back(AggregateOutputKind::Direct);
+        break;
+
+      case AggregateFunction::Count:
+        compiled_aggregate_args_.push_back(compile_expr(*aggregate->argument()));
+        value_column_kind_.push_back(ValueColumnKind::CountColumnOnes);
+        requests.push_back(cudf::groupby::streaming_aggregation_request{
+            next_index, cudf::make_sum_aggregation<cudf::groupby_aggregation>()});
+        ++next_index;
+        aggregate_output_kind_.push_back(AggregateOutputKind::Direct);
+        break;
+
+      case AggregateFunction::Avg: {
+        // See AggregateOutputKind::Average's comment in the header for why
+        // this is decomposed into our own SUM(argument)/COUNT(argument)
+        // pair (both accumulated via the SUM-of-ones trick, in genuine
+        // INT64/argument-native precision) instead of requesting cudf's
+        // native MEAN aggregation.
+        const CompiledExpr compiled_argument = compile_expr(*aggregate->argument());
+
+        compiled_aggregate_args_.push_back(compiled_argument);
+        value_column_kind_.push_back(ValueColumnKind::Expression);
+        requests.push_back(cudf::groupby::streaming_aggregation_request{
+            next_index, cudf::make_sum_aggregation<cudf::groupby_aggregation>()});
+        ++next_index;
+
+        compiled_aggregate_args_.push_back(compiled_argument);
+        value_column_kind_.push_back(ValueColumnKind::CountColumnOnes);
+        requests.push_back(cudf::groupby::streaming_aggregation_request{
+            next_index, cudf::make_sum_aggregation<cudf::groupby_aggregation>()});
+        ++next_index;
+
+        aggregate_output_kind_.push_back(AggregateOutputKind::Average);
+        break;
+      }
+    }
   }
 
   std::vector<cudf::size_type> key_indices(group_by_.size());
@@ -194,8 +269,8 @@ std::unique_ptr<cudf::table> HashAggregateOperator::build_combined_columns(const
   columns.reserve(compiled_group_by_.size() + compiled_aggregate_args_.size());
   for (const CompiledExpr& compiled : compiled_group_by_)
     columns.push_back(materialize(compiled, batch, context));
-  for (const CompiledExpr& compiled : compiled_aggregate_args_) {
-    columns.push_back(materialize(compiled, batch, context));
+  for (std::size_t i = 0; i < compiled_aggregate_args_.size(); ++i) {
+    columns.push_back(materialize_value_column(value_column_kind_[i], compiled_aggregate_args_[i], batch, context));
   }
   return std::make_unique<cudf::table>(std::move(columns));
 }
@@ -258,14 +333,31 @@ std::optional<DeviceBatch> HashAggregateOperator::next(ExecutionContext& context
 
   auto [keys_table, results] = streaming_->finalize(context.stream, context.memory_resource);
   std::vector<std::unique_ptr<cudf::column>> final_columns = keys_table->release();
-  final_columns.reserve(final_columns.size() + results.size());
-  for (std::size_t i = 0; i < results.size(); ++i) {
-    std::unique_ptr<cudf::column> column = std::move(results[i].results.front());
-    if (result_is_count_[i]) {
-      column = cudf::cast(column->view(), cudf::data_type{cudf::type_id::INT64}, context.stream,
-                          context.memory_resource);
+  final_columns.reserve(final_columns.size() + aggregate_output_kind_.size());
+
+  std::size_t result_index = 0;
+  for (AggregateOutputKind kind : aggregate_output_kind_) {
+    if (kind == AggregateOutputKind::Direct) {
+      final_columns.push_back(std::move(results[result_index].results.front()));
+      ++result_index;
+      continue;
     }
-    final_columns.push_back(std::move(column));
+
+    // Average: divide our own two SUM-of-ones-derived results ourselves --
+    // see the header's AggregateOutputKind comment for why, instead of
+    // cudf's native (32-bit-internally-accumulated) MEAN aggregation.
+    const std::unique_ptr<cudf::column>& sum_column = results[result_index].results.front();
+    const std::unique_ptr<cudf::column>& count_column = results[result_index + 1].results.front();
+    result_index += 2;
+
+    const std::unique_ptr<cudf::column> sum_as_double = cudf::cast(
+        sum_column->view(), cudf::data_type{cudf::type_id::FLOAT64}, context.stream, context.memory_resource);
+    const std::unique_ptr<cudf::column> count_as_double = cudf::cast(
+        count_column->view(), cudf::data_type{cudf::type_id::FLOAT64}, context.stream, context.memory_resource);
+    final_columns.push_back(cudf::binary_operation(sum_as_double->view(), count_as_double->view(),
+                                                    cudf::binary_operator::DIV,
+                                                    cudf::data_type{cudf::type_id::FLOAT64}, context.stream,
+                                                    context.memory_resource));
   }
   return DeviceBatch(std::make_unique<cudf::table>(std::move(final_columns)), output_schema_);
 }

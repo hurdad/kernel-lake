@@ -863,9 +863,102 @@ and covered by passing tests -- not merely designed or stubbed.
   median timings (KernelLake-CPU/GPU/PySpark: 0.077s / 0.446s / 0.271s,
   warm); `--query all` with both `--part-data` and `--orders-data` given
   runs and validates all four queries (Q1, Q6, Q19, Q12) together.
+- **Real SF1000 TPC-H run surfaces and fixes a 32-bit COUNT/AVG overflow in
+  the GPU hash-aggregate path**, plus two smaller SF1000-scale
+  infrastructure fixes needed to get there. `tools/generate_tpch.py`'s
+  `orders` table generator materialized the *entire* table (Python lists
+  sized to `max_orderkey`) before writing it -- fine through SF100, but
+  SF1000's ~1.5B `orders` rows OOM-killed a real generation run at 127GB
+  RSS; now batches into `ORDERS_BATCH_ROWS`-sized (5M row) chunks across
+  multiple `orders-NNNNN.parquet` files, the same way `lineitem` already
+  does via `--files`. The GPU backend then failed SF1000 Q1 immediately
+  with kvikio's "Too many open files" -- SF1000's `lineitem` spans 1000
+  Parquet files (10x SF100's), exceeding the default 1024 fd `ulimit`;
+  fixed by raising `--ulimit nofile` on the benchmark's `docker run` (not a
+  source change).
+
+  With those cleared, a real SF1000 Q1 run surfaced a genuine correctness
+  bug: `kernellake-gpu`'s `count_order` came back negative
+  (`-1325530532`) for TPC-H's `A`/`R` `returnflag` groups, while `pyspark`
+  reported the correct ~2.97 billion -- exactly `2969436764 - 2^32`, i.e.
+  32-bit signed wraparound. Root cause: `HashAggregateOperator` requested
+  cudf's native `COUNT`/`MEAN` groupby aggregations, both of which
+  accumulate through an internal `cudf::size_type` (INT32) counter across
+  every batch fed into the long-lived `streaming_groupby` -- fine at SF100
+  (largest per-group count ~600M), but SF1000 pushes a single group past
+  2^31 rows. The post-`finalize()` `int32->int64` cast the code already had
+  couldn't recover the value; the overflow happened during accumulation,
+  not at output. `AVG` shares the same root cause (`MEAN`'s internal
+  division uses the identical 32-bit `COUNT_VALID`), confirmed by the same
+  run's `avg_disc`/`avg_price`/`avg_qty` all being wrong for the same
+  groups while every `SUM(...)` stayed correct.
+
+  Fixed by never requesting cudf's `COUNT`/`MEAN` groupby aggregations at
+  all: `COUNT`/`COUNT(*)` are now `SUM` over a synthesized INT64 "ones"
+  column (all-valid for `COUNT(*)`; carrying the argument column's null
+  mask for `COUNT(col)`), and `AVG` is decomposed into its own
+  `SUM(argument)`/`COUNT(argument)` pair (the same trick) with the division
+  done in `finalize()` over the two genuinely-INT64-accumulated results,
+  instead of trusting cudf's internal division. See
+  `HashAggregateOperator`'s `ValueColumnKind`/`AggregateOutputKind` in
+  `hash_aggregate_operator.hpp`. Verified for real: same SF1000 Q1 run
+  re-validated `kernellake-gpu`/`pyspark` agreement after the fix; all 73
+  `gpu-dev` tests still pass (zero regressions).
+
+  With both infrastructure fixes and the aggregate fix in place, ran the
+  full SF1000 Q1/Q6 three-way benchmark (`--backends gpu,pyspark`,
+  `kernellake-cpu` deliberately skipped -- see `--backends`'s own help text
+  on the CPU backend's unbounded scan materialization, and this file's
+  SF100 entry's Q19 CPU OOM above, neither of which had been re-verified
+  safe at 10x the previously-tested scale). Both queries validated `true`.
+  Median wall-clock seconds (KernelLake-GPU / PySpark local[*]): Q1 cold
+  126.05/76.11, warm 104.49/73.43; Q6 cold 47.88/30.88, warm 28.56/24.34 --
+  PySpark now leads GPU outright on both queries at both modes, a further
+  shift from SF100 (where GPU had just overtaken PySpark on Q6) and SF10
+  (PySpark led everywhere) -- consistent with the ~1000-file/107GiB
+  -compressed `lineitem` scan's I/O and per-pass overhead scaling faster
+  than compute at this size, not yet root-caused further. Q12/Q19 (joins)
+  were not attempted at SF1000, matching SF100's own convention of not
+  reporting a number for a backend/query combination with an already-known,
+  unfixed resource limit at the tested scale (see this file's SF100 entry
+  and "Not yet started" below) rather than risking another real OOM on this
+  shared machine. Single-machine, single-run result, same caveats as the
+  SF100 entry above. Report rendered as
+  `benchmark-results/sf1000-report-v1.pdf`.
 
 ## Not yet started
 
+- **GPU `HashAggregateOperator`'s per-pass overhead dominates SF1000 Q1's
+  wall-clock time, and `max_distinct_keys_` is not the fix.** Profiling the
+  SF1000 GPU-vs-PySpark reversal noted in the entry above (`kernellake
+  query --stats`): `parquet_decoding_seconds` is only 38.6s of Q1's 106.9s
+  total, and a control comparison against Q6 (identical scan/filter,
+  `ScalarAggregateOperator` instead of `HashAggregateOperator`) showed only
+  a 1.2s non-scan gap there vs. Q1's 67.5s -- so the cost is specific to the
+  GROUP BY path, not I/O or a lack of stream overlap. Instrumented root
+  cause (temporary counters, not kept): `max_distinct_keys_`
+  (`kDefaultMaxDistinctKeys` = 10,000,000, unrelated to Q1's real ~3
+  distinct groups) doubly bounds both the persistent hash table's capacity
+  *and* the max row count `cudf::groupby::streaming_groupby::aggregate()`
+  accepts per call (an encoding-scheme constraint internal to cudf, see
+  `process_batch()`'s own comment) -- so a ~33M-row-average scan pass gets
+  sliced into ~4 separate `aggregate()` calls: 727 calls across 182 passes.
+  Tried the obvious fix -- raising `max_distinct_keys_` so passes need
+  fewer/no re-slicing -- and it does not help: at 15,000,000 (545 calls,
+  down from 727), total `aggregate()` time stayed ~60.6s, essentially
+  unchanged; 20,000,000 and 40,000,000 both `std::bad_alloc`'d against the
+  8GB VRAM budget before even finishing. So each `aggregate()` call's own
+  cost scales up with `max_distinct_keys_` (bigger hash table capacity =
+  more expensive per call, inside cudf), roughly canceling out the benefit
+  of needing fewer calls -- this is not a tunable-constant problem. A real
+  fix would mean not asking cudf's `streaming_groupby` to carry
+  O(`max_distinct_keys`) work on every call for a query whose actual
+  cardinality is tiny -- e.g. a plain (non-streaming) `cudf::groupby` sized
+  to each pass's actual data, with the (tiny, since real cardinality is
+  small) partial results merged across passes at the kernellake level
+  instead of relying on cudf's persistent cross-call hash table. Not
+  attempted this session -- a real operator redesign, not a parameter
+  change.
 - TPC-H `execution-only` benchmark mode (needs an operator-tree entry point
   that skips `ParquetScanOperator`); TPC-H beyond SF10 (SF0.01/0.1/1/10 all
   verified, see "Done" above)
