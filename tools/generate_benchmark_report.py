@@ -114,44 +114,51 @@ def add_summary_table_page(pdf: PdfPages, reports: list) -> None:
     rows = []
     for report in reports:
         sf = report.get("scale_factor", "?")
+        modes = report.get("modes", ["warm"])
         for result in report.get("results", []):
             if not result.get("validated"):
-                rows.append([f"SF{sf}", f"Q{result['query']}", "NOT VALIDATED", "--", "--"])
+                for mode in modes:
+                    rows.append([f"SF{sf}", mode, f"Q{result['query']}", "NOT VALIDATED", "--", "--"])
                 continue
-            rows.append(
-                [
-                    f"SF{sf}",
-                    f"Q{result['query']}",
-                    f"{result['kernellake-cpu']['median_seconds']:.4f}",
-                    f"{result['kernellake-gpu']['median_seconds']:.4f}",
-                    f"{result['pyspark']['median_seconds']:.4f}",
-                ]
-            )
+            for mode in modes:
+                mode_result = result[mode]
+                rows.append(
+                    [
+                        f"SF{sf}",
+                        mode,
+                        f"Q{result['query']}",
+                        f"{mode_result['kernellake-cpu']['median_seconds']:.4f}",
+                        f"{mode_result['kernellake-gpu']['median_seconds']:.4f}",
+                        f"{mode_result['pyspark']['median_seconds']:.4f}",
+                    ]
+                )
 
     table = ax.table(
         cellText=rows,
-        colLabels=["Scale factor", "Query", "KernelLake-CPU", "KernelLake-GPU", "PySpark"],
+        colLabels=["Scale factor", "Mode", "Query", "KernelLake-CPU", "KernelLake-GPU", "PySpark"],
         loc="center",
         cellLoc="center",
     )
     table.auto_set_font_size(False)
-    table.set_fontsize(10)
-    table.scale(1, 1.8)
+    table.set_fontsize(9)
+    table.scale(1, 1.6)
     pdf.savefig(fig)
     plt.close(fig)
 
 
-def add_chart_page(pdf: PdfPages, reports: list, query_number: int) -> None:
+def add_chart_page(pdf: PdfPages, reports: list, query_number: int, mode: str) -> None:
     scale_factors = []
     timings = {engine: [] for engine in ENGINE_LABELS}
     for report in reports:
+        if mode not in report.get("modes", ["warm"]):
+            continue
         sf = report.get("scale_factor", "?")
         result = next((r for r in report.get("results", []) if r.get("query") == query_number), None)
         if result is None or not result.get("validated"):
             continue
         scale_factors.append(f"SF{sf}")
         for engine in ENGINE_LABELS:
-            timings[engine].append(result[engine]["median_seconds"])
+            timings[engine].append(result[mode][engine]["median_seconds"])
 
     if not scale_factors:
         return
@@ -165,7 +172,7 @@ def add_chart_page(pdf: PdfPages, reports: list, query_number: int) -> None:
     ax.set_xticks(list(x))
     ax.set_xticklabels(scale_factors)
     ax.set_ylabel("Median wall-clock time (seconds)")
-    ax.set_title(f"Q{query_number}: median time by scale factor")
+    ax.set_title(f"Q{query_number} ({mode}): median time by scale factor")
     ax.legend()
     fig.text(
         0.5,
@@ -193,12 +200,14 @@ def main() -> int:
         return 1
 
     query_numbers = sorted({r["query"] for report in reports for r in report.get("results", [])})
+    modes_present = sorted({mode for report in reports for mode in report.get("modes", ["warm"])})
 
     with PdfPages(args.output) as pdf:
         add_title_page(pdf, reports)
         add_summary_table_page(pdf, reports)
         for query_number in query_numbers:
-            add_chart_page(pdf, reports, query_number)
+            for mode in modes_present:
+                add_chart_page(pdf, reports, query_number, mode)
 
     print(f"Wrote {args.output}")
     return 0

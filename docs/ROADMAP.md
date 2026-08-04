@@ -585,14 +585,86 @@ and covered by passing tests -- not merely designed or stubbed.
   `benchmark_three_way.py --output` JSON and the rendered PDF are gitignored
   local artifacts (hardware-specific, point-in-time), not committed --
   the tooling that produces them is what's committed.
+- **Three-way benchmark extended to SF10 (60M rows) plus cold/warm modes,
+  with two real bugs and one operational tuning issue found and fixed at
+  scale.** `tools/benchmark_three_way.py` gained `--mode {cold,warm,both}`:
+  cold evicts each engine's input file(s) from the page cache immediately
+  before that engine reads them, via `posix_fadvise(fd, 0, 0,
+  POSIX_FADV_DONTNEED)` -- the same no-root pattern already used by
+  `src/cli/benchmark_tpch_command.cpp`, since this sandbox has no root
+  access to `/proc/sys/vm/drop_caches`.
+
+  Real bug #1: at SF10, the GPU backend failed with "Batch size (59619013)
+  exceeds max_distinct_keys (10000000)" on Q1. Root cause, found by reading
+  cudf's own vendored `groupby.hpp` doc comment inside the FetchContent
+  source tree: `cudf::groupby::streaming_groupby`'s `max_distinct_keys`
+  constrains two different things -- cumulative distinct keys across the
+  object's lifetime *and* the row count of any single `aggregate()` call
+  (an encoding-scheme constraint, unrelated to actual GROUP BY
+  cardinality). `ParquetScanOperator`'s pass splitting is purely
+  memory-based (`pass_read_limit_bytes`), so a single incoming batch can
+  legitimately have far more rows than `max_distinct_keys` while still
+  having very few actual distinct keys -- exactly what happened here (a
+  59.6M-row batch, only ~6 real distinct keys). Fixed in
+  `src/execution_gpu/hash_aggregate_operator.cpp`'s `process_batch()`: when
+  a batch's row count exceeds `max_distinct_keys_`, slice it into
+  `max_distinct_keys_`-sized row ranges via `cudf::slice()` and call
+  `aggregate()` once per slice, instead of once for the whole batch.
+  Verified with a new regression test,
+  `HashAggregateOperator.SplitsSingleBatchExceedingMaxDistinctKeys` in
+  `tests/gpu/hash_aggregate_operator_test.cpp` (a 5-row single batch, 2
+  distinct keys, `max_distinct_keys=2`, forcing 3 `aggregate()` calls
+  within one `process_batch()`); all 71 `gpu-dev` tests pass with zero
+  regressions, and `dev`/`server-dev`/`otel-dev` (171/174/174) are
+  unaffected since this file is GPU-only code not compiled by those
+  presets.
+
+  Real issue #2 (operational, not a code bug): after the above fix, SF10
+  Q1 still failed with "Exceeded memory limit (failed to allocate 38.146973
+  MiB)" from RMM -- the default `pool_max_bytes`/`query_memory_limit_bytes`
+  (8 GiB) is undersized for a 60M-row hash-aggregate at this scale.
+  Resolved by raising both to 12 GiB via `kernellake.yaml`'s existing
+  config knobs (not a code change).
+
+  Real bug #3: PySpark failed SF10 with `java.lang.OutOfMemoryError: Java
+  heap space` reading a `lineitem` Parquet part file. Root cause:
+  `benchmark_three_way.py`'s `SparkSession.builder` never set
+  `spark.driver.memory`, so `local[*]` mode (driver and all executors share
+  one JVM) ran 20 parallel executor threads against 60M rows under the
+  default small heap. Fixed by adding a `--spark-driver-memory` flag
+  (default `4g`; `8g` used for the actual SF10 run, which then succeeded).
+
+  **Confirmed on real GPU hardware**: all 4 scale factors (SF0.01, SF0.1,
+  SF1, SF10) x both queries x both modes (cold/warm) = 16 combinations, all
+  `validated: true` (all three engines' actual computed values agreed).
+  GPU overtakes KernelLake-CPU by SF10 (Q1: 5.23s CPU vs. 1.22s GPU warm;
+  Q6: 1.20s CPU vs. 0.51s GPU warm) -- but PySpark stays fastest of all
+  three engines at every single scale factor and mode, including SF10 (Q1
+  warm: 1.06s PySpark vs. 1.22s GPU; Q6 warm: 0.39s PySpark vs. 0.51s GPU).
+  Reported as a real, unsmoothed result, not explained away: these are
+  both single-table scan+aggregate queries, so PySpark's `local[*]`
+  parallelizes the Parquet scan itself across all 20 CPU cores concurrently,
+  while the GPU path pays fixed CUDA-context/kernel-launch/host-device-
+  transfer overhead per query that a 60M-row/~6GB dataset still isn't large
+  enough to amortize against a well-parallelized JVM scan. Whether that
+  crossover exists at a larger scale factor or wider query shape (multi-table
+  join, higher compute-per-byte) is untested -- this project's own
+  Q1/Q6-only, single-table TPC-H subset (see "Not yet started" below) can't
+  answer that; would need SF30+ and/or the multi-table queries to find out.
+  Single-machine, single-run (5 iterations, median reported) result, not a
+  statistically-controlled study, per this project's own rule of reporting
+  real numbers rather than a general performance claim.
 
 ## Not yet started
 
 - TPC-H `execution-only` benchmark mode (needs an operator-tree entry point
-  that skips `ParquetScanOperator`); TPC-H at SF10+ scale (SF1 now verified,
-  see "Done" above; SF10 untested); Q3/Q12/Q14 (need TPC-H's actual
+  that skips `ParquetScanOperator`); TPC-H beyond SF10 (SF0.01/0.1/1/10 all
+  verified, see "Done" above); Q3/Q12/Q14 (need TPC-H's actual
   multi-way join schema wired up against hash joins' current two-table
-  scope)
+  scope) -- also the only way to test whether GPU vs. PySpark's crossover
+  point (see "Done" above -- PySpark stays fastest through SF10 on the
+  current Q1/Q6-only subset) looks different for a heavier, multi-table
+  query shape
 - A self-hosted GPU CI runner (would enable a `gpu-dev` build/test/
   benchmark/validate workflow to actually run in CI, rather than only
   locally) -- explicitly deferred; `hurdad/kernel-lake` is a public repo,

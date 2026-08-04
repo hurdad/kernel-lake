@@ -25,6 +25,7 @@ real GPU (`docker run --gpus all`).
 """
 
 import argparse
+import glob
 import json
 import os
 import platform
@@ -40,6 +41,35 @@ from duckdb_compare import normalize, rows_match, run_kernellake
 QUERIES_DIR = Path(__file__).resolve().parent.parent / "benchmarks" / "tpch" / "queries"
 
 ENGINES = ("kernellake-cpu", "kernellake-gpu", "pyspark")
+MODES = ("cold", "warm")
+
+
+def evict_from_page_cache(path: str) -> None:
+    # Best-effort cache eviction for a specific file, usable without root:
+    # POSIX_FADV_DONTNEED asks the kernel to drop that file's cached pages.
+    # Mirrors src/cli/benchmark_tpch_command.cpp's own
+    # evict_from_page_cache() exactly (same rationale: a hint, not a
+    # guarantee, and "cold" is approximate as a result) -- this Python
+    # script is a separate orchestrator process from all three engines, but
+    # it's the OS page cache for the underlying file that "cold" actually
+    # means here, not anything engine-internal, so evicting it once here
+    # (before each engine's own read) applies uniformly regardless of which
+    # engine reads the file next.
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+    except (OSError, AttributeError):
+        pass
+    finally:
+        os.close(fd)
+
+
+def evict_data_files(data_glob: str) -> None:
+    for path in glob.glob(data_glob):
+        evict_from_page_cache(path)
 
 
 def read_proc_field(path: str, field: str) -> str | None:
@@ -131,7 +161,11 @@ def spark_sql(query_number: int) -> str:
     return rewritten.strip()
 
 
-def run_kernellake_backend(kernellake_bin: str, query_number: int, data_glob: str, backend: str):
+def run_kernellake_backend(
+    kernellake_bin: str, query_number: int, data_glob: str, backend: str, cold: bool = False
+):
+    if cold:
+        evict_data_files(data_glob)
     sql = kernellake_sql(query_number, data_glob)
     start = time.perf_counter()
     table = run_kernellake(kernellake_bin, sql, backend=backend)
@@ -139,9 +173,11 @@ def run_kernellake_backend(kernellake_bin: str, query_number: int, data_glob: st
     return table, elapsed
 
 
-def run_pyspark_query(spark, query_number: int):
+def run_pyspark_query(spark, query_number: int, data_glob: str, cold: bool = False):
     import pyarrow as pa
 
+    if cold:
+        evict_data_files(data_glob)
     sql = spark_sql(query_number)
     start = time.perf_counter()
     # Spark SQL is lazy -- toPandas() is what actually triggers execution
@@ -164,15 +200,18 @@ def median_stats(samples):
     }
 
 
-def benchmark_one_query(kernellake_bin: str, spark, query_number: int, data_glob: str, iterations: int) -> dict:
+def benchmark_one_query(
+    kernellake_bin: str, spark, query_number: int, data_glob: str, iterations: int, modes: tuple
+) -> dict:
     print(f"=== Q{query_number} ===")
 
-    # Correctness first: one untimed run per engine, cross-validated
-    # pairwise before any timing is trusted.
+    # Correctness first: one untimed, warm run per engine, cross-validated
+    # pairwise before any timing is trusted. Cache state doesn't affect
+    # correctness, so this never evicts.
     try:
         cpu_table, _ = run_kernellake_backend(kernellake_bin, query_number, data_glob, "cpu")
         gpu_table, _ = run_kernellake_backend(kernellake_bin, query_number, data_glob, "gpu")
-        spark_table, _ = run_pyspark_query(spark, query_number)
+        spark_table, _ = run_pyspark_query(spark, query_number, data_glob)
     except Exception as exc:  # noqa: BLE001 -- reported as a validation failure, not a crash
         print(f"    ERROR during correctness check: {exc}")
         return {"query": query_number, "validated": False, "error": str(exc)}
@@ -197,42 +236,49 @@ def benchmark_one_query(kernellake_bin: str, spark, query_number: int, data_glob
 
     print(f"    PASS: all three engines agree ({len(cpu_rows)} rows)")
 
-    # Now timed: iterations per engine, discarding the correctness-check
-    # run above (it's untimed by construction, not reused for timing).
-    timings = {engine: [] for engine in ENGINES}
-    for i in range(iterations):
-        _, t = run_kernellake_backend(kernellake_bin, query_number, data_glob, "cpu")
-        timings["kernellake-cpu"].append(t)
-        _, t = run_kernellake_backend(kernellake_bin, query_number, data_glob, "gpu")
-        timings["kernellake-gpu"].append(t)
-        _, t = run_pyspark_query(spark, query_number)
-        timings["pyspark"].append(t)
-        print(f"    iteration {i + 1}/{iterations} done")
-
     result = {"query": query_number, "validated": True, "row_count": len(cpu_rows), "iterations": iterations}
-    for engine in ENGINES:
-        result[engine] = median_stats(timings[engine])
+    for mode in modes:
+        cold = mode == "cold"
+        # Cache is evicted again before *each* engine's own read within an
+        # iteration, not just once per iteration -- otherwise one engine's
+        # read would silently re-warm the cache for the next engine in the
+        # same iteration, making its own "cold" measurement actually warm.
+        timings = {engine: [] for engine in ENGINES}
+        for i in range(iterations):
+            _, t = run_kernellake_backend(kernellake_bin, query_number, data_glob, "cpu", cold=cold)
+            timings["kernellake-cpu"].append(t)
+            _, t = run_kernellake_backend(kernellake_bin, query_number, data_glob, "gpu", cold=cold)
+            timings["kernellake-gpu"].append(t)
+            _, t = run_pyspark_query(spark, query_number, data_glob, cold=cold)
+            timings["pyspark"].append(t)
+            print(f"    [{mode}] iteration {i + 1}/{iterations} done")
+        result[mode] = {engine: median_stats(timings[engine]) for engine in ENGINES}
     return result
 
 
-def print_summary_table(results: list) -> None:
+def print_summary_table(results: list, modes: tuple) -> None:
     print()
-    print("=" * 78)
+    print("=" * 90)
     print("UNOFFICIAL three-way benchmark -- NOT a certified TPC-H result.")
     print("KernelLake-CPU vs. KernelLake-GPU vs. PySpark (local[*]), same dataset.")
-    print("=" * 78)
-    header = f"{'query':<8}{'validated':<11}{'cpu (median s)':<16}{'gpu (median s)':<16}{'pyspark (median s)':<20}"
+    print("=" * 90)
+    header = (
+        f"{'query':<7}{'mode':<7}{'validated':<11}{'cpu (median s)':<16}"
+        f"{'gpu (median s)':<16}{'pyspark (median s)':<20}"
+    )
     print(header)
     print("-" * len(header))
     for result in results:
         if not result.get("validated"):
-            print(f"Q{result['query']:<7}{'NO':<11}{'--':<16}{'--':<16}{'--':<20}")
+            for mode in modes:
+                print(f"Q{result['query']:<6}{mode:<7}{'NO':<11}{'--':<16}{'--':<16}{'--':<20}")
             continue
-        cpu_med = result["kernellake-cpu"]["median_seconds"]
-        gpu_med = result["kernellake-gpu"]["median_seconds"]
-        spark_med = result["pyspark"]["median_seconds"]
-        print(f"Q{result['query']:<7}{'yes':<11}{cpu_med:<16.4f}{gpu_med:<16.4f}{spark_med:<20.4f}")
-    print("=" * 78)
+        for mode in modes:
+            cpu_med = result[mode]["kernellake-cpu"]["median_seconds"]
+            gpu_med = result[mode]["kernellake-gpu"]["median_seconds"]
+            spark_med = result[mode]["pyspark"]["median_seconds"]
+            print(f"Q{result['query']:<6}{mode:<7}{'yes':<11}{cpu_med:<16.4f}{gpu_med:<16.4f}{spark_med:<20.4f}")
+    print("=" * 90)
 
 
 def main() -> int:
@@ -240,17 +286,34 @@ def main() -> int:
     parser.add_argument("--kernellake", required=True, help="Path to the kernellake CLI binary (gpu-dev build)")
     parser.add_argument("--data", required=True, help="Glob pattern over generate_tpch.py's Parquet output")
     parser.add_argument("--query", required=True, help="Query number (1, 6) or 'all'")
-    parser.add_argument("--iterations", type=int, default=5, help="Timed iterations per engine per query")
+    parser.add_argument("--iterations", type=int, default=5, help="Timed iterations per engine per query per mode")
+    parser.add_argument(
+        "--mode",
+        choices=("cold", "warm", "both"),
+        default="both",
+        help="cold: evict the OS page cache (POSIX_FADV_DONTNEED, no root needed -- same approach as "
+        "src/cli/benchmark_tpch_command.cpp's own --mode cold) before every single engine read. "
+        "warm: no eviction, relies on whatever's already cached. both (default): run and report both.",
+    )
     parser.add_argument(
         "--scale-factor", type=float, default=None, help="TPC-H scale factor of --data, recorded in --output only"
     )
     parser.add_argument("--output", default=None, help="Optional path to write the full report as JSON")
+    parser.add_argument(
+        "--spark-driver-memory",
+        default="4g",
+        help="spark.driver.memory for the local[*] SparkSession (default 4g; raise this for larger "
+        "--data scale factors -- a real SF10/60M-row run hit a genuine Java heap OutOfMemoryError "
+        "at the previous unconfigured default)",
+    )
     args = parser.parse_args()
 
     if args.query == "all":
         query_numbers = [1, 6]
     else:
         query_numbers = [int(args.query)]
+
+    modes = MODES if args.mode == "both" else (args.mode,)
 
     system_stats = collect_system_stats()
     print("=== System ===")
@@ -259,10 +322,20 @@ def main() -> int:
 
     from pyspark.sql import SparkSession
 
+    # spark.driver.memory: local[*] mode runs the driver and every executor
+    # thread inside one JVM process (no separate executor JVMs), so this is
+    # the one setting that actually bounds all of it. Left at PySpark's own
+    # small default, a real run against a genuinely large dataset (SF10,
+    # 60M rows, local[*] spreading the scan across every CPU core at once)
+    # hit a real "java.lang.OutOfMemoryError: Java heap space" failure --
+    # confirmed by an actual run, not a hypothetical concern. args.driver_memory
+    # is left tunable rather than hardcoded, since the right value scales
+    # with both the dataset size and the host's available RAM.
     spark = (
         SparkSession.builder.appName("kernellake-benchmark-three-way")
         .master("local[*]")
         .config("spark.ui.showConsoleProgress", "false")
+        .config("spark.driver.memory", args.spark_driver_memory)
         .getOrCreate()
     )
     spark.sparkContext.setLogLevel("WARN")
@@ -271,11 +344,13 @@ def main() -> int:
     results = []
     try:
         for query_number in query_numbers:
-            results.append(benchmark_one_query(args.kernellake, spark, query_number, args.data, args.iterations))
+            results.append(
+                benchmark_one_query(args.kernellake, spark, query_number, args.data, args.iterations, modes)
+            )
     finally:
         spark.stop()
 
-    print_summary_table(results)
+    print_summary_table(results, modes)
 
     if args.output:
         report = {
@@ -283,6 +358,7 @@ def main() -> int:
             "disclaimer": "Unofficial TPC-H-derived benchmark. Not a certified TPC result.",
             "scale_factor": args.scale_factor,
             "data": args.data,
+            "modes": list(modes),
             "system": system_stats,
             "results": results,
         }

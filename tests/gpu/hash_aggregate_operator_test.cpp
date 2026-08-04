@@ -104,6 +104,74 @@ TEST(HashAggregateOperator, MergesPartialGroupsAcrossBatches) {
   op.close(context);
 }
 
+// Regression test: cudf::groupby::streaming_groupby::aggregate() requires a
+// single call's row count to not exceed max_distinct_keys (an
+// implementation encoding-scheme constraint, unrelated to actual GROUP BY
+// cardinality -- see cudf/groupby.hpp's own streaming_groupby doc comment;
+// max_distinct_keys separately also caps *cumulative* distinct keys across
+// the object's lifetime, confirmed by a real "Distinct key count (3) would
+// exceed max_distinct_keys (2)" failure from an earlier, wrongly-designed
+// version of this test that used 3 distinct keys against a cap of 2 --
+// fixed here by using only 2 distinct keys, well under the cap, while still
+// exceeding it in raw row count). ParquetScanOperator's own pass splitting
+// is purely memory-based (pass_read_limit_bytes), so a single incoming
+// batch can legitimately exceed max_distinct_keys in row count at real
+// scale (confirmed by a real SF10 TPC-H Q1 run: a 59.6M-row single-pass
+// batch, only ~6 actual distinct keys, against the default 10M
+// max_distinct_keys). Exercises the same code path with a deliberately
+// tiny max_distinct_keys (2) against a single 5-row batch spanning only 2
+// distinct keys, forcing HashAggregateOperator::process_batch() to slice
+// it into multiple aggregate() calls within one process_batch() -- not
+// across separate next()-returned batches, which
+// MergesPartialGroupsAcrossBatches above already covers.
+TEST(HashAggregateOperator, SplitsSingleBatchExceedingMaxDistinctKeys) {
+  RmmEnvironment env(default_config());
+
+  std::vector<DeviceBatch> batches;
+  batches.push_back(make_batch({1, 1, 1, 2, 2}, {10.0, 10.0, 10.0, 20.0, 20.0}));
+
+  auto region = std::make_shared<ColumnExpression>("region", 0, int32_type(false));
+  std::vector<NamedExpression> group_by = {NamedExpression{region, "region"}};
+
+  auto amount = std::make_shared<ColumnExpression>("amount", 1, float64_type(false));
+  auto sum_expr = std::make_shared<AggregateExpression>(AggregateFunction::Sum, amount, float64_type(true));
+  auto count_expr =
+      std::make_shared<AggregateExpression>(AggregateFunction::CountStar, nullptr, int64_type(false));
+  std::vector<NamedExpression> aggregates = {NamedExpression{sum_expr, "total"},
+                                             NamedExpression{count_expr, "n"}};
+
+  // max_distinct_keys=2, deliberately smaller than this single 5-row batch
+  // (but not smaller than its 2 actual distinct keys) -- forces at least 3
+  // aggregate() calls (slices of at most 2 rows each) within the one
+  // process_batch() call below.
+  HashAggregateOperator op(1, std::make_unique<VectorSourceOperator>(std::move(batches)), std::move(group_by),
+                           std::move(aggregates), /*max_distinct_keys=*/2);
+  ExecutionContext context = make_context();
+  op.open(context);
+
+  std::optional<DeviceBatch> result = op.next(context);
+  ASSERT_TRUE(result.has_value());
+  EXPECT_EQ(result->row_count(), 2u);  // two distinct regions
+  EXPECT_FALSE(op.next(context).has_value());
+
+  const std::vector<int32_t> region_values = copy_to_host<int32_t>(result->view().column(0));
+  const std::vector<double> total_values = copy_to_host<double>(result->view().column(1));
+  const std::vector<std::int64_t> count_values = copy_to_host<std::int64_t>(result->view().column(2));
+
+  std::map<int32_t, std::pair<double, std::int64_t>> by_region;
+  for (std::size_t i = 0; i < region_values.size(); ++i) {
+    by_region[region_values[i]] = {total_values[i], count_values[i]};
+  }
+
+  ASSERT_EQ(by_region.size(), 2u);
+  EXPECT_DOUBLE_EQ(by_region[1].first, 30.0);  // 10+10+10
+  EXPECT_EQ(by_region[1].second, 3);
+  EXPECT_DOUBLE_EQ(by_region[2].first, 40.0);  // 20+20
+  EXPECT_EQ(by_region[2].second, 2);
+
+  op.close(context);
+}
+
 TEST(HashAggregateOperator, EmptyInputProducesZeroRowResult) {
   RmmEnvironment env(default_config());
   auto region = std::make_shared<ColumnExpression>("region", 0, int32_type(false));

@@ -9,6 +9,7 @@
 #include <cudf/unary.hpp>
 #include <fmt/format.h>
 
+#include <algorithm>
 #include <numeric>
 
 #include "kernellake/common/errors.hpp"
@@ -202,7 +203,40 @@ std::unique_ptr<cudf::table> HashAggregateOperator::build_combined_columns(const
 void HashAggregateOperator::process_batch(const DeviceBatch& batch, ExecutionContext& context) {
   any_batch_seen_ = true;
   const std::unique_ptr<cudf::table> combined = build_combined_columns(batch, context);
-  streaming_->aggregate(combined->view(), context.stream);
+  const cudf::table_view combined_view = combined->view();
+  const cudf::size_type total_rows = combined_view.num_rows();
+
+  // cudf::groupby::streaming_groupby::aggregate() requires a single call's
+  // row count to not exceed max_distinct_keys_ -- its own doc comment
+  // explains why: each in-flight batch row is encoded as
+  // `max_distinct_keys + row_idx` inside the hash set, an implementation
+  // detail of the encoding scheme, unrelated to this query's actual GROUP
+  // BY cardinality (confirmed by a real failure: TPC-H Q1's own GROUP BY
+  // has ~6 distinct values, but a real SF10 run still hit "Batch size
+  // (59619013) exceeds max_distinct_keys (10000000)" because
+  // ParquetScanOperator's own pass splitting is purely memory-based
+  // (pass_read_limit_bytes), with no awareness of this separate,
+  // row-count-based constraint). Re-slicing an oversized batch here, on
+  // our side, is the fix -- not raising the global max_distinct_keys_
+  // default, which would inflate the persistent hash table/
+  // aggregation-results memory for *every* hash-aggregate query
+  // (proportional to max_distinct_keys_, regardless of that query's real
+  // cardinality -- see cudf/groupby.hpp's own streaming_groupby doc
+  // comment: "the persistent state is sized to max_distinct_keys").
+  if (total_rows <= max_distinct_keys_) {
+    streaming_->aggregate(combined_view, context.stream);
+    return;
+  }
+  std::vector<cudf::size_type> slice_indices;
+  slice_indices.reserve(2 * ((total_rows / max_distinct_keys_) + 1));
+  for (cudf::size_type offset = 0; offset < total_rows; offset += max_distinct_keys_) {
+    slice_indices.push_back(offset);
+    slice_indices.push_back(std::min(offset + max_distinct_keys_, total_rows));
+  }
+  const std::vector<cudf::table_view> chunks = cudf::slice(combined_view, slice_indices, context.stream);
+  for (const cudf::table_view& chunk : chunks) {
+    streaming_->aggregate(chunk, context.stream);
+  }
 }
 
 std::optional<DeviceBatch> HashAggregateOperator::next(ExecutionContext& context) {
