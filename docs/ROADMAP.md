@@ -769,6 +769,18 @@ and covered by passing tests -- not merely designed or stubbed.
   (`SUM(CASE WHEN p_type LIKE 'PROMO%' THEN ... ELSE ... END)`), which
   neither backend supports yet -- a separate, still-open gap from this
   session's `CASE`-in-aggregate fix (see "Not yet started" below).
+- **TPC-H Q12 wired into the three-way performance benchmark**, the same
+  way Q19 already is. `tools/benchmark_three_way.py` gained
+  `--orders-data` (mirroring `--part-data`): `kernellake_sql()` substitutes
+  `{orders_data}` alongside `{data}`/`{part_data}`; `spark_sql()` rewrites
+  `read_parquet('{orders_data}')` to a third `orders` Spark temp view;
+  cold-mode eviction covers the `orders` file(s) too. `--query all` only
+  includes Q12 when `--orders-data` is given, same rationale as Q19's
+  `--part-data` handling. Verified for real on GPU hardware in a fresh
+  `benchmark-gpu` Docker rebuild: Q12 validates `true` at SF0.01 with real
+  median timings (KernelLake-CPU/GPU/PySpark: 0.077s / 0.446s / 0.271s,
+  warm); `--query all` with both `--part-data` and `--orders-data` given
+  runs and validates all four queries (Q1, Q6, Q19, Q12) together.
 
 ## Not yet started
 
@@ -777,14 +789,11 @@ and covered by passing tests -- not merely designed or stubbed.
   verified, see "Done" above)
 - Re-running the three-way benchmark's full cold/warm x SF0.01-SF10 sweep
   (see the earlier "Confirmed on real GPU hardware" entry above) with Q19
-  (and, once wired in, Q12) included, now that Q19 is wired in -- the only
-  way to test whether GPU vs. PySpark's crossover point (PySpark stays
-  fastest through SF10 on the Q1/Q6-only sweep already run) looks different
-  for a join-shaped query; not yet done at any scale factor beyond the
-  SF0.01 spot-checks above
-- Wiring TPC-H Q12 into `tools/benchmark_three_way.py`'s three-way
-  performance comparison, the same way Q19 already is (see "Done" above) --
-  not yet done
+  and Q12 included, now that both are wired in -- the only way to test
+  whether GPU vs. PySpark's crossover point (PySpark stays fastest through
+  SF10 on the Q1/Q6-only sweep already run) looks different for a
+  join-shaped query; not yet done at any scale factor beyond the SF0.01
+  spot-checks above
 - `LIKE` inside a `CASE` branch or an aggregate argument, on either
   backend -- confirmed not yet supported (see "Done" above); needed for
   TPC-H Q14 (`SUM(CASE WHEN p_type LIKE 'PROMO%' THEN ... ELSE ... END)`)
@@ -792,7 +801,32 @@ and covered by passing tests -- not merely designed or stubbed.
   separate from the aggregate-argument fix above; the CPU backend already
   supports this via its one shared expression compiler) -- not needed by
   any TPC-H query added so far, so not yet prioritized
-- Q3 (needs a 3-table join, beyond the current two-table-only scope)
+- Q3 and most of the rest of the TPC-H suite (need a 3+-table join, beyond
+  the current two-table-only scope) -- a real investigation into this
+  found the underlying `hsql` SQL parser library already parses `A JOIN B
+  JOIN C ON ...` correctly into a left-deep nested tree
+  (`(A JOIN B) JOIN C`, the outer join's `left` being itself a
+  `kTableJoin`, not a `kTableName`); `src/sql/parser.cpp`'s own AST
+  conversion is what explicitly rejects that shape today ("JOIN sides must
+  each be a single read_parquet(...) source, not a subquery or nested
+  join"). Supporting it end to end would mean generalizing `AstJoinClause`
+  (currently exactly two `AstParquetSource` sides) to a chain, and -- the
+  larger piece -- generalizing `Binder`'s dual-mode design
+  (`input_schema_` for single-table, hardcoded `left_schema_`/
+  `right_schema_` for exactly-two-table join mode) to resolve column
+  references against a list of N (alias, schema) pairs instead. The
+  physical planner and execution layers (`HashJoinNode`/`HashJoinOperator`
+  on GPU, Acero's `"hashjoin"` on CPU) likely need **no changes at all**:
+  both already recurse on arbitrary `PhysicalPlanPtr` children, so a
+  left-deep chain of two `HashJoinNode`s should execute correctly once the
+  logical plan builds that shape -- unconfirmed since the parser/binder
+  work wasn't attempted this session, but this is where the real
+  complexity is, not in the already-generic execution operators. This is a
+  substantially bigger change than any single-query addition so far (Q1/
+  Q6/Q12/Q19 combined) -- explicitly deferred as its own follow-up rather
+  than started opportunistically, since it touches the parser, binder, and
+  logical-plan construction all at once and deserves dedicated review
+  rather than being folded into a query-by-query session.
 - A self-hosted GPU CI runner (would enable a `gpu-dev` build/test/
   benchmark/validate workflow to actually run in CI, rather than only
   locally) -- explicitly deferred; `hurdad/kernel-lake` is a public repo,
