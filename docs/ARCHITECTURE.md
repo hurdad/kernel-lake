@@ -356,17 +356,41 @@ cpu`), not a build-time one, and it works even on the CPU-only `dev` build,
 which cannot run the GPU path at all.
 
 **Scope for this phase**, matching the GPU engine's own original MVP order:
-`ParquetScan` -> `Filter` -> `Projection` (arithmetic/comparisons/`BETWEEN`/
-numeric `CAST` only) -> `ScalarAggregate`/`HashAggregate` (`SUM`/`COUNT`/
-`MIN`/`MAX`/`AVG`, grouping only by a plain column) -> `Sort` (by a plain
-column only) -> `Limit`. `LIKE`/`IN`/`CASE`/`CAST`-to-`DECIMAL`-or-`STRING`/
-`HashJoin` are not yet supported here -- `compile_expression_cpu()` and
-`acero_query_executor.cpp`'s `translate()` throw `ExecutionError`/
-`PlanningError` naming the specific unsupported construct rather than
-silently miscompiling. Arrow Compute's function registry is actually more
-complete than `cudf::ast` turned out to be for some of these (no "cannot
-output STRING" restriction, for instance), so extending this list later is
-likely less work than the GPU equivalents were -- just not free.
+`ParquetScan` -> `HashJoin` (two-table `INNER JOIN`, single equality key) ->
+`Filter` -> `Projection` (arithmetic/comparisons/`BETWEEN` only) ->
+`ScalarAggregate`/`HashAggregate` (`SUM`/`COUNT`/`MIN`/`MAX`/`AVG`, grouping
+only by a plain column) -> `Sort` (by a plain column only) -> `Limit`.
+`LIKE`/`IN`/`CASE`/`CAST`-to-`DECIMAL`-or-`STRING` are not yet supported
+here -- `compile_expression_cpu()` throws `ExecutionError` naming the
+specific unsupported construct rather than silently miscompiling. Arrow
+Compute's function registry is actually more complete than `cudf::ast`
+turned out to be for some of these (no "cannot output STRING" restriction,
+for instance), so extending this list later is likely less work than the
+GPU equivalents were -- just not free.
+
+**`HashJoinNode` -> Acero's own `"hashjoin"` node, fixed.** This backend
+used to reject every `HashJoinNode` outright ("physical plan node
+'HashJoin' is not yet supported by the CPU execution backend"), even
+though the parser/binder already accepted two-table `INNER JOIN ... ON`
+queries and the GPU backend already executed them correctly -- a real
+CPU/GPU asymmetry found while scoping which TPC-H queries beyond Q1/Q6
+could run through `tools/benchmark_three_way.py` (every join-based TPC-H
+query needs this on *both* backends to be benchmarkable at all, per this
+project's own cross-engine validation rule). Fixed in
+`acero_query_executor.cpp`'s `translate()` by mapping `HashJoinNode` to
+`arrow::acero::HashJoinNodeOptions{JoinType::INNER, {left_key},
+{right_key}}` -- Acero's own native hash-join node, which already
+implements exactly this two-table INNER equi-join shape.
+`HashJoinNodeOptions`'s default `output_all = true` (every column from both
+sides, left fields then right) matches `HashJoinNode::build_schema()`'s
+convention exactly, so no `left_output`/`right_output` field list needs to
+be built by hand. Verified for real: a new regression test,
+`QueryEngineExecuteCpuTest.TwoTableInnerJoinMatchesExpectedTotals`; a real
+2-table join query (`lineitem` join a synthetic `part`-shaped table, `OR`
+of `AND`s with `BETWEEN`, matching TPC-H Q19's WHERE shape) matches DuckDB
+exactly on both the CPU and GPU backends; `dev` (172/172, +1 new test),
+`server-dev` (175/175), `otel-dev` (175/175) all pass with zero
+regressions.
 
 **No index-based column remapping.** Acero resolves every `FieldRef` by
 name against real Arrow schemas at each stage of its `Declaration` tree, so

@@ -6,19 +6,29 @@ result -- see `NOTICE`.
 
 ## Scope
 
-Only `lineitem`-only queries are supported today: **Q6** (scan, filter,
-arithmetic expression, scalar aggregation) and **Q1** (grouped aggregation).
-Q3/Q12/Q14 and the rest of the 22-query suite need hash joins, which
-KernelLake does not implement yet (see `docs/ROADMAP.md`).
+**Q6** (scan, filter, arithmetic expression, scalar aggregation), **Q1**
+(grouped aggregation) -- both single-table scans over `lineitem` -- and
+**Q19** (a two-table `lineitem`/`part` `INNER JOIN`, `OR` of `AND`s with
+`BETWEEN`, no `CASE`). KernelLake supports a two-table `INNER JOIN ... ON`
+with a single equality key on both the CPU and GPU execution backends (see
+`docs/ARCHITECTURE.md`'s "Hash joins" section and its "CPU execution
+backend" section for the CPU-side fix), which is what makes Q19 possible.
+Two real grammar gaps remain, ruling out several other TPC-H queries for
+now: `CASE` expressions are not yet supported inside `WHERE` or an
+aggregate argument (only in the `SELECT` list/`GROUP BY` keys) -- rules out
+Q12/Q14 (need `CASE` inside `SUM(...)`) -- and only a *two*-table join is
+supported, a 3+-way join fails clearly rather than being silently
+reinterpreted -- rules out Q3. See `docs/ROADMAP.md` for the up-to-date
+list of what's next.
 
 ## 1. Generate data
 
 `tools/generate_tpch.py` is a **synthetic** generator, not the official
-TPC-H `dbgen` tool -- it produces a `lineitem` table with TPC-H's column
-names and roughly TPC-H-shaped value distributions (see the script's
-docstring for the full list of deviations, including DOUBLE instead of
-DECIMAL, since KernelLake's GPU execution layer doesn't support Decimal
-yet). It requires the `pyarrow` Python package.
+TPC-H `dbgen` tool -- it produces `lineitem` and `part` tables with TPC-H's
+column names and roughly TPC-H-shaped value distributions (see the
+script's docstring for the full list of deviations, including DOUBLE
+instead of DECIMAL, since KernelLake's GPU execution layer doesn't support
+Decimal yet). It requires the `pyarrow` Python package.
 
 ```bash
 python3 tools/generate_tpch.py \
@@ -26,22 +36,29 @@ python3 tools/generate_tpch.py \
   --format parquet --compression zstd --row-group-rows 1000000
 ```
 
-Writes `lineitem-*.parquet` plus a `manifest.json` recording the generation
-parameters. Real TPC-H SF1 has ~6,000,000 lineitem rows; this generator
-targets the same row count at the same scale factor, split across
-`--files` Parquet files.
+Writes `lineitem-*.parquet`, `part-00000.parquet`, plus a `manifest.json`
+recording the generation parameters. Real TPC-H SF1 has ~6,000,000
+`lineitem` rows and 200,000 `part` rows; this generator targets the same
+row counts at the same scale factor (`lineitem` split across `--files`
+Parquet files; `part` always a single file).
 
 ## 2. Query
 
 The queries live in version-controlled files, `benchmarks/tpch/queries/
-q01.sql` and `q06.sql`, each with a header comment documenting its specific
-deviations from canonical TPC-H syntax (`FROM lineitem` -> `FROM
-read_parquet('{data}')`, no `INTERVAL` arithmetic, no `ORDER BY`). Substitute
-`{data}` with your glob and run directly:
+q01.sql`, `q06.sql`, `q19.sql`, each with a header comment documenting its
+specific deviations from canonical TPC-H syntax (`FROM lineitem` -> `FROM
+read_parquet('{data}')`, no `INTERVAL` arithmetic, no `ORDER BY`). Q1/Q6
+need only `{data}` substituted with your `lineitem` glob; Q19 also needs
+`{part_data}` substituted with your `part` glob:
 
 ```bash
 sql=$(grep -v '^--' benchmarks/tpch/queries/q06.sql | tr '\n' ' ' | \
   sed "s|{data}|/tmp/kernellake-tpch-sf1/*.parquet|")
+./build/gpu-dev/src/cli/kernellake query --sql "$sql" --stats
+
+sql=$(grep -v '^--' benchmarks/tpch/queries/q19.sql | tr '\n' ' ' | \
+  sed "s|{data}|/tmp/kernellake-tpch-sf1/lineitem-*.parquet|; \
+       s|{part_data}|/tmp/kernellake-tpch-sf1/part-*.parquet|")
 ./build/gpu-dev/src/cli/kernellake query --sql "$sql" --stats
 ```
 
@@ -50,24 +67,35 @@ sql=$(grep -v '^--' benchmarks/tpch/queries/q06.sql | tr '\n' ' ' | \
 `tools/validate_tpch.py` runs the same query file through both `kernellake
 query --format arrow` and DuckDB against the same Parquet files, then
 compares results (row order and floating-point precision insensitive).
-Requires the `duckdb` and `pyarrow` Python packages and a `gpu-dev` build.
+Requires the `duckdb` and `pyarrow` Python packages. Works against either
+execution backend via `--backend cpu`/`--backend gpu` (omit to use the
+binary's own default).
 
 ```bash
 python3 tools/validate_tpch.py \
   --kernellake build/gpu-dev/src/cli/kernellake \
   --data '/tmp/kernellake-tpch-sf1/*.parquet' --scale-factor 1 --query all
+
+# Q19 needs --part-data (not covered by --query all, which only passes --data):
+python3 tools/validate_tpch.py \
+  --kernellake build/gpu-dev/src/cli/kernellake \
+  --data '/tmp/kernellake-tpch-sf1/lineitem-*.parquet' \
+  --part-data '/tmp/kernellake-tpch-sf1/part-*.parquet' \
+  --scale-factor 1 --query 19
 ```
 
 This has been run at SF0.01, SF0.1, and SF1 (60,000, 600,000, and
 6,000,000 generated rows) -- Q1 and Q6 matched DuckDB exactly at every
 scale, including the full SF1 run (~105 MiB single Parquet file, zstd
-compression, 1,000,000-row row groups).
+compression, 1,000,000-row row groups). Q19 has been verified at SF0.01 on
+both the CPU and GPU backends, exact match against DuckDB.
 
 ## 4. Benchmark
 
 `kernellake benchmark tpch` times a query over configurable warmup and
 measured iterations, reporting each iteration plus median/mean/min/max/
-standard deviation as JSON.
+standard deviation as JSON. Pass `--part-data` for Q19 (or any future
+query needing a second table).
 
 ```bash
 ./build/gpu-dev/src/cli/kernellake benchmark tpch \

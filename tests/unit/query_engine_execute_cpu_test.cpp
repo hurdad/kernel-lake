@@ -70,12 +70,31 @@ class QueryEngineExecuteCpuTest : public ::testing::Test {
     const arrow::Status status =
         parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), sink, /*chunk_size=*/3);
     ASSERT_TRUE(status.ok()) << status.ToString();
+
+    regions_path_ = (dir_ / "regions.parquet").string();
+    arrow::StringBuilder region_key_builder;
+    arrow::StringBuilder region_name_builder;
+    ASSERT_TRUE(region_key_builder.Append("A").ok());
+    ASSERT_TRUE(region_name_builder.Append("Alpha").ok());
+    ASSERT_TRUE(region_key_builder.Append("B").ok());
+    ASSERT_TRUE(region_name_builder.Append("Beta").ok());
+    std::shared_ptr<arrow::Array> region_key_array, region_name_array;
+    ASSERT_TRUE(region_key_builder.Finish(&region_key_array).ok());
+    ASSERT_TRUE(region_name_builder.Finish(&region_name_array).ok());
+    const auto regions_schema = arrow::schema(
+        {arrow::field("region", arrow::utf8(), false), arrow::field("region_name", arrow::utf8(), false)});
+    const auto regions_table = arrow::Table::Make(regions_schema, {region_key_array, region_name_array});
+    auto regions_sink = arrow::io::FileOutputStream::Open(regions_path_).ValueOrDie();
+    const arrow::Status regions_status = parquet::arrow::WriteTable(
+        *regions_table, arrow::default_memory_pool(), regions_sink, /*chunk_size=*/2);
+    ASSERT_TRUE(regions_status.ok()) << regions_status.ToString();
   }
 
   void TearDown() override { fs::remove_all(dir_); }
 
   fs::path dir_;
   std::string path_;
+  std::string regions_path_;
   QueryEngine engine_{cpu_backend_config()};
 };
 
@@ -241,6 +260,41 @@ TEST_F(QueryEngineExecuteCpuTest, CaseIsNotYetSupportedByCpuBackend) {
                                       "FROM read_parquet('" +
                                       path_ + "')")),
                ExecutionError);
+}
+
+// Regression test: the CPU execution backend used to reject every
+// HashJoinNode outright ("physical plan node 'HashJoin' is not yet
+// supported by the CPU execution backend"), even though the parser/binder
+// already accepted two-table INNER JOIN ... ON queries and the GPU backend
+// already executed them correctly -- a real asymmetry found while scoping
+// which TPC-H queries beyond Q1/Q6 could run through
+// tools/benchmark_three_way.py. Fixed by translating HashJoinNode to
+// Acero's own "hashjoin" node (arrow::acero::HashJoinNodeOptions), which
+// implements the same two-table INNER equi-join natively.
+TEST_F(QueryEngineExecuteCpuTest, TwoTableInnerJoinMatchesExpectedTotals) {
+  const QueryResult result =
+      engine_.execute("SELECT r.region_name, SUM(s.amount) AS total FROM read_parquet('" + path_ +
+                      "') AS s JOIN read_parquet('" + regions_path_ +
+                      "') AS r ON s.region = r.region GROUP BY r.region_name");
+
+  ASSERT_EQ(result.rows_returned, 2);
+  ASSERT_EQ(result.batches.size(), 1u);
+  const std::shared_ptr<arrow::RecordBatch>& batch = result.batches.front();
+  ASSERT_EQ(batch->num_rows(), 2);
+
+  const auto name_column =
+      std::static_pointer_cast<arrow::StringArray>(batch->GetColumnByName("region_name"));
+  const auto total_column = std::static_pointer_cast<arrow::DoubleArray>(batch->GetColumnByName("total"));
+  ASSERT_NE(name_column, nullptr);
+  ASSERT_NE(total_column, nullptr);
+
+  std::map<std::string, double> totals_by_name;
+  for (std::int64_t i = 0; i < batch->num_rows(); ++i) {
+    totals_by_name[name_column->GetString(i)] = total_column->Value(i);
+  }
+  ASSERT_EQ(totals_by_name.size(), 2u);
+  EXPECT_DOUBLE_EQ(totals_by_name.at("Alpha"), 35.0);  // 10+20+5
+  EXPECT_DOUBLE_EQ(totals_by_name.at("Beta"), 110.0);  // 100+7+3
 }
 
 }  // namespace
