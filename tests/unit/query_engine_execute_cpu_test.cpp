@@ -173,6 +173,25 @@ TEST_F(QueryEngineExecuteCpuTest, ScalarAggregateOverComputedExpressionMatchesEx
   EXPECT_DOUBLE_EQ(total_column->Value(0), 290.0);  // (10+20+5+100+7+3) * 2
 }
 
+// Regression test: build_logical_plan() used to reject a SELECT item that
+// *combines* multiple aggregates arithmetically (e.g. a ratio), throwing
+// "SELECT item '...' is neither an aggregate nor a GROUP BY column" even
+// though it bound successfully -- exactly TPC-H Q14's shape. Fixed by
+// rewrite_aggregate_refs() in logical_planner.cpp; see
+// LogicalPlanner.AggregateArithmeticCombiningTwoAggregatesBuildsBothSlots
+// in tests/unit/logical_plan_test.cpp for the structural version of this
+// same check.
+TEST_F(QueryEngineExecuteCpuTest, ScalarAggregateArithmeticCombiningTwoAggregatesMatchesExpectedRatio) {
+  const QueryResult result = engine_.execute(
+      "SELECT 100.0 * SUM(amount) / SUM(amount * 2) AS ratio FROM read_parquet('" + path_ + "')");
+
+  ASSERT_EQ(result.rows_returned, 1);
+  const auto ratio_column =
+      std::static_pointer_cast<arrow::DoubleArray>(result.batches.front()->GetColumnByName("ratio"));
+  ASSERT_NE(ratio_column, nullptr);
+  EXPECT_DOUBLE_EQ(ratio_column->Value(0), 50.0);  // 100 * 145 / 290
+}
+
 TEST_F(QueryEngineExecuteCpuTest, PlainProjectionReturnsAllRows) {
   const QueryResult result = engine_.execute("SELECT region FROM read_parquet('" + path_ + "')");
   EXPECT_EQ(result.rows_returned, 6);
@@ -249,10 +268,32 @@ TEST_F(QueryEngineExecuteCpuTest, PopulatesCpuTimingAndScanStats) {
   EXPECT_EQ(*result.files_scanned, 1);
 }
 
-TEST_F(QueryEngineExecuteCpuTest, LikeIsNotYetSupportedByCpuBackend) {
-  EXPECT_THROW(
-      (void)(engine_.execute("SELECT region FROM read_parquet('" + path_ + "') WHERE region LIKE 'A%'")),
-      ExecutionError);
+// Regression test: the CPU execution backend used to reject LIKE/NOT LIKE
+// in every context ("unrecognized expression type in CPU expression
+// compiler (LIKE/IN/CASE/DECIMAL are not yet supported...)"). Fixed by
+// mapping LikeExpression to Arrow Compute's own "match_like" kernel in
+// compile_expression_cpu() -- the same shared function the CASE fix
+// landed on, so WHERE, SELECT list, and CASE branches (see
+// CaseInGroupedAggregateWhereAndScalarAggregateMatchesExpectedTotals
+// above, which predates this fix and only covers CASE) all gain LIKE
+// support from this one change.
+TEST_F(QueryEngineExecuteCpuTest, LikeAndNotLikeInWhereMatchExpectedRows) {
+  const QueryResult like_result =
+      engine_.execute("SELECT region FROM read_parquet('" + path_ + "') WHERE region LIKE 'A%'");
+  EXPECT_EQ(like_result.rows_returned, 3);  // all 3 "A" rows
+
+  const QueryResult not_like_result =
+      engine_.execute("SELECT region FROM read_parquet('" + path_ + "') WHERE region NOT LIKE 'A%'");
+  EXPECT_EQ(not_like_result.rows_returned, 3);  // all 3 "B" rows
+
+  const QueryResult case_result = engine_.execute(
+      "SELECT SUM(CASE WHEN region LIKE 'A%' THEN 1 ELSE 0 END) AS a_count FROM read_parquet('" + path_ +
+      "')");
+  ASSERT_EQ(case_result.batches.size(), 1u);
+  const auto a_count_column =
+      std::static_pointer_cast<arrow::Int64Array>(case_result.batches.front()->GetColumnByName("a_count"));
+  ASSERT_NE(a_count_column, nullptr);
+  EXPECT_EQ(a_count_column->Value(0), 3);
 }
 
 // Regression test: the CPU execution backend used to reject CASE

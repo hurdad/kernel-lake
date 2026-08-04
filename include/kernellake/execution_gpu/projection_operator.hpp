@@ -26,11 +26,10 @@ namespace kernellake {
 //
 // A CASE expression is evaluated via a chain of cudf::copy_if_else calls
 // (cudf::ast has no ternary/branching operator) -- see
-// docs/ARCHITECTURE.md. Each branch's own condition/result must itself be
-// a plain column or AST-compilable expression; a LIKE or nested CASE inside
-// a CASE branch is not supported in this version (the ExpressionCompiler's
-// "unrecognized expression type" error is the natural failure point for
-// that).
+// docs/ARCHITECTURE.md. Each branch's own condition/result can be a plain
+// column, an AST-compilable expression, a nested CASE, or a LIKE/NOT LIKE
+// (evaluated via cudf::strings::like(), mirroring FilterOperator's
+// top-level WHERE handling -- see CompiledLike).
 class ProjectionOperator final : public PhysicalOperator {
  public:
   ProjectionOperator(OperatorId id, std::unique_ptr<PhysicalOperator> child,
@@ -46,6 +45,7 @@ class ProjectionOperator final : public PhysicalOperator {
  private:
   struct CompiledDecimalCast;  // defined below; forward-declared so CompiledValue can hold a shared_ptr to
                                // it.
+  struct CompiledLike;         // ditto.
 
   // A plain column index to copy, a plain literal to broadcast, a CAST to
   // DECIMAL to materialize directly, or a compiled AST expression to
@@ -73,11 +73,21 @@ class ProjectionOperator final : public PhysicalOperator {
     std::shared_ptr<cudf::scalar> literal_scalar;
     const cudf::ast::expression* expr = nullptr;
     std::shared_ptr<CompiledDecimalCast> decimal_cast;
+    std::shared_ptr<CompiledLike> like_expr;
   };
 
   struct CompiledDecimalCast {
     CompiledValue operand;
     DataType target_type;
+  };
+
+  // Mirrors FilterOperator::evaluate_like()'s exact algorithm (cudf::ast has
+  // no LIKE-equivalent operator) -- see HashAggregateOperator's identical
+  // fast path.
+  struct CompiledLike {
+    CompiledValue value;
+    std::string pattern;
+    bool negated;
   };
 
   struct CompiledCaseBranch {
@@ -103,6 +113,9 @@ class ProjectionOperator final : public PhysicalOperator {
                                                                 const cudf::table_view& batch,
                                                                 ExecutionContext& context);
   [[nodiscard]] std::unique_ptr<cudf::column> materialize_case(const CompiledCase& case_expr,
+                                                               const cudf::table_view& batch,
+                                                               ExecutionContext& context);
+  [[nodiscard]] std::unique_ptr<cudf::column> materialize_like(const CompiledLike& like_expr,
                                                                const cudf::table_view& batch,
                                                                ExecutionContext& context);
 

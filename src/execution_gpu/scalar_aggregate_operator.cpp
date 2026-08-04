@@ -6,6 +6,8 @@
 #include <cudf/copying.hpp>
 #include <cudf/reduction.hpp>
 #include <cudf/scalar/scalar_factories.hpp>
+#include <cudf/strings/contains.hpp>
+#include <cudf/strings/strings_column_view.hpp>
 #include <cudf/transform.hpp>
 #include <cudf/unary.hpp>
 #include <fmt/format.h>
@@ -71,6 +73,15 @@ ScalarAggregateOperator::CompiledExpr ScalarAggregateOperator::compile_expr(cons
     compiled.decimal_cast = std::move(decimal_cast);
     return compiled;
   }
+  if (const auto* like_expr = dynamic_cast<const LikeExpression*>(&expr)) {
+    auto compiled_like = std::make_shared<CompiledLike>();
+    compiled_like->value = compile_expr(*like_expr->value());
+    compiled_like->pattern = like_expr->pattern();
+    compiled_like->negated = like_expr->negated();
+    CompiledExpr compiled;
+    compiled.like_expr = std::move(compiled_like);
+    return compiled;
+  }
   CompiledExpr compiled;
   compiled.expr = &compiler_.compile(expr);
   return compiled;
@@ -80,6 +91,7 @@ std::unique_ptr<cudf::column> ScalarAggregateOperator::materialize(const Compile
                                                                    const DeviceBatch& batch,
                                                                    ExecutionContext& context) {
   if (compiled.case_expr != nullptr) return materialize_case(*compiled.case_expr, batch, context);
+  if (compiled.like_expr != nullptr) return materialize_like(*compiled.like_expr, batch, context);
   if (compiled.decimal_cast != nullptr) {
     const std::unique_ptr<cudf::column> operand = materialize(compiled.decimal_cast->operand, batch, context);
     return cudf::cast(operand->view(), to_cudf_type(compiled.decimal_cast->target_type), context.stream,
@@ -119,6 +131,20 @@ std::unique_ptr<cudf::column> ScalarAggregateOperator::materialize_case(const Co
                                 context.memory_resource);
   }
   return result;
+}
+
+// Mirrors FilterOperator::evaluate_like()'s exact algorithm -- see
+// HashAggregateOperator::materialize_like's identical comment.
+std::unique_ptr<cudf::column> ScalarAggregateOperator::materialize_like(const CompiledLike& like_expr,
+                                                                        const DeviceBatch& batch,
+                                                                        ExecutionContext& context) {
+  const std::unique_ptr<cudf::column> value = materialize(like_expr.value, batch, context);
+  std::unique_ptr<cudf::column> mask =
+      cudf::strings::like(cudf::strings_column_view(value->view()), like_expr.pattern, "", context.stream,
+                          context.memory_resource);
+  if (!like_expr.negated) return mask;
+  return cudf::unary_operation(mask->view(), cudf::unary_operator::NOT, context.stream,
+                               context.memory_resource);
 }
 
 void ScalarAggregateOperator::open(ExecutionContext& context) {

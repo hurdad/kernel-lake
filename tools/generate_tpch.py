@@ -7,15 +7,17 @@ certified TPC-H data.** It generates three tables (`lineitem`, `part`,
 "Deviations" below) and roughly TPC-H-shaped value distributions, sized
 approximately like real TPC-H at the requested scale factor. This is
 sufficient for the queries KernelLake currently supports (Q6, Q1 --
-single-table scans over `lineitem`; Q19 -- a two-table `lineitem`/`part`
-join; Q12 -- a two-table `orders`/`lineitem` join), but must never be
-described or published as an official TPC-H benchmark dataset.
+single-table scans over `lineitem`; Q19/Q14 -- a two-table
+`lineitem`/`part` join; Q12 -- a two-table `orders`/`lineitem` join), but
+must never be described or published as an official TPC-H benchmark
+dataset.
 
 Deviations from canonical TPC-H, documented per the spec's requirement to
 record every one:
   - Only `lineitem`, `part`, and `orders` are generated. `customer`/
     `supplier`/`partsupp`/`nation`/`region` are not, since every currently
-    supported TPC-H query (Q1/Q6/Q12/Q19) needs only these three tables.
+    supported TPC-H query (Q1/Q6/Q12/Q14/Q19) needs only these three
+    tables.
     KernelLake does support two-table hash joins now (see docs/ROADMAP.md/
     docs/ARCHITECTURE.md's "Hash joins"), but wiring up TPC-H's queries
     that need 3+ tables (Q3 and others) is separate, not-yet-done work, not

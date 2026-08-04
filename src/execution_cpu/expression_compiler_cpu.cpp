@@ -181,8 +181,19 @@ arrow::compute::Expression compile_expression_cpu(const Expression& expr) {
     }
     return arrow::compute::call("case_when", std::move(args));
   }
+  // Arrow Compute's "match_like" kernel takes a SQL-style pattern (the same
+  // '%'/'_' wildcard syntax LikeExpression::pattern() already stores, no
+  // conversion needed) via MatchSubstringOptions -- SQL LIKE is
+  // case-sensitive by default, matching MatchSubstringOptions's own
+  // ignore_case=false default.
+  if (const auto* like = dynamic_cast<const LikeExpression*>(&expr)) {
+    const arrow::compute::Expression matched =
+        arrow::compute::call("match_like", {compile_expression_cpu(*like->value())},
+                             arrow::compute::MatchSubstringOptions(like->pattern()));
+    return like->negated() ? arrow::compute::call("invert", {matched}) : matched;
+  }
   throw ExecutionError(
-      "unrecognized expression type in CPU expression compiler (LIKE/IN/DECIMAL are not yet supported "
+      "unrecognized expression type in CPU expression compiler (IN/DECIMAL are not yet supported "
       "by the CPU execution backend -- see docs/ARCHITECTURE.md)");
 }
 

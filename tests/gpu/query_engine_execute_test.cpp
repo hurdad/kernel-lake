@@ -468,13 +468,12 @@ TEST(QueryEngineExecuteGpuMemoryTest, GroupByWithDerivedAggregatesSucceedsUnderT
   ASSERT_TRUE(discount_builder.Finish(&discount_array).ok());
   ASSERT_TRUE(tax_builder.Finish(&tax_array).ok());
 
-  const auto schema = arrow::schema({arrow::field("flag", arrow::utf8(), false),
-                                     arrow::field("quantity", arrow::float64(), false),
-                                     arrow::field("extendedprice", arrow::float64(), false),
-                                     arrow::field("discount", arrow::float64(), false),
-                                     arrow::field("tax", arrow::float64(), false)});
-  const auto table =
-      arrow::Table::Make(schema, {flag_array, quantity_array, extendedprice_array, discount_array, tax_array});
+  const auto schema = arrow::schema(
+      {arrow::field("flag", arrow::utf8(), false), arrow::field("quantity", arrow::float64(), false),
+       arrow::field("extendedprice", arrow::float64(), false),
+       arrow::field("discount", arrow::float64(), false), arrow::field("tax", arrow::float64(), false)});
+  const auto table = arrow::Table::Make(
+      schema, {flag_array, quantity_array, extendedprice_array, discount_array, tax_array});
   auto sink = arrow::io::FileOutputStream::Open(path).ValueOrDie();
   const arrow::Status status =
       parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), sink, /*chunk_size=*/1'000'000);
@@ -509,7 +508,8 @@ TEST(QueryEngineExecuteGpuMemoryTest, GroupByWithDerivedAggregatesSucceedsUnderT
     const auto flag_column = std::static_pointer_cast<arrow::StringArray>(batch->GetColumnByName("flag"));
     const auto disc_price_column =
         std::static_pointer_cast<arrow::DoubleArray>(batch->GetColumnByName("sum_disc_price"));
-    const auto charge_column = std::static_pointer_cast<arrow::DoubleArray>(batch->GetColumnByName("sum_charge"));
+    const auto charge_column =
+        std::static_pointer_cast<arrow::DoubleArray>(batch->GetColumnByName("sum_charge"));
     const auto qty_column = std::static_pointer_cast<arrow::DoubleArray>(batch->GetColumnByName("sum_qty"));
     ASSERT_NE(flag_column, nullptr);
     ASSERT_NE(disc_price_column, nullptr);
@@ -517,7 +517,7 @@ TEST(QueryEngineExecuteGpuMemoryTest, GroupByWithDerivedAggregatesSucceedsUnderT
     ASSERT_NE(qty_column, nullptr);
     for (std::int64_t i = 0; i < batch->num_rows(); ++i) {
       totals_by_flag[flag_column->GetString(i)] = {disc_price_column->Value(i), charge_column->Value(i),
-                                                    qty_column->Value(i)};
+                                                   qty_column->Value(i)};
     }
     rows_returned += batch->num_rows();
   }

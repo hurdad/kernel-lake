@@ -104,6 +104,44 @@ TEST(LogicalPlanner, BuildsTpchQ6ScalarAggregateShape) {
   EXPECT_EQ(aggregate->aggregates()[0].name, "revenue");
 }
 
+// Regression test: build_logical_plan() used to only recognize a SELECT
+// item as valid in an aggregate query if it *was* (at the top level)
+// exactly an AggregateExpression or exactly matched a GROUP BY key by
+// to_string() -- anything else threw "SELECT item '...' is neither an
+// aggregate nor a GROUP BY column", even though the binder had already
+// bound it successfully. TPC-H Q14's own SELECT item is exactly this
+// shape: `100.00 * SUM(CASE WHEN ... THEN ... ELSE 0 END) / SUM(...)`, a
+// BinaryExpression combining two AggregateExpression subtrees arithmetically,
+// neither one bare. Fixed by rewrite_aggregate_refs(), which recursively
+// finds every distinct aggregate subtree (registering each once) and
+// rebuilds the surrounding expression with ColumnExpression references to
+// their LogicalAggregate output slots -- found and fixed while adding Q14.
+TEST(LogicalPlanner, AggregateArithmeticCombiningTwoAggregatesBuildsBothSlots) {
+  const auto stmt = sql::parse_sql(
+      "SELECT 100.0 * SUM(CASE WHEN l_quantity > 10 THEN l_extendedprice * (1 - l_discount) ELSE 0 END) "
+      "/ SUM(l_extendedprice * (1 - l_discount)) AS promo_revenue "
+      "FROM read_parquet('/data/tpch/lineitem/*.parquet')");
+  const Schema schema = lineitem_schema();
+  const BoundQuery bound = bind_query(stmt, schema);
+  const LogicalPlanPtr plan = build_logical_plan(bound, schema);
+
+  const auto* projection = dynamic_cast<const LogicalProjection*>(plan.get());
+  ASSERT_NE(projection, nullptr);
+  ASSERT_EQ(projection->items().size(), 1u);
+  EXPECT_EQ(projection->items()[0].name, "promo_revenue");
+  const auto* division = dynamic_cast<const BinaryExpression*>(projection->items()[0].expr.get());
+  ASSERT_NE(division, nullptr);
+  EXPECT_EQ(division->op(), BinaryOperator::Divide);
+
+  const auto* aggregate = dynamic_cast<const LogicalAggregate*>(projection->children()[0].get());
+  ASSERT_NE(aggregate, nullptr);
+  EXPECT_EQ(aggregate->group_by().size(), 0u);
+  // Two distinct aggregates: the CASE-wrapped SUM and the plain SUM --
+  // neither is the SELECT item itself, both had to be found by recursing
+  // into the multiplication/division tree.
+  ASSERT_EQ(aggregate->aggregates().size(), 2u);
+}
+
 TEST(LogicalPlanner, AggregateOrderByReferencesSelectListOutputName) {
   // "region" here means the SELECT-list output column (also happens to be
   // the GROUP BY key's own name in this case), not a base-table column --

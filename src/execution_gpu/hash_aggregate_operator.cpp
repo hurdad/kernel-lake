@@ -8,6 +8,8 @@
 #include <cudf/copying.hpp>
 #include <cudf/null_mask.hpp>
 #include <cudf/scalar/scalar_factories.hpp>
+#include <cudf/strings/contains.hpp>
+#include <cudf/strings/strings_column_view.hpp>
 #include <cudf/transform.hpp>
 #include <cudf/unary.hpp>
 #include <fmt/format.h>
@@ -62,7 +64,8 @@ HashAggregateOperator::HashAggregateOperator(OperatorId id, std::unique_ptr<Phys
 // through a 32-bit cudf::size_type internally and silently wrap around once
 // a single group's row count exceeds INT32_MAX -- confirmed by a real
 // SF1000 TPC-H Q1 run (see docs/ROADMAP.md).
-std::unique_ptr<cudf::groupby_aggregation> HashAggregateOperator::make_physical_aggregation(PhysicalAggKind kind) {
+std::unique_ptr<cudf::groupby_aggregation> HashAggregateOperator::make_physical_aggregation(
+    PhysicalAggKind kind) {
   switch (kind) {
     case PhysicalAggKind::Sum:
       return cudf::make_sum_aggregation<cudf::groupby_aggregation>();
@@ -109,6 +112,15 @@ HashAggregateOperator::CompiledExpr HashAggregateOperator::compile_expr(const Ex
     compiled.decimal_cast = std::move(decimal_cast);
     return compiled;
   }
+  if (const auto* like_expr = dynamic_cast<const LikeExpression*>(&expr)) {
+    auto compiled_like = std::make_shared<CompiledLike>();
+    compiled_like->value = compile_expr(*like_expr->value());
+    compiled_like->pattern = like_expr->pattern();
+    compiled_like->negated = like_expr->negated();
+    CompiledExpr compiled;
+    compiled.like_expr = std::move(compiled_like);
+    return compiled;
+  }
   CompiledExpr compiled;
   compiled.expr = &compiler_.compile(expr);
   return compiled;
@@ -118,6 +130,7 @@ std::unique_ptr<cudf::column> HashAggregateOperator::materialize(const CompiledE
                                                                  const DeviceBatch& batch,
                                                                  ExecutionContext& context) {
   if (compiled.case_expr != nullptr) return materialize_case(*compiled.case_expr, batch, context);
+  if (compiled.like_expr != nullptr) return materialize_like(*compiled.like_expr, batch, context);
   if (compiled.decimal_cast != nullptr) {
     const std::unique_ptr<cudf::column> operand = materialize(compiled.decimal_cast->operand, batch, context);
     return cudf::cast(operand->view(), to_cudf_type(compiled.decimal_cast->target_type), context.stream,
@@ -156,6 +169,21 @@ std::unique_ptr<cudf::column> HashAggregateOperator::materialize_case(const Comp
                                 context.memory_resource);
   }
   return result;
+}
+
+// Mirrors FilterOperator::evaluate_like()'s exact algorithm -- see that
+// function's own comment for why cudf::strings::like() rather than
+// cudf::ast (which has no LIKE-equivalent operator at all).
+std::unique_ptr<cudf::column> HashAggregateOperator::materialize_like(const CompiledLike& like_expr,
+                                                                      const DeviceBatch& batch,
+                                                                      ExecutionContext& context) {
+  const std::unique_ptr<cudf::column> value = materialize(like_expr.value, batch, context);
+  std::unique_ptr<cudf::column> mask =
+      cudf::strings::like(cudf::strings_column_view(value->view()), like_expr.pattern, "", context.stream,
+                          context.memory_resource);
+  if (!like_expr.negated) return mask;
+  return cudf::unary_operation(mask->view(), cudf::unary_operator::NOT, context.stream,
+                               context.memory_resource);
 }
 
 std::unique_ptr<cudf::column> HashAggregateOperator::materialize_value_column(ValueColumnKind kind,
@@ -206,9 +234,10 @@ void HashAggregateOperator::open(ExecutionContext& context) {
       case AggregateFunction::Max:
         compiled_aggregate_args_.push_back(compile_expr(*aggregate->argument()));
         value_column_kind_.push_back(ValueColumnKind::Expression);
-        physical_agg_kind_.push_back(aggregate->function() == AggregateFunction::Sum   ? PhysicalAggKind::Sum
-                                     : aggregate->function() == AggregateFunction::Min ? PhysicalAggKind::Min
-                                                                                        : PhysicalAggKind::Max);
+        physical_agg_kind_.push_back(aggregate->function() == AggregateFunction::Sum ? PhysicalAggKind::Sum
+                                     : aggregate->function() == AggregateFunction::Min
+                                         ? PhysicalAggKind::Min
+                                         : PhysicalAggKind::Max);
         aggregate_output_kind_.push_back(AggregateOutputKind::Direct);
         break;
 
@@ -259,21 +288,22 @@ std::unique_ptr<cudf::table> HashAggregateOperator::build_combined_columns(const
   for (const CompiledExpr& compiled : compiled_group_by_)
     columns.push_back(materialize(compiled, batch, context));
   for (std::size_t i = 0; i < compiled_aggregate_args_.size(); ++i) {
-    columns.push_back(materialize_value_column(value_column_kind_[i], compiled_aggregate_args_[i], batch, context));
+    columns.push_back(
+        materialize_value_column(value_column_kind_[i], compiled_aggregate_args_[i], batch, context));
   }
   return std::make_unique<cudf::table>(std::move(columns));
 }
 
-std::unique_ptr<cudf::table> HashAggregateOperator::run_groupby_and_assemble(const cudf::table_view& key_view,
-                                                                             const cudf::table_view& value_view,
-                                                                             ExecutionContext& context) {
+std::unique_ptr<cudf::table> HashAggregateOperator::run_groupby_and_assemble(
+    const cudf::table_view& key_view, const cudf::table_view& value_view, ExecutionContext& context) {
   cudf::groupby::groupby grouper(key_view);
   std::vector<cudf::groupby::aggregation_request> requests;
   requests.reserve(static_cast<std::size_t>(value_view.num_columns()));
   for (cudf::size_type i = 0; i < value_view.num_columns(); ++i) {
     cudf::groupby::aggregation_request request;
     request.values = value_view.column(i);
-    request.aggregations.push_back(make_physical_aggregation(physical_agg_kind_[static_cast<std::size_t>(i)]));
+    request.aggregations.push_back(
+        make_physical_aggregation(physical_agg_kind_[static_cast<std::size_t>(i)]));
     requests.push_back(std::move(request));
   }
   auto [keys_table, results] = grouper.aggregate(requests, context.stream, context.memory_resource);
@@ -310,17 +340,18 @@ void HashAggregateOperator::process_batch(const DeviceBatch& batch, ExecutionCon
     // stays small for a low-cardinality GROUP BY no matter how many passes
     // have gone by.
     const std::unique_ptr<cudf::table> concatenated =
-        cudf::concatenate(std::vector<cudf::table_view>{accumulated_->view(), partial->view()}, context.stream,
-                          context.memory_resource);
+        cudf::concatenate(std::vector<cudf::table_view>{accumulated_->view(), partial->view()},
+                          context.stream, context.memory_resource);
     const cudf::table_view concat_view = concatenated->view();
-    accumulated_ = run_groupby_and_assemble(column_range(concat_view, 0, group_by_count),
-                                            column_range(concat_view, group_by_count, concat_view.num_columns()),
-                                            context);
+    accumulated_ = run_groupby_and_assemble(
+        column_range(concat_view, 0, group_by_count),
+        column_range(concat_view, group_by_count, concat_view.num_columns()), context);
   }
 
   if (accumulated_->num_rows() > max_distinct_keys_) {
-    throw ExecutionError(fmt::format("HashAggregateOperator: distinct key count {} exceeds max_distinct_keys ({})",
-                                     accumulated_->num_rows(), max_distinct_keys_));
+    throw ExecutionError(
+        fmt::format("HashAggregateOperator: distinct key count {} exceeds max_distinct_keys ({})",
+                    accumulated_->num_rows(), max_distinct_keys_));
   }
 }
 
@@ -366,12 +397,12 @@ std::optional<DeviceBatch> HashAggregateOperator::next(ExecutionContext& context
 
     const std::unique_ptr<cudf::column> sum_as_double = cudf::cast(
         sum_column->view(), cudf::data_type{cudf::type_id::FLOAT64}, context.stream, context.memory_resource);
-    const std::unique_ptr<cudf::column> count_as_double = cudf::cast(
-        count_column->view(), cudf::data_type{cudf::type_id::FLOAT64}, context.stream, context.memory_resource);
-    final_columns.push_back(cudf::binary_operation(sum_as_double->view(), count_as_double->view(),
-                                                    cudf::binary_operator::DIV,
-                                                    cudf::data_type{cudf::type_id::FLOAT64}, context.stream,
-                                                    context.memory_resource));
+    const std::unique_ptr<cudf::column> count_as_double =
+        cudf::cast(count_column->view(), cudf::data_type{cudf::type_id::FLOAT64}, context.stream,
+                   context.memory_resource);
+    final_columns.push_back(cudf::binary_operation(
+        sum_as_double->view(), count_as_double->view(), cudf::binary_operator::DIV,
+        cudf::data_type{cudf::type_id::FLOAT64}, context.stream, context.memory_resource));
   }
   return DeviceBatch(std::make_unique<cudf::table>(std::move(final_columns)), output_schema_);
 }

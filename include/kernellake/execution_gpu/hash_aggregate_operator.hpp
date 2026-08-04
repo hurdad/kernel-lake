@@ -73,6 +73,7 @@ class HashAggregateOperator final : public PhysicalOperator {
  private:
   struct CompiledCase;         // defined below; forward-declared so CompiledExpr can hold a shared_ptr to it.
   struct CompiledDecimalCast;  // ditto.
+  struct CompiledLike;         // ditto.
 
   // A plain column reference (e.g. `GROUP BY region`) is copied directly
   // rather than routed through cudf::ast::compute_column: cudf's AST
@@ -92,12 +93,20 @@ class HashAggregateOperator final : public PhysicalOperator {
   // CAST_TO_DECIMAL* operator, so it's materialized directly via
   // cudf::cast() instead of through `expr`. See ProjectionOperator's
   // identical fast path and docs/ARCHITECTURE.md.
+  // `like_expr` handles a LIKE/NOT LIKE expression appearing inside a CASE
+  // branch or as a plain (non-CASE) group-by key/aggregate argument --
+  // cudf::ast has no LIKE-equivalent operator at all (same reason
+  // FilterOperator special-cases top-level WHERE LIKE conjuncts instead of
+  // routing them through its own AST compiler), so it's evaluated directly
+  // via cudf::strings::like(), mirroring FilterOperator::evaluate_like()'s
+  // exact algorithm.
   struct CompiledExpr {
     std::optional<cudf::size_type> source_column_index;
     std::shared_ptr<cudf::scalar> literal_scalar;  // plain literal (see cudf_adapter.hpp's literal_to_scalar)
     const cudf::ast::expression* expr = nullptr;
     std::shared_ptr<CompiledCase> case_expr;
     std::shared_ptr<CompiledDecimalCast> decimal_cast;
+    std::shared_ptr<CompiledLike> like_expr;
   };
 
   struct CompiledCaseBranch {
@@ -114,6 +123,12 @@ class HashAggregateOperator final : public PhysicalOperator {
   struct CompiledDecimalCast {
     CompiledExpr operand;
     DataType target_type;
+  };
+
+  struct CompiledLike {
+    CompiledExpr value;
+    std::string pattern;
+    bool negated;
   };
 
   // How to materialize a physical aggregate-request's value column (one
@@ -152,12 +167,16 @@ class HashAggregateOperator final : public PhysicalOperator {
   // special-casing.
   enum class PhysicalAggKind { Sum, Min, Max };
 
-  [[nodiscard]] static std::unique_ptr<cudf::groupby_aggregation> make_physical_aggregation(PhysicalAggKind kind);
+  [[nodiscard]] static std::unique_ptr<cudf::groupby_aggregation> make_physical_aggregation(
+      PhysicalAggKind kind);
   [[nodiscard]] CompiledExpr compile_expr(const Expression& expr);
   [[nodiscard]] std::unique_ptr<cudf::column> materialize(const CompiledExpr& compiled,
                                                           const DeviceBatch& batch,
                                                           ExecutionContext& context);
   [[nodiscard]] std::unique_ptr<cudf::column> materialize_case(const CompiledCase& case_expr,
+                                                               const DeviceBatch& batch,
+                                                               ExecutionContext& context);
+  [[nodiscard]] std::unique_ptr<cudf::column> materialize_like(const CompiledLike& like_expr,
                                                                const DeviceBatch& batch,
                                                                ExecutionContext& context);
   [[nodiscard]] std::unique_ptr<cudf::column> materialize_value_column(ValueColumnKind kind,

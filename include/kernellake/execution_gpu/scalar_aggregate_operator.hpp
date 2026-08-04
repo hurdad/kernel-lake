@@ -40,6 +40,7 @@ class ScalarAggregateOperator final : public PhysicalOperator {
  private:
   struct CompiledCase;         // defined below; forward-declared so CompiledExpr can hold a shared_ptr to it.
   struct CompiledDecimalCast;  // ditto.
+  struct CompiledLike;         // ditto.
 
   // Mirrors HashAggregateOperator::CompiledExpr exactly (same rationale for
   // each fast path -- see that class's own comments): a plain column
@@ -57,6 +58,7 @@ class ScalarAggregateOperator final : public PhysicalOperator {
     const cudf::ast::expression* expr = nullptr;
     std::shared_ptr<CompiledCase> case_expr;
     std::shared_ptr<CompiledDecimalCast> decimal_cast;
+    std::shared_ptr<CompiledLike> like_expr;
   };
 
   struct CompiledCaseBranch {
@@ -75,6 +77,15 @@ class ScalarAggregateOperator final : public PhysicalOperator {
     DataType target_type;
   };
 
+  // Mirrors FilterOperator::evaluate_like()'s exact algorithm (cudf::ast has
+  // no LIKE-equivalent operator) -- see HashAggregateOperator's identical
+  // fast path.
+  struct CompiledLike {
+    CompiledExpr value;
+    std::string pattern;
+    bool negated;
+  };
+
   struct Accumulator {
     AggregateFunction function;
     DataType result_type;
@@ -88,6 +99,9 @@ class ScalarAggregateOperator final : public PhysicalOperator {
                                                           const DeviceBatch& batch,
                                                           ExecutionContext& context);
   [[nodiscard]] std::unique_ptr<cudf::column> materialize_case(const CompiledCase& case_expr,
+                                                               const DeviceBatch& batch,
+                                                               ExecutionContext& context);
+  [[nodiscard]] std::unique_ptr<cudf::column> materialize_like(const CompiledLike& like_expr,
                                                                const DeviceBatch& batch,
                                                                ExecutionContext& context);
   [[nodiscard]] std::unique_ptr<cudf::column> materialize_argument(Accumulator& state,

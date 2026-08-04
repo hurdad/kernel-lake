@@ -847,10 +847,11 @@ and covered by passing tests -- not merely designed or stubbed.
   `otel-dev` (175/175), and a real `gpu-dev` Docker rebuild (250/250) all
   pass with zero regressions.
 
-  Q14 remains blocked: it needs `LIKE` inside a `CASE` branch
-  (`SUM(CASE WHEN p_type LIKE 'PROMO%' THEN ... ELSE ... END)`), which
-  neither backend supports yet -- a separate, still-open gap from this
-  session's `CASE`-in-aggregate fix (see "Not yet started" below).
+  Q14 was left blocked at this point (needing `LIKE` inside a `CASE`
+  branch, plus a separate gap found only once that one was fixed -- a
+  `SELECT` item combining multiple aggregates arithmetically) -- both now
+  fixed; see the later "TPC-H Q14 added" entry below for the full
+  writeup.
 - **TPC-H Q12 wired into the three-way performance benchmark**, the same
   way Q19 already is. `tools/benchmark_three_way.py` gained
   `--orders-data` (mirroring `--part-data`): `kernellake_sql()` substitutes
@@ -984,6 +985,66 @@ and covered by passing tests -- not merely designed or stubbed.
   side effects elsewhere. 2-iteration result, otherwise same caveats as the
   SF100 entry above. Report rendered as
   `benchmark-results/sf1000-report-v2.pdf`.
+- **TPC-H Q14 added, fixing two real gaps found along the way.** Q14's own
+  shape (`100.00 * SUM(CASE WHEN p_type LIKE 'PROMO%' THEN ... ELSE 0 END)
+  / SUM(...)`, a two-table `lineitem`/`part` join) needed `LIKE` inside a
+  `CASE` branch inside an aggregate argument, which neither backend
+  supported at all (confirmed real: `LIKE` was previously rejected
+  everywhere on the CPU backend, and the GPU backend's `CASE`-aware
+  operators had no `LikeExpression` case either).
+
+  Fixed CPU by mapping `LikeExpression` to Arrow Compute's own
+  `"match_like"` kernel in `compile_expression_cpu()` -- the SQL `%`/`_`
+  wildcard pattern needs no conversion, and since this is the one function
+  shared by every context on this backend, `WHERE`, `SELECT` list, and
+  `CASE` branches all gained `LIKE` support at once (mirroring exactly how
+  the earlier `CASE` fix worked). Fixed GPU by giving `HashAggregateOperator`,
+  `ScalarAggregateOperator`, and `ProjectionOperator` an identical
+  `CompiledLike` fast path (mirroring their existing `CompiledCase`/
+  `CompiledDecimalCast` pattern), each materializing via
+  `cudf::strings::like()` -- the same primitive `FilterOperator` already
+  uses for top-level `WHERE` `LIKE` conjuncts, just invoked from inside a
+  `CASE` branch instead. `CASE` inside `WHERE` on GPU remains a separate,
+  still-open gap (not needed by Q14's own `WHERE` clause, which has no
+  `CASE` at all).
+
+  Fixing `LIKE` surfaced a *third*, previously-undiscovered gap: Q14's
+  outer `100.00 * SUM(...) / SUM(...)` combines two aggregates
+  arithmetically, and `build_logical_plan()` only ever recognized a
+  `SELECT` item as valid in an aggregate query if it *was* exactly an
+  `AggregateExpression` or exactly matched a `GROUP BY` key -- anything
+  else threw `"SELECT item '...' is neither an aggregate nor a GROUP BY
+  column"`, confirmed via a minimal `SELECT 100.0 * SUM(x) / SUM(y)
+  FROM ...` reproduction with no `CASE`/`LIKE`/join involved at all. Fixed
+  by `rewrite_aggregate_refs()` in `logical_planner.cpp`: a recursive
+  rewrite that finds every distinct aggregate subtree in a `SELECT` item
+  (deduplicated by `to_string()`), replaces each with a `ColumnExpression`
+  at its `LogicalAggregate` output slot, and short-circuits at any subtree
+  matching a `GROUP BY` key (without recursing further -- essential for
+  `GROUP BY <alias>` resolving to a computed expression whose own internals
+  are deliberately exempt from the ungrouped-column check at bind time).
+  This lives in shared, backend-agnostic logical-plan code, so it fixes
+  both backends in one change. A bare top-level aggregate `SELECT` item
+  still registers under its own alias (e.g. `AS revenue`), preserving the
+  existing field-naming convention several tests already assert; any other
+  (possibly deeply-nested) aggregate reference gets a synthetic
+  `__kernellake_agg_N` name instead, since the outer `LogicalProjection`'s
+  own alias is what actually determines the final output name regardless.
+
+  Added `benchmarks/tpch/queries/q14.sql`, reusing the existing
+  `--part-data` mechanism (same second table as Q19, `part`). Verified for
+  real: Q14's full shape matches DuckDB exactly on *both* backends at
+  SF0.01 (CPU and GPU both produced `16.89287984201223`, matching DuckDB's
+  `16.892879842012228`); new regression tests
+  (`QueryEngineExecuteCpuTest.LikeAndNotLikeInWhereMatchExpectedRows`,
+  `QueryEngineExecuteCpuTest.ScalarAggregateArithmeticCombiningTwoAggregatesMatchesExpectedRatio`,
+  `LogicalPlanner.AggregateArithmeticCombiningTwoAggregatesBuildsBothSlots`,
+  `QueryEngineExecuteTest.CaseInScalarAggregateMatchesExpectedTotal` from
+  the earlier fix now also validated end-to-end with the LIKE addition);
+  `dev` (174/174), `server-dev` (177/177), `otel-dev` (177/177), and a real
+  `gpu-dev` Docker rebuild (253/253, was 251) all pass with zero
+  regressions. `--query all` (no `--part-data`/`--orders-data`) still runs
+  only Q1/Q6, confirming no regression to the existing single-table path.
 
 ## Not yet started
 
@@ -1083,9 +1144,10 @@ and covered by passing tests -- not merely designed or stubbed.
   SF10 on the Q1/Q6-only sweep already run) looks different for a
   join-shaped query; not yet done at any scale factor beyond the SF0.01
   spot-checks above
-- `LIKE` inside a `CASE` branch or an aggregate argument, on either
-  backend -- confirmed not yet supported (see "Done" above); needed for
-  TPC-H Q14 (`SUM(CASE WHEN p_type LIKE 'PROMO%' THEN ... ELSE ... END)`)
+- Wiring TPC-H Q14 into `tools/benchmark_three_way.py`'s three-way
+  performance comparison, the same way Q19 already is (it needs the same
+  `--part-data` mechanism Q19 uses, so this should be a small, mostly
+  mechanical follow-up, not a new fix) -- not yet done
 - `CASE` inside `WHERE` on the GPU backend (`FilterOperator`'s own gap,
   separate from the aggregate-argument fix above; the CPU backend already
   supports this via its one shared expression compiler) -- not needed by

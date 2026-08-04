@@ -84,10 +84,12 @@ SELECT <items> FROM read_parquet(...) AS a JOIN read_parquet(...) AS b ON <a.col
 - Numeric, string, boolean, date (`DATE 'YYYY-MM-DD'`), and `NULL` literals
 - Arithmetic (`+ - * /`), comparisons, `AND`/`OR`/`NOT`, `BETWEEN`,
   `IS [NOT] NULL`
-- `LIKE`/`NOT LIKE` (SQL `%`/`_` wildcards; scoped to top-level `WHERE`
-  AND-conjuncts -- not inside `OR`, the `SELECT` list, a `CASE` branch, or
-  an aggregate argument -- on the GPU backend; **not yet supported at all**
-  on the CPU backend, in any context)
+- `LIKE`/`NOT LIKE` (SQL `%`/`_` wildcards). Both backends support it
+  everywhere now (`WHERE`, `SELECT` list, a `CASE` branch, and both grouped
+  and scalar aggregate arguments -- e.g. TPC-H Q14's `SUM(CASE WHEN p_type
+  LIKE 'PROMO%' THEN ... ELSE ... END)`), via `cudf::strings::like()` (GPU)
+  or Arrow Compute's own `match_like` kernel (CPU) -- see "LIKE/IN/CASE/CAST
+  implementation notes" below
 - `IN (literal, ...)`/`NOT IN (...)` (desugared at bind time into an
   equivalent `OR`/`AND` chain of equality comparisons -- no new GPU
   execution support needed, and no scalar-subquery form `IN (SELECT ...)`)
@@ -101,6 +103,11 @@ SELECT <items> FROM read_parquet(...) AS a JOIN read_parquet(...) AS b ON <a.col
   arguments (e.g. `SUM(CASE WHEN ... THEN ... ELSE ... END)`, TPC-H Q12/
   Q14's shape) -- but **not yet in `WHERE`** (a separate, still-open
   `FilterOperator` gap; see "CASE expression implementation notes" below)
+- A `SELECT` item that *combines multiple aggregates arithmetically* (e.g.
+  TPC-H Q14's `100.00 * SUM(...) / SUM(...)`, a ratio of two aggregates,
+  neither one a bare aggregate call by itself) -- both backends, since this
+  is resolved in the shared logical-plan construction step, not per-backend
+  execution code; see "Aggregate-combining SELECT items" below
 - `CAST(expr AS type)` (`INT`/`BIGINT`/`DOUBLE`/`VARCHAR(n)`/`DECIMAL(p, s)`;
   see "LIKE/IN/CASE/CAST implementation notes" below for the
   truncate-vs-round caveat on numeric-to-integer casts, and "DECIMAL
@@ -113,8 +120,7 @@ SELECT <items> FROM read_parquet(...) AS a JOIN read_parquet(...) AS b ON <a.col
 
 Not yet supported (fails clearly rather than being silently reinterpreted):
 `DISTINCT`, `HAVING`, set operations (`UNION`/etc.), `WITH`/CTEs,
-subqueries, `OFFSET`, window functions, `LIKE` outside a top-level `WHERE`
-AND-conjunct (GPU) or in any context (CPU), `CASE` in `WHERE` (GPU only --
+subqueries, `OFFSET`, window functions, `CASE` in `WHERE` (GPU only --
 see above), any function other than the five aggregates above, comma-style
 joins, `LEFT`/`RIGHT`/`FULL`/`CROSS` JOIN, multi-key or non-equality join
 conditions, and 3+-table joins.
@@ -366,16 +372,30 @@ which cannot run the GPU path at all.
 
 **Scope for this phase**, matching the GPU engine's own original MVP order:
 `ParquetScan` -> `HashJoin` (two-table `INNER JOIN`, single equality key) ->
-`Filter` -> `Projection` (arithmetic/comparisons/`BETWEEN`/`CASE` only) ->
+`Filter` -> `Projection` (arithmetic/comparisons/`BETWEEN`/`CASE`/`LIKE`) ->
 `ScalarAggregate`/`HashAggregate` (`SUM`/`COUNT`/`MIN`/`MAX`/`AVG`, grouping
 only by a plain column) -> `Sort` (by a plain column only) -> `Limit`.
-`LIKE`/`IN`/`CAST`-to-`DECIMAL`-or-`STRING` are not yet supported here --
+`IN`/`CAST`-to-`DECIMAL`-or-`STRING` are not yet supported here --
 `compile_expression_cpu()` throws `ExecutionError` naming the specific
 unsupported construct rather than silently miscompiling. Arrow Compute's
 function registry is actually more complete than `cudf::ast` turned out to
 be for some of these (no "cannot output STRING" restriction, for
 instance), so extending this list later is likely less work than the GPU
 equivalents were -- just not free.
+
+**`LikeExpression` -> Arrow Compute's own `"match_like"` kernel, fixed.**
+This backend used to reject `LIKE`/`NOT LIKE` in every context
+("unrecognized expression type in CPU expression compiler
+(LIKE/IN/CASE/DECIMAL are not yet supported...)"), same as `CASE` (see
+just below) -- found together while adding TPC-H Q14, which needs `LIKE`
+inside a `CASE` branch inside an aggregate argument. Fixed in
+`compile_expression_cpu()` by mapping `LikeExpression` to `"match_like"`:
+the SQL-style `%`/`_` wildcard pattern `LikeExpression::pattern()` already
+stores needs no conversion, since `MatchSubstringOptions` accepts it
+directly; `NOT LIKE` wraps the result in `"invert"`. Since
+`compile_expression_cpu()` is the one function shared by every context on
+this backend, `WHERE`, `SELECT` list, and `CASE` branches all gained
+`LIKE` support from this one change, same as the `CASE` fix below.
 
 **`CaseExpression` -> Arrow Compute's own `"case_when"` kernel, fixed.**
 This backend used to reject `CASE` everywhere ("unrecognized expression
@@ -427,6 +447,67 @@ own `WHERE` clause needs it. Verified for real: matches DuckDB exactly for
 a scalar `SUM(CASE ...)`; a new regression test,
 `QueryEngineExecuteTest.CaseInScalarAggregateMatchesExpectedTotal`; all 250
 `gpu-dev` tests pass (was 249) with zero regressions.
+
+**`LikeExpression` support added to `HashAggregateOperator`,
+`ScalarAggregateOperator`, and `ProjectionOperator` (GPU), for `LIKE`
+inside a `CASE` branch.** Found while adding TPC-H Q14, which needs `SUM(CASE
+WHEN p_type LIKE 'PROMO%' THEN ... ELSE ... END)` -- a `LikeExpression` as a
+`CASE` branch's condition, compiled via each operator's own `compile_expr()`/
+`compile_value()`, which had no `LikeExpression` case at all (falling
+through to the plain `cudf::ast` `ExpressionCompiler`, which has no
+LIKE-equivalent operator, same reason `FilterOperator` special-cases
+top-level `WHERE` LIKE conjuncts instead of routing them through its own AST
+compiler). Fixed by adding an identical `CompiledLike` fast path (mirroring
+`CompiledCase`/`CompiledDecimalCast`'s existing pattern) to all three
+operators, each materializing via `cudf::strings::like()` directly --
+exactly `FilterOperator::evaluate_like()`'s own algorithm, just invoked from
+inside a `CASE` branch's evaluation instead of a top-level `WHERE`
+conjunct. This does **not** add general `LIKE` support to `WHERE` beyond
+what `FilterOperator` already had (that gap remains open, see above) --
+only `LIKE` reachable via a `CASE` branch or a plain (non-`CASE`) `GROUP
+BY`/aggregate-argument expression. Verified for real: TPC-H Q14's full
+shape (join + `CASE` + `LIKE` + two aggregates combined arithmetically --
+see the logical-planner fix just below) matches DuckDB exactly on GPU;
+`gpu-dev` (251/251, +1) passes with zero regressions.
+
+**A `SELECT` item combining multiple aggregates arithmetically, fixed (both
+backends).** `build_logical_plan()` used to only recognize a `SELECT` item
+as valid in an aggregate query if it *was* (at the top level) exactly an
+`AggregateExpression`, or exactly matched a `GROUP BY` key by `to_string()`
+-- anything else threw `"SELECT item '...' is neither an aggregate nor a
+GROUP BY column"`, even after the binder had already bound it successfully.
+TPC-H Q14's own `SELECT` item is exactly this shape: `100.00 * SUM(CASE
+WHEN ... THEN ... ELSE 0 END) / SUM(...)`, a `BinaryExpression` combining
+two `AggregateExpression` subtrees arithmetically, neither one bare --
+found while adding Q14, *after* the `LIKE`-in-`CASE` fixes above already
+made the query's individual pieces work; this was a third, separate gap.
+Fixed by `rewrite_aggregate_refs()` in `logical_planner.cpp`: a recursive
+rewrite that finds every distinct `AggregateExpression` subtree in a
+`SELECT` item (registering each once in `LogicalAggregate`'s output --
+deduplicated by `to_string()`, so `SUM(x) / SUM(x)` only computes it once),
+replaces it with a `ColumnExpression` pointing at its slot, and similarly
+short-circuits (without recursing further) at any subtree matching a
+`GROUP BY` key -- essential for `GROUP BY <alias>` resolving to a computed
+`SELECT`-list expression whose own internals (e.g. a column reference
+inside a `CASE`'s condition) are deliberately exempted from the
+ungrouped-column check at bind time specifically because the match happens
+at that whole-subtree level, not by decomposing further (see binder.cpp).
+A bare top-level aggregate `SELECT` item is special-cased to keep
+registering its slot under the query's own alias (e.g. `AS revenue`)
+rather than a synthetic name, preserving this project's existing
+field-naming convention for the common case; every other (newly
+discovered, possibly deeply-nested) aggregate reference gets a synthetic
+`__kernellake_agg_N` name instead, since there is no single natural
+output name for an aggregate that isn't itself a whole `SELECT` item.
+This fix lives in shared, backend-agnostic logical-plan-construction code,
+not per-backend execution code, so it applies to both the CPU and GPU
+backends at once. Verified for real: TPC-H Q14's full shape matches
+DuckDB exactly on *both* backends; two new regression tests,
+`LogicalPlanner.AggregateArithmeticCombiningTwoAggregatesBuildsBothSlots`
+and
+`QueryEngineExecuteCpuTest.ScalarAggregateArithmeticCombiningTwoAggregatesMatchesExpectedRatio`;
+`dev` (174/174), `server-dev` (177/177), `otel-dev` (177/177), and a real
+`gpu-dev` Docker rebuild (253/253) all pass with zero regressions.
 
 **`HashJoinNode` -> Acero's own `"hashjoin"` node, fixed.** This backend
 used to reject every `HashJoinNode` outright ("physical plan node

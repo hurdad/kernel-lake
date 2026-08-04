@@ -4,6 +4,8 @@
 #include <cudf/column/column_factories.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/scalar/scalar_factories.hpp>
+#include <cudf/strings/contains.hpp>
+#include <cudf/strings/strings_column_view.hpp>
 #include <cudf/transform.hpp>
 #include <cudf/unary.hpp>
 
@@ -32,10 +34,11 @@ ProjectionOperator::ProjectionOperator(OperatorId id, std::unique_ptr<PhysicalOp
 
 ProjectionOperator::CompiledValue ProjectionOperator::compile_value(const Expression& expr) {
   if (const auto* column_ref = dynamic_cast<const ColumnExpression*>(&expr)) {
-    return CompiledValue{static_cast<cudf::size_type>(column_ref->column_index()), nullptr, nullptr, nullptr};
+    return CompiledValue{static_cast<cudf::size_type>(column_ref->column_index()), nullptr, nullptr, nullptr,
+                         nullptr};
   }
   if (const auto* literal = dynamic_cast<const LiteralExpression*>(&expr)) {
-    return CompiledValue{std::nullopt, literal_to_scalar(*literal), nullptr, nullptr};
+    return CompiledValue{std::nullopt, literal_to_scalar(*literal), nullptr, nullptr, nullptr};
   }
   if (const auto* cast_expr = dynamic_cast<const CastExpression*>(&expr);
       cast_expr != nullptr && cast_expr->result_type().id == TypeId::Decimal) {
@@ -46,7 +49,16 @@ ProjectionOperator::CompiledValue ProjectionOperator::compile_value(const Expres
     value.decimal_cast = std::move(decimal_cast);
     return value;
   }
-  return CompiledValue{std::nullopt, nullptr, &compiler_.compile(expr), nullptr};
+  if (const auto* like_expr = dynamic_cast<const LikeExpression*>(&expr)) {
+    auto compiled_like = std::make_shared<CompiledLike>();
+    compiled_like->value = compile_value(*like_expr->value());
+    compiled_like->pattern = like_expr->pattern();
+    compiled_like->negated = like_expr->negated();
+    CompiledValue value;
+    value.like_expr = std::move(compiled_like);
+    return value;
+  }
+  return CompiledValue{std::nullopt, nullptr, &compiler_.compile(expr), nullptr, nullptr};
 }
 
 ProjectionOperator::CompiledItem ProjectionOperator::compile_item(const Expression& expr) {
@@ -75,6 +87,7 @@ void ProjectionOperator::open(ExecutionContext& context) {
 std::unique_ptr<cudf::column> ProjectionOperator::materialize_value(const CompiledValue& value,
                                                                     const cudf::table_view& batch,
                                                                     ExecutionContext& context) {
+  if (value.like_expr != nullptr) return materialize_like(*value.like_expr, batch, context);
   if (value.decimal_cast != nullptr) {
     const std::unique_ptr<cudf::column> operand =
         materialize_value(value.decimal_cast->operand, batch, context);
@@ -114,6 +127,20 @@ std::unique_ptr<cudf::column> ProjectionOperator::materialize_case(const Compile
                                 context.memory_resource);
   }
   return result;
+}
+
+// Mirrors FilterOperator::evaluate_like()'s exact algorithm -- see
+// HashAggregateOperator::materialize_like's identical comment.
+std::unique_ptr<cudf::column> ProjectionOperator::materialize_like(const CompiledLike& like_expr,
+                                                                   const cudf::table_view& batch,
+                                                                   ExecutionContext& context) {
+  const std::unique_ptr<cudf::column> value = materialize_value(like_expr.value, batch, context);
+  std::unique_ptr<cudf::column> mask =
+      cudf::strings::like(cudf::strings_column_view(value->view()), like_expr.pattern, "", context.stream,
+                          context.memory_resource);
+  if (!like_expr.negated) return mask;
+  return cudf::unary_operation(mask->view(), cudf::unary_operator::NOT, context.stream,
+                               context.memory_resource);
 }
 
 std::optional<DeviceBatch> ProjectionOperator::next(ExecutionContext& context) {
