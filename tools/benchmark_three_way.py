@@ -256,92 +256,102 @@ def benchmark_one_query(
     orders_data_glob: str | None,
     iterations: int,
     modes: tuple,
+    backends: tuple,
 ) -> dict:
     print(f"=== Q{query_number} ===")
 
-    # Correctness first: one untimed, warm run per engine, cross-validated
-    # pairwise before any timing is trusted. Cache state doesn't affect
-    # correctness, so this never evicts.
+    # Correctness first: one untimed, warm run per *enabled* engine (see
+    # --backends -- a real large-scale run can have a genuine, real reason
+    # to skip one, e.g. the CPU backend's unbounded read_scan_table()
+    # against a dataset too big to fit in host RAM; see docs/ROADMAP.md),
+    # cross-validated pairwise before any timing is trusted. Cache state
+    # doesn't affect correctness, so this never evicts.
     try:
-        cpu_table, _ = run_kernellake_backend(
-            kernellake_bin, query_number, data_glob, "cpu", part_data_glob, orders_data_glob
-        )
-        gpu_table, _ = run_kernellake_backend(
-            kernellake_bin, query_number, data_glob, "gpu", part_data_glob, orders_data_glob
-        )
-        spark_table, _ = run_pyspark_query(spark, query_number, data_glob, part_data_glob, orders_data_glob)
+        tables = {}
+        if "kernellake-cpu" in backends:
+            tables["kernellake-cpu"], _ = run_kernellake_backend(
+                kernellake_bin, query_number, data_glob, "cpu", part_data_glob, orders_data_glob
+            )
+        if "kernellake-gpu" in backends:
+            tables["kernellake-gpu"], _ = run_kernellake_backend(
+                kernellake_bin, query_number, data_glob, "gpu", part_data_glob, orders_data_glob
+            )
+        if "pyspark" in backends:
+            tables["pyspark"], _ = run_pyspark_query(spark, query_number, data_glob, part_data_glob, orders_data_glob)
     except Exception as exc:  # noqa: BLE001 -- reported as a validation failure, not a crash
         print(f"    ERROR during correctness check: {exc}")
         return {"query": query_number, "validated": False, "error": str(exc)}
 
-    cpu_rows = normalize(cpu_table)
-    gpu_rows = normalize(gpu_table)
-    spark_rows = normalize(spark_table)
+    rows_by_engine = {engine: normalize(table) for engine, table in tables.items()}
 
     pairs = [
-        ("kernellake-cpu", "kernellake-gpu", cpu_rows, gpu_rows),
-        ("kernellake-cpu", "pyspark", cpu_rows, spark_rows),
-        ("kernellake-gpu", "pyspark", gpu_rows, spark_rows),
+        (a, b, rows_by_engine[a], rows_by_engine[b])
+        for i, a in enumerate(backends)
+        for b in backends[i + 1 :]
     ]
     mismatches = [(a, b) for a, b, ra, rb in pairs if not rows_match(ra, rb)]
     if mismatches:
         for a, b in mismatches:
             print(f"    FAIL: {a} and {b} disagree")
-        print(f"    kernellake-cpu sample: {cpu_rows[:3]}")
-        print(f"    kernellake-gpu sample: {gpu_rows[:3]}")
-        print(f"    pyspark sample:        {spark_rows[:3]}")
-        return {"query": query_number, "validated": False, "row_count": len(cpu_rows)}
+        for engine, rows in rows_by_engine.items():
+            print(f"    {engine} sample: {rows[:3]}")
+        return {"query": query_number, "validated": False, "row_count": len(next(iter(rows_by_engine.values())))}
 
-    print(f"    PASS: all three engines agree ({len(cpu_rows)} rows)")
+    row_count = len(next(iter(rows_by_engine.values())))
+    print(f"    PASS: {', '.join(backends)} agree ({row_count} rows)")
 
-    result = {"query": query_number, "validated": True, "row_count": len(cpu_rows), "iterations": iterations}
+    result = {"query": query_number, "validated": True, "row_count": row_count, "iterations": iterations}
     for mode in modes:
         cold = mode == "cold"
         # Cache is evicted again before *each* engine's own read within an
         # iteration, not just once per iteration -- otherwise one engine's
         # read would silently re-warm the cache for the next engine in the
         # same iteration, making its own "cold" measurement actually warm.
-        timings = {engine: [] for engine in ENGINES}
+        timings = {engine: [] for engine in backends}
         for i in range(iterations):
-            _, t = run_kernellake_backend(
-                kernellake_bin, query_number, data_glob, "cpu", part_data_glob, orders_data_glob, cold=cold
-            )
-            timings["kernellake-cpu"].append(t)
-            _, t = run_kernellake_backend(
-                kernellake_bin, query_number, data_glob, "gpu", part_data_glob, orders_data_glob, cold=cold
-            )
-            timings["kernellake-gpu"].append(t)
-            _, t = run_pyspark_query(
-                spark, query_number, data_glob, part_data_glob, orders_data_glob, cold=cold
-            )
-            timings["pyspark"].append(t)
+            if "kernellake-cpu" in backends:
+                _, t = run_kernellake_backend(
+                    kernellake_bin, query_number, data_glob, "cpu", part_data_glob, orders_data_glob, cold=cold
+                )
+                timings["kernellake-cpu"].append(t)
+            if "kernellake-gpu" in backends:
+                _, t = run_kernellake_backend(
+                    kernellake_bin, query_number, data_glob, "gpu", part_data_glob, orders_data_glob, cold=cold
+                )
+                timings["kernellake-gpu"].append(t)
+            if "pyspark" in backends:
+                _, t = run_pyspark_query(
+                    spark, query_number, data_glob, part_data_glob, orders_data_glob, cold=cold
+                )
+                timings["pyspark"].append(t)
             print(f"    [{mode}] iteration {i + 1}/{iterations} done")
-        result[mode] = {engine: median_stats(timings[engine]) for engine in ENGINES}
+        result[mode] = {engine: median_stats(timings[engine]) for engine in backends}
     return result
 
 
-def print_summary_table(results: list, modes: tuple) -> None:
+def print_summary_table(results: list, modes: tuple, backends: tuple) -> None:
     print()
     print("=" * 90)
     print("UNOFFICIAL three-way benchmark -- NOT a certified TPC-H result.")
     print("KernelLake-CPU vs. KernelLake-GPU vs. PySpark (local[*]), same dataset.")
+    if len(backends) < len(ENGINES):
+        skipped = [e for e in ENGINES if e not in backends]
+        print(f"NOTE: {', '.join(skipped)} skipped for this run (--backends) -- see docs/ROADMAP.md.")
     print("=" * 90)
-    header = (
-        f"{'query':<7}{'mode':<7}{'validated':<11}{'cpu (median s)':<16}"
-        f"{'gpu (median s)':<16}{'pyspark (median s)':<20}"
+    columns = {"kernellake-cpu": "cpu (median s)", "kernellake-gpu": "gpu (median s)", "pyspark": "pyspark (median s)"}
+    header = f"{'query':<7}{'mode':<7}{'validated':<11}" + "".join(
+        f"{columns[engine]:<20}" for engine in backends
     )
     print(header)
     print("-" * len(header))
     for result in results:
         if not result.get("validated"):
             for mode in modes:
-                print(f"Q{result['query']:<6}{mode:<7}{'NO':<11}{'--':<16}{'--':<16}{'--':<20}")
+                print(f"Q{result['query']:<6}{mode:<7}{'NO':<11}" + "".join(f"{'--':<20}" for _ in backends))
             continue
         for mode in modes:
-            cpu_med = result[mode]["kernellake-cpu"]["median_seconds"]
-            gpu_med = result[mode]["kernellake-gpu"]["median_seconds"]
-            spark_med = result[mode]["pyspark"]["median_seconds"]
-            print(f"Q{result['query']:<6}{mode:<7}{'yes':<11}{cpu_med:<16.4f}{gpu_med:<16.4f}{spark_med:<20.4f}")
+            medians = "".join(f"{result[mode][engine]['median_seconds']:<20.4f}" for engine in backends)
+            print(f"Q{result['query']:<6}{mode:<7}{'yes':<11}{medians}")
     print("=" * 90)
 
 
@@ -378,7 +388,26 @@ def main() -> int:
         "--data scale factors -- a real SF10/60M-row run hit a genuine Java heap OutOfMemoryError "
         "at the previous unconfigured default)",
     )
+    parser.add_argument(
+        "--backends",
+        default="cpu,gpu,pyspark",
+        help="Comma-separated subset of cpu,gpu,pyspark to run and cross-validate (default: all three). "
+        "Skip an engine with a known real limit at the scale being tested -- e.g. the CPU backend's "
+        "read_scan_table() materializes an entire scan into host RAM with no bound (see "
+        "docs/ROADMAP.md), which doesn't fit at large enough scale factors regardless of query. "
+        "At least two backends are required, since this script's whole point is validating that "
+        "engines agree before trusting any timing.",
+    )
     args = parser.parse_args()
+
+    backends = tuple(b.strip() for b in args.backends.split(","))
+    backend_name_by_flag = {"cpu": "kernellake-cpu", "gpu": "kernellake-gpu", "pyspark": "pyspark"}
+    unknown = [b for b in backends if b not in backend_name_by_flag]
+    if unknown:
+        parser.error(f"--backends: unknown engine(s) {unknown} -- choose from cpu, gpu, pyspark")
+    backends = tuple(backend_name_by_flag[b] for b in backends)
+    if len(backends) < 2:
+        parser.error("--backends: need at least two engines to cross-validate against each other")
 
     if args.query == "all":
         # Q19 needs --part-data, Q12 needs --orders-data; each is silently
@@ -396,30 +425,33 @@ def main() -> int:
     for key, value in system_stats.items():
         print(f"    {key}: {value}")
 
-    from pyspark.sql import SparkSession
+    spark = None
+    if "pyspark" in backends:
+        from pyspark.sql import SparkSession
 
-    # spark.driver.memory: local[*] mode runs the driver and every executor
-    # thread inside one JVM process (no separate executor JVMs), so this is
-    # the one setting that actually bounds all of it. Left at PySpark's own
-    # small default, a real run against a genuinely large dataset (SF10,
-    # 60M rows, local[*] spreading the scan across every CPU core at once)
-    # hit a real "java.lang.OutOfMemoryError: Java heap space" failure --
-    # confirmed by an actual run, not a hypothetical concern. args.driver_memory
-    # is left tunable rather than hardcoded, since the right value scales
-    # with both the dataset size and the host's available RAM.
-    spark = (
-        SparkSession.builder.appName("kernellake-benchmark-three-way")
-        .master("local[*]")
-        .config("spark.ui.showConsoleProgress", "false")
-        .config("spark.driver.memory", args.spark_driver_memory)
-        .getOrCreate()
-    )
-    spark.sparkContext.setLogLevel("WARN")
-    spark.read.parquet(args.data).createOrReplaceTempView("lineitem")
-    if args.part_data:
-        spark.read.parquet(args.part_data).createOrReplaceTempView("part")
-    if args.orders_data:
-        spark.read.parquet(args.orders_data).createOrReplaceTempView("orders")
+        # spark.driver.memory: local[*] mode runs the driver and every
+        # executor thread inside one JVM process (no separate executor
+        # JVMs), so this is the one setting that actually bounds all of it.
+        # Left at PySpark's own small default, a real run against a
+        # genuinely large dataset (SF10, 60M rows, local[*] spreading the
+        # scan across every CPU core at once) hit a real
+        # "java.lang.OutOfMemoryError: Java heap space" failure -- confirmed
+        # by an actual run, not a hypothetical concern. args.driver_memory
+        # is left tunable rather than hardcoded, since the right value
+        # scales with both the dataset size and the host's available RAM.
+        spark = (
+            SparkSession.builder.appName("kernellake-benchmark-three-way")
+            .master("local[*]")
+            .config("spark.ui.showConsoleProgress", "false")
+            .config("spark.driver.memory", args.spark_driver_memory)
+            .getOrCreate()
+        )
+        spark.sparkContext.setLogLevel("WARN")
+        spark.read.parquet(args.data).createOrReplaceTempView("lineitem")
+        if args.part_data:
+            spark.read.parquet(args.part_data).createOrReplaceTempView("part")
+        if args.orders_data:
+            spark.read.parquet(args.orders_data).createOrReplaceTempView("orders")
 
     results = []
     try:
@@ -434,12 +466,14 @@ def main() -> int:
                     args.orders_data,
                     args.iterations,
                     modes,
+                    backends,
                 )
             )
     finally:
-        spark.stop()
+        if spark is not None:
+            spark.stop()
 
-    print_summary_table(results, modes)
+    print_summary_table(results, modes, backends)
 
     if args.output:
         report = {
@@ -450,6 +484,7 @@ def main() -> int:
             "part_data": args.part_data,
             "orders_data": args.orders_data,
             "modes": list(modes),
+            "backends": list(backends),
             "system": system_stats,
             "results": results,
         }

@@ -694,14 +694,14 @@ and covered by passing tests -- not merely designed or stubbed.
 
   **Confirmed on real GPU hardware**: both queries x both modes, all
   `validated: true`. Median wall-clock seconds (KernelLake-CPU /
-  KernelLake-GPU / PySpark local[*]): Q1 cold 42.0526/10.2696/9.0160, warm
-  40.1890/9.5549/7.9632; Q6 cold 10.2655/2.7019/3.2189, warm
-  8.5967/1.9393/3.0081. Notable real pattern: the GPU backend now beats
+  KernelLake-GPU / PySpark local[*]): Q1 cold 41.7954/10.2624/8.8723, warm
+  40.0814/9.4430/7.9964; Q6 cold 10.2550/2.6891/3.2825, warm
+  8.7350/1.9475/2.9804. Notable real pattern: the GPU backend now beats
   PySpark outright on Q6 at both modes (a reversal from SF0.01-SF10, where
   PySpark stayed fastest of all three engines at every scale factor tried)
   -- but PySpark still edges out GPU on Q1, though by a much smaller margin
   than at SF10. `--mode both`'s cold-vs-warm gap is modest for every engine
-  at this scale (e.g. GPU Q1 10.27s cold vs. 9.55s warm), unlike smaller
+  at this scale (e.g. GPU Q1 10.26s cold vs. 9.44s warm), unlike smaller
   scale factors where it was closer to negligible -- consistent with disk
   I/O becoming a real, if still secondary, cost component once the working
   set (~11 GiB compressed, more decompressed) stops comfortably fitting in
@@ -710,8 +710,32 @@ and covered by passing tests -- not merely designed or stubbed.
   statistically-controlled study or a general performance claim, per this
   project's own reporting rule. Report (system stats, summary table, a
   bar chart per query across modes) rendered as `benchmark-results/
-  sf100-report.pdf` via `tools/generate_benchmark_report.py`; raw JSON and
-  PDF are gitignored local artifacts, not committed.
+  sf100-report-v3.pdf` via `tools/generate_benchmark_report.py`; raw JSON
+  and PDF are gitignored local artifacts, not committed.
+
+  Q19 and Q12 were also attempted at SF100 once wired in (see the later
+  "TPC-H Q19/Q12 wired into the three-way performance benchmark" entries
+  below), surfacing two more real, separate resource limits at this scale
+  -- both left out of the final SF100 numbers above rather than reported
+  as false failures or silently retried away: **Q12 on GPU** OOM'd
+  immediately (see the `HashJoinOperator` streaming gap in "Not yet
+  started" below -- `orders`, the smaller table, ends up as the probe
+  side and `lineitem`, the larger one, as the unconditionally-materialized
+  build side, the opposite of what a real planner should choose). **Q19 on
+  CPU** validated correctly and completed 2 of 5 cold iterations before
+  the `kernellake` subprocess died with empty `stderr` -- the signature of
+  a SIGKILL, not a normal exception (every other real failure in this
+  session printed an actual error message) -- and host swap usage went
+  from 0 B at the start of this session to 3 GiB, consistent with a real
+  OOM. Root cause not fully isolated (candidates: `acero_query_executor
+  .cpp`'s `read_scan_table()` materializing the full `lineitem`
+  scan for a join into host RAM with no bound, already a documented MVP
+  simplification in that file's own comment; PySpark's 64 GiB-capped
+  driver JVM heap not being reclaimed between iterations; or both
+  compounding) -- noted here as a real, reproduced-once symptom, not
+  chased further this session. Both are left as open follow-ups (see "Not
+  yet started" below) rather than blocking the Q1/Q6 numbers this entry
+  reports.
 - **CPU execution backend's `HashJoin`, fixed** (Phase 3 of the
   CPU-backend/benchmark epic -- scoping out which TPC-H queries beyond
   Q1/Q6 could be added next). The CPU backend rejected every join query
@@ -912,6 +936,72 @@ and covered by passing tests -- not merely designed or stubbed.
   closest) and there is no Rust toolchain in this project's dev environment
   yet, which makes this a genuinely new class of dependency deserving its
   own spike rather than a fourth line item bolted onto the two epics above.
+- CPU execution backend's Parquet scan is single-threaded, unlike Acero
+  itself. `acero_query_executor.cpp`'s `read_scan_table()` (every
+  `ParquetScanNode` is translated to a `"table_source"` Declaration fed by
+  this function, not Acero's own dataset-aware `"scan"` node) reads each
+  fragment with `parquet::arrow::FileReader::Make()` (no `use_threads` set,
+  defaults off) in a plain sequential loop across files, entirely before
+  Acero's own multi-threaded `ExecPlan` (`DeclarationToTable()`'s default
+  `ExecContext`, backed by `arrow::internal::GetCpuThreadPool()`) ever
+  starts -- so the scan itself, likely the dominant cost for a
+  near-unfiltered query like Q1, never uses more than one core. Noticed
+  investigating why KernelLake-CPU's SF100 Q1 (42.05s median) is
+  disproportionately slower than both KernelLake-GPU (10.27s) and
+  PySpark's `local[*]` (9.02s, which explicitly parallelizes the scan
+  across every core) -- not yet root-caused further or fixed, just
+  identified for a later session. Likely fix shape: either read fragments
+  concurrently (e.g. one thread per file, matching this project's own
+  20-core dev hardware) or switch to Acero's native `"scan"`
+  (`arrow::acero::ScanNodeOptions` over an `arrow::dataset::Dataset`)
+  instead of pre-materializing a `table_source`, which would also pick up
+  Acero's own fragment-level parallelism for free.
+- GPU `HashJoinOperator` has no bounded-memory/streaming design at all --
+  unlike `ParquetScanOperator`'s pass-based reading or
+  `HashAggregateOperator`'s `max_distinct_keys` batching, `open()`
+  unconditionally drains the *entire* right (build) side into device
+  memory (`while (right_->next()) { right_batches.push_back(...) }`, then
+  `cudf::concatenate()` and one `cudf::hash_join` over all of it) before
+  the probe side is ever touched. A real SF100 attempt at Q12 (`FROM
+  orders JOIN lineitem ON o_orderkey = l_orderkey`) threw a real
+  `std::bad_alloc: ... RMM ... Exceeded memory limit` immediately -- and
+  not only from this gap: `orders` is the left/probe side and `lineitem`
+  (600M rows, the *larger* table) ends up as the right/build side, the
+  opposite of what a real query planner should choose (build on the
+  smaller side). Even fixing the build-side choice (build on `orders`,
+  150M rows) would likely still exceed 8 GiB VRAM at this scale --
+  swapping sides narrows the gap but doesn't close it; genuinely bounded
+  memory needs a streaming/partitioned (grace) hash join, a substantially
+  bigger feature than this session's Q1 pass-sizing fix. Q19 (`lineitem`
+  600M rows JOIN `part` 20M rows -- `part` already the smaller side,
+  matching this operator's current "build whichever side is `right`"
+  behavior by coincidence, not by any actual size-aware choice) succeeded
+  fine at the same scale, so this is specifically a build-side-materialization
+  problem, not a blanket "joins don't work at scale" one. SF100's
+  three-way benchmark run omits `--orders-data` (skips Q12 entirely,
+  same "missing argument, not attempted-and-failed" convention
+  `tools/benchmark_three_way.py` already uses) rather than reporting a
+  fake or misleading number.
+- Q19 on the **CPU** backend got killed partway through SF100 timed
+  iterations (correctness validated fine first; died on cold iteration
+  3/5) -- a real, reproduced-once resource failure, root cause not yet
+  isolated. The `kernellake` subprocess's `stderr` was empty on failure
+  (every other real crash this session printed an actual message), and
+  host swap usage went from unused to 3 GiB over the session, both
+  consistent with the OS OOM-killing the process rather than it throwing
+  a normal exception. Candidate causes, none confirmed yet: (1)
+  `acero_query_executor.cpp`'s `read_scan_table()` materializes an
+  entire join's input tables into host RAM with no bound (a documented
+  MVP simplification, see that file's own comment -- for Q19 that's all
+  of `lineitem`'s needed columns, ~600M rows); (2) PySpark's
+  `spark.driver.memory=64g` JVM heap not being reclaimed between the
+  three-way loop's repeated iterations; (3) both compounding under `both`
+  mode's repeated cold-then-warm cycles. A retry of the same run
+  immediately after (with `--orders-data` dropped, Q19 kept) completed
+  Q1/Q6 cleanly through all 20 iterations with no recurrence, so this
+  isn't a hard, deterministic block at this scale -- but also not
+  something to treat as a one-off fluke without further investigation
+  before trusting a full Q1/Q6/Q19 SF100 (or larger) run's numbers.
 
 ## Explicit non-goals for the MVP
 

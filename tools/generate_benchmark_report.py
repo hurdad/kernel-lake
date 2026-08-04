@@ -106,36 +106,45 @@ def add_title_page(pdf: PdfPages, reports: list) -> None:
     plt.close(fig)
 
 
+def report_backends(report: dict) -> list:
+    # "backends" is only present in reports from a benchmark_three_way.py
+    # new enough to have --backends; older reports always ran all three, so
+    # that's the correct fallback for them, not an arbitrary default.
+    return report.get("backends", list(ENGINE_LABELS))
+
+
 def add_summary_table_page(pdf: PdfPages, reports: list) -> None:
     fig, ax = plt.subplots(figsize=(8.5, 11))
     ax.axis("off")
     ax.set_title("Median wall-clock time per query (seconds)", fontsize=13, weight="bold", pad=20)
 
+    # Fixed column set across the whole table (union of every report's
+    # backends, in ENGINE_LABELS' canonical order) -- a report that skipped
+    # an engine (e.g. --backends gpu,pyspark) gets "n/a" in that column
+    # rather than a differently-shaped table per report.
+    all_backends = [e for e in ENGINE_LABELS if any(e in report_backends(r) for r in reports)]
+
     rows = []
     for report in reports:
         sf = report.get("scale_factor", "?")
         modes = report.get("modes", ["warm"])
+        backends = report_backends(report)
         for result in report.get("results", []):
             if not result.get("validated"):
                 for mode in modes:
-                    rows.append([f"SF{sf}", mode, f"Q{result['query']}", "NOT VALIDATED", "--", "--"])
+                    rows.append([f"SF{sf}", mode, f"Q{result['query']}"] + ["NOT VALIDATED"] * len(all_backends))
                 continue
             for mode in modes:
                 mode_result = result[mode]
-                rows.append(
-                    [
-                        f"SF{sf}",
-                        mode,
-                        f"Q{result['query']}",
-                        f"{mode_result['kernellake-cpu']['median_seconds']:.4f}",
-                        f"{mode_result['kernellake-gpu']['median_seconds']:.4f}",
-                        f"{mode_result['pyspark']['median_seconds']:.4f}",
-                    ]
-                )
+                cells = [
+                    f"{mode_result[engine]['median_seconds']:.4f}" if engine in backends else "n/a"
+                    for engine in all_backends
+                ]
+                rows.append([f"SF{sf}", mode, f"Q{result['query']}"] + cells)
 
     table = ax.table(
         cellText=rows,
-        colLabels=["Scale factor", "Mode", "Query", "KernelLake-CPU", "KernelLake-GPU", "PySpark"],
+        colLabels=["Scale factor", "Mode", "Query"] + [ENGINE_LABELS[e] for e in all_backends],
         loc="center",
         cellLoc="center",
     )
@@ -158,17 +167,23 @@ def add_chart_page(pdf: PdfPages, reports: list, query_number: int, mode: str) -
             continue
         scale_factors.append(f"SF{sf}")
         for engine in ENGINE_LABELS:
-            timings[engine].append(result[mode][engine]["median_seconds"])
+            mode_result = result[mode]
+            timings[engine].append(mode_result[engine]["median_seconds"] if engine in mode_result else None)
 
     if not scale_factors:
         return
 
+    # An engine skipped (--backends) for every scale factor in this chart
+    # gets no bar and no legend entry at all, rather than a row of zeros.
+    present_engines = [e for e in ENGINE_LABELS if any(v is not None for v in timings[e])]
+
     fig, ax = plt.subplots(figsize=(8.5, 6))
     x = range(len(scale_factors))
     width = 0.25
-    for i, engine in enumerate(ENGINE_LABELS):
+    for i, engine in enumerate(present_engines):
         offsets = [pos + (i - 1) * width for pos in x]
-        ax.bar(offsets, timings[engine], width=width, label=ENGINE_LABELS[engine], color=ENGINE_COLORS[engine])
+        values = [v if v is not None else 0.0 for v in timings[engine]]
+        ax.bar(offsets, values, width=width, label=ENGINE_LABELS[engine], color=ENGINE_COLORS[engine])
     ax.set_xticks(list(x))
     ax.set_xticklabels(scale_factors)
     ax.set_ylabel("Median wall-clock time (seconds)")
