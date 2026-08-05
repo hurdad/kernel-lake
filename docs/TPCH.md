@@ -152,9 +152,11 @@ compression, 1,000,000-row row groups). Q19, Q12, Q14, and Q3 have each
 been verified at SF0.01 on both the CPU and GPU backends, exact match
 against DuckDB (Q3 including its 3-way join, `ORDER BY revenue DESC,
 o_orderdate` multi-key sort, and `LIMIT 10`) -- also cross-validated
-against PySpark via `tools/benchmark_three_way.py`'s four-way engine
-comparison (KernelLake-CPU, KernelLake-GPU, PySpark, DuckDB all agree on
-every query, real GPU hardware, SF0.01).
+against PySpark and DuckDB via `tools/benchmark_three_way.py` (KernelLake
+via a persistent `kernellake-server` over Arrow Flight SQL, PySpark, and
+DuckDB all agree on every query, real GPU hardware, SF0.01/SF1/SF10 -- see
+`docs/ROADMAP.md` for the full crossover numbers and a
+`--cost-per-hour`-based cost-per-TB comparison).
 
 ## 4. Benchmark
 

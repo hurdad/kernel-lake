@@ -155,8 +155,9 @@ ctest --preset gpu-dev
 ./build/gpu-dev/src/cli/kernellake query --sql "..." --stats   # prints measured metrics to stderr
 
 # Run the same query on the CPU (Apache Arrow Acero) instead -- works with
-# either build, including the CPU-only dev build. See docs/ARCHITECTURE.md
-# for this backend's current query-shape scope (no LIKE/IN/CASE/HashJoin yet).
+# either build, including the CPU-only dev build. Supports LIKE/CASE/JOIN
+# (including N-way chains) too; see docs/ARCHITECTURE.md for this
+# backend's current query-shape scope.
 ./build/dev/src/cli/kernellake query --backend cpu \
   --sql "SELECT region, SUM(amount) FROM read_parquet('/tmp/kernellake-sales/*.parquet') GROUP BY region"
 ```
@@ -186,12 +187,20 @@ grouped aggregates (including a ~40,000-group `GROUP BY customer_id`), and
 
 ## TPC-H-derived benchmarking (unofficial)
 
-**Unofficial TPC-H-derived benchmark. Not a certified TPC result.** Q6 and
-Q1 (both `lineitem`-only, no joins) are supported; see
-[docs/TPCH.md](docs/TPCH.md) for the full generate -> query -> validate ->
-benchmark workflow, including `tools/generate_tpch.py` (a synthetic
-generator, not the official `dbgen`) and `kernellake benchmark tpch`'s
-cold/warm timing modes.
+**Unofficial TPC-H-derived benchmark. Not a certified TPC result.** Q1, Q3,
+Q6, Q12, Q14, and Q19 are supported -- both single-table scans (Q1/Q6) and
+multi-table `INNER JOIN` chains (Q3's 3-way `customer`/`orders`/`lineitem`
+join, Q12/Q14/Q19's 2-way joins), on both the CPU and GPU execution
+backends. See [docs/TPCH.md](docs/TPCH.md) for the full generate -> query
+-> validate -> benchmark workflow, including `tools/generate_tpch.py` (a
+synthetic generator, not the official `dbgen`) and `kernellake benchmark
+tpch`'s cold/warm timing modes.
+
+`tools/benchmark_three_way.py` additionally cross-validates and times
+KernelLake (via a persistent `kernellake-server` over Arrow Flight SQL),
+PySpark, and DuckDB against the same generated dataset, including a
+`--cost-per-hour` flag for a real cost-per-TB-processed comparison across
+engines -- see `docs/ROADMAP.md` for real numbers from this.
 
 ## Docker
 
@@ -233,7 +242,7 @@ no arm64 hardware or runner was used to verify this). `kernel-lake-gpu` is
 arm64 GPU hardware (e.g. NVIDIA Grace/Jetson) to verify, which hasn't
 happened yet; see `docs/ROADMAP.md`. `docker run --gpus all` against a real
 GPU (RTX 5060 Ti) has been verified for real against this Ubuntu 26.04
-baseline: all 214 tests pass in the `dev-gpu` image, and a real query
+baseline: all 261 tests pass in the `dev-gpu` image, and a real query
 against real generated data through the `runtime-gpu` image alone produces
 correct GPU-executed results -- see `docs/ARCHITECTURE.md`. `runtime-cpu`
 has been verified for real too: a real `docker build --target runtime-cpu`,
@@ -242,6 +251,21 @@ produce correct results through the built image. CI's own `docker-publish`
 job (building against the previous, pre-cpu/gpu-split Dockerfile) had
 separately succeeded end to end on real GitHub Actions; re-confirming CI
 still passes with this restructuring is still pending.
+
+## Arrow Flight SQL server and observability
+
+`kernellake-server` (built behind `KERNELLAKE_BUILD_SERVER`, the
+`server-dev` preset) serves SQL queries over Arrow Flight SQL instead of
+one-shot CLI invocations -- the same `QueryEngine` the CLI uses, so it
+supports the identical SQL grammar and both execution backends. Query it
+from Python with `adbc-driver-flightsql`, or deploy it to Kubernetes via
+`charts/kernellake/` (see that chart's own `README.md`).
+
+Built behind `KERNELLAKE_ENABLE_OTEL` (the `otel-dev` preset), KernelLake
+also exports OpenTelemetry traces (one span per query), one query-duration
+histogram metric, and every existing log line -- see
+[docs/OBSERVABILITY.md](docs/OBSERVABILITY.md) for the full signal list,
+config schema, and how to point it at a real collector.
 
 ## Project layout
 
@@ -252,7 +276,7 @@ tests/unit/                    GoogleTest unit tests (CPU-only, both presets)
 tests/gpu/                     GoogleTest GPU tests (gpu-dev preset only)
 tools/                         Python tooling (DuckDB cross-validation, TPC-H generation)
 benchmarks/tpch/queries/       Version-controlled TPC-H-derived SQL (q01.sql, q06.sql)
-docs/                          ARCHITECTURE.md, ROADMAP.md, TPCH.md
+docs/                          ARCHITECTURE.md, ROADMAP.md, TPCH.md, OBSERVABILITY.md
 config/kernellake.yaml         default engine configuration
 ```
 

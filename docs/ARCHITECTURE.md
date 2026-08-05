@@ -372,8 +372,10 @@ cpu`), not a build-time one, and it works even on the CPU-only `dev` build,
 which cannot run the GPU path at all.
 
 **Scope for this phase**, matching the GPU engine's own original MVP order:
-`ParquetScan` -> `HashJoin` (two-table `INNER JOIN`, single equality key) ->
-`Filter` -> `Projection` (arithmetic/comparisons/`BETWEEN`/`CASE`/`LIKE`) ->
+`ParquetScan` -> `HashJoin` (a chain of two or more tables, `INNER JOIN`
+only, each step a single equality key -- see "Hash joins" below for the
+full N-way scope, which applies identically to this backend) -> `Filter`
+-> `Projection` (arithmetic/comparisons/`BETWEEN`/`CASE`/`LIKE`) ->
 `ScalarAggregate`/`HashAggregate` (`SUM`/`COUNT`/`MIN`/`MAX`/`AVG`, grouping
 only by a plain column) -> `Sort` (by a plain column only) -> `Limit`.
 `IN`/`CAST`-to-`DECIMAL`-or-`STRING` are not yet supported here --
@@ -559,16 +561,48 @@ input, which `translate_aggregate()` uses instead for
 `count`/`hash_count` with `CountOptions::ONLY_VALID`, matching the GPU
 path's null-exclusion semantics).
 
-**Scan pruning is reused, not rediscovered.** `read_scan_table()` reads
-each `ParquetScanNode` fragment via `parquet::arrow::FileReader::
+**Scan pruning is reused, not rediscovered.** `make_streaming_scan_reader()`
+opens each `ParquetScanNode` fragment via `parquet::arrow::FileReader::
 GetRecordBatchReader(selected_row_groups, column_indices)`, honoring the
 exact row-group and column pruning decisions the physical planner already
 computed -- deliberately not routed through `arrow::dataset`, which would
 have no way to know about pruning this project's own physical planner
-already did. Unlike the GPU path's bounded-memory, pass-based streaming
-(`ParquetScanOperator`), this reads each fragment's selected row groups
-fully into memory: a real, documented MVP simplification, not a bounded
-streaming scan.
+already did.
+
+**The scan is lazy and memory-bounded, not a full-table materialization.**
+An earlier version of this backend (`read_scan_table()`, since replaced)
+read every fragment's every selected row group fully into one in-memory
+`arrow::Table` before Acero's pipeline even started, fed in via
+`TableSourceNodeOptions`/`"table_source"` -- memory footprint scaled with
+total input size, not whatever was actually in flight. `translate()` now
+builds a lazy `arrow::RecordBatchReader` instead (one `arrow::Iterator`
+wrapping a small `ScanIterationState`: opens and reads one fragment at a
+time, one batch at a time, only opening the *next* fragment once the
+current one is exhausted), handed to Acero via
+`RecordBatchReaderSourceNodeOptions`/`"record_batch_reader_source"`.
+Verified for real: a SF10 TPC-H run (`benchmarks/tpch/queries/q01.sql`,
+60M-row `lineitem`) peaked at 130 MB resident (`/usr/bin/time -v`) instead
+of holding the whole decompressed table in memory.
+
+Two real bugs surfaced building this, not just a mechanical swap: (1) a
+genuine use-after-free -- `parquet::arrow::FileReader::
+GetRecordBatchReader()`'s own docs say "FileReaders must outlive their
+RecordBatchReaders," and an early draft returned only the
+`RecordBatchReader` from a helper, letting the `FileReader` it depends on
+be destroyed at that helper's return; crashed every CPU query-execution
+test with a segfault, caught immediately by the existing suite. Fixed by
+bundling both together in one `OpenFragment` struct. (2) Every exception
+the lazy reader's fragment-opening logic can throw must be caught *inside*
+the iterator callback itself and converted to an `arrow::Status` failure --
+`RecordBatchReaderSourceNodeOptions` runs each `ReadNext()` as a task on
+Acero's own I/O thread pool, where an uncaught C++ exception would escape
+a thread-pool worker rather than reach `execute_physical_plan_cpu()`'s
+top-level `try`/`catch`.
+
+Still true, and explicitly not addressed by this fix: the scan itself
+remains single-threaded (each fragment is still read sequentially, one
+core, before Acero's own multi-threaded `ExecPlan` starts) -- see
+`docs/ROADMAP.md` for that separate, still-open gap.
 
 **`QueryResult::cpu_execution_seconds`, not `gpu_execution_seconds`, times
 this backend.** The two fields are kept separate (both `std::optional`,
@@ -707,10 +741,36 @@ would fail on an implementation detail unrelated to correctness.
   longer than `kMaxJoinSources` (12, in `parser.cpp`, generous relative to
   any real query -- TPC-H's own deepest join, Q8, needs 7) is rejected the
   same way, purely as a guard against pathological input. For each step,
-  the newly-joined (right-hand) table is always the *build* side
-  (materialized in full before probing begins); put the smaller table
-  there for performance -- there is no cost-based optimizer to choose this
-  automatically.
+  the *build* side (materialized in full before probing begins) is now
+  chosen by size, not always the newly-joined (right-hand) table -- see
+  "Size-aware build-side selection" below.
+- **Size-aware build-side selection.** `physical_planner.cpp`'s
+  `convert()` estimates both sides' row counts (`estimate_row_count()`: a
+  `ParquetScanNode` reports the sum of its scanned files' whole-file row
+  counts; a nested `HashJoinNode` reports `min(left, right)`; every
+  single-child node above either just passes its child's estimate through
+  via the generic `children()` accessor, no per-node-type case needed) and
+  swaps `left`/`right` (and their key indices) whenever the left side's
+  estimate is smaller -- since `HashJoinOperator` (GPU) and Acero's
+  `"hashjoin"` (CPU) both always materialize their *right* child, this
+  puts the actually-smaller table there regardless of which side a query
+  wrote first. This is a rough, pre-filter/pre-aggregation estimate (not
+  real cardinality estimation, no join-selectivity modeling), and it's a
+  planning-time decision applied identically to both backends, not a
+  per-backend cost model. Safe to reorder: every expression above a
+  `HashJoinNode` already resolves columns by *name* against its own
+  `output_schema()` (see `find_scan_schema()`'s own comment above), never
+  by fixed position, and the same holds recursively into an outer join's
+  own key resolution in an N-way chain. Verified for real against SF10
+  TPC-H data: Q12's `orders JOIN lineitem` now builds on `orders` (the
+  smaller table) instead of `lineitem`, confirmed via `kernellake explain
+  --format json`; Q3's 3-way chain shows the swap propagating sensibly
+  through both join steps (smallest table innermost/build, largest
+  outermost/probe). This narrows, but doesn't eliminate, the real SF100
+  OOM risk documented in `docs/ROADMAP.md` -- neither execution operator
+  has a bounded/streaming join design (see below), so an arbitrarily large
+  build side, even the smaller of the two, can still exceed available
+  memory at large enough scale.
 - **N-way joins, generalized from an original two-table-only design.** A
   real investigation found the underlying `hsql` SQL parser already parses
   `A JOIN B JOIN C ON ...` correctly into a left-deep nested `TableRef` tree
@@ -1124,6 +1184,12 @@ aggregate query against `generate-data`-produced Parquet returned correct
 rows. `dev` (145/145) and `gpu-dev` (214/214) both reconfirmed unaffected.
 
 ### OpenTelemetry observability (`KERNELLAKE_ENABLE_OTEL`)
+
+See `docs/OBSERVABILITY.md` for the operator-facing reference (every
+metric/span/log signal actually emitted, the full config schema, and how
+to point it at a real collector) -- this section is the implementation
+writeup: why the module is split the way it is, and the real bugs found
+building it.
 
 Phase 2 of the Flight SQL/otel-cpp/Helm-chart epic (Phase 1,
 `kernellake-server`, above). Built behind `KERNELLAKE_ENABLE_OTEL` (default
