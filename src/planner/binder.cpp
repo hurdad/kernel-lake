@@ -266,12 +266,12 @@ class Binder {
  public:
   explicit Binder(const Schema& input_schema) : input_schema_(&input_schema) {}
 
-  Binder(std::string left_alias, const Schema& left_schema, std::string right_alias,
-         const Schema& right_schema)
-      : left_alias_(std::move(left_alias)),
-        left_schema_(&left_schema),
-        right_alias_(std::move(right_alias)),
-        right_schema_(&right_schema) {}
+  // `join_sources` is in FROM-clause left-to-right order (source 0's
+  // fields occupy the combined row's lowest indices, then source 1's,
+  // ...) -- every alias must be non-empty (parser.cpp rejects an
+  // unaliased JOIN side before an AstJoinClause is ever constructed).
+  explicit Binder(std::vector<std::pair<std::string, const Schema*>> join_sources)
+      : join_sources_(std::move(join_sources)) {}
 
   // `allow_aggregates` is true only while binding SELECT-list / ORDER BY
   // expressions; WHERE and GROUP BY must not contain aggregate functions.
@@ -284,8 +284,8 @@ class Binder {
 
   // Every field this query's FROM clause exposes, paired with its combined
   // index -- used for `SELECT *` expansion. Enumerated positionally (not
-  // via a by-name lookup) so two same-named columns from opposite JOIN
-  // sides expand as two separate output columns instead of spuriously
+  // via a by-name lookup) so two same-named columns from different JOIN
+  // sources expand as separate output columns instead of spuriously
   // tripping the ambiguity check find_field_by_plain_name() below applies
   // to an actual *reference*.
   [[nodiscard]] std::vector<std::pair<Field, std::size_t>> all_fields_with_index() const {
@@ -296,45 +296,40 @@ class Binder {
       }
       return fields;
     }
-    for (std::size_t i = 0; i < left_schema_->field_count(); ++i) {
-      fields.emplace_back(left_schema_->field(i), i);
-    }
-    const std::size_t offset = left_schema_->field_count();
-    for (std::size_t i = 0; i < right_schema_->field_count(); ++i) {
-      fields.emplace_back(right_schema_->field(i), offset + i);
+    std::size_t offset = 0;
+    for (const auto& [alias, schema] : join_sources_) {
+      for (std::size_t i = 0; i < schema->field_count(); ++i) {
+        fields.emplace_back(schema->field(i), offset + i);
+      }
+      offset += schema->field_count();
     }
     return fields;
   }
 
-  // Resolves a plain (unqualified) name against every side's schema,
-  // throwing BindingError if it matches more than one -- used for GROUP
-  // BY's "does this match a base column" check, which needs the same
+  // Resolves a plain (unqualified) name against every JOIN source's
+  // schema, throwing BindingError if it matches more than one -- used for
+  // GROUP BY's "does this match a base column" check, which needs the same
   // ambiguity handling a real column reference does.
   [[nodiscard]] std::optional<std::size_t> find_field_by_plain_name(const std::string& name) const {
     if (input_schema_ != nullptr) {
       return input_schema_->find_field(name);
     }
-    const std::optional<std::size_t> left_index = left_schema_->find_field(name);
-    const std::optional<std::size_t> right_index = right_schema_->find_field(name);
-    if (left_index && right_index) {
-      // left_alias_/right_alias_ are always set here: this overload only runs
-      // when input_schema_ == nullptr, i.e. the two-schema (JOIN) Binder
-      // constructor was used, which requires both aliases as plain
-      // std::string constructor arguments (see the Binder(std::string
-      // left_alias, ...) overload above).
-      const std::string& left = *left_alias_;    // NOLINT(bugprone-unchecked-optional-access)
-      const std::string& right = *right_alias_;  // NOLINT(bugprone-unchecked-optional-access)
-      throw BindingError(fmt::format(
-          "ambiguous column '{}' (present on both sides of the JOIN; qualify it with {}.{} or {}.{})", name,
-          left, name, right, name));
+    std::optional<std::size_t> found_index;
+    std::string found_alias;
+    std::size_t offset = 0;
+    for (const auto& [alias, schema] : join_sources_) {
+      if (const std::optional<std::size_t> index = schema->find_field(name); index.has_value()) {
+        if (found_index.has_value()) {
+          throw BindingError(fmt::format(
+              "ambiguous column '{}' (present in more than one JOIN source; qualify it with {}.{} or {}.{})",
+              name, found_alias, name, alias, name));
+        }
+        found_index = offset + *index;
+        found_alias = alias;
+      }
+      offset += schema->field_count();
     }
-    if (left_index) {
-      return left_index;
-    }
-    if (right_index) {
-      return left_schema_->field_count() + *right_index;
-    }
-    return std::nullopt;
+    return found_index;
   }
 
  private:
@@ -356,27 +351,35 @@ class Binder {
       return resolve_column(*input_schema_, 0, node.name);
     }
     if (node.table.has_value()) {
-      if (*node.table == left_alias_) {
-        return resolve_column(*left_schema_, 0, node.name);
+      std::size_t offset = 0;
+      for (const auto& [alias, schema] : join_sources_) {
+        if (alias == *node.table) {
+          return resolve_column(*schema, offset, node.name);
+        }
+        offset += schema->field_count();
       }
-      if (*node.table == right_alias_) {
-        return resolve_column(*right_schema_, left_schema_->field_count(), node.name);
+      std::string known_aliases;
+      for (const auto& [alias, schema] : join_sources_) {
+        if (!known_aliases.empty()) {
+          known_aliases += ", ";
+        }
+        known_aliases += "'" + alias + "'";
       }
-      // See find_field_by_plain_name()'s comment: left_alias_/right_alias_
-      // are always set on this path (input_schema_ == nullptr).
-      const std::string& left = *left_alias_;    // NOLINT(bugprone-unchecked-optional-access)
-      const std::string& right = *right_alias_;  // NOLINT(bugprone-unchecked-optional-access)
       throw BindingError(
-          fmt::format("unknown table qualifier '{}' (expected '{}' or '{}')", *node.table, left, right));
+          fmt::format("unknown table qualifier '{}' (expected one of: {})", *node.table, known_aliases));
     }
     const std::optional<std::size_t> combined_index = find_field_by_plain_name(node.name);
     if (!combined_index) {
       throw BindingError(fmt::format("unknown column '{}'", node.name));
     }
-    if (*combined_index < left_schema_->field_count()) {
-      return resolve_column(*left_schema_, 0, node.name);
+    std::size_t offset = 0;
+    for (const auto& [alias, schema] : join_sources_) {
+      if (*combined_index < offset + schema->field_count()) {
+        return resolve_column(*schema, offset, node.name);
+      }
+      offset += schema->field_count();
     }
-    return resolve_column(*right_schema_, left_schema_->field_count(), node.name);
+    throw BindingError("unreachable: combined_index did not fall within any JOIN source's field range");
   }
 
   ExpressionPtr bind_node(const AstStar&, bool) {
@@ -711,10 +714,10 @@ class Binder {
   }
 
   const Schema* input_schema_ = nullptr;  // single-table mode
-  std::optional<std::string> left_alias_;
-  const Schema* left_schema_ = nullptr;  // join mode
-  std::optional<std::string> right_alias_;
-  const Schema* right_schema_ = nullptr;
+  // JOIN mode: one (alias, schema) pair per FROM-clause source, in
+  // left-to-right order -- empty (and input_schema_ non-null) in
+  // single-table mode.
+  std::vector<std::pair<std::string, const Schema*>> join_sources_;
 };
 
 }  // namespace
@@ -881,12 +884,17 @@ BoundQuery bind_query_common(const sql::AstSelectStatement& stmt, Binder& binder
 }
 
 // Validates that `condition` is exactly `<column> = <column>`, one column
-// from each side (in either order) and of identical type -- the only shape
+// already in the accumulated combined schema so far (index in
+// [0, combined_field_count)) and one column from the new source being
+// joined at this step (index in [combined_field_count, combined_field_count
+// + source_field_count)), of identical type -- the only shape
 // HashJoinOperator's cudf::hash_join can consume directly, with no
-// pre-join casting step. Returns (left_key_index, right_key_index), each
-// into that side's *own* schema.
-std::pair<std::size_t, std::size_t> extract_equi_join_keys(const ExpressionPtr& condition,
-                                                           std::size_t left_field_count) {
+// pre-join casting step. Returns (combined_key_index, source_key_index):
+// the former into the accumulated schema so far, the latter into the new
+// source's *own* schema.
+std::pair<std::size_t, std::size_t> extract_join_step_keys(const ExpressionPtr& condition,
+                                                           std::size_t combined_field_count,
+                                                           std::size_t source_field_count) {
   const auto* binary = dynamic_cast<const BinaryExpression*>(condition.get());
   if (binary == nullptr || binary->op() != BinaryOperator::Equal) {
     throw BindingError(
@@ -907,15 +915,16 @@ std::pair<std::size_t, std::size_t> extract_equi_join_keys(const ExpressionPtr& 
   }
   const std::size_t left_idx = left_operand->column_index();
   const std::size_t right_idx = right_operand->column_index();
-  if (left_idx < left_field_count && right_idx >= left_field_count) {
-    return {left_idx, right_idx - left_field_count};
+  const std::size_t combined_end = combined_field_count + source_field_count;
+  if (left_idx < combined_field_count && right_idx >= combined_field_count && right_idx < combined_end) {
+    return {left_idx, right_idx - combined_field_count};
   }
-  if (right_idx < left_field_count && left_idx >= left_field_count) {
-    return {right_idx, left_idx - left_field_count};
+  if (right_idx < combined_field_count && left_idx >= combined_field_count && left_idx < combined_end) {
+    return {right_idx, left_idx - combined_field_count};
   }
   throw BindingError(
-      "JOIN ON condition must compare one column from each side of the JOIN, not two columns "
-      "from the same side");
+      "JOIN ON condition must compare one column already joined so far with one column from the "
+      "newly-joined source, not two columns from the same side");
 }
 
 }  // namespace
@@ -930,25 +939,47 @@ BoundQuery bind_query(const sql::AstSelectStatement& stmt, const Schema& input_s
   return result;
 }
 
-BoundQuery bind_query(const sql::AstSelectStatement& stmt, const Schema& left_schema,
-                      const Schema& right_schema) {
+BoundQuery bind_query(const sql::AstSelectStatement& stmt, const std::vector<Schema>& join_schemas) {
   if (!stmt.join.has_value()) {
-    throw PlanningError("unreachable: bind_query(left, right) called without a JOIN clause");
+    throw PlanningError("unreachable: bind_query(join_schemas) called without a JOIN clause");
+  }
+  if (join_schemas.size() != stmt.join->steps.size() + 1) {
+    throw PlanningError(
+        "unreachable: bind_query(join_schemas) called with the wrong number of schemas for this JOIN chain");
   }
   const bool is_aggregate_query =
       !stmt.group_by.empty() ||
       std::any_of(stmt.select_list.begin(), stmt.select_list.end(), contains_aggregate);
-  // parser.cpp rejects a JOIN whose sides aren't both aliased (see its
-  // "both sides of a JOIN must be aliased" check) before an AstJoinClause is
-  // ever constructed, so left.alias/right.alias are always set here.
-  Binder binder(*stmt.join->left.alias, left_schema,     // NOLINT(bugprone-unchecked-optional-access)
-                *stmt.join->right.alias, right_schema);  // NOLINT(bugprone-unchecked-optional-access)
 
-  const ExpressionPtr condition = binder.bind(stmt.join->condition, /*allow_aggregates=*/false);
-  const auto [left_key_index, right_key_index] = extract_equi_join_keys(condition, left_schema.field_count());
+  // parser.cpp rejects a JOIN whose sides aren't all aliased (see its
+  // "both sides of a JOIN must be aliased" check) before an AstJoinClause
+  // is ever constructed, so every source's alias is always set here.
+  std::vector<std::pair<std::string, const Schema*>> join_sources;
+  join_sources.reserve(join_schemas.size());
+  join_sources.emplace_back(*stmt.join->first.alias,  // NOLINT(bugprone-unchecked-optional-access)
+                            &join_schemas[0]);
+  for (std::size_t i = 0; i < stmt.join->steps.size(); ++i) {
+    join_sources.emplace_back(
+        *stmt.join->steps[i].source.alias,  // NOLINT(bugprone-unchecked-optional-access)
+        &join_schemas[i + 1]);
+  }
+  Binder binder(join_sources);
+
+  BoundJoin join;
+  join.first_source_paths = stmt.join->first.paths;
+  join.steps.reserve(stmt.join->steps.size());
+  std::size_t combined_field_count = join_schemas[0].field_count();
+  for (std::size_t i = 0; i < stmt.join->steps.size(); ++i) {
+    const sql::AstJoinStep& step = stmt.join->steps[i];
+    const ExpressionPtr condition = binder.bind(step.condition, /*allow_aggregates=*/false);
+    const auto [combined_key_index, source_key_index] =
+        extract_join_step_keys(condition, combined_field_count, join_schemas[i + 1].field_count());
+    join.steps.push_back(BoundJoinStep{step.source.paths, combined_key_index, source_key_index});
+    combined_field_count += join_schemas[i + 1].field_count();
+  }
 
   BoundQuery result = bind_query_common(stmt, binder, is_aggregate_query);
-  result.join = BoundJoin{stmt.join->left.paths, left_key_index, stmt.join->right.paths, right_key_index};
+  result.join = std::move(join);
   return result;
 }
 

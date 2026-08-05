@@ -1045,6 +1045,110 @@ and covered by passing tests -- not merely designed or stubbed.
   `gpu-dev` Docker rebuild (253/253, was 251) all pass with zero
   regressions. `--query all` (no `--part-data`/`--orders-data`) still runs
   only Q1/Q6, confirming no regression to the existing single-table path.
+- **N-way (3+-table) joins, generalized from an original two-table-only
+  design.** A prior session's investigation (see this file's own earlier
+  entry, now superseded) found the underlying `hsql` SQL parser library
+  already parses `A JOIN B JOIN C ON ...` correctly into a left-deep nested
+  `TableRef` tree (`(A JOIN B) JOIN C`) -- this project's own AST
+  conversion was the only thing rejecting that shape. Generalized across
+  the whole pipeline: `sql::AstJoinClause` became a chain (`first` +
+  `steps`) instead of a fixed `left`/`right` pair, with `parser.cpp`'s new
+  `flatten_join_chain()` recursively unwinding hsql's nested tree (only
+  ever recursing on `join->left`, since hsql's left-associative parsing
+  guarantees `join->right` is always a plain leaf table); `Binder`
+  (binder.cpp) generalized from its hardcoded dual-mode design
+  (`input_schema_` vs. exactly-two `left_schema_`/`right_schema_`) to a
+  single `std::vector<(alias, schema)>` list; `BoundJoin` became a chain of
+  `BoundJoinStep`s, each `combined_key_index` an index into the
+  *accumulated* schema of every source before that step (not just the
+  immediately-preceding one); `build_logical_plan()` builds a left-deep
+  chain of `LogicalJoin` nodes from that chain. The physical planner and
+  execution layers (`HashJoinNode`/`HashJoinOperator` on GPU, Acero's
+  `"hashjoin"` on CPU) needed **zero changes** -- both already recursed on
+  arbitrary children, confirming the real complexity was entirely in the
+  parser/binder/logical-plan layers, exactly as suspected going in. See
+  `docs/ARCHITECTURE.md`'s "Hash joins" section for the full technical
+  writeup.
+
+  Also added a guard against a pathological join-chain length
+  (`kMaxJoinSources = 12` in `parser.cpp`, well beyond any real query --
+  TPC-H's own deepest join, Q8, needs 7), matching this project's existing
+  convention of bounding parser input size/nesting depth.
+
+  Verified for real against DuckDB (both backends), not just unit tests: a
+  3-way join with a `GROUP BY` and an aggregate spanning all three sources;
+  a third step's join condition referencing the *first* source directly
+  (not the immediately-preceding second source), confirming
+  `combined_key_index` resolves against the whole accumulated schema, not
+  just adjacent sources; ambiguous-unqualified-column rejection across
+  non-adjacent sources; qualified-column resolution and `SELECT *`
+  expansion across 3 sources. New regression tests:
+  `SqlParser.ParsesThreeTableInnerJoinChain`,
+  `SqlParser.RejectsExcessiveJoinChainLength`,
+  `Binder.ThreeWayJoinResolvesColumnsAcrossEveryStep`,
+  `Binder.ThreeWayJoinRejectsAmbiguousUnqualifiedColumnFromNonAdjacentSources`,
+  `LogicalPlanner.BuildsLeftDeepJoinChainForThreeTableJoin`,
+  `QueryEngineExecuteCpuTest.ThreeTableInnerJoinMatchesExpectedTotals`,
+  `HashJoinQueryTest.ThreeWayJoinGroupedSumMatchesExpectedTotals`. `dev`
+  (179/179), `server-dev` (182/182), `otel-dev` (182/182), and a real
+  `gpu-dev` Docker rebuild (259/259, was 253) all pass with zero
+  regressions.
+- **TPC-H Q3** (`customer JOIN orders JOIN lineitem`, `GROUP BY`, `ORDER BY
+  revenue DESC, o_orderdate`, `LIMIT 10`), the concrete query the N-way
+  join generalization above was building toward. `generate_tpch.py` gained
+  `generate_customer_table()` (a fixed `CUSTOMER_ROWS = 150_000` rows
+  regardless of scale factor, matching TPC-H's own SF1 customer count;
+  `c_custkey`/`o_custkey` both drawn from the same `[1, CUSTOMER_ROWS]`
+  range) and now writes `customer-00000.parquet` alongside `lineitem`/
+  `part`/`orders`. New query file `benchmarks/tpch/queries/q03.sql`.
+  `--customer-data` wired through every tool that already had
+  `--part-data`/`--orders-data`: `tools/validate_tpch.py`,
+  `kernellake benchmark tpch` (`src/cli/benchmark_tpch_command.cpp`), and
+  `tools/benchmark_three_way.py`. Confirmed the two open questions from the
+  "not yet started" entry this superseded: a multi-key `ORDER BY` after a
+  3-way `JOIN` works correctly (initially assumed otherwise without
+  testing it -- corrected after actually running it), and `ORDER BY ...
+  LIMIT` after a `JOIN` needs a real `ORDER BY` to establish ordering
+  before the `LIMIT`/`fetch` node (Q3 has one, so this isn't a concern for
+  it). Verified against DuckDB at SF0.01 on the CPU backend: exact
+  row-for-row, value-for-value match; not yet re-verified on the GPU
+  backend.
+- **DuckDB as a fourth benchmarking engine in `tools/benchmark_three_way.py`**
+  (`ENGINES` gained `"duckdb"`, alongside `kernellake-cpu`/`kernellake-gpu`/
+  `pyspark`). Unlike PySpark, which needs its own placeholder-to-temp-view
+  SQL rewrite (`spark_sql()`), DuckDB natively supports
+  `read_parquet('path') AS alias JOIN ...`, so it reuses the exact same
+  substituted SQL `kernellake_sql()` already produces -- no new rewrite
+  function needed, just a `run_duckdb_query()` wrapper around the existing
+  `duckdb_compare.run_duckdb()` helper (already used by
+  `validate_tpch.py`/`validate_against_duckdb.py`) with the same cold-mode
+  page-cache-eviction handling every other engine gets. `--backends`
+  default changed to `"cpu,gpu,pyspark,duckdb"`; `--query all`'s query-list
+  logic extended to include Q3 once both `--orders-data` and
+  `--customer-data` are passed.
+- **CI fix: `tpch-tooling-smoke` job's query-file validation step used a
+  bare `{data}` -> `*.parquet` glob**, which was safe when
+  `generate_tpch.py` only wrote `lineitem` files but broke once
+  `orders`/`part`/`customer` joined `lineitem` in the same output
+  directory (starting at commit `2556abee`, from a concurrent session on
+  another machine, then compounded by this session's own `customer`
+  addition) -- the glob matched every table at once, so
+  `kernellake explain` failed with a schema mismatch
+  (`l_orderkey INT64 NOT NULL vs o_orderkey INT64 NOT NULL`) for every
+  query file, five consecutive failed CI runs before being caught.
+  `{part_data}`/`{orders_data}`/`{customer_data}` were also never
+  substituted at all in this step, which would have surfaced as a
+  *different* failure (file-not-found) for Q12/Q14/Q19/Q3 once the
+  schema-mismatch bug was fixed, had that been missed too. Fixed
+  `.github/workflows/ci.yml` to substitute `{data}` with
+  `lineitem-*.parquet` specifically and added the three other
+  placeholders' substitutions. Verified by reproducing the exact CI
+  scenario locally (SF0.001, same generation command, same for-loop, same
+  `sed` pattern): all 6 query files (`q01`/`q03`/`q06`/`q12`/`q14`/`q19`)
+  now `explain` successfully with exit code 0. The same bare-glob mistake
+  was also present in `docs/TPCH.md`'s own example commands (harmless
+  there since they're illustrative, not executed, but corrected for
+  consistency and to avoid readers copy-pasting a broken example).
 
 ## Not yet started
 
@@ -1152,32 +1256,6 @@ and covered by passing tests -- not merely designed or stubbed.
   separate from the aggregate-argument fix above; the CPU backend already
   supports this via its one shared expression compiler) -- not needed by
   any TPC-H query added so far, so not yet prioritized
-- Q3 and most of the rest of the TPC-H suite (need a 3+-table join, beyond
-  the current two-table-only scope) -- a real investigation into this
-  found the underlying `hsql` SQL parser library already parses `A JOIN B
-  JOIN C ON ...` correctly into a left-deep nested tree
-  (`(A JOIN B) JOIN C`, the outer join's `left` being itself a
-  `kTableJoin`, not a `kTableName`); `src/sql/parser.cpp`'s own AST
-  conversion is what explicitly rejects that shape today ("JOIN sides must
-  each be a single read_parquet(...) source, not a subquery or nested
-  join"). Supporting it end to end would mean generalizing `AstJoinClause`
-  (currently exactly two `AstParquetSource` sides) to a chain, and -- the
-  larger piece -- generalizing `Binder`'s dual-mode design
-  (`input_schema_` for single-table, hardcoded `left_schema_`/
-  `right_schema_` for exactly-two-table join mode) to resolve column
-  references against a list of N (alias, schema) pairs instead. The
-  physical planner and execution layers (`HashJoinNode`/`HashJoinOperator`
-  on GPU, Acero's `"hashjoin"` on CPU) likely need **no changes at all**:
-  both already recurse on arbitrary `PhysicalPlanPtr` children, so a
-  left-deep chain of two `HashJoinNode`s should execute correctly once the
-  logical plan builds that shape -- unconfirmed since the parser/binder
-  work wasn't attempted this session, but this is where the real
-  complexity is, not in the already-generic execution operators. This is a
-  substantially bigger change than any single-query addition so far (Q1/
-  Q6/Q12/Q19 combined) -- explicitly deferred as its own follow-up rather
-  than started opportunistically, since it touches the parser, binder, and
-  logical-plan construction all at once and deserves dedicated review
-  rather than being folded into a query-by-query session.
 - A self-hosted GPU CI runner (would enable a `gpu-dev` build/test/
   benchmark/validate workflow to actually run in CI, rather than only
   locally) -- explicitly deferred; `hurdad/kernel-lake` is a public repo,

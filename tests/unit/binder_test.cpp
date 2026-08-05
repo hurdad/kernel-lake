@@ -47,6 +47,16 @@ Schema lineitem_schema() {
   });
 }
 
+// A third table for N-way-join tests: joins onto customers_schema() via
+// customer_id, deliberately reusing "name" (also present in
+// customers_schema()) to exercise cross-source ambiguity.
+Schema nations_schema() {
+  return Schema({
+      Field{"customer_id", int64_type(false)},
+      Field{"name", string_type(false)},
+  });
+}
+
 TEST(Binder, BindsGeneralMvpQuery) {
   const auto stmt = sql::parse_sql(
       "SELECT region, SUM(amount) AS total_amount, COUNT(*) AS order_count "
@@ -347,11 +357,12 @@ TEST(Binder, JoinResolvesQualifiedAndUnambiguousUnqualifiedColumns) {
   const auto stmt = sql::parse_sql(
       "SELECT o.order_id, name, amount FROM read_parquet('/o.parquet') AS o "
       "JOIN read_parquet('/c.parquet') AS c ON o.customer_id = c.customer_id");
-  const BoundQuery bound = bind_query(stmt, orders_schema(), customers_schema());
+  const BoundQuery bound = bind_query(stmt, std::vector<Schema>{orders_schema(), customers_schema()});
   ASSERT_TRUE(bound.join.has_value());
+  ASSERT_EQ(bound.join->steps.size(), 1u);
   // customer_id is orders_schema()'s index 1, customers_schema()'s index 0.
-  EXPECT_EQ(bound.join->left_key_index, 1u);
-  EXPECT_EQ(bound.join->right_key_index, 0u);
+  EXPECT_EQ(bound.join->steps[0].combined_key_index, 1u);
+  EXPECT_EQ(bound.join->steps[0].source_key_index, 0u);
 
   ASSERT_EQ(bound.select_list.size(), 3u);
   // o.order_id -> orders_schema() index 0 (left side, no offset).
@@ -375,28 +386,32 @@ TEST(Binder, JoinRejectsAmbiguousUnqualifiedColumn) {
   const auto stmt = sql::parse_sql(
       "SELECT customer_id FROM read_parquet('/o.parquet') AS o "
       "JOIN read_parquet('/c.parquet') AS c ON o.customer_id = c.customer_id");
-  EXPECT_THROW((void)(bind_query(stmt, orders_schema(), customers_schema())), BindingError);
+  EXPECT_THROW((void)(bind_query(stmt, std::vector<Schema>{orders_schema(), customers_schema()})),
+               BindingError);
 }
 
 TEST(Binder, JoinRejectsUnknownTableQualifier) {
   const auto stmt = sql::parse_sql(
       "SELECT z.order_id FROM read_parquet('/o.parquet') AS o "
       "JOIN read_parquet('/c.parquet') AS c ON o.customer_id = c.customer_id");
-  EXPECT_THROW((void)(bind_query(stmt, orders_schema(), customers_schema())), BindingError);
+  EXPECT_THROW((void)(bind_query(stmt, std::vector<Schema>{orders_schema(), customers_schema()})),
+               BindingError);
 }
 
 TEST(Binder, JoinRejectsNonEqualityCondition) {
   const auto stmt = sql::parse_sql(
       "SELECT o.order_id FROM read_parquet('/o.parquet') AS o "
       "JOIN read_parquet('/c.parquet') AS c ON o.customer_id > c.customer_id");
-  EXPECT_THROW((void)(bind_query(stmt, orders_schema(), customers_schema())), BindingError);
+  EXPECT_THROW((void)(bind_query(stmt, std::vector<Schema>{orders_schema(), customers_schema()})),
+               BindingError);
 }
 
 TEST(Binder, JoinRejectsConditionComparingTwoColumnsFromTheSameSide) {
   const auto stmt = sql::parse_sql(
       "SELECT o.order_id FROM read_parquet('/o.parquet') AS o "
       "JOIN read_parquet('/c.parquet') AS c ON o.customer_id = o.order_id");
-  EXPECT_THROW((void)(bind_query(stmt, orders_schema(), customers_schema())), BindingError);
+  EXPECT_THROW((void)(bind_query(stmt, std::vector<Schema>{orders_schema(), customers_schema()})),
+               BindingError);
 }
 
 TEST(Binder, JoinRejectsMismatchedKeyTypes) {
@@ -407,7 +422,8 @@ TEST(Binder, JoinRejectsMismatchedKeyTypes) {
   const auto stmt = sql::parse_sql(
       "SELECT o.order_id FROM read_parquet('/o.parquet') AS o "
       "JOIN read_parquet('/c.parquet') AS c ON o.customer_id = c.name");
-  EXPECT_THROW((void)(bind_query(stmt, orders_schema(), customers_schema())), BindingError);
+  EXPECT_THROW((void)(bind_query(stmt, std::vector<Schema>{orders_schema(), customers_schema()})),
+               BindingError);
 }
 
 TEST(Binder, JoinStarExpandsBothSidesInOrder) {
@@ -421,7 +437,7 @@ TEST(Binder, JoinStarExpandsBothSidesInOrder) {
   const auto stmt = sql::parse_sql(
       "SELECT * FROM read_parquet('/o.parquet') AS o "
       "JOIN read_parquet('/c.parquet') AS c ON o.cust_id = c.cust_key");
-  const BoundQuery bound = bind_query(stmt, left, right);
+  const BoundQuery bound = bind_query(stmt, std::vector<Schema>{left, right});
   ASSERT_EQ(bound.select_list.size(), 4u);
   EXPECT_EQ(bound.select_list[0].output_name, "order_id");
   EXPECT_EQ(bound.select_list[1].output_name, "cust_id");
@@ -433,7 +449,63 @@ TEST(Binder, JoinStarWithCollidingColumnNamesIsRejected) {
   const auto stmt = sql::parse_sql(
       "SELECT * FROM read_parquet('/o.parquet') AS o "
       "JOIN read_parquet('/c.parquet') AS c ON o.customer_id = c.customer_id");
-  EXPECT_THROW((void)(bind_query(stmt, orders_schema(), customers_schema())), BindingError);
+  EXPECT_THROW((void)(bind_query(stmt, std::vector<Schema>{orders_schema(), customers_schema()})),
+               BindingError);
+}
+
+// Regression test: a 3+-way JOIN chain used to be rejected outright at
+// parse time; this pins down that binding one all the way through
+// actually resolves columns correctly across every source in the chain,
+// not just the AST shape (see sql_parser_test.cpp's own coverage of that
+// part). `n.customer_id` in the third step's ON condition resolves against
+// the *combined* [orders, customers] schema so far (not just
+// customers_schema(), the immediately-preceding source) -- exercising
+// BoundJoinStep::combined_key_index's whole point.
+TEST(Binder, ThreeWayJoinResolvesColumnsAcrossEveryStep) {
+  const auto stmt = sql::parse_sql(
+      "SELECT o.order_id, c.name AS c_name, n.name AS n_name FROM read_parquet('/o.parquet') AS o "
+      "JOIN read_parquet('/c.parquet') AS c ON o.customer_id = c.customer_id "
+      "JOIN read_parquet('/n.parquet') AS n ON o.customer_id = n.customer_id");
+  const BoundQuery bound =
+      bind_query(stmt, std::vector<Schema>{orders_schema(), customers_schema(), nations_schema()});
+  ASSERT_TRUE(bound.join.has_value());
+  ASSERT_EQ(bound.join->steps.size(), 2u);
+  // Step 0: customers joins onto orders via customer_id (orders index 1,
+  // customers index 0).
+  EXPECT_EQ(bound.join->steps[0].combined_key_index, 1u);
+  EXPECT_EQ(bound.join->steps[0].source_key_index, 0u);
+  // Step 1: nations joins via o.customer_id -- still index 1 in the
+  // combined [orders, customers] schema so far (orders_schema().field_count()
+  // == 3, so customers' own fields start at 3, unrelated to this
+  // reference), confirming the condition was resolved against orders
+  // (source 0), not customers (source 1, the immediately-preceding one).
+  EXPECT_EQ(bound.join->steps[1].combined_key_index, 1u);
+  EXPECT_EQ(bound.join->steps[1].source_key_index, 0u);
+
+  ASSERT_EQ(bound.select_list.size(), 3u);
+  const auto* order_id = dynamic_cast<const ColumnExpression*>(bound.select_list[0].expr.get());
+  ASSERT_NE(order_id, nullptr);
+  EXPECT_EQ(order_id->column_index(), 0u);  // orders.order_id, no offset
+  const auto* c_name = dynamic_cast<const ColumnExpression*>(bound.select_list[1].expr.get());
+  ASSERT_NE(c_name, nullptr);
+  EXPECT_EQ(c_name->column_index(), 4u);  // customers.name: 3 (orders fields) + 1
+  const auto* n_name = dynamic_cast<const ColumnExpression*>(bound.select_list[2].expr.get());
+  ASSERT_NE(n_name, nullptr);
+  EXPECT_EQ(n_name->column_index(), 6u);  // nations.name: 3 + 2 (customers fields) + 1
+}
+
+TEST(Binder, ThreeWayJoinRejectsAmbiguousUnqualifiedColumnFromNonAdjacentSources) {
+  // "name" is present on both customers_schema() (source 1) and
+  // nations_schema() (source 2) -- not adjacent to each other in the
+  // "which one is the immediately-preceding source" sense, but still must
+  // be rejected the same as any other cross-source ambiguity.
+  const auto stmt = sql::parse_sql(
+      "SELECT name FROM read_parquet('/o.parquet') AS o "
+      "JOIN read_parquet('/c.parquet') AS c ON o.customer_id = c.customer_id "
+      "JOIN read_parquet('/n.parquet') AS n ON o.customer_id = n.customer_id");
+  EXPECT_THROW(
+      (void)(bind_query(stmt, std::vector<Schema>{orders_schema(), customers_schema(), nations_schema()})),
+      BindingError);
 }
 
 }  // namespace

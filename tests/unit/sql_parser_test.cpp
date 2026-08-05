@@ -102,12 +102,13 @@ TEST(SqlParser, ParsesTwoTableInnerJoin) {
       "SELECT a.x, b.y FROM read_parquet('/x.parquet') AS a "
       "JOIN read_parquet('/y.parquet') AS b ON a.order_id = b.order_id");
   ASSERT_TRUE(stmt.join.has_value());
-  EXPECT_EQ(stmt.join->left.paths, std::vector<std::string>{"/x.parquet"});
-  EXPECT_EQ(stmt.join->left.alias, "a");
-  EXPECT_EQ(stmt.join->right.paths, std::vector<std::string>{"/y.parquet"});
-  EXPECT_EQ(stmt.join->right.alias, "b");
-  ASSERT_NE(stmt.join->condition, nullptr);
-  const auto* condition = std::get_if<AstBinary>(&stmt.join->condition->node);
+  EXPECT_EQ(stmt.join->first.paths, std::vector<std::string>{"/x.parquet"});
+  EXPECT_EQ(stmt.join->first.alias, "a");
+  ASSERT_EQ(stmt.join->steps.size(), 1u);
+  EXPECT_EQ(stmt.join->steps[0].source.paths, std::vector<std::string>{"/y.parquet"});
+  EXPECT_EQ(stmt.join->steps[0].source.alias, "b");
+  ASSERT_NE(stmt.join->steps[0].condition, nullptr);
+  const auto* condition = std::get_if<AstBinary>(&stmt.join->steps[0].condition->node);
   ASSERT_NE(condition, nullptr);
   EXPECT_EQ(condition->op, AstBinaryOp::Eq);
   const auto* left_ref = std::get_if<AstColumnRef>(&condition->left->node);
@@ -124,6 +125,35 @@ TEST(SqlParser, ParsesTwoTableInnerJoin) {
   EXPECT_EQ(*select_a->table, "a");
 }
 
+// Regression test: a 3+-way JOIN chain used to be rejected outright
+// ("KernelLake supports at most two read_parquet(...) sources"), even
+// though the underlying hsql SQL parser already parses `A JOIN B JOIN C`
+// correctly into a left-deep nested TableRef tree ((A JOIN B) JOIN C) --
+// this project's own AST conversion was what rejected it, not hsql. Fixed
+// by generalizing AstJoinClause to a chain (`first` + `steps`, one step
+// per additional source) and flattening the nested TableRef tree via
+// flatten_join_chain() in parser.cpp.
+TEST(SqlParser, ParsesThreeTableInnerJoinChain) {
+  const auto stmt = parse_sql(
+      "SELECT a.x FROM read_parquet('/x.parquet') AS a "
+      "JOIN read_parquet('/y.parquet') AS b ON a.order_id = b.order_id "
+      "JOIN read_parquet('/z.parquet') AS c ON b.order_id = c.order_id");
+  ASSERT_TRUE(stmt.join.has_value());
+  EXPECT_EQ(stmt.join->first.paths, std::vector<std::string>{"/x.parquet"});
+  EXPECT_EQ(stmt.join->first.alias, "a");
+  ASSERT_EQ(stmt.join->steps.size(), 2u);
+  EXPECT_EQ(stmt.join->steps[0].source.paths, std::vector<std::string>{"/y.parquet"});
+  EXPECT_EQ(stmt.join->steps[0].source.alias, "b");
+  EXPECT_EQ(stmt.join->steps[1].source.paths, std::vector<std::string>{"/z.parquet"});
+  EXPECT_EQ(stmt.join->steps[1].source.alias, "c");
+  const auto* second_condition = std::get_if<AstBinary>(&stmt.join->steps[1].condition->node);
+  ASSERT_NE(second_condition, nullptr);
+  const auto* second_left_ref = std::get_if<AstColumnRef>(&second_condition->left->node);
+  ASSERT_NE(second_left_ref, nullptr);
+  ASSERT_TRUE(second_left_ref->table.has_value());
+  EXPECT_EQ(*second_left_ref->table, "b");
+}
+
 TEST(SqlParser, RejectsNonInnerJoin) {
   EXPECT_THROW((void)(parse_sql("SELECT a.x FROM read_parquet('/x.parquet') AS a "
                                 "LEFT JOIN read_parquet('/y.parquet') AS b ON a.order_id = b.order_id")),
@@ -137,11 +167,20 @@ TEST(SqlParser, RejectsCommaStyleJoin) {
       SqlError);
 }
 
-TEST(SqlParser, RejectsThreeReadParquetSources) {
-  EXPECT_THROW((void)(parse_sql("SELECT a.x FROM read_parquet('/x.parquet') AS a "
-                                "JOIN read_parquet('/y.parquet') AS b ON a.order_id = b.order_id "
-                                "JOIN read_parquet('/z.parquet') AS c ON b.order_id = c.order_id")),
-               SqlError);
+// A 3-way JOIN chain is now supported (see ParsesThreeTableInnerJoinChain
+// above) -- but an excessive number of chained sources is still rejected,
+// as a guard against a pathological number of joined sources driving
+// unbounded chain-building work (kMaxJoinSources in parser.cpp), same
+// rationale as the paren-depth/SQL-text-length limits elsewhere in this
+// file.
+TEST(SqlParser, RejectsExcessiveJoinChainLength) {
+  std::string sql = "SELECT a0.x FROM read_parquet('/t0.parquet') AS a0";
+  for (int i = 1; i <= 13; ++i) {
+    const std::string prev = std::to_string(i - 1);
+    const std::string cur = std::to_string(i);
+    sql += " JOIN read_parquet('/t" + cur + ".parquet') AS a" + cur + " ON a" + prev + ".k = a" + cur + ".k";
+  }
+  EXPECT_THROW((void)(parse_sql(sql)), SqlError);
 }
 
 TEST(SqlParser, RejectsUnsupportedFunction) {

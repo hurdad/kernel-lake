@@ -105,10 +105,15 @@ Preprocessed preprocess_from_read_parquet(const std::string& sql) {
         "KernelLake requires at least one data source of the form "
         "read_parquet('path' [, 'path2', ...]); no such clause was found in the query");
   }
-  if (sources.size() > 2) {
-    throw SqlError(fmt::format(
-        "KernelLake supports at most two read_parquet(...) sources (for a two-table JOIN), got {}",
-        sources.size()));
+  // Generous relative to any real query (TPC-H's own deepest join, Q8,
+  // needs 7) -- purely a guard against a pathological number of joined
+  // sources driving unbounded chain-building work, same rationale as
+  // kMaxParenDepth above.
+  constexpr std::size_t kMaxJoinSources = 12;
+  if (sources.size() > kMaxJoinSources) {
+    throw SqlError(
+        fmt::format("KernelLake supports at most {} read_parquet(...) sources in a JOIN chain, got {}",
+                    kMaxJoinSources, sources.size()));
   }
   return Preprocessed{std::move(rewritten), std::move(sources)};
 }
@@ -395,6 +400,61 @@ AstExprPtr convert_expr(const hsql::Expr* e) {
   }
 }
 
+// Resolves one JOIN side's TableRef (a leaf, never itself a nested JOIN --
+// see flatten_join_chain()'s own comment) to its read_parquet(...) paths
+// and required alias.
+AstParquetSource convert_join_source(const hsql::TableRef* ref, const Preprocessed& preprocessed) {
+  if (ref == nullptr || ref->type != hsql::kTableName || ref->name == nullptr) {
+    unsupported("JOIN sides must each be a single read_parquet(...) source, not a subquery or nested join");
+  }
+  if (ref->alias == nullptr || ref->alias->name == nullptr) {
+    unsupported("both sides of a JOIN must be aliased, e.g. read_parquet('a.parquet') AS a");
+  }
+  for (const PlaceholderSource& source : preprocessed.sources) {
+    if (source.placeholder == ref->name) {
+      return AstParquetSource{source.paths, std::string(ref->alias->name)};
+    }
+  }
+  unsupported("JOIN source does not reference a read_parquet(...) call");
+}
+
+// hsql parses a multi-way JOIN left-associatively: `A JOIN B ON c1 JOIN C
+// ON c2` becomes a TableRef tree `(A JOIN B ON c1) JOIN C ON c2`, i.e.
+// `join->left` is itself a kTableJoin for a chain of 3+ sources, while
+// `join->right` is always a plain leaf table -- so this recurses only on
+// `join->left`, appending each level's `join->right`/condition as one more
+// AstJoinStep, in left-to-right source order. Every join in the chain must
+// be a plain INNER JOIN between a (possibly-nested) JOIN and a single
+// aliased read_parquet(...) source -- anything else (a comma-style join, a
+// subquery on either side, a non-INNER join type) fails clearly via
+// convert_join_source()/the checks below, at whichever level of the chain
+// it appears.
+AstJoinClause flatten_join_chain(const hsql::TableRef* table_ref, const Preprocessed& preprocessed) {
+  if (table_ref == nullptr || table_ref->type != hsql::kTableJoin || table_ref->join == nullptr) {
+    unsupported("malformed JOIN");
+  }
+  const hsql::JoinDefinition* join = table_ref->join;
+  if (join->left == nullptr || join->right == nullptr) {
+    unsupported("malformed JOIN");
+  }
+  if (join->type != hsql::kJoinInner) {
+    unsupported("JOIN types other than INNER JOIN");
+  }
+  if (join->condition == nullptr) {
+    unsupported("JOIN with no ON condition");
+  }
+
+  AstJoinClause clause;
+  if (join->left->type == hsql::kTableJoin) {
+    clause = flatten_join_chain(join->left, preprocessed);
+  } else {
+    clause.first = convert_join_source(join->left, preprocessed);
+  }
+  clause.steps.push_back(
+      AstJoinStep{convert_join_source(join->right, preprocessed), convert_expr(join->condition)});
+  return clause;
+}
+
 }  // namespace
 
 AstSelectStatement parse_sql(std::string_view sql_view) {
@@ -448,41 +508,15 @@ AstSelectStatement parse_sql(std::string_view sql_view) {
       out.from.alias = std::string(stmt->fromTable->alias->name);
     }
   } else if (stmt->fromTable != nullptr && stmt->fromTable->type == hsql::kTableJoin) {
-    const hsql::JoinDefinition* join = stmt->fromTable->join;
-    if (join == nullptr || join->left == nullptr || join->right == nullptr) {
-      unsupported("malformed JOIN");
+    AstJoinClause clause = flatten_join_chain(stmt->fromTable, preprocessed);
+    // clause.steps.size() + 1 (the "first" source) must equal every
+    // read_parquet(...) call actually found in the query text -- catches a
+    // read_parquet(...) source that appears in the FROM clause but outside
+    // the JOIN chain the parser understood (this project has no other FROM
+    // shape a source could legitimately appear in).
+    if (preprocessed.sources.size() != clause.steps.size() + 1) {
+      unsupported("a JOIN requires exactly one read_parquet(...) source per table in the chain");
     }
-    if (join->type != hsql::kJoinInner) {
-      unsupported("JOIN types other than INNER JOIN");
-    }
-    if (join->left->type != hsql::kTableName || join->right->type != hsql::kTableName ||
-        join->left->name == nullptr || join->right->name == nullptr) {
-      unsupported("JOIN sides must each be a single read_parquet(...) source, not a subquery or nested join");
-    }
-    if (join->left->alias == nullptr || join->left->alias->name == nullptr || join->right->alias == nullptr ||
-        join->right->alias->name == nullptr) {
-      unsupported("both sides of a JOIN must be aliased, e.g. read_parquet('a.parquet') AS a");
-    }
-    if (preprocessed.sources.size() != 2) {
-      unsupported("a JOIN requires exactly two read_parquet(...) sources");
-    }
-    if (join->condition == nullptr) {
-      unsupported("JOIN with no ON condition");
-    }
-
-    auto find_source = [&](const char* placeholder) -> const std::vector<std::string>& {
-      for (const PlaceholderSource& source : preprocessed.sources) {
-        if (source.placeholder == placeholder) {
-          return source.paths;
-        }
-      }
-      unsupported("JOIN source does not reference a read_parquet(...) call");
-    };
-
-    AstJoinClause clause;
-    clause.left = AstParquetSource{find_source(join->left->name), std::string(join->left->alias->name)};
-    clause.right = AstParquetSource{find_source(join->right->name), std::string(join->right->alias->name)};
-    clause.condition = convert_expr(join->condition);
     out.join = std::move(clause);
   } else {
     unsupported(

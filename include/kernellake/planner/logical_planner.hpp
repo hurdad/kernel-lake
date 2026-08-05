@@ -12,10 +12,15 @@ namespace kernellake {
 // function must be called with the same schema(s) that were passed to the
 // matching bind_query() overload.
 //
-// `right_schema` must be non-null exactly when `query.join.has_value()` --
-// builds a LogicalJoin(LogicalScan(left), LogicalScan(right)) as the plan's
-// source instead of a single LogicalScan.
-[[nodiscard]] LogicalPlanPtr build_logical_plan(const BoundQuery& query, const Schema& source_schema,
-                                                const Schema* right_schema = nullptr);
+// The single-table overload; only valid when `!query.join.has_value()`.
+[[nodiscard]] LogicalPlanPtr build_logical_plan(const BoundQuery& query, const Schema& source_schema);
+
+// The JOIN-chain overload; only valid when `query.join.has_value()`.
+// `join_schemas` must have exactly `query.join->steps.size() + 1` entries,
+// one per FROM-clause source in left-to-right order (matching the schemas
+// passed to bind_query()'s own JOIN overload) -- builds a left-deep chain
+// of LogicalJoin(..., LogicalScan(...)) nodes, one join per step.
+[[nodiscard]] LogicalPlanPtr build_logical_plan(const BoundQuery& query,
+                                                const std::vector<Schema>& join_schemas);
 
 }  // namespace kernellake

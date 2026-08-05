@@ -115,15 +115,16 @@ SELECT <items> FROM read_parquet(...) AS a JOIN read_parquet(...) AS b ON <a.col
 - `DECIMAL(p, s)` columns and literals -- see "DECIMAL support" below
 - Aggregates: `SUM`, `COUNT`, `COUNT(*)`, `MIN`, `MAX`, `AVG` (`AVG` does
   not support a `DECIMAL` argument; see "DECIMAL support")
-- A two-table `INNER JOIN ... ON` with a single equality key (see "Hash
-  joins" below for the full scope)
+- A chain of two or more tables via `INNER JOIN ... ON`, each step a single
+  equality key (see "Hash joins" below for the full scope, including the
+  N-way generalization)
 
 Not yet supported (fails clearly rather than being silently reinterpreted):
 `DISTINCT`, `HAVING`, set operations (`UNION`/etc.), `WITH`/CTEs,
 subqueries, `OFFSET`, window functions, `CASE` in `WHERE` (GPU only --
 see above), any function other than the five aggregates above, comma-style
-joins, `LEFT`/`RIGHT`/`FULL`/`CROSS` JOIN, multi-key or non-equality join
-conditions, and 3+-table joins.
+joins, `LEFT`/`RIGHT`/`FULL`/`CROSS` JOIN, and multi-key or non-equality
+join conditions.
 
 `GROUP BY <name>` resolves `<name>` against the base-table schema first,
 then falls back to matching a `SELECT`-list output alias -- this is what
@@ -696,33 +697,95 @@ would fail on an implementation detail unrelated to correctness.
 
 ### Hash joins
 
-- **Scope**: exactly two `read_parquet(...)` sources, both explicitly
-  aliased, joined with `INNER JOIN ... ON <a.col = b.col>` -- a single
-  equality between one plain column from each side, of identical type.
+- **Scope**: a chain of two or more `read_parquet(...)` sources, all
+  explicitly aliased, joined with `INNER JOIN ... ON <a.col = b.col>` per
+  step -- a single equality between one plain column already in scope and
+  one plain column from the newly-joined source, of identical type.
   Comma-style joins (`FROM a, b WHERE a.k = b.k`), `LEFT`/`RIGHT`/`FULL`/
-  `CROSS` JOIN, multi-key/non-equality conditions, and 3+-table joins all
-  fail clearly at parse or bind time rather than being silently
-  reinterpreted. The right-hand (second) table is always the *build* side
+  `CROSS` JOIN, and multi-key/non-equality conditions all fail clearly at
+  parse or bind time rather than being silently reinterpreted; a chain
+  longer than `kMaxJoinSources` (12, in `parser.cpp`, generous relative to
+  any real query -- TPC-H's own deepest join, Q8, needs 7) is rejected the
+  same way, purely as a guard against pathological input. For each step,
+  the newly-joined (right-hand) table is always the *build* side
   (materialized in full before probing begins); put the smaller table
   there for performance -- there is no cost-based optimizer to choose this
   automatically.
+- **N-way joins, generalized from an original two-table-only design.** A
+  real investigation found the underlying `hsql` SQL parser already parses
+  `A JOIN B JOIN C ON ...` correctly into a left-deep nested `TableRef` tree
+  (`(A JOIN B) JOIN C`, the outer join's `left` being itself a `kTableJoin`,
+  not a `kTableName`) -- this project's own AST conversion was the only
+  thing rejecting that shape. Fixed across the whole pipeline:
+  - `sql::AstJoinClause` became a chain (`first` + `steps`, one
+    `AstJoinStep{source, condition}` per additional table) instead of a
+    fixed `left`/`right` pair; `parser.cpp`'s `flatten_join_chain()`
+    recursively unwinds hsql's nested `TableRef` tree into this flat chain
+    (recursing only on `join->left`, since hsql's own left-associative
+    parsing guarantees `join->right` is always a plain leaf table, never
+    another nested join).
+  - `Binder` (binder.cpp) generalized from a hardcoded
+    `input_schema_`-vs-`left_schema_`/`right_schema_` dual-mode design to a
+    single `std::vector<std::pair<alias, schema>> join_sources_`, in
+    FROM-clause left-to-right order -- `all_fields_with_index()`,
+    `find_field_by_plain_name()` (ambiguity checking), and
+    `bind_node(AstColumnRef)` (qualified/unqualified resolution) all now
+    iterate this list generically instead of special-casing exactly two
+    sides.
+  - `BoundJoin` became `{first_source_paths, std::vector<BoundJoinStep>}`;
+    each `BoundJoinStep::combined_key_index` is an index into the
+    *accumulated* schema of every source before that step (not just the
+    immediately-preceding one) -- `extract_join_step_keys()` (renamed from
+    `extract_equi_join_keys()`) validates each step's condition against a
+    shifting `[0, combined_field_count)` vs. `[combined_field_count,
+    combined_field_count + source_field_count)` boundary instead of one
+    fixed split point.
+  - `build_logical_plan()` builds a left-deep chain of `LogicalJoin` nodes
+    from `BoundJoin`'s chain, e.g. `LogicalJoin(LogicalJoin(Scan(a),
+    Scan(b)), Scan(c))` for 3 sources -- each step's `combined_key_index`
+    is already the right index for a `left` child that is itself a nested
+    `LogicalJoin`, not just a plain `LogicalScan`, so no extra remapping
+    was needed here.
+  - The physical planner and execution layers (`HashJoinNode`/
+    `HashJoinOperator` on GPU, Acero's `"hashjoin"` on CPU) needed **no
+    changes at all** -- both already recursed on arbitrary
+    `PhysicalPlanPtr`/`arrow::acero::Declaration` children, so a left-deep
+    chain of joins executes correctly with zero new code once the logical
+    plan builds that shape. This confirms what was suspected going in: the
+    real complexity of N-way joins was entirely in the parser/binder/
+    logical-plan layers, not the already-generic execution operators.
+
+  Verified for real against DuckDB (both backends): a 3-way join with a
+  `GROUP BY` and an aggregate spanning all three sources; a join condition
+  in the *third* step referencing the *first* source directly (not the
+  immediately-preceding second source), confirming `combined_key_index`
+  resolution against the whole accumulated schema, not just adjacent
+  sources; ambiguous-unqualified-column rejection across non-adjacent
+  sources. New regression tests: `SqlParser.ParsesThreeTableInnerJoinChain`,
+  `SqlParser.RejectsExcessiveJoinChainLength`,
+  `Binder.ThreeWayJoinResolvesColumnsAcrossEveryStep`,
+  `Binder.ThreeWayJoinRejectsAmbiguousUnqualifiedColumnFromNonAdjacentSources`,
+  `LogicalPlanner.BuildsLeftDeepJoinChainForThreeTableJoin`,
+  `QueryEngineExecuteCpuTest.ThreeTableInnerJoinMatchesExpectedTotals`,
+  `HashJoinQueryTest.ThreeWayJoinGroupedSumMatchesExpectedTotals`.
 - **Combined-index design**: the binder resolves every column reference in
   a JOIN query (qualified or not) to a `ColumnExpression` whose index is
-  into the *combined* `[left_schema fields..., right_schema fields...]`
-  row -- exactly what `HashJoinOperator` actually produces (left columns
-  gathered first, then right). This is what lets almost the entire rest of
-  the pipeline (the GPU expression compiler, the optimizer's column
-  collection, every operator except the join itself) treat a joined query
-  no differently from a single-table one above the join; only the physical
-  planner's `LogicalJoin` -> `HashJoinNode` conversion and the join
-  operator itself need to know two tables are involved at all. An
-  unqualified reference that exists on both sides is rejected as ambiguous
-  at bind time, same as SQL generally requires.
+  into the *combined* row across every source in FROM-clause order (source
+  0's fields, then source 1's, ...) -- exactly what a left-deep chain of
+  `HashJoinOperator`s actually produces. This is what lets almost the
+  entire rest of the pipeline (the GPU expression compiler, the
+  optimizer's column collection, every operator except the join itself)
+  treat a joined query no differently from a single-table one above the
+  join; only the physical planner's `LogicalJoin` -> `HashJoinNode`
+  conversion and the join operator itself need to know multiple tables are
+  involved at all. An unqualified reference that exists on more than one
+  source is rejected as ambiguous at bind time, same as SQL generally
+  requires.
 - **Implicit promotion does not extend across a JOIN condition**: the two
   key columns must already be the same type. Mixing e.g. `INT32` and
   `INT64` join keys produces an implicit `CastExpression` around one side
   during binding (the same promotion `WHERE` comparisons get), which is no
-  longer a bare `ColumnExpression` -- `extract_equi_join_keys()` in
+  longer a bare `ColumnExpression` -- `extract_join_step_keys()` in
   binder.cpp rejects this with a clear `BindingError` rather than trying to
   compile a cast into the join key extraction. Make both sides the same
   type instead.

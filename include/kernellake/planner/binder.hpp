@@ -21,24 +21,38 @@ struct BoundOrderByItem {
   bool ascending;
 };
 
-// The bound form of a two-table `JOIN ... ON` clause (see
-// sql::AstJoinClause). `left_key_index`/`right_key_index` are indices into
-// each side's *own* (unpruned) schema, not the combined post-join row --
-// the physical planner needs each side's key column to build the
-// HashJoinOperator against the actual pruned Parquet scan schema, the same
-// way any other column reference gets remapped above a scan.
+// One additional source joined onto the running left-deep chain built so
+// far -- see sql::AstJoinStep and BoundJoin below. `combined_key_index` is
+// an index into the *accumulated* schema of every source before this step
+// (source 0's fields, then source 1's, ...), matching exactly what a
+// left-deep chain of LogicalJoin/HashJoinNode nodes produces at each
+// level; `source_key_index` is an index into this step's own new source's
+// *own* (unpruned) schema, not the combined row -- the physical planner
+// needs it to build the HashJoinOperator against the actual pruned
+// Parquet scan schema, the same way any other column reference gets
+// remapped above a scan.
+struct BoundJoinStep {
+  std::vector<std::string> source_paths;
+  std::size_t combined_key_index;
+  std::size_t source_key_index;
+};
+
+// The bound form of a `JOIN ... ON` chain (see sql::AstJoinClause):
+// `first_source_paths` is the leftmost source, `steps` joins one more
+// source at a time onto the running combined result, in left-to-right
+// order -- `steps.size() + 1` total sources, matching a left-deep chain of
+// binary joins (`(first JOIN steps[0]) JOIN steps[1]) ...`), which is
+// exactly what build_logical_plan() constructs from this.
 struct BoundJoin {
-  std::vector<std::string> left_source_paths;
-  std::size_t left_key_index;
-  std::vector<std::string> right_source_paths;
-  std::size_t right_key_index;
+  std::vector<std::string> first_source_paths;
+  std::vector<BoundJoinStep> steps;  // at least one
 };
 
 struct BoundQuery {
   std::vector<BoundSelectItem> select_list;
   Schema output_schema{std::vector<Field>{}};
   std::vector<std::string> source_paths;  // single-table case; empty when `join` is set
-  std::optional<BoundJoin> join;          // two-table case (see bind_query's two-schema overload)
+  std::optional<BoundJoin> join;          // JOIN chain case (see bind_query's join overload)
   ExpressionPtr where;                    // null if no WHERE clause
   std::vector<ExpressionPtr> group_by;
   std::vector<BoundOrderByItem> order_by;
@@ -61,16 +75,20 @@ struct BoundQuery {
 // comparisons, unsupported '*' usage, and duplicate output names.
 [[nodiscard]] BoundQuery bind_query(const sql::AstSelectStatement& stmt, const Schema& input_schema);
 
-// The two-table `FROM ... JOIN ... ON ...` overload -- only called when
-// `stmt.join.has_value()`. Every resolved column's index (in the SELECT
-// list, WHERE, GROUP BY, ...) is into the *combined* [left_schema fields...,
-// right_schema fields...] row, matching what HashJoinOperator actually
-// produces; only the JOIN condition itself is required to be a single
-// equality between one plain column from each side (of identical type --
-// mixing e.g. INT32 and INT64 join keys is not supported, see
+// The `FROM ... JOIN ... ON ... [JOIN ... ON ...]` overload -- only called
+// when `stmt.join.has_value()`. `join_schemas` must have exactly
+// `stmt.join->steps.size() + 1` entries, one per source in left-to-right
+// FROM-clause order (matching `stmt.join->first`/`stmt.join->steps`).
+// Every resolved column's index (in the SELECT list, WHERE, GROUP BY, ...)
+// is into the *combined* row (source 0's fields, then source 1's, ...),
+// matching what a left-deep chain of HashJoinOperators actually produces;
+// each JOIN step's own condition is required to be a single equality
+// between one plain column already in the running combined schema and one
+// plain column from the newly-joined source (of identical type -- mixing
+// e.g. INT32 and INT64 join keys is not supported, see
 // docs/ARCHITECTURE.md), which `BoundQuery::join` records by each side's
 // *own* (pre-join) column index for the physical planner.
-[[nodiscard]] BoundQuery bind_query(const sql::AstSelectStatement& stmt, const Schema& left_schema,
-                                    const Schema& right_schema);
+[[nodiscard]] BoundQuery bind_query(const sql::AstSelectStatement& stmt,
+                                    const std::vector<Schema>& join_schemas);
 
 }  // namespace kernellake

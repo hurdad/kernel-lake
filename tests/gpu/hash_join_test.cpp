@@ -82,6 +82,30 @@ class HashJoinQueryTest : public ::testing::Test {
           parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), sink, /*chunk_size=*/3);
       ASSERT_TRUE(status.ok()) << status.ToString();
     }
+    // regions: a third table, for a 3-way-join test -- joins onto
+    // customers via customer_id (same key orders->customers already
+    // uses), one row per customer (10, 20, 30).
+    {
+      regions_path_ = (dir_ / "regions.parquet").string();
+      arrow::Int64Builder customer_id_builder;
+      arrow::StringBuilder region_name_builder;
+      const std::vector<std::int64_t> customer_ids = {10, 20, 30};
+      const std::vector<std::string> region_names = {"North", "South", "North"};
+      for (std::size_t i = 0; i < customer_ids.size(); ++i) {
+        ASSERT_TRUE(customer_id_builder.Append(customer_ids[i]).ok());
+        ASSERT_TRUE(region_name_builder.Append(region_names[i]).ok());
+      }
+      std::shared_ptr<arrow::Array> customer_id_array, region_name_array;
+      ASSERT_TRUE(customer_id_builder.Finish(&customer_id_array).ok());
+      ASSERT_TRUE(region_name_builder.Finish(&region_name_array).ok());
+      const auto schema = arrow::schema({arrow::field("customer_id", arrow::int64(), false),
+                                         arrow::field("region_name", arrow::utf8(), false)});
+      const auto table = arrow::Table::Make(schema, {customer_id_array, region_name_array});
+      auto sink = arrow::io::FileOutputStream::Open(regions_path_).ValueOrDie();
+      const arrow::Status status =
+          parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), sink, /*chunk_size=*/3);
+      ASSERT_TRUE(status.ok()) << status.ToString();
+    }
   }
 
   void TearDown() override { fs::remove_all(dir_); }
@@ -94,6 +118,7 @@ class HashJoinQueryTest : public ::testing::Test {
   fs::path dir_;
   std::string orders_path_;
   std::string customers_path_;
+  std::string regions_path_;
   QueryEngine engine_{default_config()};
 };
 
@@ -180,6 +205,42 @@ TEST_F(HashJoinQueryTest, ScalarCountOverJoinMatchesExpectedRowCount) {
       std::static_pointer_cast<arrow::Int64Array>(result.batches.front()->GetColumnByName("n"));
   ASSERT_NE(n_column, nullptr);
   EXPECT_EQ(n_column->Value(0), 4);
+}
+
+// Regression test: a 3+-way JOIN chain used to be rejected outright at
+// parse time ("KernelLake supports at most two read_parquet(...)
+// sources"), even though the underlying hsql SQL parser already builds a
+// correct left-deep join tree for it -- KernelLake's own AST conversion
+// was what rejected it. Fixed by generalizing AstJoinClause/BoundJoin to a
+// chain and building a left-deep chain of LogicalJoin/HashJoinOperator
+// nodes -- see docs/ARCHITECTURE.md's "N-way joins" section. Order 5
+// (customer_id=99, no matching customer) is excluded by the first join,
+// same as the two-table tests above; the remaining 4 orders' regions:
+// North (customers 10, 30) = 100+50+20 = 170, South (customer 20) = 75.
+TEST_F(HashJoinQueryTest, ThreeWayJoinGroupedSumMatchesExpectedTotals) {
+  const QueryResult result =
+      engine_.execute("SELECT r.region_name, SUM(o.amount) AS total FROM read_parquet('" + orders_path_ +
+                      "') AS o JOIN read_parquet('" + customers_path_ +
+                      "') AS c ON o.customer_id = c.customer_id "
+                      "JOIN read_parquet('" +
+                      regions_path_ + "') AS r ON c.customer_id = r.customer_id GROUP BY r.region_name");
+
+  ASSERT_EQ(result.batches.size(), 1u);
+  const std::shared_ptr<arrow::RecordBatch>& batch = result.batches.front();
+  ASSERT_EQ(batch->num_rows(), 2);
+  const auto region_column =
+      std::static_pointer_cast<arrow::StringArray>(batch->GetColumnByName("region_name"));
+  const auto total_column = std::static_pointer_cast<arrow::DoubleArray>(batch->GetColumnByName("total"));
+  ASSERT_NE(region_column, nullptr);
+  ASSERT_NE(total_column, nullptr);
+
+  std::map<std::string, double> totals_by_region;
+  for (std::int64_t i = 0; i < batch->num_rows(); ++i) {
+    totals_by_region[region_column->GetString(i)] = total_column->Value(i);
+  }
+  ASSERT_EQ(totals_by_region.size(), 2u);
+  EXPECT_DOUBLE_EQ(totals_by_region.at("North"), 170.0);  // 100 + 50 + 20
+  EXPECT_DOUBLE_EQ(totals_by_region.at("South"), 75.0);
 }
 
 TEST_F(HashJoinQueryTest, RejectsLeftJoinAtParseTime) {

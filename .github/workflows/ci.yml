@@ -215,8 +215,20 @@ jobs:
       # parses/binds against the schema generate_tpch.py produces.
       - name: TPC-H query-file validation (parse/bind/plan only, no GPU)
         run: |
+          # {data} must resolve to lineitem-*.parquet specifically, not a
+          # bare *.parquet glob -- generate_tpch.py now writes lineitem/
+          # part/orders/customer all into this same directory, so an
+          # unqualified glob would pull in every table at once and fail
+          # with a schema mismatch. {part_data}/{orders_data}/
+          # {customer_data} are substituted unconditionally too, one sed
+          # expression per placeholder; a query file that doesn't contain
+          # a given placeholder is unaffected by that expression.
           for q in benchmarks/tpch/queries/*.sql; do
-            sql=$(grep -v '^--' "$q" | tr '\n' ' ' | sed "s|{data}|/tmp/kernellake-tpch-smoke/*.parquet|")
+            sql=$(grep -v '^--' "$q" | tr '\n' ' ' | \
+              sed "s|{data}|/tmp/kernellake-tpch-smoke/lineitem-*.parquet|; \
+                   s|{part_data}|/tmp/kernellake-tpch-smoke/part-*.parquet|; \
+                   s|{orders_data}|/tmp/kernellake-tpch-smoke/orders-*.parquet|; \
+                   s|{customer_data}|/tmp/kernellake-tpch-smoke/customer-*.parquet|")
             echo "=== $q ==="
             ./build/dev/src/cli/kernellake explain --sql "$sql"
           done

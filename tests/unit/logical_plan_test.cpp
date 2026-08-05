@@ -24,6 +24,18 @@ Schema lineitem_schema() {
   });
 }
 
+// Three small schemas for N-way-join tests: a (a_key, a_val), b (b_key,
+// a_key -- joins onto a), c (c_key, b_key -- joins onto b).
+Schema table_a_schema() {
+  return Schema({Field{"a_key", int64_type(false)}, Field{"a_val", string_type(false)}});
+}
+Schema table_b_schema() {
+  return Schema({Field{"b_key", int64_type(false)}, Field{"a_key", int64_type(false)}});
+}
+Schema table_c_schema() {
+  return Schema({Field{"c_val", string_type(false)}, Field{"b_key", int64_type(false)}});
+}
+
 TEST(LogicalPlanner, BuildsGeneralMvpQueryShape) {
   const auto stmt = sql::parse_sql(
       "SELECT region, SUM(amount) AS total_amount, COUNT(*) AS order_count "
@@ -102,6 +114,47 @@ TEST(LogicalPlanner, BuildsTpchQ6ScalarAggregateShape) {
   EXPECT_EQ(aggregate->group_by().size(), 0u);
   ASSERT_EQ(aggregate->aggregates().size(), 1u);
   EXPECT_EQ(aggregate->aggregates()[0].name, "revenue");
+}
+
+// Regression test: a 3+-way JOIN chain used to be rejected outright at
+// parse time; this pins down that build_logical_plan() constructs the
+// expected left-deep chain of two LogicalJoin nodes for 3 sources
+// (LogicalJoin(LogicalJoin(Scan(a), Scan(b)), Scan(c))), not some other
+// shape -- see docs/ARCHITECTURE.md's "N-way joins" section.
+TEST(LogicalPlanner, BuildsLeftDeepJoinChainForThreeTableJoin) {
+  const auto stmt = sql::parse_sql(
+      "SELECT a.a_val, c.c_val FROM read_parquet('/a.parquet') AS a "
+      "JOIN read_parquet('/b.parquet') AS b ON a.a_key = b.a_key "
+      "JOIN read_parquet('/c.parquet') AS c ON b.b_key = c.b_key");
+  const std::vector<Schema> schemas = {table_a_schema(), table_b_schema(), table_c_schema()};
+  const BoundQuery bound = bind_query(stmt, schemas);
+  const LogicalPlanPtr plan = build_logical_plan(bound, schemas);
+
+  const auto* projection = dynamic_cast<const LogicalProjection*>(plan.get());
+  ASSERT_NE(projection, nullptr);
+  const auto* outer_join = dynamic_cast<const LogicalJoin*>(projection->children()[0].get());
+  ASSERT_NE(outer_join, nullptr);
+  const auto* outer_right_scan = dynamic_cast<const LogicalScan*>(outer_join->right().get());
+  ASSERT_NE(outer_right_scan, nullptr);
+  EXPECT_EQ(outer_right_scan->output_schema().field_count(), table_c_schema().field_count());
+
+  const auto* inner_join = dynamic_cast<const LogicalJoin*>(outer_join->left().get());
+  ASSERT_NE(inner_join, nullptr);
+  const auto* inner_left_scan = dynamic_cast<const LogicalScan*>(inner_join->left().get());
+  ASSERT_NE(inner_left_scan, nullptr);
+  EXPECT_EQ(inner_left_scan->output_schema().field_count(), table_a_schema().field_count());
+  const auto* inner_right_scan = dynamic_cast<const LogicalScan*>(inner_join->right().get());
+  ASSERT_NE(inner_right_scan, nullptr);
+  EXPECT_EQ(inner_right_scan->output_schema().field_count(), table_b_schema().field_count());
+
+  // Inner join key: a.a_key (index 0) = b.a_key (index 1 in table_b_schema()).
+  EXPECT_EQ(inner_join->left_key_index(), 0u);
+  EXPECT_EQ(inner_join->right_key_index(), 1u);
+  // Outer join key: b.b_key -- index 2 in the combined [a, b] schema so
+  // far (a contributes 2 fields, b_key is b's own index 0) = c.b_key
+  // (index 1 in table_c_schema()).
+  EXPECT_EQ(outer_join->left_key_index(), 2u);
+  EXPECT_EQ(outer_join->right_key_index(), 1u);
 }
 
 // Regression test: build_logical_plan() used to only recognize a SELECT

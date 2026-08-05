@@ -88,6 +88,29 @@ class QueryEngineExecuteCpuTest : public ::testing::Test {
     const arrow::Status regions_status = parquet::arrow::WriteTable(
         *regions_table, arrow::default_memory_pool(), regions_sink, /*chunk_size=*/2);
     ASSERT_TRUE(regions_status.ok()) << regions_status.ToString();
+
+    // A third table, for a 3-way-join test: joins onto regions.parquet via
+    // region_name (not region -- a step further removed from sales.parquet
+    // in the chain, so the test genuinely exercises a 3-source join, not
+    // just two 2-source joins glued together).
+    managers_path_ = (dir_ / "managers.parquet").string();
+    arrow::StringBuilder manager_region_name_builder;
+    arrow::StringBuilder manager_builder;
+    ASSERT_TRUE(manager_region_name_builder.Append("Alpha").ok());
+    ASSERT_TRUE(manager_builder.Append("Ann").ok());
+    ASSERT_TRUE(manager_region_name_builder.Append("Beta").ok());
+    ASSERT_TRUE(manager_builder.Append("Bo").ok());
+    std::shared_ptr<arrow::Array> manager_region_name_array, manager_array;
+    ASSERT_TRUE(manager_region_name_builder.Finish(&manager_region_name_array).ok());
+    ASSERT_TRUE(manager_builder.Finish(&manager_array).ok());
+    const auto managers_schema = arrow::schema(
+        {arrow::field("region_name", arrow::utf8(), false), arrow::field("manager", arrow::utf8(), false)});
+    const auto managers_table =
+        arrow::Table::Make(managers_schema, {manager_region_name_array, manager_array});
+    auto managers_sink = arrow::io::FileOutputStream::Open(managers_path_).ValueOrDie();
+    const arrow::Status managers_status = parquet::arrow::WriteTable(
+        *managers_table, arrow::default_memory_pool(), managers_sink, /*chunk_size=*/2);
+    ASSERT_TRUE(managers_status.ok()) << managers_status.ToString();
   }
 
   void TearDown() override { fs::remove_all(dir_); }
@@ -95,6 +118,7 @@ class QueryEngineExecuteCpuTest : public ::testing::Test {
   fs::path dir_;
   std::string path_;
   std::string regions_path_;
+  std::string managers_path_;
   QueryEngine engine_{cpu_backend_config()};
 };
 
@@ -380,6 +404,40 @@ TEST_F(QueryEngineExecuteCpuTest, TwoTableInnerJoinMatchesExpectedTotals) {
   ASSERT_EQ(totals_by_name.size(), 2u);
   EXPECT_DOUBLE_EQ(totals_by_name.at("Alpha"), 35.0);  // 10+20+5
   EXPECT_DOUBLE_EQ(totals_by_name.at("Beta"), 110.0);  // 100+7+3
+}
+
+// Regression test: a 3+-way JOIN chain used to be rejected outright at
+// parse time ("KernelLake supports at most two read_parquet(...)
+// sources"), even though the underlying hsql SQL parser already builds a
+// correct left-deep join tree for it. Fixed by generalizing AstJoinClause/
+// BoundJoin to a chain and building a left-deep chain of LogicalJoin nodes
+// in build_logical_plan() -- see docs/ARCHITECTURE.md's "N-way joins"
+// section. This end-to-end test exercises the whole pipeline (parse ->
+// bind -> logical plan -> physical plan -> Acero execution) for a real
+// 3-source join: sales -> regions (via region) -> managers (via
+// region_name, a column that doesn't even exist on sales.parquet, so this
+// genuinely requires the third source's schema to be resolved against the
+// *combined* [sales, regions] schema, not just regions.parquet alone).
+TEST_F(QueryEngineExecuteCpuTest, ThreeTableInnerJoinMatchesExpectedTotals) {
+  const QueryResult result = engine_.execute(
+      "SELECT m.manager, SUM(s.amount) AS total FROM read_parquet('" + path_ + "') AS s JOIN read_parquet('" +
+      regions_path_ + "') AS r ON s.region = r.region JOIN read_parquet('" + managers_path_ +
+      "') AS m ON r.region_name = m.region_name GROUP BY m.manager");
+
+  ASSERT_EQ(result.rows_returned, 2);
+  const std::shared_ptr<arrow::RecordBatch>& batch = result.batches.front();
+  const auto manager_column = std::static_pointer_cast<arrow::StringArray>(batch->GetColumnByName("manager"));
+  const auto total_column = std::static_pointer_cast<arrow::DoubleArray>(batch->GetColumnByName("total"));
+  ASSERT_NE(manager_column, nullptr);
+  ASSERT_NE(total_column, nullptr);
+
+  std::map<std::string, double> totals_by_manager;
+  for (std::int64_t i = 0; i < batch->num_rows(); ++i) {
+    totals_by_manager[manager_column->GetString(i)] = total_column->Value(i);
+  }
+  ASSERT_EQ(totals_by_manager.size(), 2u);
+  EXPECT_DOUBLE_EQ(totals_by_manager.at("Ann"), 35.0);  // Alpha: 10+20+5
+  EXPECT_DOUBLE_EQ(totals_by_manager.at("Bo"), 110.0);  // Beta: 100+7+3
 }
 
 }  // namespace

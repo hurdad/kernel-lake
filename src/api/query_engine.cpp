@@ -37,12 +37,16 @@ LogicalPlanPtr QueryEngine::plan_logical(std::string_view sql,
   const sql::AstSelectStatement ast = sql::parse_sql(sql);
 
   if (ast.join.has_value()) {
-    const Schema left_schema =
-        inspect_source_schema(store_, ast.join->left.paths, metadata_inspection_seconds_out);
-    const Schema right_schema =
-        inspect_source_schema(store_, ast.join->right.paths, metadata_inspection_seconds_out);
-    const BoundQuery bound = bind_query(ast, left_schema, right_schema);
-    LogicalPlanPtr logical = build_logical_plan(bound, left_schema, &right_schema);
+    std::vector<Schema> join_schemas;
+    join_schemas.reserve(ast.join->steps.size() + 1);
+    join_schemas.push_back(
+        inspect_source_schema(store_, ast.join->first.paths, metadata_inspection_seconds_out));
+    for (const sql::AstJoinStep& step : ast.join->steps) {
+      join_schemas.push_back(
+          inspect_source_schema(store_, step.source.paths, metadata_inspection_seconds_out));
+    }
+    const BoundQuery bound = bind_query(ast, join_schemas);
+    LogicalPlanPtr logical = build_logical_plan(bound, join_schemas);
     return optimize(logical);
   }
 

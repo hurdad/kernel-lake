@@ -10,34 +10,36 @@ result -- see `NOTICE`.
 (grouped aggregation) -- both single-table scans over `lineitem` --
 **Q19** (a two-table `lineitem`/`part` `INNER JOIN`, `OR` of `AND`s with
 `BETWEEN`, no `CASE`), **Q12** (a two-table `orders`/`lineitem`
-`INNER JOIN`, `CASE` inside a grouped aggregate argument), and **Q14** (a
+`INNER JOIN`, `CASE` inside a grouped aggregate argument), **Q14** (a
 two-table `lineitem`/`part` `INNER JOIN`, `LIKE` inside a `CASE` inside a
 *scalar* aggregate argument, two aggregates combined arithmetically into a
-ratio). KernelLake supports a two-table `INNER JOIN ... ON` with a single
-equality key on both the CPU and GPU execution backends (see
-`docs/ARCHITECTURE.md`'s "Hash joins" section and its "CPU execution
-backend" section for the CPU-side fix), which is what makes Q19/Q12/Q14
-possible; `CASE` inside an aggregate argument (grouped *or* scalar), `LIKE`
-inside a `CASE` branch, and a `SELECT` item that combines multiple
+ratio), and **Q3** (a three-table `customer`/`orders`/`lineitem`
+`INNER JOIN` chain, a multi-key `ORDER BY` plus `LIMIT` after the join).
+KernelLake supports a chain of two or more tables via `INNER JOIN ... ON`,
+each step a single equality key, on both the CPU and GPU execution
+backends (see `docs/ARCHITECTURE.md`'s "Hash joins" section, including its
+N-way-join generalization, and its "CPU execution backend" section for the
+CPU-side fix); `CASE` inside an aggregate argument (grouped *or* scalar),
+`LIKE` inside a `CASE` branch, and a `SELECT` item that combines multiple
 aggregates arithmetically (Q14's `100.00 * SUM(...) / SUM(...)`, rather
 than a single bare aggregate call) all now work on both backends too (see
 `docs/ARCHITECTURE.md`'s "CASE expression implementation notes" and the
-entries just above it). One real grammar gap remains, ruling out most of
-the rest of the TPC-H suite for now: only a *two*-table join is supported,
-a 3+-way join fails clearly rather than being silently reinterpreted
-(rules out Q3 and most others). `CASE` inside `WHERE` on the GPU backend
-also remains unsupported (a separate `FilterOperator` gap; the CPU backend
-already supports it) but isn't needed by any TPC-H query added so far. See
-`docs/ROADMAP.md` for the up-to-date list of what's next.
+entries just above it).
+
+`CASE` inside `WHERE` on the GPU backend remains unsupported (a separate
+`FilterOperator` gap; the CPU backend already supports it) but isn't
+needed by any TPC-H query added so far. See `docs/ROADMAP.md` for the
+up-to-date list of what's next.
 
 ## 1. Generate data
 
 `tools/generate_tpch.py` is a **synthetic** generator, not the official
-TPC-H `dbgen` tool -- it produces `lineitem`, `part`, and `orders` tables
-with TPC-H's column names and roughly TPC-H-shaped value distributions
-(see the script's docstring for the full list of deviations, including
-DOUBLE instead of DECIMAL, since KernelLake's GPU execution layer doesn't
-support Decimal yet). It requires the `pyarrow` Python package.
+TPC-H `dbgen` tool -- it produces `lineitem`, `part`, `orders`, and
+`customer` tables with TPC-H's column names and roughly TPC-H-shaped value
+distributions (see the script's docstring for the full list of
+deviations, including DOUBLE instead of DECIMAL, since KernelLake's GPU
+execution layer doesn't support Decimal yet). It requires the `pyarrow`
+Python package.
 
 ```bash
 python3 tools/generate_tpch.py \
@@ -46,28 +48,36 @@ python3 tools/generate_tpch.py \
 ```
 
 Writes `lineitem-*.parquet`, `part-00000.parquet`, `orders-00000.parquet`,
-plus a `manifest.json` recording the generation parameters. Real TPC-H SF1
-has ~6,000,000 `lineitem` rows, 200,000 `part` rows, and ~1,500,000
-`orders` rows; this generator targets the same row counts at the same
-scale factor (`lineitem` split across `--files` Parquet files; `part` and
-`orders` always a single file each -- `orders` gets exactly one row per
-distinct `l_orderkey` generated, per TPC-H's own 1:N orders:lineitem
-relationship).
+`customer-00000.parquet`, plus a `manifest.json` recording the generation
+parameters. Real TPC-H SF1 has ~6,000,000 `lineitem` rows, 200,000 `part`
+rows, ~1,500,000 `orders` rows, and 150,000 `customer` rows; this
+generator targets the same `lineitem`/`part`/`orders` row counts at the
+same scale factor (`lineitem` split across `--files` Parquet files;
+`part`/`orders` always a single file each -- `orders` gets exactly one row
+per distinct `l_orderkey` generated, per TPC-H's own 1:N orders:lineitem
+relationship). `customer` is a fixed 150,000 rows regardless of scale
+factor (matching TPC-H's own SF1 customer count), also written as a single
+file.
 
 ## 2. Query
 
 The queries live in version-controlled files, `benchmarks/tpch/queries/
-q01.sql`, `q06.sql`, `q12.sql`, `q14.sql`, `q19.sql`, each with a header
-comment documenting its specific deviations from canonical TPC-H syntax
-(`FROM lineitem` -> `FROM read_parquet('{data}')`, no `INTERVAL`
-arithmetic, no `ORDER BY`). Q1/Q6 need only `{data}` substituted with your
+q01.sql`, `q03.sql`, `q06.sql`, `q12.sql`, `q14.sql`, `q19.sql`, each with
+a header comment documenting its specific deviations from canonical
+TPC-H syntax (`FROM lineitem` -> `FROM read_parquet('{data}')`, no
+`INTERVAL` arithmetic). Q1/Q6 need only `{data}` substituted with your
 `lineitem` glob; Q19/Q14 also need `{part_data}` substituted with your
 `part` glob; Q12 also needs `{orders_data}` substituted with your `orders`
-glob:
+glob; Q3 needs both `{orders_data}` and `{customer_data}` substituted with
+your `orders` and `customer` globs. `{data}` must always be a
+`lineitem`-specific glob (e.g. `lineitem-*.parquet`), not a bare
+`*.parquet` -- `generate_tpch.py` writes every table into the same output
+directory, so a bare glob would pull in all of them at once and fail with
+a schema mismatch:
 
 ```bash
 sql=$(grep -v '^--' benchmarks/tpch/queries/q06.sql | tr '\n' ' ' | \
-  sed "s|{data}|/tmp/kernellake-tpch-sf1/*.parquet|")
+  sed "s|{data}|/tmp/kernellake-tpch-sf1/lineitem-*.parquet|")
 ./build/gpu-dev/src/cli/kernellake query --sql "$sql" --stats
 
 sql=$(grep -v '^--' benchmarks/tpch/queries/q19.sql | tr '\n' ' ' | \
@@ -84,6 +94,12 @@ sql=$(grep -v '^--' benchmarks/tpch/queries/q12.sql | tr '\n' ' ' | \
   sed "s|{data}|/tmp/kernellake-tpch-sf1/lineitem-*.parquet|; \
        s|{orders_data}|/tmp/kernellake-tpch-sf1/orders-*.parquet|")
 ./build/gpu-dev/src/cli/kernellake query --sql "$sql" --stats
+
+sql=$(grep -v '^--' benchmarks/tpch/queries/q03.sql | tr '\n' ' ' | \
+  sed "s|{data}|/tmp/kernellake-tpch-sf1/lineitem-*.parquet|; \
+       s|{orders_data}|/tmp/kernellake-tpch-sf1/orders-*.parquet|; \
+       s|{customer_data}|/tmp/kernellake-tpch-sf1/customer-*.parquet|")
+./build/gpu-dev/src/cli/kernellake query --sql "$sql" --stats
 ```
 
 ## 3. Validate against DuckDB
@@ -98,10 +114,14 @@ binary's own default).
 ```bash
 python3 tools/validate_tpch.py \
   --kernellake build/gpu-dev/src/cli/kernellake \
-  --data '/tmp/kernellake-tpch-sf1/*.parquet' --scale-factor 1 --query all
+  --data '/tmp/kernellake-tpch-sf1/lineitem-*.parquet' --scale-factor 1 --query 1
+python3 tools/validate_tpch.py \
+  --kernellake build/gpu-dev/src/cli/kernellake \
+  --data '/tmp/kernellake-tpch-sf1/lineitem-*.parquet' --scale-factor 1 --query 6
 
-# Q19/Q14 need --part-data, Q12 needs --orders-data (none covered by
-# --query all, which only passes --data):
+# Q19/Q14 need --part-data, Q12 needs --orders-data, Q3 needs both
+# --orders-data and --customer-data (none covered by --query all, which
+# only passes --data):
 python3 tools/validate_tpch.py \
   --kernellake build/gpu-dev/src/cli/kernellake \
   --data '/tmp/kernellake-tpch-sf1/lineitem-*.parquet' \
@@ -117,6 +137,12 @@ python3 tools/validate_tpch.py \
   --data '/tmp/kernellake-tpch-sf1/lineitem-*.parquet' \
   --orders-data '/tmp/kernellake-tpch-sf1/orders-*.parquet' \
   --scale-factor 1 --query 12
+python3 tools/validate_tpch.py \
+  --kernellake build/gpu-dev/src/cli/kernellake \
+  --data '/tmp/kernellake-tpch-sf1/lineitem-*.parquet' \
+  --orders-data '/tmp/kernellake-tpch-sf1/orders-*.parquet' \
+  --customer-data '/tmp/kernellake-tpch-sf1/customer-*.parquet' \
+  --scale-factor 1 --query 3
 ```
 
 This has been run at SF0.01, SF0.1, and SF1 (60,000, 600,000, and
@@ -124,18 +150,22 @@ This has been run at SF0.01, SF0.1, and SF1 (60,000, 600,000, and
 scale, including the full SF1 run (~105 MiB single Parquet file, zstd
 compression, 1,000,000-row row groups). Q19, Q12, and Q14 have each been
 verified at SF0.01 on both the CPU and GPU backends, exact match against
-DuckDB.
+DuckDB. Q3 has been verified at SF0.01 on the CPU backend, exact
+row-for-row and value-for-value match against DuckDB, including its
+3-way join, `ORDER BY revenue DESC, o_orderdate` multi-key sort, and
+`LIMIT 10`; not yet re-verified on the GPU backend.
 
 ## 4. Benchmark
 
 `kernellake benchmark tpch` times a query over configurable warmup and
 measured iterations, reporting each iteration plus median/mean/min/max/
 standard deviation as JSON. Pass `--part-data` for Q19/Q14, `--orders-data`
-for Q12 (or either for any future query needing that second table).
+for Q12, or both `--orders-data` and `--customer-data` for Q3 (or any
+combination for a future query needing those extra tables).
 
 ```bash
 ./build/gpu-dev/src/cli/kernellake benchmark tpch \
-  --data '/tmp/kernellake-tpch-sf1/*.parquet' --scale-factor 1 \
+  --data '/tmp/kernellake-tpch-sf1/lineitem-*.parquet' --scale-factor 1 \
   --query 6 --iterations 5 --mode cold --output tpch-q6-sf1.json
 ```
 

@@ -165,20 +165,33 @@ struct AstParquetSource {
   std::optional<std::string> alias;
 };
 
-// `FROM read_parquet(...) AS a JOIN read_parquet(...) AS b ON <condition>`.
-// Only a two-table INNER JOIN is supported -- see docs/ARCHITECTURE.md for
-// the full scope (single equality key, both sides must be aliased
-// `read_parquet(...)` sources, no comma-style joins or 3+ tables).
-struct AstJoinClause {
-  AstParquetSource left;
-  AstParquetSource right;
+// One additional source joined onto the running left-deep chain so far,
+// e.g. in `A JOIN B ON c1 JOIN C ON c2`, the chain is `first = A`,
+// `steps = [{B, c1}, {C, c2}]` -- matching exactly how the underlying
+// hsql SQL parser itself left-associates a multi-way JOIN into nested
+// `(A JOIN B) JOIN C` TableRefs (see parser.cpp's `convert_join_chain()`),
+// so no parser-side re-association is needed, just flattening. `condition`
+// is bound against the *combined* schema of every source before this one
+// plus this step's own `source` -- see binder.cpp.
+struct AstJoinStep {
+  AstParquetSource source;
   AstExprPtr condition;
+};
+
+// `FROM read_parquet(...) AS a JOIN read_parquet(...) AS b ON <c1> [JOIN
+// read_parquet(...) AS c ON <c2> ...]`. Each step is a two-table INNER
+// JOIN with a single equality key against the running combined schema so
+// far -- see docs/ARCHITECTURE.md for the full scope (both sides of every
+// step must be aliased `read_parquet(...)` sources, no comma-style joins).
+struct AstJoinClause {
+  AstParquetSource first;
+  std::vector<AstJoinStep> steps;  // at least one
 };
 
 struct AstSelectStatement {
   std::vector<AstExprPtr> select_list;
   AstParquetSource from;              // single-table FROM; unused when `join` is set
-  std::optional<AstJoinClause> join;  // two-table FROM ... JOIN ... ON ...
+  std::optional<AstJoinClause> join;  // FROM ... JOIN ... ON ... [JOIN ... ON ...]
   AstExprPtr where;                   // null if no WHERE clause
   std::vector<AstExprPtr> group_by;
   std::vector<AstOrderByItem> order_by;

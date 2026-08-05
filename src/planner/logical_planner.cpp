@@ -140,23 +140,13 @@ ExpressionPtr rewrite_aggregate_refs(const ExpressionPtr& expr, std::vector<Name
   return expr;
 }
 
-}  // namespace
-
-LogicalPlanPtr build_logical_plan(const BoundQuery& query, const Schema& source_schema,
-                                  const Schema* right_schema) {
-  LogicalPlanPtr plan;
-  if (query.join.has_value()) {
-    if (right_schema == nullptr) {
-      throw PlanningError("unreachable: a JOIN query requires a right_schema");
-    }
-    auto left_scan = std::make_shared<LogicalScan>(query.join->left_source_paths, source_schema);
-    auto right_scan = std::make_shared<LogicalScan>(query.join->right_source_paths, *right_schema);
-    plan = std::make_shared<LogicalJoin>(std::move(left_scan), std::move(right_scan),
-                                         query.join->left_key_index, query.join->right_key_index);
-  } else {
-    plan = std::make_shared<LogicalScan>(query.source_paths, source_schema);
-  }
-
+// Everything after the source (a single LogicalScan, or a left-deep chain
+// of LogicalJoin/LogicalScan nodes) is built: WHERE, ORDER BY (placed
+// before an aggregate-free projection), aggregation + re-projection or a
+// plain projection, LIMIT -- identical regardless of whether `plan` came
+// from a single-table FROM or a JOIN chain, so this is shared by both
+// build_logical_plan() overloads below.
+LogicalPlanPtr finish_logical_plan(LogicalPlanPtr plan, const BoundQuery& query) {
   if (query.where != nullptr) {
     plan = std::make_shared<LogicalFilter>(plan, query.where);
   }
@@ -237,6 +227,43 @@ LogicalPlanPtr build_logical_plan(const BoundQuery& query, const Schema& source_
   }
 
   return plan;
+}
+
+}  // namespace
+
+LogicalPlanPtr build_logical_plan(const BoundQuery& query, const Schema& source_schema) {
+  if (query.join.has_value()) {
+    throw PlanningError("unreachable: build_logical_plan(source_schema) called for a JOIN query");
+  }
+  LogicalPlanPtr plan = std::make_shared<LogicalScan>(query.source_paths, source_schema);
+  return finish_logical_plan(std::move(plan), query);
+}
+
+LogicalPlanPtr build_logical_plan(const BoundQuery& query, const std::vector<Schema>& join_schemas) {
+  if (!query.join.has_value()) {
+    throw PlanningError("unreachable: build_logical_plan(join_schemas) called without a JOIN clause");
+  }
+  if (join_schemas.size() != query.join->steps.size() + 1) {
+    throw PlanningError(
+        "unreachable: build_logical_plan(join_schemas) called with the wrong number of schemas for this "
+        "JOIN chain");
+  }
+  // Builds a left-deep chain of LogicalJoin nodes, one per step, e.g.
+  // LogicalJoin(LogicalJoin(Scan(0), Scan(1)), Scan(2)) for 3 sources --
+  // exactly matching BoundJoin's own left-to-right chain structure (see
+  // binder.hpp). Every join's `combined_key_index` is already an index
+  // into the *accumulated* schema so far (see BoundJoinStep's own
+  // comment), which is exactly what LogicalJoin's own left_key_index
+  // expects for a `left` child that is itself a nested LogicalJoin, not
+  // just a plain LogicalScan -- no remapping needed here.
+  LogicalPlanPtr plan = std::make_shared<LogicalScan>(query.join->first_source_paths, join_schemas[0]);
+  for (std::size_t i = 0; i < query.join->steps.size(); ++i) {
+    const BoundJoinStep& step = query.join->steps[i];
+    auto right_scan = std::make_shared<LogicalScan>(step.source_paths, join_schemas[i + 1]);
+    plan = std::make_shared<LogicalJoin>(std::move(plan), std::move(right_scan), step.combined_key_index,
+                                         step.source_key_index);
+  }
+  return finish_logical_plan(std::move(plan), query);
 }
 
 }  // namespace kernellake
