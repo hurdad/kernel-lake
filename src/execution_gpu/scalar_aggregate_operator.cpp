@@ -191,33 +191,54 @@ void ScalarAggregateOperator::process_batch(Accumulator& state, const DeviceBatc
     case AggregateFunction::Min:
     case AggregateFunction::Max: {
       std::unique_ptr<cudf::column> column = materialize_argument(state, batch, context);
+      // A batch with zero valid values (either genuinely empty, or every row's
+      // argument is NULL) must leave the running value untouched: cudf::reduce's
+      // init-based overload returns an *invalid* scalar whenever the column itself
+      // contributes no valid values, regardless of whether `init` was valid --
+      // folding such a batch in via init would silently wipe an already-accumulated
+      // running SUM/MIN/MAX back to NULL. See
+      // SumAcrossBatchesSurvivesAnEntirelyNullBatch/
+      // SumAcrossBatchesWhereLaterBatchIsEntirelyNull in the test file, which
+      // reproduce this against a real GPU either way round.
+      if (column->size() == 0 || column->null_count() == column->size()) return;
+
       std::unique_ptr<cudf::reduce_aggregation> agg =
           state.function == AggregateFunction::Sum   ? cudf::make_sum_aggregation<cudf::reduce_aggregation>()
           : state.function == AggregateFunction::Min ? cudf::make_min_aggregation<cudf::reduce_aggregation>()
                                                      : cudf::make_max_aggregation<cudf::reduce_aggregation>();
       const cudf::data_type output_type = to_cudf_type(state.result_type);
-      const std::optional<std::reference_wrapper<cudf::scalar const>> init =
-          state.running_value
-              ? std::optional<std::reference_wrapper<cudf::scalar const>>(*state.running_value)
-              : std::nullopt;
-      state.running_value =
-          cudf::reduce(column->view(), *agg, output_type, init, context.stream, context.memory_resource);
+      if (!state.running_value) {
+        state.running_value =
+            cudf::reduce(column->view(), *agg, output_type, context.stream, context.memory_resource);
+      } else {
+        const std::optional<std::reference_wrapper<cudf::scalar const>> init = *state.running_value;
+        state.running_value =
+            cudf::reduce(column->view(), *agg, output_type, init, context.stream, context.memory_resource);
+      }
       return;
     }
     case AggregateFunction::Avg: {
       std::unique_ptr<cudf::column> column = materialize_argument(state, batch, context);
-      auto sum_agg = cudf::make_sum_aggregation<cudf::reduce_aggregation>();
-      const std::optional<std::reference_wrapper<cudf::scalar const>> init =
-          state.running_value
-              ? std::optional<std::reference_wrapper<cudf::scalar const>>(*state.running_value)
-              : std::nullopt;
-      state.running_value = cudf::reduce(column->view(), *sum_agg, cudf::data_type{cudf::type_id::FLOAT64},
-                                         init, context.stream, context.memory_resource);
       auto count_agg = cudf::make_count_aggregation<cudf::reduce_aggregation>(cudf::null_policy::EXCLUDE);
       std::unique_ptr<cudf::scalar> count =
           cudf::reduce(column->view(), *count_agg, cudf::data_type{cudf::type_id::INT64}, context.stream,
                        context.memory_resource);
       state.running_count += static_cast<cudf::numeric_scalar<std::int64_t>&>(*count).value(context.stream);
+
+      // Same guard as Sum/Min/Max above: a batch contributing zero valid values
+      // must not fold into running_value via cudf::reduce's init overload, or it
+      // silently poisons an already-accumulated sum back to NULL.
+      if (column->size() == 0 || column->null_count() == column->size()) return;
+
+      auto sum_agg = cudf::make_sum_aggregation<cudf::reduce_aggregation>();
+      if (!state.running_value) {
+        state.running_value = cudf::reduce(column->view(), *sum_agg, cudf::data_type{cudf::type_id::FLOAT64},
+                                           context.stream, context.memory_resource);
+      } else {
+        const std::optional<std::reference_wrapper<cudf::scalar const>> init = *state.running_value;
+        state.running_value = cudf::reduce(column->view(), *sum_agg, cudf::data_type{cudf::type_id::FLOAT64},
+                                           init, context.stream, context.memory_resource);
+      }
       return;
     }
   }

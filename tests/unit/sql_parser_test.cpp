@@ -217,10 +217,81 @@ TEST(SqlParser, AcceptsReasonablyDeepExpressionNesting) {
   EXPECT_NO_THROW((void)(parse_sql("SELECT a FROM read_parquet('/x.parquet') WHERE a > " + ok_expr)));
 }
 
+// Regression test: hsql's own recursive-descent parser builds a chained
+// JOIN (`A JOIN B JOIN C JOIN ...`) as a left-deep TableRef tree, and
+// recurses once per level while doing so -- with no depth limit of its
+// own, same as its parenthesized-expression parsing above. A long enough
+// chain (empirically ~40,000 JOINs -- well under this file's 1 MiB
+// kMaxSqlBytes cap) drove it into a real C-stack overflow (SIGSEGV)
+// *inside hsql::SQLParser::parse() itself*, before KernelLake's own
+// semantic kMaxJoinSources check (which only runs after hsql has already
+// built its tree, see RejectsExcessiveJoinChainLength above) ever got a
+// chance to reject it. Confirmed with a standalone repro before this was
+// fixed by adding a cheap pre-scan (kMaxJoinKeywords) alongside the
+// existing paren-depth one. If this ever regressed, this test would
+// crash the whole test binary, not just fail an assertion.
+TEST(SqlParser, RejectsExcessivelyLongJoinChainWithoutCrashing) {
+  std::string sql = "SELECT a.x FROM read_parquet('/x.parquet') AS a";
+  for (int i = 0; i < 40000; ++i) {
+    sql += " JOIN t" + std::to_string(i) + " ON true";
+  }
+  EXPECT_THROW((void)(parse_sql(sql)), SqlError);
+}
+
 TEST(SqlParser, RejectsExcessivelyLongSqlText) {
   const std::string huge_sql =
       "SELECT a FROM read_parquet('/x.parquet') WHERE a > 1 -- " + std::string(1 << 21, 'x');
   EXPECT_THROW((void)(parse_sql(huge_sql)), SqlError);
+}
+
+// Regression test: preprocess_from_read_parquet() used to extract
+// read_parquet(...)'s comma-separated string-literal arguments with a
+// std::regex pattern containing a repeated group
+// (`(?:'...'\s*,\s*)*'...'`). libstdc++'s std::regex recurses once per
+// repetition of a `(...)*` group, so a single path argument long enough
+// (empirically ~35,000 characters -- well under this file's own 1 MiB
+// kMaxSqlBytes cap) drove it into a real C-stack overflow: a process
+// crash (SIGSEGV), not a catchable SqlError -- confirmed with a
+// standalone repro before this was fixed by replacing the regex with a
+// linear, non-recursive hand-written scanner. If this ever regressed,
+// this test would crash the whole test binary, not just fail an
+// assertion.
+TEST(SqlParser, AcceptsAVeryLongSinglePathArgumentWithoutCrashing) {
+  const std::string long_path(200000, 'a');
+  const auto stmt = parse_sql("SELECT a FROM read_parquet('" + long_path + "')");
+  ASSERT_EQ(stmt.from.paths.size(), 1u);
+  EXPECT_EQ(stmt.from.paths[0], long_path);
+}
+
+// Companion regression test for the same underlying bug, exercising many
+// repetitions of the comma-separated-argument group instead of one long
+// argument.
+TEST(SqlParser, AcceptsManyCommaSeparatedPathArgumentsWithoutCrashing) {
+  std::string sql = "SELECT a FROM read_parquet(";
+  constexpr int kPathCount = 20000;
+  for (int i = 0; i < kPathCount; ++i) sql += "'/data/a.parquet', ";
+  sql += "'/data/last.parquet')";
+
+  const auto stmt = parse_sql(sql);
+  ASSERT_EQ(stmt.from.paths.size(), static_cast<std::size_t>(kPathCount) + 1);
+  EXPECT_EQ(stmt.from.paths.front(), "/data/a.parquet");
+  EXPECT_EQ(stmt.from.paths.back(), "/data/last.parquet");
+}
+
+TEST(SqlParser, ReadParquetIsCaseInsensitive) {
+  const auto stmt = parse_sql("SELECT a FROM READ_PARQUET('/x.parquet')");
+  ASSERT_EQ(stmt.from.paths.size(), 1u);
+  EXPECT_EQ(stmt.from.paths[0], "/x.parquet");
+}
+
+TEST(SqlParser, ReadParquetPathArgumentPreservesEscapedQuoteVerbatim) {
+  // Matches the pre-existing (unchanged by this fix) behavior of the old
+  // regex: an escaped quote inside a path argument doesn't end the string
+  // early, but the captured path text keeps the backslash character
+  // as-is rather than unescaping it.
+  const auto stmt = parse_sql(R"(SELECT a FROM read_parquet('/data/a\'b.parquet'))");
+  ASSERT_EQ(stmt.from.paths.size(), 1u);
+  EXPECT_EQ(stmt.from.paths[0], R"(/data/a\'b.parquet)");
 }
 
 }  // namespace

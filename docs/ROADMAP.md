@@ -1556,6 +1556,185 @@ and covered by passing tests -- not merely designed or stubbed.
 
   Verified for real: `gpu-dev` 263/263 (up from 261), `dev`/`server-dev`/
   `otel-dev` still 181/184/184, zero regressions.
+- **Continued the audit into modules not touched this session
+  (`optimizer.cpp`, `binder.cpp`, GPU operators, cloud object stores) --
+  found one more real bug, in `gcs_object_store.cpp`'s
+  `parse_iso8601_utc()`.** `std::get_time(&tm, "%Y-%m-%dT%H:%M:%S")` only
+  validates that specific format and leaves any trailing characters in the
+  stream unconsumed without failing -- an offset-form timestamp like
+  `"2026-01-01T00:00:00+05:00"` (a real ISO-8601 variant, just not the "Z"
+  form this function's own comment says is the only one supported) would
+  parse "successfully," silently discard the `+05:00`, and misinterpret
+  the result as UTC -- producing an access-token expiration silently wrong
+  by the offset amount, with no error at all. Fixed by capturing the
+  remainder of the stream after the timestamp portion and requiring it be
+  exactly `"Z"`, turning this into the same clear rejection every other
+  malformed input already got. Three new regression tests
+  (`GcsObjectStore.RejectsAccessTokenExpirationWithNonUtcOffset`,
+  `.RejectsAccessTokenExpirationMissingUtcSuffix`,
+  `.AcceptsValidUtcAccessTokenExpiration`) -- this module had no test file
+  at all before. `optimizer.cpp`/`binder.cpp`/the GPU hash-join, hash-
+  aggregate, and filter operators/S3 and Azure object stores were all
+  read carefully and found already correct; HDFS's authority-stripping
+  logic (`strip_authority()`, relies on a double `strip_scheme()`
+  application) was traced through manually and confirmed correct, but
+  left otherwise unverified -- consistent with this project's existing,
+  already-documented position that HDFS has no real cluster or
+  lightweight emulator available to test against. `dev` 184/184 (up
+  from 181), `server-dev`/`otel-dev` unaffected at 184/184.
+- **Continued the audit into the remaining GPU operators
+  (`parquet_scan_operator.cpp`, `scalar_aggregate_operator.cpp`,
+  `sort_operator.cpp`, `limit_operator.cpp`) -- found a real bug in
+  `ScalarAggregateOperator::process_batch()`'s SUM/MIN/MAX/AVG
+  accumulation.** The operator folds each batch's contribution into a
+  running `cudf::scalar` across batches via `cudf::reduce()`'s `init`
+  overload (`cudf::reduce(column, agg, output_type, init=running_value)`),
+  needed since batches aren't retained. `cudf::reduce()`'s own header
+  documents that empty or all-null input produces an invalid scalar, but
+  doesn't say what happens when `init` is combined with such a column --
+  empirically confirmed against a real GPU (RTX 5060 Ti, standalone
+  `cudf::reduce` repro plus two new operator-level tests) that the
+  init-based overload returns an *invalid* scalar whenever the **current
+  batch** contributes zero valid values, regardless of whether `init`
+  itself was valid, in either order (all-null batch first poisons a later
+  valid batch's contribution; a valid running total followed by an
+  all-null batch is wiped out too). Any nullable aggregate argument column
+  with an all-NULL batch or pass anywhere in a multi-batch GPU scan (very
+  plausible for sparse/clustered NULLs, or simply any pass on its own
+  scanning a value that happens to be entirely NULL) silently turned the
+  whole `SUM`/`MIN`/`MAX`/`AVG` result to NULL instead of the correct
+  value from the other batches -- no error, wrong answer. Fixed by
+  checking `column->size() == 0 || column->null_count() == column->size()`
+  before ever touching `running_value`: a batch contributing nothing
+  leaves the running value untouched; a first contribution is reduced
+  without `init`; a later contribution folds in via `init` only once a
+  running value already exists. Applied the same guard to `Avg`'s
+  separate sum/count accumulation. Four new regression tests
+  (`ScalarAggregateOperator.SumAcrossBatchesSurvivesAnEntirelyNullBatch`,
+  `.SumAcrossBatchesWhereLaterBatchIsEntirelyNull`,
+  `.AvgComputesMeanAcrossBatchesIncludingAnEntirelyNullBatch`, plus the
+  standalone repro used to first pin down cudf's actual behavior before
+  touching the real file). `parquet_scan_operator.cpp` (the all-local vs.
+  `ObjectStoreDatasource`-backed chunked-reader branching, the
+  empty-chunk-skipping loop in `next()`), `sort_operator.cpp` (full
+  materialize-then-`stable_sorted_order`+`gather`, NULL ordering matching
+  PostgreSQL's ASC-nulls-last/DESC-nulls-first convention), and
+  `limit_operator.cpp` (truncation via `cudf::slice` plus a deep copy into
+  an owned table, needed since the source batch's buffer is about to go
+  out of scope) were all read carefully and found already correct.
+  Verified for real: incremental `ninja`/`docker exec` rebuild against the
+  existing `dev-gpu` image and a real RTX 5060 Ti (not a full image
+  rebuild) -- the `kernellake_gpu_tests` binary went from 76/76 to 79/79,
+  `kernellake_unit_tests` unaffected at 187/187. `dev`/`server-dev`/
+  `otel-dev` untouched (this file is GPU-only, not linked into the
+  CPU-only presets).
+- **Continued the audit into the GPU and CPU expression compilers
+  (`expression_compiler.cpp`, `expression_compiler_cpu.cpp`) -- found a
+  real bug in `binder.cpp`'s numeric type promotion, shared by both
+  execution backends.** `promote_numeric()` picks `UInt64` as the common
+  type whenever either side of a comparison/arithmetic expression is
+  `UInt64` (and `UInt32` similarly for a mixed `UInt32`/`Int32` pair), then
+  `cast_if_needed()` casts the other (signed) side to match. Confirmed
+  against a real GPU that this silently two's-complement-wraps a negative
+  value instead of erroring: `CAST(-5 AS UINT64)` evaluates to
+  `18446744073709551611` (`2^64 - 5`), not an error and not saturated to
+  0 -- so e.g. `WHERE signed_col < unsigned_col` would silently produce
+  the wrong answer for any negative `signed_col` (`UInt32`/`UInt64` are
+  real, reachable KernelLake column types, mapped straight from Parquet's
+  `UINT32`/`UINT64` logical types via `arrow_adapter.cpp`, not a
+  theoretical corner case). Separately, `expression_compiler.cpp`'s
+  `Negate` case synthesizes unary `-x` as `0 - x` in `x`'s own type (cudf's
+  AST has no dedicated negation operator); for an unsigned `x` that wraps
+  the same way -- confirmed `0u - 5u` (`UINT32`) evaluates to
+  `4294967291` (`2^32 - 5`). Fixed both at bind time (shared by both
+  backends, so the CPU backend's `expression_compiler_cpu.cpp` -- whose
+  `Negate` case delegates straight to Arrow's own `"negate"` kernel -- is
+  protected by the same guard without needing a separate fix there):
+  `promote_numeric()` now throws a clear `BindingError` when mixing a
+  signed and unsigned integer type (matching the existing rejection style
+  for mismatched DECIMALs just above it in the same function), and
+  `bind_node(AstUnary)` now rejects unary `-` on a `UInt32`/`UInt64`
+  operand outright, since there is no correct unsigned negative result to
+  produce. Six new regression tests: two GPU characterization tests
+  pinning down the exact cudf wraparound values so a future cudf upgrade
+  changing this behavior fails loudly rather than silently
+  (`ExpressionCompiler.CastingNegativeInt64ToUInt64SilentlyWrapsAround`,
+  `.UnaryNegateOnUnsignedColumnSilentlyWrapsAround`), and four
+  binder-level rejection/acceptance tests
+  (`Binder.MixingSignedAndUnsignedIntegerTypesInComparisonIsRejected`,
+  `.MixingSignedAndUnsignedIntegerTypesInArithmeticIsRejected`,
+  `.UnaryNegateOnUnsignedColumnIsRejected`,
+  `.UnaryNegateOnSignedColumnStillWorks` -- the last confirming the fix
+  doesn't overreach into signed operands). An explicit
+  `CAST(unsigned_col AS BIGINT)` narrowing a large `UInt64` value was
+  deliberately left as-is (not rejected): unlike the implicit-promotion
+  case, an explicit user-written CAST losing precision on an
+  out-of-range value is ordinary, widely-accepted SQL CAST semantics
+  (the same way `CAST(3.9 AS INT)` truncates elsewhere in this project),
+  not a hidden footgun the user never asked for. Verified for real:
+  `dev` 188/188 (up from 184), `server-dev` 40/40 `Binder.*` tests
+  passing (full-suite count unaffected by this change), `gpu-dev`
+  191/191 `kernellake_unit_tests` (up from 187) and 78/78
+  `kernellake_gpu_tests` (up from 76, both counts from this bug's own
+  round -- the earlier `ScalarAggregateOperator` fix's container had
+  already been torn down), via the same incremental `ninja`/`docker exec`
+  rebuild against a real RTX 5060 Ti.
+- **Continued the audit into the SQL parser (`parser.cpp`) -- found two
+  more real, high-severity process-crash bugs, both confirmed with
+  standalone repros before being fixed.** (1)
+  `preprocess_from_read_parquet()`'s `read_parquet(...)` argument
+  extraction used a `std::regex` pattern with a repeated group
+  (`(?:'...'\s*,\s*)*'...'`). libstdc++'s `std::regex` recurses once per
+  repetition of a `(...)*` group, so a single path argument long enough
+  (confirmed empirically at ~35,000 characters -- well under this same
+  file's own 1 MiB `kMaxSqlBytes` cap, which exists specifically to guard
+  against this class of problem for hsql's own recursive-descent parser)
+  drove it into a real C-stack overflow: `SELECT * FROM
+  read_parquet('<~35,000-char path>')` segfaulted the whole process
+  rather than raising a catchable `SqlError`. Since `kernellake-server`
+  accepts arbitrary SQL text over Arrow Flight SQL from any client, this
+  was a remotely-triggerable denial of service requiring nothing beyond
+  the ability to send an ordinary-looking query. Fixed by replacing the
+  regex entirely with a linear, non-recursive hand-written scanner
+  (`try_parse_read_parquet_args`/`try_parse_quoted_string`) -- O(1) stack
+  usage regardless of input size or shape, preserving the exact same
+  matching semantics (case-insensitive `read_parquet`, verbatim
+  passthrough of backslash-escaped characters inside a path, "no match"
+  falling through to hsql's own parse error). (2) Separately, hsql's own
+  recursive-descent parser builds a chained JOIN (`A JOIN B JOIN C JOIN
+  ...`) as a left-deep TableRef tree and recurses once per level while
+  doing so, with no depth limit of its own -- the same class of bug this
+  file's pre-existing `kMaxParenDepth` guard already exists to catch for
+  nested parentheses, just never extended to JOIN-chain depth. Confirmed
+  a ~40,000-JOIN chain (comfortably under the 1 MiB SQL-length cap)
+  segfaults *inside `hsql::SQLParser::parse()` itself*, before this
+  project's own semantic `kMaxJoinSources` check (which only runs after
+  hsql has already built its tree) ever gets a chance to reject it. Fixed
+  by adding a second cheap pre-scan, `kMaxJoinKeywords` (64, generous
+  above the semantic ceiling of 12 actual JOIN sources), counting
+  case-insensitive `"join"` substring occurrences alongside the existing
+  paren-depth scan in `check_sql_within_limits()` -- same "well before any
+  parsing work, real or hsql's" philosophy as the existing guards. Both
+  fixes verified by first reproducing the actual segfault (via a
+  standalone program linked against the real `kernellake_sql`/`hsql`
+  libraries, and separately by temporarily reverting just the
+  `read_parquet` fix and re-running the new test, which crashed the whole
+  gtest binary as expected) and then confirming the fix turns it into a
+  clean `SqlError`. Six new regression tests: `AcceptsAVeryLong
+  SinglePathArgumentWithoutCrashing`, `AcceptsManyCommaSeparated
+  PathArgumentsWithoutCrashing`, `ReadParquetIsCaseInsensitive`,
+  `ReadParquetPathArgumentPreservesEscapedQuoteVerbatim`,
+  `RejectsExcessivelyLongJoinChainWithoutCrashing`, plus re-verifying
+  `AcceptsManyCommaSeparatedPathArgumentsWithoutCrashing`'s companion
+  path-count case. Separately stress-tested (no bug found, no fix
+  needed): a 100,000-element `IN (...)` list parses fine with no
+  recursion-depth issue, since hsql builds a flat list iteratively there
+  rather than a nested tree the way JOIN chains and parenthesized
+  expressions are built. Verified for real: `dev` 193/193 (up from 188),
+  `server-dev` 25/25 `SqlParser.*` (full suite unaffected), `gpu-dev`
+  199/199 `kernellake_unit_tests` (up from 198, this round's own count,
+  bundled with every other fix from this same audit session applied
+  together in one container) and 81/81 `kernellake_gpu_tests`.
 
 ## Not yet started
 

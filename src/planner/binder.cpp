@@ -76,6 +76,30 @@ DataType promote_numeric(const DataType& a, const DataType& b) {
   if (is_floating(a.id) || is_floating(b.id)) {
     return float64_type(nullable);
   }
+  {
+    const bool a_signed = a.id == TypeId::Int32 || a.id == TypeId::Int64;
+    const bool b_signed = b.id == TypeId::Int32 || b.id == TypeId::Int64;
+    const bool a_unsigned = a.id == TypeId::UInt32 || a.id == TypeId::UInt64;
+    const bool b_unsigned = b.id == TypeId::UInt32 || b.id == TypeId::UInt64;
+    if ((a_signed && b_unsigned) || (a_unsigned && b_signed)) {
+      // Mixing a signed and an unsigned integer type has no always-safe
+      // common representation here: cudf::ast's CAST_TO_UINT64/CAST_TO_INT64
+      // silently two's-complement-wraps a negative value instead of erroring
+      // (confirmed against a real GPU: CAST(-5 AS UINT64) ==
+      // 18446744073709551611), so promoting the signed side to match the
+      // unsigned one would make e.g. `WHERE signed_col < unsigned_col`
+      // silently wrong whenever signed_col is negative. Reject instead,
+      // matching how mixing two differently-shaped DECIMALs is rejected
+      // just above.
+      const DataType& signed_side = a_signed ? a : b;
+      const DataType& unsigned_side = a_unsigned ? a : b;
+      throw BindingError(fmt::format(
+          "mixing signed ({}) and unsigned ({}) integer types is not yet supported -- a negative value "
+          "on the signed side would silently wrap around when cast to match the unsigned side; wrap the "
+          "signed side in an explicit CAST if you know it is always non-negative",
+          signed_side.to_string(), unsigned_side.to_string()));
+    }
+  }
   if (a.id == TypeId::UInt64 || b.id == TypeId::UInt64) {
     return uint64_type(nullable);
   }
@@ -519,6 +543,18 @@ class Binder {
         if (!is_numeric(operand_type.id)) {
           throw BindingError(
               fmt::format("unary '-' requires a numeric operand, got {}", operand_type.to_string()));
+        }
+        if (operand_type.id == TypeId::UInt32 || operand_type.id == TypeId::UInt64) {
+          // expression_compiler.cpp synthesizes unary '-' as `0 - x` in x's
+          // own type (cudf::ast has no dedicated negation operator); for an
+          // unsigned x that silently two's-complement-wraps instead of
+          // producing a negative value (confirmed against a real GPU: `0u -
+          // 5u` (UINT32) == 4294967291). There is no correct unsigned
+          // negative result to produce, so reject clearly instead.
+          throw BindingError(
+              fmt::format("unary '-' is not supported on an unsigned operand ({}) -- it would silently "
+                          "wrap around instead of producing a negative value",
+                          operand_type.to_string()));
         }
         return std::make_shared<UnaryExpression>(UnaryOperator::Negate, std::move(operand), operand_type);
       case AstUnaryOp::IsNull:

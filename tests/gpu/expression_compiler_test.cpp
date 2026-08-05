@@ -102,5 +102,63 @@ TEST(ExpressionCompiler, CompilesTpchQ6FilterShapeAndArithmetic) {
   for (double value : copy_to_host<double>(revenue->view())) EXPECT_DOUBLE_EQ(value, 6.0);  // 100.0*0.06
 }
 
+TEST(ExpressionCompiler, CastingNegativeInt64ToUInt64SilentlyWrapsAround) {
+  // Characterization test: pins down the exact cudf::ast behavior that
+  // motivates binder.cpp's promote_numeric() rejecting a signed/unsigned
+  // integer mix instead of promoting to UInt64 (see
+  // Binder.MixingSignedAndUnsignedIntegerTypesInComparisonIsRejected).
+  // Without that bind-time rejection, `WHERE signed_col < unsigned_col`
+  // would silently misevaluate for any negative signed_col: CAST_TO_UINT64
+  // two's-complement-wraps rather than erroring or saturating. If a future
+  // cudf upgrade ever changes this, this test fails first and the
+  // corresponding binder rejection can be revisited.
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  auto column = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT64}, 1);
+  auto scalar = cudf::make_fixed_width_scalar<int64_t>(-5);
+  cudf::mutable_column_view mutable_view = column->mutable_view();
+  cudf::fill_in_place(mutable_view, 0, 1, *scalar);
+  columns.push_back(std::move(column));
+  cudf::table table(std::move(columns));
+
+  auto col = std::make_shared<ColumnExpression>("signed_col", 0, int64_type(false));
+  auto cast_expr = std::make_shared<CastExpression>(col, uint64_type(false));
+
+  ExpressionCompiler compiler;
+  std::unique_ptr<cudf::column> result = cudf::compute_column(table.view(), compiler.compile(*cast_expr));
+  ASSERT_EQ(result->type().id(), cudf::type_id::UINT64);
+
+  cudaDeviceSynchronize();
+  const std::vector<std::uint64_t> host = copy_to_host<std::uint64_t>(result->view());
+  EXPECT_EQ(host[0], 18446744073709551611ULL);  // 2^64 - 5, not an error and not saturated to 0.
+}
+
+TEST(ExpressionCompiler, UnaryNegateOnUnsignedColumnSilentlyWrapsAround) {
+  // Companion characterization test for
+  // Binder.UnaryNegateOnUnsignedColumnIsRejected: expression_compiler.cpp's
+  // Negate case synthesizes `0 - x` in x's own type (cudf::ast has no
+  // dedicated negation operator); for unsigned x that wraps instead of
+  // producing a negative value or erroring. If a future cudf upgrade ever
+  // changes this, this test fails first and the corresponding binder
+  // rejection can be revisited.
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  auto column = cudf::make_numeric_column(cudf::data_type{cudf::type_id::UINT32}, 1);
+  auto scalar = cudf::make_fixed_width_scalar<std::uint32_t>(5);
+  cudf::mutable_column_view mutable_view = column->mutable_view();
+  cudf::fill_in_place(mutable_view, 0, 1, *scalar);
+  columns.push_back(std::move(column));
+  cudf::table table(std::move(columns));
+
+  auto col = std::make_shared<ColumnExpression>("u", 0, uint32_type(false));
+  auto negate_expr = std::make_shared<UnaryExpression>(UnaryOperator::Negate, col, uint32_type(false));
+
+  ExpressionCompiler compiler;
+  std::unique_ptr<cudf::column> result = cudf::compute_column(table.view(), compiler.compile(*negate_expr));
+  ASSERT_EQ(result->type().id(), cudf::type_id::UINT32);
+
+  cudaDeviceSynchronize();
+  const std::vector<std::uint32_t> host = copy_to_host<std::uint32_t>(result->view());
+  EXPECT_EQ(host[0], 4294967291U);  // 2^32 - 5, not an error and not saturated to 0.
+}
+
 }  // namespace
 }  // namespace kernellake

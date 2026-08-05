@@ -9,6 +9,7 @@ add_executable(kernellake_unit_tests
   logical_plan_test.cpp
   optimizer_test.cpp
   storage_test.cpp
+  gcs_object_store_test.cpp
   object_store_registry_test.cpp
   parquet_metadata_test.cpp
   parquet_pruning_test.cpp

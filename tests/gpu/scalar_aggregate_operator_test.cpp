@@ -58,6 +58,10 @@ bool single_row_is_null(const DeviceBatch& batch, cudf::size_type column_index =
   return batch.view().column(column_index).null_count() > 0;
 }
 
+std::unique_ptr<cudf::column> all_null_column(cudf::type_id type, cudf::size_type num_rows) {
+  return cudf::make_numeric_column(cudf::data_type{type}, num_rows, cudf::mask_state::ALL_NULL);
+}
+
 TEST(ScalarAggregateOperator, SumAccumulatesAcrossMultipleBatches) {
   RmmEnvironment env(default_config());
   Schema schema({Field{"amount", float64_type(false)}});
@@ -142,6 +146,128 @@ TEST(ScalarAggregateOperator, SumOfEmptyInputIsNullNotZero) {
   std::optional<DeviceBatch> result = op.next(context);
   ASSERT_TRUE(result.has_value());
   EXPECT_TRUE(single_row_is_null(*result));
+  op.close(context);
+}
+
+TEST(ScalarAggregateOperator, SumAcrossBatchesSurvivesAnEntirelyNullBatch) {
+  // process_batch() folds each batch into state.running_value via cudf::reduce's
+  // `init` parameter (see the header's own comment on this design). If the first
+  // batch is entirely NULL, that reduce() call itself returns an invalid scalar
+  // (sum of zero valid values is NULL). The concern: does passing that *invalid*
+  // scalar back in as `init` for the next batch poison the whole running result to
+  // NULL forever, even though the next batch has real values? cudf::reduce's own
+  // doc table lists `init` as required only for sum/min/max/any/all/product and
+  // says nothing about invalid init scalars specifically, so this must be checked
+  // empirically rather than assumed.
+  RmmEnvironment env(default_config());
+  Schema schema({Field{"amount", float64_type(true)}});
+  std::vector<DeviceBatch> batches;
+  {
+    std::vector<std::unique_ptr<cudf::column>> columns;
+    columns.push_back(all_null_column(cudf::type_id::FLOAT64, 5));
+    batches.push_back(DeviceBatch(std::make_unique<cudf::table>(std::move(columns)),
+                                  std::make_shared<const Schema>(schema)));
+  }
+  {
+    std::vector<std::unique_ptr<cudf::column>> columns;
+    columns.push_back(filled_column(cudf::type_id::FLOAT64, 10.0, 5));
+    batches.push_back(DeviceBatch(std::make_unique<cudf::table>(std::move(columns)),
+                                  std::make_shared<const Schema>(schema)));
+  }
+
+  auto amount = std::make_shared<ColumnExpression>("amount", 0, float64_type(true));
+  auto sum_expr = std::make_shared<AggregateExpression>(AggregateFunction::Sum, amount, float64_type(true));
+  std::vector<NamedExpression> aggregates = {NamedExpression{sum_expr, "total"}};
+
+  ScalarAggregateOperator op(1, std::make_unique<VectorSourceOperator>(std::move(batches)),
+                             std::move(aggregates));
+  ExecutionContext context = make_context();
+  op.open(context);
+
+  std::optional<DeviceBatch> result = op.next(context);
+  ASSERT_TRUE(result.has_value());
+  // SQL semantics: SUM ignores NULLs, so this must be 50.0 (5 rows of 10.0), not NULL.
+  EXPECT_FALSE(single_row_is_null(*result));
+  EXPECT_DOUBLE_EQ(single_row_value<double>(*result), 50.0);
+  op.close(context);
+}
+
+TEST(ScalarAggregateOperator, SumAcrossBatchesWhereLaterBatchIsEntirelyNull) {
+  // Companion to SumAcrossBatchesSurvivesAnEntirelyNullBatch, checking the other
+  // order: does an all-NULL batch *after* a valid running total wipe it out too,
+  // or only the all-NULL-first case? Needed to pin down cudf::reduce()'s actual
+  // init-scalar semantics before deciding how to fix process_batch().
+  RmmEnvironment env(default_config());
+  Schema schema({Field{"amount", float64_type(true)}});
+  std::vector<DeviceBatch> batches;
+  {
+    std::vector<std::unique_ptr<cudf::column>> columns;
+    columns.push_back(filled_column(cudf::type_id::FLOAT64, 10.0, 5));
+    batches.push_back(DeviceBatch(std::make_unique<cudf::table>(std::move(columns)),
+                                  std::make_shared<const Schema>(schema)));
+  }
+  {
+    std::vector<std::unique_ptr<cudf::column>> columns;
+    columns.push_back(all_null_column(cudf::type_id::FLOAT64, 5));
+    batches.push_back(DeviceBatch(std::make_unique<cudf::table>(std::move(columns)),
+                                  std::make_shared<const Schema>(schema)));
+  }
+
+  auto amount = std::make_shared<ColumnExpression>("amount", 0, float64_type(true));
+  auto sum_expr = std::make_shared<AggregateExpression>(AggregateFunction::Sum, amount, float64_type(true));
+  std::vector<NamedExpression> aggregates = {NamedExpression{sum_expr, "total"}};
+
+  ScalarAggregateOperator op(1, std::make_unique<VectorSourceOperator>(std::move(batches)),
+                             std::move(aggregates));
+  ExecutionContext context = make_context();
+  op.open(context);
+
+  std::optional<DeviceBatch> result = op.next(context);
+  ASSERT_TRUE(result.has_value());
+  EXPECT_FALSE(single_row_is_null(*result));
+  EXPECT_DOUBLE_EQ(single_row_value<double>(*result), 50.0);
+  op.close(context);
+}
+
+TEST(ScalarAggregateOperator, AvgComputesMeanAcrossBatchesIncludingAnEntirelyNullBatch) {
+  // Same class of bug as the two Sum tests above, exercised through AVG's
+  // separate running_value(=sum)/running_count(=denominator) accumulation.
+  RmmEnvironment env(default_config());
+  Schema schema({Field{"amount", float64_type(true)}});
+  std::vector<DeviceBatch> batches;
+  {
+    std::vector<std::unique_ptr<cudf::column>> columns;
+    columns.push_back(filled_column(cudf::type_id::FLOAT64, 2.0, 2));
+    batches.push_back(DeviceBatch(std::make_unique<cudf::table>(std::move(columns)),
+                                  std::make_shared<const Schema>(schema)));
+  }
+  {
+    std::vector<std::unique_ptr<cudf::column>> columns;
+    columns.push_back(all_null_column(cudf::type_id::FLOAT64, 3));
+    batches.push_back(DeviceBatch(std::make_unique<cudf::table>(std::move(columns)),
+                                  std::make_shared<const Schema>(schema)));
+  }
+  {
+    std::vector<std::unique_ptr<cudf::column>> columns;
+    columns.push_back(filled_column(cudf::type_id::FLOAT64, 6.0, 2));
+    batches.push_back(DeviceBatch(std::make_unique<cudf::table>(std::move(columns)),
+                                  std::make_shared<const Schema>(schema)));
+  }
+
+  auto amount = std::make_shared<ColumnExpression>("amount", 0, float64_type(true));
+  auto avg_expr = std::make_shared<AggregateExpression>(AggregateFunction::Avg, amount, float64_type(true));
+  std::vector<NamedExpression> aggregates = {NamedExpression{avg_expr, "avg"}};
+
+  ScalarAggregateOperator op(1, std::make_unique<VectorSourceOperator>(std::move(batches)),
+                             std::move(aggregates));
+  ExecutionContext context = make_context();
+  op.open(context);
+  std::optional<DeviceBatch> result = op.next(context);
+  ASSERT_TRUE(result.has_value());
+  EXPECT_FALSE(single_row_is_null(*result));
+  // (2+2+6+6)/4 = 4.0. The middle all-null batch contributes 0 to both the sum
+  // and the count and must not wipe out the other two batches' contribution.
+  EXPECT_DOUBLE_EQ(single_row_value<double>(*result), 4.0);
   op.close(context);
 }
 

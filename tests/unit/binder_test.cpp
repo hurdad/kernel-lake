@@ -47,6 +47,13 @@ Schema lineitem_schema() {
   });
 }
 
+Schema unsigned_counters_schema() {
+  return Schema({
+      Field{"signed_count", int64_type(false)},
+      Field{"unsigned_count", uint64_type(false)},
+  });
+}
+
 // A third table for N-way-join tests: joins onto customers_schema() via
 // customer_id, deliberately reusing "name" (also present in
 // customers_schema()) to exercise cross-source ambiguity.
@@ -312,6 +319,38 @@ TEST(Binder, MixingTwoDifferentDecimalTypesIsRejected) {
   const auto stmt = sql::parse_sql(
       "SELECT price FROM read_parquet('/x.parquet') WHERE price > CAST(amount AS DECIMAL(12, 4))");
   EXPECT_THROW((void)(bind_query(stmt, priced_sales_schema())), BindingError);
+}
+
+TEST(Binder, MixingSignedAndUnsignedIntegerTypesInComparisonIsRejected) {
+  // A negative signed_count would silently wrap around to a huge positive
+  // value if promoted to UINT64 and compared (confirmed against a real GPU:
+  // CAST(-5 AS UINT64) == 18446744073709551611) -- must fail cleanly at bind
+  // time instead, same as mismatched DECIMALs above.
+  const auto stmt = sql::parse_sql(
+      "SELECT signed_count FROM read_parquet('/x.parquet') WHERE signed_count < unsigned_count");
+  EXPECT_THROW((void)(bind_query(stmt, unsigned_counters_schema())), BindingError);
+}
+
+TEST(Binder, MixingSignedAndUnsignedIntegerTypesInArithmeticIsRejected) {
+  const auto stmt = sql::parse_sql(
+      "SELECT signed_count + unsigned_count FROM read_parquet('/x.parquet')");
+  EXPECT_THROW((void)(bind_query(stmt, unsigned_counters_schema())), BindingError);
+}
+
+TEST(Binder, UnaryNegateOnUnsignedColumnIsRejected) {
+  // expression_compiler.cpp synthesizes unary '-' as `0 - x`; for an
+  // unsigned x that silently two's-complement-wraps instead of producing a
+  // negative value (confirmed against a real GPU: `0u - 5u` (UINT32) ==
+  // 4294967291) -- must fail cleanly at bind time instead.
+  const auto stmt =
+      sql::parse_sql("SELECT -unsigned_count FROM read_parquet('/x.parquet')");
+  EXPECT_THROW((void)(bind_query(stmt, unsigned_counters_schema())), BindingError);
+}
+
+TEST(Binder, UnaryNegateOnSignedColumnStillWorks) {
+  const auto stmt =
+      sql::parse_sql("SELECT -signed_count FROM read_parquet('/x.parquet')");
+  EXPECT_NO_THROW((void)(bind_query(stmt, unsigned_counters_schema())));
 }
 
 TEST(Binder, SumOverDecimalPreservesPrecisionAndScale) {

@@ -18,12 +18,21 @@ namespace {
 // Parses an ISO-8601 UTC timestamp ("2026-01-01T00:00:00Z") into Arrow's
 // TimePoint, for GcsOptions::FromAccessToken's expiration argument. Kept
 // minimal (UTC "Z" suffix only, no offset parsing) since this only matters
-// for the narrow "access_token" credentials_kind path.
+// for the narrow "access_token" credentials_kind path. std::get_time()
+// only validates the "%Y-%m-%dT%H:%M:%S" portion and leaves any trailing
+// characters unconsumed without failing the stream -- an offset-form
+// timestamp like "2026-01-01T00:00:00+05:00" would otherwise parse
+// "successfully" with the +05:00 silently discarded and the result
+// misinterpreted as UTC, five hours off with no error at all. The
+// trailing-"Z"-and-nothing-else check below turns that into the same
+// clear rejection every other malformed input already gets.
 arrow::fs::TimePoint parse_iso8601_utc(const std::string& text) {
   std::tm tm{};
   std::istringstream stream(text);
   stream >> std::get_time(&tm, "%Y-%m-%dT%H:%M:%S");
-  if (stream.fail()) {
+  std::string remainder;
+  std::getline(stream, remainder);
+  if (stream.fail() || remainder != "Z") {
     throw StorageError(fmt::format(
         "gcs: storage.gcs.access_token_expiration '{}' is not a valid ISO-8601 UTC timestamp (expected e.g. "
         "'2026-01-01T00:00:00Z')",

@@ -4,8 +4,11 @@
 #include <fmt/format.h>
 
 #include <algorithm>
-#include <regex>
+#include <cctype>
+#include <optional>
 #include <string>
+#include <string_view>
+#include <utility>
 #include <vector>
 
 #include "kernellake/common/date_util.hpp"
@@ -15,21 +18,45 @@ namespace kernellake::sql {
 
 namespace {
 
+bool starts_with_ci(std::string_view sql, std::size_t pos, std::string_view lower_literal) {
+  if (pos + lower_literal.size() > sql.size()) return false;
+  for (std::size_t i = 0; i < lower_literal.size(); ++i) {
+    if (std::tolower(static_cast<unsigned char>(sql[pos + i])) != lower_literal[i]) return false;
+  }
+  return true;
+}
+
 // hyrise/sql-parser (bison/flex, recursive-descent) recurses once per
-// nesting level of a parenthesized expression, with no depth limit of its
-// own -- a query with many thousands of nested parens
-// ("SELECT (((((...1...))))) FROM ...") drives it into a C-stack overflow,
-// which crashes the process outright rather than raising a catchable
-// exception. This is a real concern for kernellake-server specifically:
-// its Flight SQL surface accepts arbitrary-length query text over the wire
-// with no prior validation. A cheap pre-scan here (well before any parsing
-// work, real or hsql's) rejects both pathologically long SQL text and
-// pathologically deep nesting with a clean SqlError instead. The limits
-// are generous relative to any real query (TPC-H's own queries, the
-// deepest in this project, nest nowhere close to either) specifically to
-// avoid false positives on legitimate SQL.
+// nesting level of both a parenthesized expression AND a chained JOIN
+// (`A JOIN B JOIN C JOIN ...`, built as a left-deep TableRef tree -- see
+// flatten_join_chain() below), with no depth limit of its own in either
+// case -- confirmed for real: a query with many thousands of nested parens
+// *or* many thousands of chained JOINs (~40,000, well under this
+// function's own 1 MiB byte cap -- KernelLake's own semantic
+// kMaxJoinSources limit below can't help here, since that only runs
+// *after* hsql::SQLParser::parse() has already built its full tree)
+// each independently drove it into a C-stack overflow, which crashes the
+// process outright rather than raising a catchable exception. This is a
+// real concern for kernellake-server specifically: its Flight SQL surface
+// accepts arbitrary-length query text over the wire with no prior
+// validation. A cheap pre-scan here (well before any parsing work, real
+// or hsql's) rejects pathologically long SQL text, pathologically deep
+// paren nesting, and a pathologically long JOIN chain with a clean
+// SqlError instead. The limits are generous relative to any real query
+// (TPC-H's own queries, the deepest in this project, nest nowhere close
+// to any of these) specifically to avoid false positives on legitimate
+// SQL.
 constexpr std::size_t kMaxSqlBytes = 1 << 20;  // 1 MiB
 constexpr int kMaxParenDepth = 500;
+// Generous relative to KernelLake's own semantic ceiling (kMaxJoinSources
+// = 12 read_parquet(...) sources per JOIN chain, checked later, after
+// hsql has already parsed): counting the substring "join" case-
+// insensitively (not a real tokenizer -- same coarse-but-safe philosophy
+// as counting bare '(' / ')' above, and just as unaffected by a stray
+// "join" appearing inside a string literal, since the threshold is so far
+// above any legitimate count) is enough to reject the pathological case
+// long before hsql ever sees the text.
+constexpr int kMaxJoinKeywords = 64;
 
 void check_sql_within_limits(std::string_view sql) {
   if (sql.size() > kMaxSqlBytes) {
@@ -48,6 +75,14 @@ void check_sql_within_limits(std::string_view sql) {
     throw SqlError(
         fmt::format("SQL expression nesting is too deep ({} levels, max {})", max_depth, kMaxParenDepth));
   }
+  int join_count = 0;
+  for (std::size_t pos = 0; pos < sql.size(); ++pos) {
+    if (starts_with_ci(sql, pos, "join")) ++join_count;
+  }
+  if (join_count > kMaxJoinKeywords) {
+    throw SqlError(
+        fmt::format("SQL JOIN chain is too long ({} JOIN keywords, max {})", join_count, kMaxJoinKeywords));
+  }
 }
 
 struct PlaceholderSource {
@@ -59,6 +94,82 @@ struct Preprocessed {
   std::string sql;
   std::vector<PlaceholderSource> sources;  // in order of appearance
 };
+
+std::size_t skip_whitespace(std::string_view sql, std::size_t pos) {
+  while (pos < sql.size() && std::isspace(static_cast<unsigned char>(sql[pos]))) ++pos;
+  return pos;
+}
+
+// Parses a single-quoted string literal starting at `sql[pos]` (which must
+// be '\''). The returned content is the raw, unprocessed text between the
+// quotes -- a backslash-escaped character is skipped over (so an escaped
+// quote doesn't end the string early) but copied through verbatim rather
+// than being unescaped; this matches this function's own former regex
+// equivalent (`'((?:[^'\\]|\\.)*)'` captures the escape sequence as-is, it
+// never transforms it). Returns nullopt if `pos` isn't a quote, or the
+// string never closes.
+std::optional<std::pair<std::string, std::size_t>> try_parse_quoted_string(std::string_view sql,
+                                                                           std::size_t pos) {
+  if (pos >= sql.size() || sql[pos] != '\'') return std::nullopt;
+  std::string content;
+  std::size_t i = pos + 1;
+  while (i < sql.size()) {
+    const char c = sql[i];
+    if (c == '\'') return std::make_pair(std::move(content), i + 1);
+    if (c == '\\' && i + 1 < sql.size()) {
+      content += c;
+      content += sql[i + 1];
+      i += 2;
+      continue;
+    }
+    content += c;
+    ++i;
+  }
+  return std::nullopt;
+}
+
+// Hand-rolled replacement for a former std::regex pattern
+// (`read_parquet\s*\(\s*(('...'\s*,\s*)*'...')\s*\)`): libstdc++'s
+// std::regex recurses once per repetition of a `(...)*` group, so that
+// pattern's repeated comma-separated-string group crashed the whole
+// process via a C-stack overflow given attacker-controlled input well
+// within this file's own 1 MiB SQL-length cap below -- confirmed for
+// real, a single `read_parquet('<~35,000-character path>')` (let alone
+// many comma-separated paths) segfaulted the process instead of raising
+// a catchable error, defeating the exact threat model
+// check_sql_within_limits() above already exists to guard against
+// (kernellake-server's Flight SQL surface accepts arbitrary-length query
+// text over the wire with no other validation). This scanner is a single
+// linear pass with no recursion and no backtracking, so its stack usage
+// is O(1) regardless of input size or shape. `start` must point just past
+// "read_parquet"; returns the parsed path list and the position just past
+// the closing ')', or nullopt if the shape there isn't a parenthesized
+// comma-separated list of single-quoted strings -- exactly the old
+// regex's "no match" case, left for hsql itself to reject with its own
+// parse error.
+std::optional<std::pair<std::vector<std::string>, std::size_t>> try_parse_read_parquet_args(
+    std::string_view sql, std::size_t start) {
+  std::size_t pos = skip_whitespace(sql, start);
+  if (pos >= sql.size() || sql[pos] != '(') return std::nullopt;
+  pos = skip_whitespace(sql, pos + 1);
+
+  std::vector<std::string> paths;
+  while (true) {
+    std::optional<std::pair<std::string, std::size_t>> literal = try_parse_quoted_string(sql, pos);
+    if (!literal) return std::nullopt;
+    paths.push_back(std::move(literal->first));
+    pos = skip_whitespace(sql, literal->second);
+    if (pos < sql.size() && sql[pos] == ',') {
+      pos = skip_whitespace(sql, pos + 1);
+      continue;
+    }
+    break;
+  }
+  if (pos >= sql.size() || sql[pos] != ')') return std::nullopt;
+  return std::make_pair(std::move(paths), pos + 1);
+}
+
+}  // namespace
 
 // hyrise/sql-parser's FROM-clause grammar only accepts table names, joins,
 // and subqueries -- it has no notion of a table-valued function call like
@@ -72,33 +183,34 @@ struct Preprocessed {
 // general SQL-string rewriting -- and any FROM clause whose shape isn't
 // recognized after this substitution fails clearly in parse_sql() below
 // rather than being silently reinterpreted.
+namespace {
 Preprocessed preprocess_from_read_parquet(const std::string& sql) {
-  static const std::regex kReadParquetPattern(
-      R"(read_parquet\s*\(\s*((?:'(?:[^'\\]|\\.)*'\s*,\s*)*'(?:[^'\\]|\\.)*')\s*\))", std::regex::icase);
-  static const std::regex kStringLiteralPattern(R"('((?:[^'\\]|\\.)*)')");
+  static constexpr std::string_view kFunctionName = "read_parquet";
 
   std::string rewritten;
   std::vector<PlaceholderSource> sources;
-  std::size_t last_pos = 0;
-  for (auto it = std::sregex_iterator(sql.begin(), sql.end(), kReadParquetPattern);
-       it != std::sregex_iterator(); ++it) {
-    const std::smatch& match = *it;
-    const auto match_pos = static_cast<std::size_t>(match.position(0));
-    rewritten.append(sql, last_pos, match_pos - last_pos);
-
-    std::string placeholder = "kernellake_parquet_source_" + std::to_string(sources.size());
-    const std::string args = match[1].str();
-    std::vector<std::string> paths;
-    for (auto path_it = std::sregex_iterator(args.begin(), args.end(), kStringLiteralPattern);
-         path_it != std::sregex_iterator(); ++path_it) {
-      paths.push_back((*path_it)[1].str());
+  std::size_t pos = 0;
+  while (pos < sql.size()) {
+    if (!starts_with_ci(sql, pos, kFunctionName)) {
+      rewritten += sql[pos];
+      ++pos;
+      continue;
     }
+    std::optional<std::pair<std::vector<std::string>, std::size_t>> parsed =
+        try_parse_read_parquet_args(sql, pos + kFunctionName.size());
+    if (!parsed) {
+      // Doesn't have the shape this preprocessor understands (e.g. a
+      // non-string argument) -- leave the text untouched; hsql's own
+      // grammar will reject it with a normal parse error.
+      rewritten += sql[pos];
+      ++pos;
+      continue;
+    }
+    std::string placeholder = "kernellake_parquet_source_" + std::to_string(sources.size());
     rewritten += placeholder;
-    sources.push_back(PlaceholderSource{std::move(placeholder), std::move(paths)});
-
-    last_pos = match_pos + static_cast<std::size_t>(match.length(0));
+    sources.push_back(PlaceholderSource{placeholder, std::move(parsed->first)});
+    pos = parsed->second;
   }
-  rewritten.append(sql, last_pos, sql.size() - last_pos);
 
   if (sources.empty()) {
     throw SqlError(
