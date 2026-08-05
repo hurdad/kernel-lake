@@ -1161,6 +1161,143 @@ and covered by passing tests -- not merely designed or stubbed.
   was also present in `docs/TPCH.md`'s own example commands (harmless
   there since they're illustrative, not executed, but corrected for
   consistency and to avoid readers copy-pasting a broken example).
+- **Four-way (KernelLake-CPU/GPU, PySpark, DuckDB) crossover sweep at
+  SF0.01, SF1, and SF10 -- all five queries (Q1/Q6/Q19/Q12/Q3), real GPU
+  hardware (RTX 5060 Ti), 2 cold + 2 warm iterations each.** Answers "at
+  what scale does GPU beat the others": it's query-shape-dependent, not a
+  single crossover point.
+  - **GPU vs. KernelLake-CPU**: GPU overtakes CPU on the join queries
+    (Q12, Q3) by SF1 already, and on Q1 (single-table `GROUP BY`) by SF10.
+  - **GPU vs. PySpark (`local[*]`)**: PySpark stays fastest at SF0.01
+    across every query. By SF1, GPU already edges PySpark on Q12 and Q3.
+    By SF10, GPU also overtakes PySpark on Q1, and Q3's margin widens
+    substantially (GPU 1.38s vs. PySpark 2.57s warm) -- but PySpark still
+    wins Q6 and Q19 at SF10 (both narrower, filter-heavy scans where
+    `local[*]`'s 20-core-parallel Parquet read keeps an edge).
+  - **GPU vs. DuckDB**: DuckDB wins every single query at every scale
+    factor tested (SF0.01/SF1/SF10) by a wide margin (3-10x), being an
+    in-process, no-subprocess, no-JVM engine with essentially zero
+    per-query fixed overhead. No crossover found in this range; untested
+    beyond SF10.
+  - Full numbers (median wall-clock seconds, warm mode):
+
+    | Query | SF | CPU | GPU | PySpark | DuckDB |
+    |---|---|---|---|---|---|
+    | Q1 | 0.01 | 0.059 | 0.311 | 0.140 | 0.0065 |
+    | Q1 | 1 | 0.558 | 0.412 | 0.290 | 0.055 |
+    | Q1 | 10 | -- | 0.843 | 1.014 | 0.261 |
+    | Q6 | 0.01 | 0.047 | 0.291 | 0.082 | 0.0028 |
+    | Q6 | 1 | 0.143 | 0.322 | 0.122 | 0.020 |
+    | Q6 | 10 | -- | 0.522 | 0.382 | 0.096 |
+    | Q19 | 0.01 | 0.056 | 0.298 | 0.170 | 0.0051 |
+    | Q19 | 1 | 0.788 | 0.420 | 0.224 | 0.053 |
+    | Q19 | 10 | -- | 1.102 | 0.638 | 0.294 |
+    | Q12 | 0.01 | 0.063 | 0.332 | 0.169 | 0.0047 |
+    | Q12 | 1 | 0.913 | 0.432 | 0.672 | 0.038 |
+    | Q12 | 10 | -- | 0.904 | 1.222 | 0.148 |
+    | Q3 | 0.01 | 0.094 | 0.395 | 0.187 | 0.010 |
+    | Q3 | 1 | 0.826 | 0.502 | 0.513 | 0.065 |
+    | Q3 | 10 | -- | 1.384 | 2.567 | 0.286 |
+
+  Two real, reproducible resource limits surfaced along the way (neither a
+  correctness bug -- both genuine capacity limits, documented per this
+  project's own rule rather than silently retried away):
+  1. **KernelLake-CPU backend crashed at SF10 with an empty-stderr,
+     non-zero exit** when run as part of the four-way script specifically
+     (a standalone repro of the exact same query/SQL/backend outside the
+     script succeeded immediately). Root cause: the four-way script keeps
+     one `SparkSession` (`--spark-driver-memory 8g`) resident for the
+     *entire* run, and CPU's own `read_scan_table()` has no memory bound
+     (see the "Not yet started" entry below) -- at SF10 the two together
+     exceeded the container's 15.49 GiB RAM. Not a new bug (the
+     unbounded-materialization limitation was already known and
+     documented); worked around for this sweep by excluding
+     `kernellake-cpu` from `--backends` at SF10, rather than reporting a
+     false failure or lowering Spark's memory back into its own known
+     SF10 OOM range.
+  2. **GPU backend hit its configured `query_memory_limit_bytes` (8 GiB
+     default in `config/kernellake.yaml`) on Q3 at SF10**: `std::bad_alloc:
+     ... RMM ... Exceeded memory limit (failed to allocate 1.342852 GiB)`.
+     This is a configured ceiling, not the RTX 5060 Ti's actual 16311 MiB
+     VRAM -- raised to 12 GiB (`query_memory_limit_bytes`/`pool_max_bytes`
+     both, mounted over the container's `config/kernellake.yaml`) and Q3
+     then completed correctly, still with headroom under the physical
+     card. All five queries subsequently validated and timed with this
+     raised limit at SF10 (the table above uses it).
+- **New "kernellake-gpu-server" engine in `tools/benchmark_three_way.py`**,
+  answering a real question the four-way sweep above raised: how much of
+  "kernellake-gpu"'s (the CLI-subprocess measurement) slowness is genuine
+  GPU execution time vs. fixed per-query overhead the other engines don't
+  pay? `run_kernellake()` (`duckdb_compare.py`) relaunches the `kernellake`
+  CLI as a *fresh subprocess for every single query* -- for the GPU
+  backend specifically, this means a brand new CUDA context + RMM memory
+  pool (`GpuExecutionCoordinator`'s `RmmEnvironment`) every iteration.
+  `kernellake-server` (Arrow Flight SQL, `KERNELLAKE_BUILD_SERVER` --
+  already built by `docker/Dockerfile`'s `dev-gpu` stage, no new build
+  work needed) constructs that same `RmmEnvironment` exactly **once**, at
+  server startup (`src/server/flight_sql_server.cpp`'s constructor), and
+  reuses it for every request after that. Added `start_kernellake_server()`
+  (spawns the server against a temp config with just `server.port`
+  overridden -- `engine.backend` already defaults to `"gpu"` -- and polls a
+  raw TCP connect for readiness) and `run_kernellake_server_query()` (an
+  `adbc-driver-flightsql` ADBC/DBAPI connection, opened once and reused for
+  every query and iteration, `cursor.execute(sql)` +
+  `cursor.fetch_arrow_table()`, timing only the round trip). New
+  `--kernellake-server <path>` and `--server-port` flags; opt-in via
+  `--backends ...,gpu-server` (not in the default set, since it needs an
+  extra binary path and pip package). `docker/Dockerfile`'s `benchmark-gpu`
+  stage gained the `adbc-driver-flightsql` pip package (pulls in
+  `adbc-driver-manager` automatically).
+
+  **Confirmed for real** (RTX 5060 Ti, `docker run --gpus all`, SF1 and
+  SF10, all five queries): the server path is dramatically faster than the
+  CLI-subprocess path, as the overhead hypothesis predicted --
+  6-11x at SF1 (e.g. Q1 warm: 0.045s server vs. 0.383s CLI; Q6 warm:
+  0.028s vs. 0.310s), and still a large, consistent margin at SF10 (Q3
+  warm: 3.19s server vs. 9.29s CLI). At SF1, `kernellake-gpu-server` even
+  **overtakes DuckDB** on Q1 (0.045s vs. 0.059s warm) -- the only engine
+  configuration in this whole investigation that has beaten DuckDB on any
+  query so far. That crossover doesn't hold at SF10, though: DuckDB pulls
+  back ahead on every query there (0.11-0.31s vs. `gpu-server`'s
+  0.17-3.6s) as real compute/transfer cost starts to dominate over the
+  fixed overhead the server path eliminates. SF10 numbers came from only 2
+  iterations each and show real variance worth flagging rather than
+  smoothing over (e.g. Q12 `gpu-server` cold 2.66s vs. warm 0.83s, Q3
+  `kernellake-gpu` CLI cold 5.73s vs. warm 9.29s -- warm slower than cold
+  is not a stable trend at this sample size, not reported as one). More
+  iterations and a wider scale-factor sweep would be needed to
+  characterize the `gpu-server`-vs-DuckDB crossover precisely rather than
+  bracket it between SF1 (server wins Q1) and SF10 (DuckDB wins
+  everything).
+- **`tools/benchmark_three_way.py` simplified from five engines down to
+  three: KernelLake (via `kernellake-gpu-server`), PySpark, DuckDB.**
+  Dropped `kernellake-cpu` and the CLI-subprocess `kernellake-gpu`
+  measurement (`run_kernellake_backend()`, `--kernellake`) entirely, now
+  that the server-based measurement above has shown the CLI-subprocess
+  numbers were measuring mostly fixed per-query overhead rather than real
+  execution time -- keeping both around no longer served a clear purpose
+  for this script. `ENGINES` is now `("kernellake-gpu-server", "pyspark",
+  "duckdb")`; `--backends` accordingly simplified to `gpu-server,pyspark,
+  duckdb` (default: all three); `--kernellake` removed (no longer needed,
+  since nothing invokes the CLI as a subprocess any more). This is a
+  benchmarking-tool decision only -- the CPU and GPU-CLI execution paths
+  in KernelLake itself (`kernellake query --backend cpu|gpu`) are
+  untouched; only this comparison script's engine set changed.
+  `tools/generate_benchmark_report.py` (the PDF report renderer) needed
+  two real fixes to handle the wider five-engine data already collected
+  before this simplification: its `ENGINE_LABELS`/`ENGINE_COLORS` dicts
+  still only listed the original three engines (kernellake-cpu/-gpu/
+  pyspark), so `duckdb` and `kernellake-gpu-server` were silently dropped
+  from the table and charts entirely; and its bar-chart centering math
+  (`(i - 1) * width`) assumed exactly 3 bars per group, which would
+  misalign/overlap with a different count. Both fixed (labels/colors
+  cover all five current engine names; centering now scales with however
+  many engines are actually present). Confirmed for real: a rendered PDF
+  across SF0.01/SF1/SF10 initially had garbled, overlapping column headers
+  in the summary table from `ax.table()`'s equal-width column default not
+  fitting 5 engine-name columns -- fixed with
+  `table.auto_set_column_width()` and shorter labels (`KL-CPU`, `KL-GPU
+  (CLI)`, `KL-GPU (server)`), re-rendered and visually confirmed clean.
 
 ## Not yet started
 

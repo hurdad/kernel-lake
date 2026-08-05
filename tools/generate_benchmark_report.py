@@ -28,14 +28,18 @@ import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
 
 ENGINE_LABELS = {
-    "kernellake-cpu": "KernelLake (CPU)",
-    "kernellake-gpu": "KernelLake (GPU)",
+    "kernellake-cpu": "KL-CPU",
+    "kernellake-gpu": "KL-GPU (CLI)",
+    "kernellake-gpu-server": "KL-GPU (server)",
     "pyspark": "PySpark",
+    "duckdb": "DuckDB",
 }
 ENGINE_COLORS = {
     "kernellake-cpu": "#4C72B0",
     "kernellake-gpu": "#55A868",
+    "kernellake-gpu-server": "#64B5CD",
     "pyspark": "#C44E52",
+    "duckdb": "#8172B2",
 }
 
 
@@ -60,6 +64,18 @@ def format_system_stats(system: dict) -> str:
     return "\n".join(lines)
 
 
+def report_backends(report: dict) -> list:
+    # "backends" is only present in reports from a benchmark_three_way.py
+    # new enough to have --backends; older reports always ran the original
+    # three engines, so that's the correct fallback for them, not an
+    # arbitrary default.
+    return report.get("backends", ["kernellake-cpu", "kernellake-gpu", "pyspark"])
+
+
+def engines_present(reports: list) -> list:
+    return [e for e in ENGINE_LABELS if any(e in report_backends(r) for r in reports)]
+
+
 def add_title_page(pdf: PdfPages, reports: list) -> None:
     # verticalalignment="top" anchors each text block's *top* edge at `y`,
     # not its baseline -- much easier to stack multiple blocks without
@@ -72,11 +88,11 @@ def add_title_page(pdf: PdfPages, reports: list) -> None:
     BLOCK_GAP = 0.03
 
     fig = plt.figure(figsize=(8.5, 11))
-    fig.text(0.5, 0.92, "KernelLake Three-Way Benchmark", ha="center", va="top", fontsize=20, weight="bold")
+    fig.text(0.5, 0.92, "KernelLake Benchmark", ha="center", va="top", fontsize=20, weight="bold")
     fig.text(
         0.5,
         0.87,
-        "KernelLake-CPU vs. KernelLake-GPU vs. PySpark",
+        " vs. ".join(ENGINE_LABELS[e] for e in engines_present(reports)),
         ha="center",
         va="top",
         fontsize=14,
@@ -106,13 +122,6 @@ def add_title_page(pdf: PdfPages, reports: list) -> None:
     plt.close(fig)
 
 
-def report_backends(report: dict) -> list:
-    # "backends" is only present in reports from a benchmark_three_way.py
-    # new enough to have --backends; older reports always ran all three, so
-    # that's the correct fallback for them, not an arbitrary default.
-    return report.get("backends", list(ENGINE_LABELS))
-
-
 def add_summary_table_page(pdf: PdfPages, reports: list) -> None:
     fig, ax = plt.subplots(figsize=(8.5, 11))
     ax.axis("off")
@@ -122,7 +131,7 @@ def add_summary_table_page(pdf: PdfPages, reports: list) -> None:
     # backends, in ENGINE_LABELS' canonical order) -- a report that skipped
     # an engine (e.g. --backends gpu,pyspark) gets "n/a" in that column
     # rather than a differently-shaped table per report.
-    all_backends = [e for e in ENGINE_LABELS if any(e in report_backends(r) for r in reports)]
+    all_backends = engines_present(reports)
 
     rows = []
     for report in reports:
@@ -142,14 +151,21 @@ def add_summary_table_page(pdf: PdfPages, reports: list) -> None:
                 ]
                 rows.append([f"SF{sf}", mode, f"Q{result['query']}"] + cells)
 
+    col_labels = ["Scale factor", "Mode", "Query"] + [ENGINE_LABELS[e] for e in all_backends]
     table = ax.table(
         cellText=rows,
-        colLabels=["Scale factor", "Mode", "Query"] + [ENGINE_LABELS[e] for e in all_backends],
+        colLabels=col_labels,
         loc="center",
         cellLoc="center",
     )
     table.auto_set_font_size(False)
     table.set_fontsize(9)
+    # Column width defaults to an equal 1/n split of the axes, which
+    # overlaps/garbles headers once there are enough engine columns for
+    # their labels to outgrow that share (5 engines + 3 metadata columns,
+    # confirmed by a real rendered overlap before this was added) --
+    # auto_set_column_width sizes each column to its own content instead.
+    table.auto_set_column_width(col=list(range(len(col_labels))))
     table.scale(1, 1.6)
     pdf.savefig(fig)
     plt.close(fig)
@@ -179,9 +195,14 @@ def add_chart_page(pdf: PdfPages, reports: list, query_number: int, mode: str) -
 
     fig, ax = plt.subplots(figsize=(8.5, 6))
     x = range(len(scale_factors))
-    width = 0.25
+    # width/centering scale with however many engines are actually present
+    # (1-5, not hardcoded to 3) -- (i - (n-1)/2) centers the whole group of
+    # bars on each tick regardless of n, rather than assuming exactly 3.
+    n = len(present_engines)
+    width = 0.8 / n
     for i, engine in enumerate(present_engines):
-        offsets = [pos + (i - 1) * width for pos in x]
+        offset = (i - (n - 1) / 2) * width
+        offsets = [pos + offset for pos in x]
         values = [v if v is not None else 0.0 for v in timings[engine]]
         ax.bar(offsets, values, width=width, label=ENGINE_LABELS[engine], color=ENGINE_COLORS[engine])
     ax.set_xticks(list(x))

@@ -241,10 +241,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # installed" failure before this was added. matplotlib is for
 # tools/generate_benchmark_report.py (renders the multi-scale-factor PDF
 # report from benchmark_three_way.py's --output JSON files), not the
-# benchmark script itself. duckdb: benchmark_three_way.py's fourth engine
+# benchmark script itself. duckdb: benchmark_three_way.py's third engine
 # (tools/duckdb_compare.py's run_duckdb()), same package validate_tpch.py
-# already depends on.
-RUN pip install --break-system-packages --no-cache-dir pyspark pyarrow pandas matplotlib duckdb
+# already depends on. adbc-driver-flightsql (pulls in adbc-driver-manager
+# as a dependency automatically): benchmark_three_way.py's KernelLake
+# engine, an ADBC Flight SQL client hitting a long-lived `kernellake-server`
+# process -- an earlier version of the script relaunched the `kernellake`
+# CLI as a fresh subprocess per query instead, which paid CUDA context/RMM
+# pool init on every single query and was dropped for that reason (see
+# run_kernellake_server_query() in benchmark_three_way.py).
+RUN pip install --break-system-packages --no-cache-dir \
+      pyspark pyarrow pandas matplotlib duckdb adbc-driver-flightsql
 
 ENTRYPOINT ["python3", "tools/benchmark_three_way.py"]
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Four-way benchmark: KernelLake-CPU vs. KernelLake-GPU vs. PySpark vs. DuckDB.
+"""Three-way benchmark: KernelLake-GPU (server) vs. PySpark vs. DuckDB.
 
 Unofficial, TPC-H-*derived* benchmark (see tools/generate_tpch.py and
 benchmarks/tpch/queries/ for the same caveats already documented there --
@@ -15,25 +15,41 @@ any timing number. A query whose engines disagree is reported as a
 validation failure and excluded from the timing table, never silently
 timed anyway.
 
+KernelLake is measured by hitting a long-lived `kernellake-server` process
+over Arrow Flight SQL (via adbc-driver-flightsql), not by relaunching the
+`kernellake` CLI as a fresh subprocess for every query. An earlier version
+of this script did exactly that (one subprocess per query, `--backend
+cpu`/`gpu`), and it turned out to measure mostly fixed overhead rather
+than real execution time: process launch, dynamic-linker loading of every
+shared library (Arrow/Parquet/CUDA/cudf/RMM), and -- specific to the GPU
+backend -- a fresh CUDA context + RMM memory pool init on *every single
+query*. `kernellake-server` constructs that same `RmmEnvironment` exactly
+**once**, at server startup (`src/server/flight_sql_server.cpp`'s
+constructor), and reuses it for every request after that -- confirmed for
+real to be 6-11x faster than the CLI-subprocess measurement at the same
+scale factor (see docs/ROADMAP.md). The CPU backend and the CLI-subprocess
+GPU measurement were dropped from this script for that reason, not because
+either backend itself was removed from KernelLake.
+
 Usage:
     python3 tools/benchmark_three_way.py \
-        --kernellake build/gpu-dev/src/cli/kernellake \
+        --kernellake-server build/gpu-dev/src/server/kernellake-server \
         --data '/tmp/kernellake-tpch/lineitem-*.parquet' \
         --query all --iterations 5
 
     # Q19 needs a second table (--query all only runs it if --part-data is
     # given -- see the --query all handling in main()):
     python3 tools/benchmark_three_way.py \
-        --kernellake build/gpu-dev/src/cli/kernellake \
+        --kernellake-server build/gpu-dev/src/server/kernellake-server \
         --data '/tmp/kernellake-tpch/lineitem-*.parquet' \
         --part-data '/tmp/kernellake-tpch/part-*.parquet' \
         --query 19 --iterations 5
 
-Requires: pyspark (+ a JVM on PATH), pyarrow. Not part of this project's
-own CPU-only dev environment's dependency set -- see docker/Dockerfile's
-`benchmark-gpu` stage, which adds both to a `dev-gpu`-based image
-specifically to run this script in a reproducible container alongside a
-real GPU (`docker run --gpus all`).
+Requires: pyspark (+ a JVM on PATH), pyarrow, duckdb, adbc-driver-flightsql.
+Not part of this project's own CPU-only dev environment's dependency set --
+see docker/Dockerfile's `benchmark-gpu` stage, which adds all of them to a
+`dev-gpu`-based image specifically to run this script in a reproducible
+container alongside a real GPU (`docker run --gpus all`).
 """
 
 import argparse
@@ -42,17 +58,18 @@ import json
 import os
 import platform
 import re
+import socket
 import statistics
 import subprocess
 import sys
 import time
 from pathlib import Path
 
-from duckdb_compare import normalize, rows_match, run_duckdb, run_kernellake
+from duckdb_compare import normalize, rows_match, run_duckdb
 
 QUERIES_DIR = Path(__file__).resolve().parent.parent / "benchmarks" / "tpch" / "queries"
 
-ENGINES = ("kernellake-cpu", "kernellake-gpu", "pyspark", "duckdb")
+ENGINES = ("kernellake-gpu-server", "pyspark", "duckdb")
 MODES = ("cold", "warm")
 
 
@@ -201,31 +218,6 @@ def spark_sql(query_number: int) -> str:
     return rewritten.strip()
 
 
-def run_kernellake_backend(
-    kernellake_bin: str,
-    query_number: int,
-    data_glob: str,
-    backend: str,
-    part_data_glob: str | None = None,
-    orders_data_glob: str | None = None,
-    customer_data_glob: str | None = None,
-    cold: bool = False,
-):
-    if cold:
-        evict_data_files(data_glob)
-        if part_data_glob:
-            evict_data_files(part_data_glob)
-        if orders_data_glob:
-            evict_data_files(orders_data_glob)
-        if customer_data_glob:
-            evict_data_files(customer_data_glob)
-    sql = kernellake_sql(query_number, data_glob, part_data_glob, orders_data_glob, customer_data_glob)
-    start = time.perf_counter()
-    table = run_kernellake(kernellake_bin, sql, backend=backend)
-    elapsed = time.perf_counter() - start
-    return table, elapsed
-
-
 def run_pyspark_query(
     spark,
     query_number: int,
@@ -286,6 +278,79 @@ def run_duckdb_query(
     return table, elapsed
 
 
+def write_server_config(port: int, base_config_path: str = "config/kernellake.yaml") -> str:
+    # A literal-string replace of the exact default ("port: 31337"), not a
+    # generic `port: \d+` regex -- config/kernellake.yaml also has an
+    # unrelated `hdfs.connection_config.port: 0` earlier in the file, which
+    # a generic regex's first match would hit instead. engine.backend
+    # already defaults to "gpu" (include/kernellake/common/config.hpp), so
+    # no override needed there.
+    text = Path(base_config_path).read_text()
+    needle = "port: 31337"
+    if needle not in text:
+        raise RuntimeError(f"{base_config_path}: expected to find '{needle}' under server: to override")
+    text = text.replace(needle, f"port: {port}", 1)
+    out_path = Path(f"/tmp/kernellake-server-benchmark-{port}.yaml")
+    out_path.write_text(text)
+    return str(out_path)
+
+
+def start_kernellake_server(server_bin: str, port: int, startup_timeout_seconds: float = 30.0) -> subprocess.Popen:
+    config_path = write_server_config(port)
+    proc = subprocess.Popen(
+        [server_bin, "--config", config_path], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+    )
+    # kernellake-server blocks in Serve() once Init() succeeds, with no
+    # separate "ready" signal easy to consume from a Popen pipe
+    # concurrently -- polling a raw TCP connect on its own listening port is
+    # simpler and backend-agnostic (works whether GpuExecutionCoordinator's
+    # RmmEnvironment construction, the slow part on the "gpu" backend, has
+    # finished or not, since Init()/Serve() only run after that).
+    deadline = time.monotonic() + startup_timeout_seconds
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            output = proc.stdout.read() if proc.stdout else ""
+            raise RuntimeError(f"kernellake-server exited early (code {proc.returncode}):\n{output}")
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.5):
+                return proc
+        except OSError:
+            time.sleep(0.2)
+    proc.terminate()
+    raise RuntimeError(f"kernellake-server did not start listening on port {port} within {startup_timeout_seconds}s")
+
+
+def run_kernellake_server_query(
+    cursor,
+    query_number: int,
+    data_glob: str,
+    part_data_glob: str | None = None,
+    orders_data_glob: str | None = None,
+    customer_data_glob: str | None = None,
+    cold: bool = False,
+):
+    # Same substituted SQL as the CLI-subprocess and DuckDB paths -- the
+    # server runs it through the exact same QueryEngine. Cache eviction
+    # still applies here: the server process itself stays warm (that's the
+    # whole point), but the underlying Parquet files' OS-page-cache state
+    # is independent of the server process's lifetime, so "cold" still
+    # means what it means for every other engine.
+    if cold:
+        evict_data_files(data_glob)
+        if part_data_glob:
+            evict_data_files(part_data_glob)
+        if orders_data_glob:
+            evict_data_files(orders_data_glob)
+        if customer_data_glob:
+            evict_data_files(customer_data_glob)
+    sql = kernellake_sql(query_number, data_glob, part_data_glob, orders_data_glob, customer_data_glob)
+    start = time.perf_counter()
+    cursor.execute(sql)
+    table = cursor.fetch_arrow_table()
+    elapsed = time.perf_counter() - start
+    return table, elapsed
+
+
 def median_stats(samples):
     return {
         "median_seconds": statistics.median(samples),
@@ -296,8 +361,8 @@ def median_stats(samples):
 
 
 def benchmark_one_query(
-    kernellake_bin: str,
     spark,
+    server_cursor,
     query_number: int,
     data_glob: str,
     part_data_glob: str | None,
@@ -310,20 +375,15 @@ def benchmark_one_query(
     print(f"=== Q{query_number} ===")
 
     # Correctness first: one untimed, warm run per *enabled* engine (see
-    # --backends -- a real large-scale run can have a genuine, real reason
-    # to skip one, e.g. the CPU backend's unbounded read_scan_table()
-    # against a dataset too big to fit in host RAM; see docs/ROADMAP.md),
-    # cross-validated pairwise before any timing is trusted. Cache state
-    # doesn't affect correctness, so this never evicts.
+    # --backends -- a real reason to skip one exists, e.g. at a large
+    # enough scale factor -- see docs/ROADMAP.md), cross-validated
+    # pairwise before any timing is trusted. Cache state doesn't affect
+    # correctness, so this never evicts.
     try:
         tables = {}
-        if "kernellake-cpu" in backends:
-            tables["kernellake-cpu"], _ = run_kernellake_backend(
-                kernellake_bin, query_number, data_glob, "cpu", part_data_glob, orders_data_glob, customer_data_glob
-            )
-        if "kernellake-gpu" in backends:
-            tables["kernellake-gpu"], _ = run_kernellake_backend(
-                kernellake_bin, query_number, data_glob, "gpu", part_data_glob, orders_data_glob, customer_data_glob
+        if "kernellake-gpu-server" in backends:
+            tables["kernellake-gpu-server"], _ = run_kernellake_server_query(
+                server_cursor, query_number, data_glob, part_data_glob, orders_data_glob, customer_data_glob
             )
         if "pyspark" in backends:
             tables["pyspark"], _ = run_pyspark_query(
@@ -364,30 +424,17 @@ def benchmark_one_query(
         # same iteration, making its own "cold" measurement actually warm.
         timings = {engine: [] for engine in backends}
         for i in range(iterations):
-            if "kernellake-cpu" in backends:
-                _, t = run_kernellake_backend(
-                    kernellake_bin,
+            if "kernellake-gpu-server" in backends:
+                _, t = run_kernellake_server_query(
+                    server_cursor,
                     query_number,
                     data_glob,
-                    "cpu",
                     part_data_glob,
                     orders_data_glob,
                     customer_data_glob,
                     cold=cold,
                 )
-                timings["kernellake-cpu"].append(t)
-            if "kernellake-gpu" in backends:
-                _, t = run_kernellake_backend(
-                    kernellake_bin,
-                    query_number,
-                    data_glob,
-                    "gpu",
-                    part_data_glob,
-                    orders_data_glob,
-                    customer_data_glob,
-                    cold=cold,
-                )
-                timings["kernellake-gpu"].append(t)
+                timings["kernellake-gpu-server"].append(t)
             if "pyspark" in backends:
                 _, t = run_pyspark_query(
                     spark, query_number, data_glob, part_data_glob, orders_data_glob, customer_data_glob, cold=cold
@@ -406,15 +453,14 @@ def benchmark_one_query(
 def print_summary_table(results: list, modes: tuple, backends: tuple) -> None:
     print()
     print("=" * 90)
-    print("UNOFFICIAL four-way benchmark -- NOT a certified TPC-H result.")
-    print("KernelLake-CPU vs. KernelLake-GPU vs. PySpark (local[*]) vs. DuckDB, same dataset.")
+    print("UNOFFICIAL benchmark -- NOT a certified TPC-H result.")
+    print("KernelLake-GPU (server) vs. PySpark (local[*]) vs. DuckDB.")
     if len(backends) < len(ENGINES):
         skipped = [e for e in ENGINES if e not in backends]
         print(f"NOTE: {', '.join(skipped)} skipped for this run (--backends) -- see docs/ROADMAP.md.")
     print("=" * 90)
     columns = {
-        "kernellake-cpu": "cpu (median s)",
-        "kernellake-gpu": "gpu (median s)",
+        "kernellake-gpu-server": "gpu-server (median s)",
         "pyspark": "pyspark (median s)",
         "duckdb": "duckdb (median s)",
     }
@@ -436,7 +482,6 @@ def print_summary_table(results: list, modes: tuple, backends: tuple) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--kernellake", required=True, help="Path to the kernellake CLI binary (gpu-dev build)")
     parser.add_argument("--data", required=True, help="Glob pattern over generate_tpch.py's lineitem Parquet output")
     parser.add_argument(
         "--part-data", default=None, help="Glob pattern over generate_tpch.py's part Parquet output (Q19 needs this)"
@@ -473,30 +518,39 @@ def main() -> int:
         "at the previous unconfigured default)",
     )
     parser.add_argument(
+        "--kernellake-server",
+        default=None,
+        help="Path to the kernellake-server binary (gpu-dev build, at "
+        "build/gpu-dev/src/server/kernellake-server). Required by --backends ...,gpu-server -- spawns "
+        "one long-lived server process (paying CUDA context/RMM pool init once, at startup, not per "
+        "query) and hits it over Arrow Flight SQL via adbc-driver-flightsql for every query instead.",
+    )
+    parser.add_argument(
+        "--server-port", type=int, default=31337, help="Port for the --kernellake-server process to listen on"
+    )
+    parser.add_argument(
         "--backends",
-        default="cpu,gpu,pyspark,duckdb",
-        help="Comma-separated subset of cpu,gpu,pyspark,duckdb to run and cross-validate (default: all "
-        "four). Skip an engine with a known real limit at the scale being tested -- e.g. the CPU "
-        "backend's read_scan_table() materializes an entire scan into host RAM with no bound (see "
-        "docs/ROADMAP.md), which doesn't fit at large enough scale factors regardless of query. "
-        "At least two backends are required, since this script's whole point is validating that "
-        "engines agree before trusting any timing.",
+        default="gpu-server,pyspark,duckdb",
+        help="Comma-separated subset of gpu-server,pyspark,duckdb to run and cross-validate (default: "
+        "all three). At least two backends are required, since this script's whole point is validating "
+        "that engines agree before trusting any timing.",
     )
     args = parser.parse_args()
 
     backends = tuple(b.strip() for b in args.backends.split(","))
     backend_name_by_flag = {
-        "cpu": "kernellake-cpu",
-        "gpu": "kernellake-gpu",
+        "gpu-server": "kernellake-gpu-server",
         "pyspark": "pyspark",
         "duckdb": "duckdb",
     }
     unknown = [b for b in backends if b not in backend_name_by_flag]
     if unknown:
-        parser.error(f"--backends: unknown engine(s) {unknown} -- choose from cpu, gpu, pyspark, duckdb")
+        parser.error(f"--backends: unknown engine(s) {unknown} -- choose from gpu-server, pyspark, duckdb")
     backends = tuple(backend_name_by_flag[b] for b in backends)
     if len(backends) < 2:
         parser.error("--backends: need at least two engines to cross-validate against each other")
+    if "kernellake-gpu-server" in backends and not args.kernellake_server:
+        parser.error("--backends gpu-server requires --kernellake-server <path>")
 
     if args.query == "all":
         # Q19 needs --part-data, Q12 needs --orders-data, Q3 needs both
@@ -550,13 +604,24 @@ def main() -> int:
         if args.customer_data:
             spark.read.parquet(args.customer_data).createOrReplaceTempView("customer")
 
+    server_proc = None
+    server_conn = None
+    server_cursor = None
+    if "kernellake-gpu-server" in backends:
+        print(f"=== Starting kernellake-server on port {args.server_port} ===")
+        server_proc = start_kernellake_server(args.kernellake_server, args.server_port)
+        import adbc_driver_flightsql.dbapi as flightsql
+
+        server_conn = flightsql.connect(f"grpc://127.0.0.1:{args.server_port}")
+        server_cursor = server_conn.cursor()
+
     results = []
     try:
         for query_number in query_numbers:
             results.append(
                 benchmark_one_query(
-                    args.kernellake,
                     spark,
+                    server_cursor,
                     query_number,
                     args.data,
                     args.part_data,
@@ -570,6 +635,13 @@ def main() -> int:
     finally:
         if spark is not None:
             spark.stop()
+        if server_cursor is not None:
+            server_cursor.close()
+        if server_conn is not None:
+            server_conn.close()
+        if server_proc is not None:
+            server_proc.terminate()
+            server_proc.wait(timeout=10)
 
     print_summary_table(results, modes, backends)
 
@@ -582,6 +654,7 @@ def main() -> int:
             "part_data": args.part_data,
             "orders_data": args.orders_data,
             "customer_data": args.customer_data,
+            "kernellake_server": args.kernellake_server,
             "modes": list(modes),
             "backends": list(backends),
             "system": system_stats,
