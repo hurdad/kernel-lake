@@ -44,7 +44,7 @@ helm install kernellake charts/kernellake \
 | `nodeSelector` / `tolerations` / `affinity` | `{}` / `[]` / `{}` | Standard Kubernetes scheduling passthrough |
 | `config.engine.batchRows` | `1000000` | `engine.batch_rows` |
 | `config.engine.resultBatchRows` | `65536` | `engine.result_batch_rows` |
-| `config.engine.queryMemoryLimitBytes` | `8589934592` | `engine.query_memory_limit_bytes` |
+| `config.engine.queryMemoryLimitBytes` | `0` | `engine.query_memory_limit_bytes` -- `0` auto-detects from the GPU's free VRAM |
 | `config.storage.localRoot` | `/` | `storage.local_root` |
 | `observability.enabled` | `false` | Only takes effect if the image was built with `KERNELLAKE_ENABLE_OTEL=ON` (both `runtime-cpu` and `runtime-gpu` are) |
 | `observability.otlpProtocol` | `grpc` | `grpc` or `http` |

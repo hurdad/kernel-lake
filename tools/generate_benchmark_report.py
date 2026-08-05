@@ -171,9 +171,17 @@ def add_summary_table_page(pdf: PdfPages, reports: list) -> None:
     plt.close(fig)
 
 
-def add_chart_page(pdf: PdfPages, reports: list, query_number: int, mode: str) -> None:
+def add_chart_page(
+    pdf: PdfPages,
+    reports: list,
+    query_number: int,
+    mode: str,
+    metric: str = "median_seconds",
+    ylabel: str = "Median wall-clock time (seconds)",
+    title: str = "median time",
+) -> None:
     scale_factors = []
-    timings = {engine: [] for engine in ENGINE_LABELS}
+    values_by_engine = {engine: [] for engine in ENGINE_LABELS}
     for report in reports:
         if mode not in report.get("modes", ["warm"]):
             continue
@@ -182,16 +190,21 @@ def add_chart_page(pdf: PdfPages, reports: list, query_number: int, mode: str) -
         if result is None or not result.get("validated"):
             continue
         scale_factors.append(f"SF{sf}")
+        mode_result = result[mode]
         for engine in ENGINE_LABELS:
-            mode_result = result[mode]
-            timings[engine].append(mode_result[engine]["median_seconds"] if engine in mode_result else None)
+            engine_result = mode_result.get(engine)
+            values_by_engine[engine].append(engine_result.get(metric) if engine_result else None)
 
     if not scale_factors:
         return
 
-    # An engine skipped (--backends) for every scale factor in this chart
-    # gets no bar and no legend entry at all, rather than a row of zeros.
-    present_engines = [e for e in ENGINE_LABELS if any(v is not None for v in timings[e])]
+    # An engine skipped (--backends), or missing this metric (e.g. no
+    # --cost-per-hour rate given for it) for every scale factor in this
+    # chart, gets no bar and no legend entry at all, rather than a row of
+    # zeros.
+    present_engines = [e for e in ENGINE_LABELS if any(v is not None for v in values_by_engine[e])]
+    if not present_engines:
+        return
 
     fig, ax = plt.subplots(figsize=(8.5, 6))
     x = range(len(scale_factors))
@@ -203,12 +216,12 @@ def add_chart_page(pdf: PdfPages, reports: list, query_number: int, mode: str) -
     for i, engine in enumerate(present_engines):
         offset = (i - (n - 1) / 2) * width
         offsets = [pos + offset for pos in x]
-        values = [v if v is not None else 0.0 for v in timings[engine]]
+        values = [v if v is not None else 0.0 for v in values_by_engine[engine]]
         ax.bar(offsets, values, width=width, label=ENGINE_LABELS[engine], color=ENGINE_COLORS[engine])
     ax.set_xticks(list(x))
     ax.set_xticklabels(scale_factors)
-    ax.set_ylabel("Median wall-clock time (seconds)")
-    ax.set_title(f"Q{query_number} ({mode}): median time by scale factor")
+    ax.set_ylabel(ylabel)
+    ax.set_title(f"Q{query_number} ({mode}): {title} by scale factor")
     ax.legend()
     fig.text(
         0.5,
@@ -220,6 +233,50 @@ def add_chart_page(pdf: PdfPages, reports: list, query_number: int, mode: str) -
         color="firebrick",
     )
     fig.tight_layout()
+    pdf.savefig(fig)
+    plt.close(fig)
+
+
+def any_report_has_cost_data(reports: list) -> bool:
+    return any(report.get("cost_per_hour") for report in reports)
+
+
+def add_cost_summary_table_page(pdf: PdfPages, reports: list) -> None:
+    fig, ax = plt.subplots(figsize=(8.5, 11))
+    ax.axis("off")
+    ax.set_title("Cost per TB processed ($, from each report's --cost-per-hour)", fontsize=13, weight="bold", pad=20)
+
+    cost_backends = [e for e in engines_present(reports) if any((r.get("cost_per_hour") or {}).get(e) for r in reports)]
+    if not cost_backends:
+        plt.close(fig)
+        return
+
+    rows = []
+    for report in reports:
+        sf = report.get("scale_factor", "?")
+        modes = report.get("modes", ["warm"])
+        for result in report.get("results", []):
+            if not result.get("validated"):
+                continue
+            for mode in modes:
+                mode_result = result[mode]
+                cells = []
+                for engine in cost_backends:
+                    engine_result = mode_result.get(engine)
+                    value = engine_result.get("cost_per_tb_dollars") if engine_result else None
+                    cells.append(f"{value:.4f}" if value is not None else "n/a")
+                rows.append([f"SF{sf}", mode, f"Q{result['query']}"] + cells)
+
+    if not rows:
+        plt.close(fig)
+        return
+
+    col_labels = ["Scale factor", "Mode", "Query"] + [ENGINE_LABELS[e] for e in cost_backends]
+    table = ax.table(cellText=rows, colLabels=col_labels, loc="center", cellLoc="center")
+    table.auto_set_font_size(False)
+    table.set_fontsize(9)
+    table.auto_set_column_width(col=list(range(len(col_labels))))
+    table.scale(1, 1.6)
     pdf.savefig(fig)
     plt.close(fig)
 
@@ -244,6 +301,19 @@ def main() -> int:
         for query_number in query_numbers:
             for mode in modes_present:
                 add_chart_page(pdf, reports, query_number, mode)
+        if any_report_has_cost_data(reports):
+            add_cost_summary_table_page(pdf, reports)
+            for query_number in query_numbers:
+                for mode in modes_present:
+                    add_chart_page(
+                        pdf,
+                        reports,
+                        query_number,
+                        mode,
+                        metric="cost_per_tb_dollars",
+                        ylabel="Cost per TB processed ($)",
+                        title="cost per TB",
+                    )
 
     print(f"Wrote {args.output}")
     return 0

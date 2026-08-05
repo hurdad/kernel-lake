@@ -104,6 +104,46 @@ std::vector<NamedExpression> remap_named(const std::vector<NamedExpression>& ite
 // index, see binder.cpp), only for additional WHERE/SELECT/GROUP BY
 // references after the join -- avoid colliding column names across joined
 // tables, or select/rename them distinctly, until this is tightened.
+// Estimates a physical plan node's output row count, for choosing a hash
+// join's build side (HashJoinOperator always materializes its *right*
+// child into device memory -- see that class's own doc comment -- so the
+// smaller side should end up there, not whichever side a query happened
+// to write first). This is a rough, pre-filter/pre-aggregation size
+// estimate, not real cardinality estimation: a ParquetScanNode reports the
+// sum of its scanned files' whole-file row counts (ignoring row-group
+// pruning and any filter selectivity), and every single-child node above
+// it (Filter, Projection, aggregates, Sort, Limit, ...) just passes that
+// estimate through unchanged via its generic children() accessor, rather
+// than needing a case for every node type. Returns nullopt when no
+// estimate is available (never guesses in that case).
+std::optional<std::int64_t> estimate_row_count(const PhysicalPlanPtr& node) {
+  if (const auto* scan = dynamic_cast<const ParquetScanNode*>(node.get())) {
+    std::int64_t total = 0;
+    for (const PhysicalFileFragment& fragment : scan->fragments()) {
+      total += fragment.file_row_count;
+    }
+    return total;
+  }
+  if (const auto* join = dynamic_cast<const HashJoinNode*>(node.get())) {
+    const std::optional<std::int64_t> left_estimate = estimate_row_count(join->left());
+    const std::optional<std::int64_t> right_estimate = estimate_row_count(join->right());
+    if (!left_estimate || !right_estimate) {
+      return std::nullopt;
+    }
+    // A real inner join's output can exceed either input (duplicate
+    // keys), but "smaller of the two inputs" is the usual fallback real
+    // planners use absent join-selectivity statistics, and is enough to
+    // let an N-way chain's outer join estimate a nested join child's
+    // size too.
+    return std::min(*left_estimate, *right_estimate);
+  }
+  const std::vector<PhysicalPlanPtr> children = node->children();
+  if (children.size() == 1) {
+    return estimate_row_count(children.front());
+  }
+  return std::nullopt;
+}
+
 const Schema* find_scan_schema(const PhysicalPlanNode& node) {
   if (const auto* scan = dynamic_cast<const ParquetScanNode*>(&node)) {
     return &scan->output_schema();
@@ -190,14 +230,28 @@ PhysicalPlanPtr convert(const LogicalPlanPtr& node, ObjectStore& store) {
     // other column reference above a scan.
     const std::string& left_key_name = join->left()->output_schema().field(join->left_key_index()).name;
     const std::string& right_key_name = join->right()->output_schema().field(join->right_key_index()).name;
-    const std::optional<std::size_t> left_key_narrowed =
-        left_child->output_schema().find_field(left_key_name);
-    const std::optional<std::size_t> right_key_narrowed =
-        right_child->output_schema().find_field(right_key_name);
+    std::optional<std::size_t> left_key_narrowed = left_child->output_schema().find_field(left_key_name);
+    std::optional<std::size_t> right_key_narrowed = right_child->output_schema().find_field(right_key_name);
     if (!left_key_narrowed || !right_key_narrowed) {
       throw PlanningError(
           "physical planner: JOIN key column missing from its pruned column list (internal "
           "error)");
+    }
+    // HashJoinOperator always builds its hash table on the *right* child
+    // (see its own doc comment) -- swap here if the left side's
+    // estimated row count is smaller, so the smaller table ends up
+    // materialized into device memory instead of whichever side a query
+    // happened to write first in its FROM/JOIN clause. Every expression
+    // above this node already resolves columns by *name* against this
+    // node's own output_schema() (see find_scan_schema()'s own comment),
+    // never by fixed position, so reordering left/right here is
+    // transparent to everything above it. Only swaps when both sides'
+    // sizes are actually known -- never guesses.
+    const std::optional<std::int64_t> left_estimate = estimate_row_count(left_child);
+    const std::optional<std::int64_t> right_estimate = estimate_row_count(right_child);
+    if (left_estimate && right_estimate && *left_estimate < *right_estimate) {
+      std::swap(left_child, right_child);
+      std::swap(left_key_narrowed, right_key_narrowed);
     }
     return std::make_shared<HashJoinNode>(std::move(left_child), std::move(right_child), *left_key_narrowed,
                                           *right_key_narrowed);

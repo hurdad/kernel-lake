@@ -14,7 +14,18 @@ struct EngineSection {
   int device_id = 0;
   std::uint64_t batch_rows = 1'000'000;
   std::uint64_t result_batch_rows = 65'536;
-  std::uint64_t query_memory_limit_bytes = 8ULL * 1024 * 1024 * 1024;
+  // 0 (the default) means "auto-detect": resolve_query_memory_limit_bytes()
+  // (kernellake/memory/rmm_environment.hpp) sizes it as a fraction of the
+  // GPU's currently *free* VRAM (see that function's own comment for why
+  // free, not total, and why 75%), queried fresh via cudaMemGetInfo()
+  // rather than baked in at config-load time -- a fixed absolute default
+  // here would either waste most of a large card's VRAM or, as happened
+  // for real this session (a 3-way join that needed the inherited 8 GiB
+  // default manually raised to 12 GiB on a 16 GiB card just to complete),
+  // be too tight on anything bigger than the card this default happened
+  // to be tuned against. An explicit non-zero value here always overrides
+  // auto-detection.
+  std::uint64_t query_memory_limit_bytes = 0;
   // "gpu" (default) or "cpu" -- see docs/ARCHITECTURE.md's CPU backend
   // section. "gpu" on a CPU-only (dev preset) build throws the existing
   // clear ExecutionError explaining why, exactly as it always has;

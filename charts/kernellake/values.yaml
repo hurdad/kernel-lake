@@ -50,7 +50,11 @@ config:
   engine:
     batchRows: 1000000
     resultBatchRows: 65536
-    queryMemoryLimitBytes: 8589934592
+    # 0 means auto-detect from the GPU's currently free VRAM -- see
+    # EngineSection::query_memory_limit_bytes's own comment
+    # (include/kernellake/common/config.hpp). Set an explicit non-zero
+    # byte count to override auto-detection.
+    queryMemoryLimitBytes: 0
   storage:
     localRoot: /
 

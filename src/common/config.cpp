@@ -298,9 +298,10 @@ void validate_config(const EngineConfig& config) {
   if (config.engine.result_batch_rows == 0) {
     throw ConfigurationError("engine.result_batch_rows must be > 0");
   }
-  if (config.engine.query_memory_limit_bytes == 0) {
-    throw ConfigurationError("engine.query_memory_limit_bytes must be > 0");
-  }
+  // 0 is a real, meaningful value here ("auto-detect from GPU VRAM" -- see
+  // EngineSection::query_memory_limit_bytes's own comment), not an error;
+  // no validation needed either way, since any std::uint64_t is a valid
+  // byte count.
   if (config.engine.backend != "gpu" && config.engine.backend != "cpu") {
     throw ConfigurationError(
         fmt::format("engine.backend '{}' is unsupported (expected 'gpu' or 'cpu')", config.engine.backend));

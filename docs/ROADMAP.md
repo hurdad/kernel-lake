@@ -1298,6 +1298,205 @@ and covered by passing tests -- not merely designed or stubbed.
   fitting 5 engine-name columns -- fixed with
   `table.auto_set_column_width()` and shorter labels (`KL-CPU`, `KL-GPU
   (CLI)`, `KL-GPU (server)`), re-rendered and visually confirmed clean.
+- **`HashJoinOperator` build-side selection is now size-aware**, fixing
+  the exact gap the "Not yet started" entry below (this superseded a
+  version of it that flagged Q12 OOM'ing at SF100 specifically because
+  `lineitem`, the *larger* table, ended up as the unconditionally-
+  materialized build side purely because it was written second/`right`
+  in the query, not because of any real size comparison).
+  `src/io/physical_planner.cpp` gained `estimate_row_count()` (a
+  `ParquetScanNode` reports the sum of its scanned files' whole-file row
+  counts; a nested `HashJoinNode` reports `min(left, right)`; every
+  single-child node above either just passes its child's estimate through
+  via the generic `children()` accessor rather than needing a case per
+  node type) and, in the `LogicalJoin` -> `HashJoinNode` conversion, swaps
+  `left_child`/`right_child` (and their matching key indices) whenever the
+  left side's estimate is smaller -- since `HashJoinOperator` always
+  materializes its *right* child (see that class's own doc comment), this
+  puts the actually-smaller table there instead of whichever side a query
+  happened to write first. Confirmed safe to swap: every expression above
+  a `HashJoinNode` already resolves columns by *name* against its
+  `output_schema()` (see `find_scan_schema()`'s own comment), never by
+  fixed position, so reordering is transparent throughout, including into
+  an outer join in an N-way chain (which also resolves its own join key by
+  name against whatever schema its already-converted child produced).
+
+  New regression tests,
+  `PhysicalPlannerJoinBuildSideTest.BuildsOnSmallerSideEvenWhenItIsWrittenFirstInTheQuery`
+  and `.DoesNotSwapWhenTheSmallerSideIsAlreadyOnTheRight`. Verified for
+  real against the actual TPC-H query files at SF10: `kernellake explain
+  --format json` on Q12 now shows `lineitem` (8 files/64 row groups) as
+  `left`/probe and `orders` (4 files/16 row groups) as `right`/build,
+  reversed from before the fix; Q19 (where `part` was already the smaller
+  side) shows no change, confirming the swap only fires when it should;
+  Q3's 3-way chain shows the swap propagating sensibly through both join
+  steps, ending with `customer` (smallest) innermost/build and `lineitem`
+  (largest) outermost/probe -- a genuinely better join order, not just a
+  2-table special case. `dev` (181/181, up from 179), `server-dev`
+  (184/184, up from 182), `otel-dev` (184/184, up from 182), and a real
+  `gpu-dev` Docker rebuild (261/261, up from 259) all pass with zero
+  regressions. A real SF10 before/after `benchmark_three_way.py` run shows
+  Q3 (the query the swap changes most, per the explain output above)
+  ~18% faster warm (0.6626s -> 0.5448s); Q12 is flat at this scale (SF10's
+  absolute data size isn't yet large enough for build-side choice to
+  matter the way it did at the documented SF100 OOM) -- the real payoff
+  is expected at the scale that originally surfaced the bug, not yet
+  re-verified there.
+- **Cost-per-TB-processed analysis added to `tools/benchmark_three_way.py`
+  and `tools/generate_benchmark_report.py`**, for comparing engines on
+  $/TB rather than just wall-clock time. New `--cost-per-hour
+  engine=dollars,...` flag (e.g. `gpu-server=3.00,pyspark=1.00,
+  duckdb=0.10`) -- deliberately has no built-in default rate for any
+  engine, since real cost varies by cloud region, on-demand vs. reserved
+  pricing, and on-prem amortization, and a fabricated default would
+  misrepresent an actual dollar figure. `bytes_processed_for_query()`
+  computes real on-disk (compressed Parquet) bytes for whichever tables a
+  *specific* query's SQL actually references (checking each query file's
+  own `{part_data}`/`{orders_data}`/`{customer_data}` placeholders, the
+  same check `kernellake_sql()` already does), not every glob passed on
+  the command line. `cost_per_tb_dollars()` = `rate * (median_seconds /
+  3600) / (bytes_processed / 1e12)`, stored per engine per mode per query,
+  alongside a new printed cost table (only shown when `--cost-per-hour`
+  was given) and a new PDF page (table) plus one bar chart per query/mode
+  in `generate_benchmark_report.py`, gated on `any_report_has_cost_data()`
+  so older reports without cost data don't render empty cost pages.
+  `add_chart_page()` generalized to take a `metric`/`ylabel`/`title` triple
+  instead of hardcoding `median_seconds`, reused for both the existing
+  timing charts and the new cost charts rather than duplicating the whole
+  function. Verified for real at SF10 with illustrative example rates
+  (`gpu-server=3.00,pyspark=1.00,duckdb=0.10` -- not real cloud pricing,
+  just numbers to exercise the feature): DuckDB dominates $/TB at these
+  rates as expected, but the GPU-server-vs-PySpark comparison flips by
+  query -- GPU-server is cheaper on Q3 (0.33 vs. 0.53 $/TB) despite a 3x
+  higher hourly rate, since it's fast enough to overcome that, but
+  PySpark edges it on Q6 (0.113 vs. 0.125 $/TB), where GPU-server isn't
+  fast enough to overcome the same rate gap -- a genuinely different
+  conclusion than the raw-time table gives, which is the whole point of
+  this metric. PDF re-rendered and visually confirmed (cost table shows
+  `n/a` for the SF0.01/SF1 reports that were generated without
+  `--cost-per-hour`, real figures for SF10).
+- **CPU execution backend's Parquet scan is no longer unbounded** -- the
+  documented gap (see the "Not yet started" entries this partially
+  supersedes, below) where `acero_query_executor.cpp`'s `read_scan_table()`
+  read every fragment's every selected row group fully into one in-memory
+  `std::vector` before building a single `arrow::Table`, handed to Acero
+  via `TableSourceNodeOptions`/`"table_source"` -- meaning this backend's
+  memory footprint scaled with total input size, not whatever the pipeline
+  actually had in flight. Replaced with `make_streaming_scan_reader()`: a
+  lazy `arrow::RecordBatchReader` (built via `arrow::MakeFunctionIterator`
+  + `RecordBatchReader::MakeFromIterator`) that opens and reads each
+  fragment one batch at a time, handed to Acero via
+  `RecordBatchReaderSourceNodeOptions`/`"record_batch_reader_source"`
+  instead -- confirmed by a standalone test program that this factory name
+  and node type actually work (not documented anywhere in the installed
+  Arrow headers directly, only inferable from the `TableSourceNodeOptions`
+  naming convention) before committing to it in the real fix.
+
+  Two real bugs surfaced and fixed along the way, not just a mechanical
+  swap: (1) a genuine **use-after-free/segfault** in the first draft --
+  `parquet::arrow::FileReader::GetRecordBatchReader()`'s own docs say
+  "FileReaders must outlive their RecordBatchReaders," but the first draft
+  returned only the `RecordBatchReader` from a helper function, letting the
+  `FileReader` local variable (which the returned reader depends on
+  internally) be destroyed at that function's return -- crashed all 14
+  `QueryEngineExecuteCpuTest` cases with a segfault, caught immediately by
+  the existing test suite. Fixed by bundling both together in one
+  `OpenFragment` struct with matched lifetimes. (2) Every exception the
+  lazy reader's fragment-opening logic can throw (`StorageError`, etc.)
+  must be caught *inside* the iterator callback itself and converted to an
+  `arrow::Status` failure, not left to propagate as a C++ exception --
+  `RecordBatchReaderSourceNodeOptions`'s own docs note each `ReadNext()`
+  call runs as a task on Acero's I/O thread pool, where an uncaught
+  exception would escape a thread-pool worker (likely `std::terminate()`)
+  rather than reach `execute_physical_plan_cpu()`'s top-level try/catch the
+  way every synchronous code path in this backend could previously assume.
+
+  Verified for real: `dev`/`server-dev`/`otel-dev` all 181/184/184 (zero
+  regressions, and this is exactly the suite that caught bug (1) above).
+  Real SF10 CPU-backend run, Q1 (single-table, no join): peak RSS 130 MB
+  (`/usr/bin/time -v`) while scanning ~1.08 GiB of compressed `lineitem`
+  Parquet (and considerably more decompressed) -- genuinely bounded, not
+  scaling with input size. Q12 (a join): peak RSS 3.2 GB, much higher than
+  Q1's, but expected and unrelated to this fix -- Acero's own `"hashjoin"`
+  node still fully materializes its build side in memory, an inherent
+  property of hash joins (the same class of limitation already documented
+  for the GPU `HashJoinOperator`, not something a scan-side fix changes).
+  Both queries' results cross-checked against DuckDB and matched exactly
+  (row-for-row, value-for-value) at SF10.
+
+  Explicitly **not** addressed by this fix, still open: the adjacent "Not
+  yet started" entry below about the CPU scan being single-threaded
+  (`read_scan_table()`'s per-fragment reads ran sequentially, one core,
+  entirely before Acero's own multi-threaded `ExecPlan` starts) -- this fix
+  keeps that same sequential-per-fragment shape, it just no longer holds
+  every fragment's data in memory simultaneously. Switching to Acero's
+  native `"scan"`/`ScanNodeOptions` over an `arrow::dataset::Dataset`
+  (which that entry already suggested) would address both memory *and*
+  parallelism at once, but is a larger change than this session's fix.
+- **`engine.query_memory_limit_bytes` now auto-detects from the GPU's free
+  VRAM instead of a fixed 8 GiB default.** The fixed default was already a
+  real source of friction this session -- Q3's 3-way join at SF10 needed
+  it manually raised to 12 GiB on a 16 GiB card just to complete (see the
+  four-way benchmark entries above). `0` (the new default, both in
+  `EngineSection::query_memory_limit_bytes` and the checked-in
+  `config/kernellake.yaml`/Helm chart `values.yaml`) now means
+  "auto-detect"; a new `resolve_query_memory_limit_bytes()`
+  (`kernellake/memory/rmm_environment.hpp`) resolves it via
+  `cudaMemGetInfo()`, called by both `RmmEnvironment`'s constructor (the
+  actually-enforced `limiting_resource_adaptor` ceiling) and
+  `query_engine_execute_gpu.cpp`'s `pass_read_limit_bytes` sizing --
+  deliberately the same function for both, since computing "auto" twice
+  independently (even moments apart) could otherwise resolve to two
+  different byte counts on a GPU with fluctuating external usage. An
+  explicit non-zero config value always overrides auto-detection.
+
+  **Three real, non-obvious findings from getting this right on actual
+  hardware** (RTX 5060 Ti, WSL2, this session's own dev machine -- also
+  used interactively, including for gaming, not a dedicated headless
+  card), each one changing the design:
+  1. Sizing off `cudaMemGetInfo()`'s *total* byte count (the card's full
+     capacity) is unsafe -- confirmed by a real OOM at 75% of this card's
+     16 GiB total, because several GiB were permanently or transiently
+     held by something else entirely (the desktop compositor baseline,
+     and separately, live GPU-memory usage while a game was running)
+     unrelated to kernellake. Switched to the *free* byte count instead.
+  2. 75% of *free* turned out too conservative -- it also OOM'd, needing
+     more than that ceiling allowed, while a manually configured ~12 GiB
+     ceiling succeeded even when free VRAM was reportedly *lower* than 12
+     GiB at measurement time. This clarified what the ceiling actually is:
+     RMM's `limiting_resource_adaptor` only *permits* allocation up to the
+     configured amount, it doesn't reserve it upfront, and the real
+     hardware ceiling is separately enforced by the CUDA allocator itself
+     regardless of this config value -- so being too conservative here is
+     the worse failure mode (it fails queries that could have actually
+     fit), while being too generous just reproduces the same clean,
+     already-handled "Exceeded memory limit" error a manually-misconfigured
+     value would, in the rare case it's still not enough. Raised to 90% of
+     free.
+  3. **The actual root cause of every failed verification attempt during
+     this work wasn't the resolution formula at all** -- the checked-in
+     `config/kernellake.yaml` explicitly set `query_memory_limit_bytes:
+     8589934592`, which (correctly, per this field's own "explicit value
+     always overrides auto-detection" contract) meant `resolve_query_
+     memory_limit_bytes()` was returning that fixed 8 GiB unchanged on
+     every single test, regardless of which formula the code used --
+     three different formula attempts, three identical "failed to
+     allocate 779.213134 MiB" errors, byte-for-byte, was the tell.
+     Fixed by changing the shipped config file's value (and the Helm
+     chart's `values.yaml` default) to `0` too -- changing the C++
+     default alone was not enough for anyone actually running the
+     checked-in config, which is everyone using the CLI/server without
+     passing `--config`.
+
+  Verified for real once all three were fixed: `gpu-dev` 261/261 (zero
+  regressions), and Q3's 3-way join at SF10 now succeeds using the
+  **default config file, with zero manual overrides** -- the exact
+  friction this feature set out to remove -- cross-checked against DuckDB,
+  exact match (10 rows). `dev`/`server-dev`/`otel-dev` all still
+  181/184/184 (this change is compiled everywhere, `config.cpp`/
+  `config.hpp` are CPU-agnostic, but `resolve_query_memory_limit_bytes()`
+  itself only compiles into GPU-enabled builds, matching where
+  `RmmEnvironment` already lived).
 
 ## Not yet started
 
@@ -1452,32 +1651,22 @@ and covered by passing tests -- not merely designed or stubbed.
   (`arrow::acero::ScanNodeOptions` over an `arrow::dataset::Dataset`)
   instead of pre-materializing a `table_source`, which would also pick up
   Acero's own fragment-level parallelism for free.
-- GPU `HashJoinOperator` has no bounded-memory/streaming design at all --
+- GPU `HashJoinOperator` still has no bounded-memory/streaming design --
   unlike `ParquetScanOperator`'s pass-based reading or
   `HashAggregateOperator`'s `max_distinct_keys` batching, `open()`
   unconditionally drains the *entire* right (build) side into device
   memory (`while (right_->next()) { right_batches.push_back(...) }`, then
   `cudf::concatenate()` and one `cudf::hash_join` over all of it) before
-  the probe side is ever touched. A real SF100 attempt at Q12 (`FROM
-  orders JOIN lineitem ON o_orderkey = l_orderkey`) threw a real
-  `std::bad_alloc: ... RMM ... Exceeded memory limit` immediately -- and
-  not only from this gap: `orders` is the left/probe side and `lineitem`
-  (600M rows, the *larger* table) ends up as the right/build side, the
-  opposite of what a real query planner should choose (build on the
-  smaller side). Even fixing the build-side choice (build on `orders`,
-  150M rows) would likely still exceed 8 GiB VRAM at this scale --
-  swapping sides narrows the gap but doesn't close it; genuinely bounded
-  memory needs a streaming/partitioned (grace) hash join, a substantially
-  bigger feature than this session's Q1 pass-sizing fix. Q19 (`lineitem`
-  600M rows JOIN `part` 20M rows -- `part` already the smaller side,
-  matching this operator's current "build whichever side is `right`"
-  behavior by coincidence, not by any actual size-aware choice) succeeded
-  fine at the same scale, so this is specifically a build-side-materialization
-  problem, not a blanket "joins don't work at scale" one. SF100's
-  three-way benchmark run omits `--orders-data` (skips Q12 entirely,
-  same "missing argument, not attempted-and-failed" convention
-  `tools/benchmark_three_way.py` already uses) rather than reporting a
-  fake or misleading number.
+  the probe side is ever touched. The physical planner now chooses the
+  smaller side to build on (see "Done" above), which narrows the real
+  SF100 Q12 OOM this entry originally documented (`lineitem`, 600M rows,
+  used to be forced onto the build side purely by clause order), but
+  doesn't close it: building on `orders` (150M rows) instead would still
+  likely exceed a real 8-12 GiB VRAM budget at that scale. Genuinely
+  bounded memory needs a streaming/partitioned (grace) hash join, a
+  substantially bigger feature than the build-side fix. Not yet
+  re-attempted at SF100 with the fix in place to confirm exactly how much
+  it narrows the gap in practice.
 - Q19 on the **CPU** backend got killed partway through SF100 timed
   iterations (correctness validated fine first; died on cold iteration
   3/5) -- a real, reproduced-once resource failure, root cause not yet
@@ -1498,6 +1687,12 @@ and covered by passing tests -- not merely designed or stubbed.
   isn't a hard, deterministic block at this scale -- but also not
   something to treat as a one-off fluke without further investigation
   before trusting a full Q1/Q6/Q19 SF100 (or larger) run's numbers.
+
+  Candidate cause (1) above (`read_scan_table()`'s unbounded
+  materialization) has since been fixed -- see "Done" above -- though
+  whether that was actually *this* crash's root cause was never confirmed
+  either way, so this entry is left as an open, not-fully-explained
+  historical incident rather than marked resolved.
 
 ## Explicit non-goals for the MVP
 

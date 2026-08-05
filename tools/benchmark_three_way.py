@@ -101,6 +101,36 @@ def evict_data_files(data_glob: str) -> None:
         evict_from_page_cache(path)
 
 
+def bytes_for_glob(data_glob: str) -> int:
+    return sum(os.path.getsize(path) for path in glob.glob(data_glob))
+
+
+def bytes_processed_for_query(
+    query_number: int,
+    data_glob: str,
+    part_data_glob: str | None,
+    orders_data_glob: str | None,
+    customer_data_glob: str | None,
+) -> int:
+    # Real on-disk (compressed Parquet) bytes for whichever tables this
+    # specific query's SQL actually references -- not every --data/
+    # --part-data/--orders-data/--customer-data glob passed on the command
+    # line, since e.g. Q1/Q6 only ever touch {data} regardless of what
+    # else was supplied for other queries in the same --query all run.
+    # This is what "cost per TB processed" (see --cost-per-hour) divides
+    # against: a real, measured input size, not a query's row count or
+    # output size.
+    text = load_query_text(query_number)
+    total = bytes_for_glob(data_glob)
+    if part_data_glob and "{part_data}" in text:
+        total += bytes_for_glob(part_data_glob)
+    if orders_data_glob and "{orders_data}" in text:
+        total += bytes_for_glob(orders_data_glob)
+    if customer_data_glob and "{customer_data}" in text:
+        total += bytes_for_glob(customer_data_glob)
+    return total
+
+
 def read_proc_field(path: str, field: str) -> str | None:
     try:
         with open(path) as f:
@@ -360,6 +390,14 @@ def median_stats(samples):
     }
 
 
+def cost_per_tb_dollars(cost_per_hour: float, median_seconds: float, bytes_processed: int) -> float | None:
+    if bytes_processed <= 0:
+        return None
+    tb_processed = bytes_processed / 1e12
+    hours = median_seconds / 3600
+    return cost_per_hour * hours / tb_processed
+
+
 def benchmark_one_query(
     spark,
     server_cursor,
@@ -371,6 +409,7 @@ def benchmark_one_query(
     iterations: int,
     modes: tuple,
     backends: tuple,
+    cost_per_hour: dict | None = None,
 ) -> dict:
     print(f"=== Q{query_number} ===")
 
@@ -415,7 +454,16 @@ def benchmark_one_query(
     row_count = len(next(iter(rows_by_engine.values())))
     print(f"    PASS: {', '.join(backends)} agree ({row_count} rows)")
 
-    result = {"query": query_number, "validated": True, "row_count": row_count, "iterations": iterations}
+    bytes_processed = bytes_processed_for_query(
+        query_number, data_glob, part_data_glob, orders_data_glob, customer_data_glob
+    )
+    result = {
+        "query": query_number,
+        "validated": True,
+        "row_count": row_count,
+        "iterations": iterations,
+        "bytes_processed": bytes_processed,
+    }
     for mode in modes:
         cold = mode == "cold"
         # Cache is evicted again before *each* engine's own read within an
@@ -447,10 +495,16 @@ def benchmark_one_query(
                 timings["duckdb"].append(t)
             print(f"    [{mode}] iteration {i + 1}/{iterations} done")
         result[mode] = {engine: median_stats(timings[engine]) for engine in backends}
+        if cost_per_hour:
+            for engine in backends:
+                if engine in cost_per_hour:
+                    result[mode][engine]["cost_per_tb_dollars"] = cost_per_tb_dollars(
+                        cost_per_hour[engine], result[mode][engine]["median_seconds"], bytes_processed
+                    )
     return result
 
 
-def print_summary_table(results: list, modes: tuple, backends: tuple) -> None:
+def print_summary_table(results: list, modes: tuple, backends: tuple, cost_per_hour: dict | None = None) -> None:
     print()
     print("=" * 90)
     print("UNOFFICIAL benchmark -- NOT a certified TPC-H result.")
@@ -477,6 +531,30 @@ def print_summary_table(results: list, modes: tuple, backends: tuple) -> None:
         for mode in modes:
             medians = "".join(f"{result[mode][engine]['median_seconds']:<20.4f}" for engine in backends)
             print(f"Q{result['query']:<6}{mode:<7}{'yes':<11}{medians}")
+    print("=" * 90)
+
+    if not cost_per_hour:
+        return
+    cost_columns = [e for e in backends if e in cost_per_hour]
+    if not cost_columns:
+        return
+    print()
+    print("=" * 90)
+    print("Cost per TB processed (real on-disk Parquet bytes, $/hour you supplied via --cost-per-hour).")
+    print("=" * 90)
+    cost_labels = {e: columns[e].replace("median s", "$/TB") for e in cost_columns}
+    cost_header = f"{'query':<7}{'mode':<7}" + "".join(f"{cost_labels[e]:<20}" for e in cost_columns)
+    print(cost_header)
+    print("-" * len(cost_header))
+    for result in results:
+        if not result.get("validated"):
+            continue
+        for mode in modes:
+            cells = []
+            for engine in cost_columns:
+                value = result[mode][engine].get("cost_per_tb_dollars")
+                cells.append(f"{value:<20.4f}" if value is not None else f"{'n/a':<20}")
+            print(f"Q{result['query']:<6}{mode:<7}" + "".join(cells))
     print("=" * 90)
 
 
@@ -535,7 +613,37 @@ def main() -> int:
         "all three). At least two backends are required, since this script's whole point is validating "
         "that engines agree before trusting any timing.",
     )
+    parser.add_argument(
+        "--cost-per-hour",
+        default=None,
+        help="Comma-separated engine=dollars-per-hour pairs (e.g. "
+        "'gpu-server=3.06,pyspark=0.85,duckdb=0.10'), the $/hour of whatever hardware that engine "
+        "actually runs on in your deployment -- there is no built-in default, since real cost varies by "
+        "cloud region, on-demand vs. reserved pricing, and on-prem amortization, and a fabricated "
+        "default would misrepresent an actual dollar figure. When given, each result gains a "
+        "cost_per_tb_dollars figure (rate * median_seconds/3600, divided by real on-disk Parquet bytes "
+        "that specific query reads / 1e12) -- a real cost-efficiency comparison, not just wall-clock "
+        "time. An engine with no rate given here is simply left without a cost figure.",
+    )
     args = parser.parse_args()
+
+    cost_per_hour = None
+    if args.cost_per_hour:
+        cost_per_hour = {}
+        for pair in args.cost_per_hour.split(","):
+            engine, _, rate = pair.partition("=")
+            if not rate:
+                parser.error(f"--cost-per-hour: '{pair}' is not engine=dollars-per-hour")
+            try:
+                cost_per_hour[engine.strip()] = float(rate)
+            except ValueError:
+                parser.error(f"--cost-per-hour: '{rate}' is not a number")
+        engine_name_by_flag = {"gpu-server": "kernellake-gpu-server", "pyspark": "pyspark", "duckdb": "duckdb"}
+        unknown_cost_engines = [e for e in cost_per_hour if e not in engine_name_by_flag]
+        if unknown_cost_engines:
+            parser.error(f"--cost-per-hour: unknown engine(s) {unknown_cost_engines} -- choose from gpu-server, "
+                        "pyspark, duckdb")
+        cost_per_hour = {engine_name_by_flag[e]: rate for e, rate in cost_per_hour.items()}
 
     backends = tuple(b.strip() for b in args.backends.split(","))
     backend_name_by_flag = {
@@ -630,6 +738,7 @@ def main() -> int:
                     args.iterations,
                     modes,
                     backends,
+                    cost_per_hour,
                 )
             )
     finally:
@@ -643,7 +752,7 @@ def main() -> int:
             server_proc.terminate()
             server_proc.wait(timeout=10)
 
-    print_summary_table(results, modes, backends)
+    print_summary_table(results, modes, backends, cost_per_hour)
 
     if args.output:
         report = {
@@ -655,6 +764,7 @@ def main() -> int:
             "orders_data": args.orders_data,
             "customer_data": args.customer_data,
             "kernellake_server": args.kernellake_server,
+            "cost_per_hour": cost_per_hour,
             "modes": list(modes),
             "backends": list(backends),
             "system": system_stats,

@@ -12,6 +12,48 @@
 
 namespace kernellake {
 
+std::uint64_t resolve_query_memory_limit_bytes(const EngineConfig& config) {
+  if (config.engine.query_memory_limit_bytes != 0) {
+    return config.engine.query_memory_limit_bytes;
+  }
+  // CudaDeviceGuard: cudaMemGetInfo() reports the *current* device's
+  // memory, which may not be config.engine.device_id yet at whatever point
+  // a caller invokes this from (RmmEnvironment's own constructor, in
+  // particular, runs before query_engine_execute_gpu.cpp's own
+  // CudaDeviceGuard for the query itself -- see that file's comment on
+  // construction order).
+  const CudaDeviceGuard device_guard(config.engine.device_id);
+  std::size_t free_bytes = 0;
+  std::size_t total_bytes = 0;
+  check_cuda(cudaMemGetInfo(&free_bytes, &total_bytes),
+             "cudaMemGetInfo for query_memory_limit_bytes auto-detect");
+  // free_bytes, not total_bytes -- confirmed a real, not hypothetical,
+  // reason this matters: this project's own dev GPU (WSL2, RTX 5060 Ti,
+  // also used interactively -- e.g. gaming -- not a dedicated headless
+  // card) can have several GiB of its 16 GiB total held by something else
+  // entirely, fluctuating in real time, unrelated to anything kernellake
+  // does. Sizing off total_bytes there would set a limit the allocator
+  // can never actually satisfy in full, reproducing the exact "Exceeded
+  // memory limit" failure this auto-detection exists to avoid, just with
+  // a subtler cause (nothing obviously wrong, yet still OOM).
+  //
+  // 90%, not a more conservative fraction: an empirical real-GPU
+  // comparison (RTX 5060 Ti, TPC-H Q3's 3-way join at SF10) found 75% of
+  // free (a first attempt) too tight -- it failed with "Exceeded memory
+  // limit", needing noticeably more -- while a manually configured ~12
+  // GiB ceiling succeeded even when free VRAM was reportedly lower than
+  // that at measurement time (the query's actual peak usage turned out to
+  // fit regardless, since this ceiling only *permits* allocation up to
+  // that amount rather than reserving it upfront; the real hardware
+  // ceiling is still enforced independently by the CUDA allocator itself).
+  // Being too conservative here has a worse failure mode than being too
+  // generous: an over-tight auto-detected limit fails a query that could
+  // have actually fit, while an over-generous one, in the rare case it's
+  // still not enough, produces the exact same clean, already-handled
+  // "Exceeded memory limit" error a manually-misconfigured value would.
+  return static_cast<std::uint64_t>(free_bytes) * 9 / 10;
+}
+
 struct RmmEnvironment::Impl {
   cuda::mr::any_resource<cuda::mr::device_accessible> base_resource;
   rmm::mr::statistics_resource_adaptor stats;
@@ -22,7 +64,7 @@ struct RmmEnvironment::Impl {
        cuda::mr::any_resource<cuda::mr::device_accessible> previous)
       : base_resource(std::move(base)),
         stats(base_resource),
-        limiter(stats, config.engine.query_memory_limit_bytes),
+        limiter(stats, resolve_query_memory_limit_bytes(config)),
         previous_resource(std::move(previous)) {}
 };
 

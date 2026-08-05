@@ -3,6 +3,7 @@
 #include <arrow/acero/api.h>
 #include <arrow/compute/api_aggregate.h>
 #include <arrow/compute/initialize.h>
+#include <arrow/util/iterator.h>
 #include <fmt/format.h>
 #include <parquet/arrow/reader.h>
 
@@ -36,99 +37,170 @@ void ensure_compute_initialized() {
   });
 }
 
-// Reads every fragment of `scan` into one combined arrow::Table, respecting
-// the row-group pruning decisions already computed by the physical planner
-// (PhysicalFileFragment::selected_row_groups) and the already-narrowed
-// column list (ParquetScanNode::columns()) -- reusing the exact same
-// pruning/column-pruning work the GPU path's ParquetScanOperator consumes,
-// just with a different reader underneath. Deliberately simpler than the
-// GPU path's bounded-memory, pass-based streaming (see ParquetScanOperator):
-// this reads each fragment's selected row groups fully into memory, so this
-// backend's memory footprint scales with input size rather than being
-// bounded -- a real, documented MVP simplification for this phase.
-std::shared_ptr<arrow::Table> read_scan_table(const ParquetScanNode& scan, ObjectStore& store) {
-  const std::vector<std::string>& columns = scan.columns();
-  std::vector<std::shared_ptr<arrow::RecordBatch>> all_batches;
-  std::shared_ptr<arrow::Schema> table_schema;
+// parquet::arrow::FileReader::GetRecordBatchReader()'s own docs are explicit:
+// "FileReaders must outlive their RecordBatchReaders." Bundled together here
+// so nothing can accidentally drop the FileReader while its RecordBatchReader
+// is still in use (a real use-after-free bug this fix's first version hit:
+// an earlier draft returned only the RecordBatchReader from a helper
+// function, letting the FileReader local variable be destroyed at that
+// function's return -- crashed every CPU-backend test with a segfault).
+struct OpenFragment {
+  std::unique_ptr<parquet::arrow::FileReader> file_reader;
+  std::unique_ptr<arrow::RecordBatchReader> batch_reader;
+};
 
-  for (const PhysicalFileFragment& fragment : scan.fragments()) {
-    // store.open() itself already throws StorageError on failure to open;
-    // Open() below can still throw parquet::ParquetException separately for
-    // malformed/corrupt Parquet content once bytes are flowing, same as
-    // src/io/parquet_metadata.cpp's inspect_parquet_file().
-    std::unique_ptr<parquet::ParquetFileReader> raw_reader;
-    try {
-      raw_reader = parquet::ParquetFileReader::Open(store.open(fragment.file)->as_arrow_file());
-    } catch (const parquet::ParquetException& e) {
-      throw StorageError(
-          fmt::format("failed to open Parquet file '{}' for CPU scan: {}", fragment.file.value(), e.what()));
-    }
-
-    arrow::Result<std::unique_ptr<parquet::arrow::FileReader>> reader_result =
-        parquet::arrow::FileReader::Make(arrow::default_memory_pool(), std::move(raw_reader));
-    if (!reader_result.ok()) {
-      throw StorageError(fmt::format("failed to open Parquet file '{}' for CPU scan: {}",
-                                     fragment.file.value(), reader_result.status().ToString()));
-    }
-    std::unique_ptr<parquet::arrow::FileReader> reader = std::move(*reader_result);
-
-    std::shared_ptr<arrow::Schema> file_schema;
-    const arrow::Status schema_status = reader->GetSchema(&file_schema);
-    if (!schema_status.ok()) {
-      throw StorageError(
-          fmt::format("failed to read Parquet schema for CPU scan: {}", schema_status.ToString()));
-    }
-
-    std::vector<int> column_indices;
-    column_indices.reserve(columns.size());
-    for (const std::string& name : columns) {
-      const int index = file_schema->GetFieldIndex(name);
-      if (index < 0) {
-        throw StorageError(
-            fmt::format("column '{}' not found in Parquet file '{}'", name, fragment.file.value()));
-      }
-      column_indices.push_back(index);
-    }
-
-    arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> rb_reader_result =
-        reader->GetRecordBatchReader(fragment.selected_row_groups, column_indices);
-    if (!rb_reader_result.ok()) {
-      throw StorageError(fmt::format("failed to build a record batch reader for CPU scan: {}",
-                                     rb_reader_result.status().ToString()));
-    }
-    std::unique_ptr<arrow::RecordBatchReader> rb_reader = std::move(*rb_reader_result);
-    if (table_schema == nullptr) {
-      table_schema = rb_reader->schema();
-    }
-
-    while (true) {
-      std::shared_ptr<arrow::RecordBatch> batch;
-      const arrow::Status next_status = rb_reader->ReadNext(&batch);
-      if (!next_status.ok()) {
-        throw StorageError(
-            fmt::format("failed reading a Parquet batch for CPU scan: {}", next_status.ToString()));
-      }
-      if (batch == nullptr) {
-        break;
-      }
-      all_batches.push_back(std::move(batch));
-    }
-  }
-
-  // No fragments at all (every file/row-group was pruned away): fall back
-  // to the scan's own declared (narrowed) schema so the result is a real,
-  // correctly-typed empty table rather than a null schema.
-  if (table_schema == nullptr) {
-    table_schema = to_arrow_schema(scan.output_schema());
-  }
-
-  arrow::Result<std::shared_ptr<arrow::Table>> table_result =
-      arrow::Table::FromRecordBatches(table_schema, all_batches);
-  if (!table_result.ok()) {
+// Opens one fragment's selected row groups/narrowed columns -- store.open()
+// itself already throws StorageError on failure to open; Open() below can
+// still throw parquet::ParquetException separately for malformed/corrupt
+// Parquet content once bytes are flowing, same as
+// src/io/parquet_metadata.cpp's inspect_parquet_file().
+OpenFragment open_fragment_reader(const PhysicalFileFragment& fragment,
+                                  const std::vector<std::string>& columns, ObjectStore& store) {
+  std::unique_ptr<parquet::ParquetFileReader> raw_reader;
+  try {
+    raw_reader = parquet::ParquetFileReader::Open(store.open(fragment.file)->as_arrow_file());
+  } catch (const parquet::ParquetException& e) {
     throw StorageError(
-        fmt::format("failed to assemble the CPU scan's result table: {}", table_result.status().ToString()));
+        fmt::format("failed to open Parquet file '{}' for CPU scan: {}", fragment.file.value(), e.what()));
   }
-  return *table_result;
+
+  arrow::Result<std::unique_ptr<parquet::arrow::FileReader>> reader_result =
+      parquet::arrow::FileReader::Make(arrow::default_memory_pool(), std::move(raw_reader));
+  if (!reader_result.ok()) {
+    throw StorageError(fmt::format("failed to open Parquet file '{}' for CPU scan: {}", fragment.file.value(),
+                                   reader_result.status().ToString()));
+  }
+  OpenFragment opened;
+  opened.file_reader = std::move(*reader_result);
+
+  std::shared_ptr<arrow::Schema> file_schema;
+  const arrow::Status schema_status = opened.file_reader->GetSchema(&file_schema);
+  if (!schema_status.ok()) {
+    throw StorageError(
+        fmt::format("failed to read Parquet schema for CPU scan: {}", schema_status.ToString()));
+  }
+
+  std::vector<int> column_indices;
+  column_indices.reserve(columns.size());
+  for (const std::string& name : columns) {
+    const int index = file_schema->GetFieldIndex(name);
+    if (index < 0) {
+      throw StorageError(
+          fmt::format("column '{}' not found in Parquet file '{}'", name, fragment.file.value()));
+    }
+    column_indices.push_back(index);
+  }
+
+  arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> rb_reader_result =
+      opened.file_reader->GetRecordBatchReader(fragment.selected_row_groups, column_indices);
+  if (!rb_reader_result.ok()) {
+    throw StorageError(fmt::format("failed to build a record batch reader for CPU scan: {}",
+                                   rb_reader_result.status().ToString()));
+  }
+  opened.batch_reader = std::move(*rb_reader_result);
+  return opened;
+}
+
+// Iteration state for make_streaming_scan_reader()'s lazy, cross-fragment
+// RecordBatchReader -- shared_ptr since Acero's "record_batch_reader_source"
+// node (see its own doc comment) runs each ReadNext() call as a task on its
+// own I/O thread pool, not synchronously inline like the rest of this
+// backend's translate()/execute_physical_plan_cpu() -- the reader itself
+// (and this state) must outlive that asynchronous execution, not just the
+// synchronous scope that constructs it.
+struct ScanIterationState {
+  const ParquetScanNode* scan;
+  ObjectStore* store;
+  std::size_t next_fragment_index = 0;
+  OpenFragment current;
+};
+
+// Builds one RecordBatchReader spanning every fragment of `scan`, opening
+// and reading each fragment lazily -- one at a time, one batch at a time --
+// instead of read_scan_table()'s previous approach of draining every
+// fragment's every batch into one in-memory vector before Acero's pipeline
+// even starts. Handed to Acero via RecordBatchReaderSourceNodeOptions
+// ("record_batch_reader_source"), this backend's memory footprint no longer
+// scales with total input size the way TableSourceNodeOptions's
+// full-materialization did -- only whatever's actually in flight through
+// the rest of the pipeline at once, matching (in spirit, not exact
+// mechanism) the GPU path's own pass-based, bounded-memory scan.
+std::shared_ptr<arrow::RecordBatchReader> make_streaming_scan_reader(const ParquetScanNode& scan,
+                                                                     ObjectStore& store) {
+  const std::vector<PhysicalFileFragment>& fragments = scan.fragments();
+
+  // No fragments at all (every file/row-group was pruned away): the scan's
+  // own declared (narrowed) schema is the only schema available, and there
+  // are zero batches to stream -- a real, correctly-typed empty result,
+  // not a null schema.
+  if (fragments.empty()) {
+    arrow::Result<std::shared_ptr<arrow::RecordBatchReader>> empty_reader_result =
+        arrow::RecordBatchReader::Make({}, to_arrow_schema(scan.output_schema()));
+    if (!empty_reader_result.ok()) {
+      throw StorageError(fmt::format("failed to build an empty CPU scan reader: {}",
+                                     empty_reader_result.status().ToString()));
+    }
+    return *empty_reader_result;
+  }
+
+  // Opening a fragment's reader only reads Parquet *metadata* (schema, row
+  // group offsets) -- ReadNext() is what actually reads row data, and nothing
+  // calls it here. Eagerly opening exactly the first fragment (synchronously,
+  // before this function returns) to determine the real schema matches
+  // read_scan_table()'s previous behavior exactly (using the first fragment's
+  // actual reader-derived schema, not scan.output_schema(), which can differ
+  // in nullability once real Parquet file metadata is consulted) while still
+  // reading zero rows of data up front.
+  auto state = std::make_shared<ScanIterationState>();
+  state->scan = &scan;
+  state->store = &store;
+  state->current = open_fragment_reader(fragments.front(), scan.columns(), store);
+  state->next_fragment_index = 1;
+  const std::shared_ptr<arrow::Schema> schema = state->current.batch_reader->schema();
+
+  arrow::Iterator<std::shared_ptr<arrow::RecordBatch>> iterator =
+      arrow::MakeFunctionIterator([state]() -> arrow::Result<std::shared_ptr<arrow::RecordBatch>> {
+        // Every exception this callback's own call chain can throw
+        // (StorageError from open_fragment_reader(), any other
+        // KernelLakeError) must be caught *here*, inside this single
+        // invocation -- it runs on Acero's I/O thread pool (see this
+        // function's own doc comment), where an uncaught C++ exception
+        // would escape a thread-pool worker rather than propagate back to
+        // execute_physical_plan_cpu()'s try/catch, crashing the process
+        // instead of failing the query cleanly.
+        try {
+          while (true) {
+            if (state->current.batch_reader == nullptr) {
+              const std::vector<PhysicalFileFragment>& fragments = state->scan->fragments();
+              if (state->next_fragment_index >= fragments.size()) {
+                return std::shared_ptr<arrow::RecordBatch>();  // end of stream
+              }
+              state->current = open_fragment_reader(fragments[state->next_fragment_index],
+                                                    state->scan->columns(), *state->store);
+              ++state->next_fragment_index;
+            }
+            std::shared_ptr<arrow::RecordBatch> batch;
+            ARROW_RETURN_NOT_OK(state->current.batch_reader->ReadNext(&batch));
+            if (batch == nullptr) {
+              state->current = OpenFragment{};
+              continue;  // this fragment is exhausted; try the next one
+            }
+            return batch;
+          }
+        } catch (const KernelLakeError& e) {
+          return arrow::Status::IOError(e.what());
+        } catch (const std::exception& e) {
+          return arrow::Status::UnknownError(e.what());
+        }
+      });
+
+  arrow::Result<std::shared_ptr<arrow::RecordBatchReader>> reader_result =
+      arrow::RecordBatchReader::MakeFromIterator(std::move(iterator), schema);
+  if (!reader_result.ok()) {
+    throw StorageError(fmt::format("failed to build the CPU scan's streaming reader: {}",
+                                   reader_result.status().ToString()));
+  }
+  return *reader_result;
 }
 
 // Resolves a NamedExpression that must be a plain column reference (a
@@ -234,8 +306,9 @@ arrow::compute::Aggregate translate_aggregate(AggregateInputPlan& plan, const Ag
 
 arrow::acero::Declaration translate(const PhysicalPlanPtr& node, ObjectStore& store) {
   if (const auto* scan = dynamic_cast<const ParquetScanNode*>(node.get())) {
-    return arrow::acero::Declaration{"table_source",
-                                     arrow::acero::TableSourceNodeOptions{read_scan_table(*scan, store)}};
+    return arrow::acero::Declaration{
+        "record_batch_reader_source",
+        arrow::acero::RecordBatchReaderSourceNodeOptions{make_streaming_scan_reader(*scan, store)}};
   }
   // Acero's own "hashjoin" node (HashJoinNodeOptions) implements exactly the
   // two-table INNER equi-join HashJoinNode describes; output_all defaults to

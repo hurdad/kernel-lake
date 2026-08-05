@@ -7,6 +7,7 @@
 #include <filesystem>
 
 #include "kernellake/common/errors.hpp"
+#include "kernellake/io/parquet_metadata.hpp"
 #include "kernellake/io/physical_planner.hpp"
 #include "kernellake/optimizer/optimizer.hpp"
 #include "kernellake/planner/logical_planner.hpp"
@@ -291,6 +292,105 @@ TEST_F(PhysicalPlannerTest, ExplainShowsFilesAndRowGroupCounts) {
   EXPECT_NE(text.find("ParquetScan"), std::string::npos);
   EXPECT_NE(text.find("files: 1/1"), std::string::npos);
   EXPECT_NE(text.find("row_groups: 1/2"), std::string::npos);
+}
+
+// A key/single-value table with `row_count` rows, one row group -- used by
+// the build-side-selection tests below, where the two joined tables' row
+// counts (not their column shapes) are what matters.
+void write_key_value_file(const std::string& path, const std::string& value_column, int64_t row_count) {
+  arrow::Int64Builder key_builder;
+  arrow::DoubleBuilder value_builder;
+  for (int64_t i = 0; i < row_count; ++i) {
+    ASSERT_TRUE(key_builder.Append(i % 3).ok());
+    ASSERT_TRUE(value_builder.Append(static_cast<double>(i)).ok());
+  }
+  std::shared_ptr<arrow::Array> key_array, value_array;
+  ASSERT_TRUE(key_builder.Finish(&key_array).ok());
+  ASSERT_TRUE(value_builder.Finish(&value_array).ok());
+  const auto schema = arrow::schema(
+      {arrow::field("jkey", arrow::int64(), false), arrow::field(value_column, arrow::float64(), false)});
+  const auto table = arrow::Table::Make(schema, {key_array, value_array});
+  auto sink = arrow::io::FileOutputStream::Open(path).ValueOrDie();
+  const arrow::Status status = parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), sink,
+                                                          /*chunk_size=*/row_count);
+  ASSERT_TRUE(status.ok()) << status.ToString();
+}
+
+class PhysicalPlannerJoinBuildSideTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    dir_ = fs::temp_directory_path() /
+           fs::path("kernellake_physical_planner_join_test_" +
+                    std::string(::testing::UnitTest::GetInstance()->current_test_info()->name()));
+    fs::create_directories(dir_);
+    small_path_ = (dir_ / "small.parquet").string();
+    large_path_ = (dir_ / "large.parquet").string();
+    write_key_value_file(small_path_, "sval", 3);
+    write_key_value_file(large_path_, "lval", 20);
+  }
+
+  void TearDown() override { fs::remove_all(dir_); }
+
+  PhysicalPlanPtr plan_for_join(const std::string& sql) {
+    const sql::AstSelectStatement stmt = sql::parse_sql(sql);
+    std::vector<Schema> join_schemas;
+    for (const std::string& path :
+         {stmt.join->first.paths.front(), stmt.join->steps.front().source.paths.front()}) {
+      const FileMetadata metadata = inspect_parquet_file(store_, Uri{path});
+      join_schemas.push_back(metadata.schema);
+    }
+    const BoundQuery bound = bind_query(stmt, join_schemas);
+    LogicalPlanPtr logical = build_logical_plan(bound, join_schemas);
+    logical = optimize(std::move(logical));
+    return build_physical_plan(logical, store_);
+  }
+
+  static const HashJoinNode* find_hash_join(const PhysicalPlanNode* node) {
+    if (const auto* join = dynamic_cast<const HashJoinNode*>(node)) {
+      return join;
+    }
+    for (const PhysicalPlanPtr& child : node->children()) {
+      if (const HashJoinNode* found = find_hash_join(child.get())) {
+        return found;
+      }
+    }
+    return nullptr;
+  }
+
+  fs::path dir_;
+  std::string small_path_;
+  std::string large_path_;
+  LocalObjectStore store_;
+};
+
+TEST_F(PhysicalPlannerJoinBuildSideTest, BuildsOnSmallerSideEvenWhenItIsWrittenFirstInTheQuery) {
+  // small (3 rows) is written *first*/left in the FROM clause, large (20
+  // rows) second/right -- without the size-aware swap, HashJoinOperator
+  // would build its hash table on `large` (the right/build side by
+  // convention), the opposite of what performs well. The fix should swap
+  // so `right()` ends up holding the smaller table regardless of clause
+  // order.
+  const PhysicalPlanPtr plan =
+      plan_for_join("SELECT sval, lval FROM read_parquet('" + small_path_ + "') AS s JOIN read_parquet('" +
+                    large_path_ + "') AS l ON s.jkey = l.jkey");
+  const HashJoinNode* join = find_hash_join(plan.get());
+  ASSERT_NE(join, nullptr);
+  EXPECT_NE(join->right()->output_schema().find_field("sval"), std::nullopt)
+      << "right() should be the small table";
+  EXPECT_EQ(join->right()->output_schema().find_field("lval"), std::nullopt);
+}
+
+TEST_F(PhysicalPlannerJoinBuildSideTest, DoesNotSwapWhenTheSmallerSideIsAlreadyOnTheRight) {
+  // Same two tables, opposite clause order: large first/left, small
+  // second/right -- already the preferred shape, so no swap should occur.
+  const PhysicalPlanPtr plan =
+      plan_for_join("SELECT lval, sval FROM read_parquet('" + large_path_ + "') AS l JOIN read_parquet('" +
+                    small_path_ + "') AS s ON l.jkey = s.jkey");
+  const HashJoinNode* join = find_hash_join(plan.get());
+  ASSERT_NE(join, nullptr);
+  EXPECT_NE(join->right()->output_schema().find_field("sval"), std::nullopt)
+      << "right() should still be the small table";
+  EXPECT_EQ(join->right()->output_schema().find_field("lval"), std::nullopt);
 }
 
 }  // namespace
