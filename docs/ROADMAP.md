@@ -1111,8 +1111,12 @@ and covered by passing tests -- not merely designed or stubbed.
   LIMIT` after a `JOIN` needs a real `ORDER BY` to establish ordering
   before the `LIMIT`/`fetch` node (Q3 has one, so this isn't a concern for
   it). Verified against DuckDB at SF0.01 on the CPU backend: exact
-  row-for-row, value-for-value match; not yet re-verified on the GPU
-  backend.
+  row-for-row, value-for-value match. Since then, also verified for real
+  on the GPU backend via a `tools/benchmark_three_way.py` four-way run
+  (real GPU hardware, RTX 5060 Ti, inside the `benchmark-gpu` Docker
+  target) -- KernelLake-CPU, KernelLake-GPU, PySpark, and DuckDB all
+  agreed on Q3's result (10 rows) at SF0.01, alongside Q1/Q6/Q19/Q12 all
+  passing too.
 - **DuckDB as a fourth benchmarking engine in `tools/benchmark_three_way.py`**
   (`ENGINES` gained `"duckdb"`, alongside `kernellake-cpu`/`kernellake-gpu`/
   `pyspark`). Unlike PySpark, which needs its own placeholder-to-temp-view
@@ -1125,7 +1129,15 @@ and covered by passing tests -- not merely designed or stubbed.
   page-cache-eviction handling every other engine gets. `--backends`
   default changed to `"cpu,gpu,pyspark,duckdb"`; `--query all`'s query-list
   logic extended to include Q3 once both `--orders-data` and
-  `--customer-data` are passed.
+  `--customer-data` are passed. `docker/Dockerfile`'s `benchmark-gpu` stage
+  (the image `tools/benchmark_three_way.py` actually runs inside, per its
+  own docstring) installed `pyspark`/`pyarrow`/`pandas`/`matplotlib` but not
+  `duckdb` -- added it there too, found and fixed before the first real run
+  rather than after a container failure. Verified for real: a full
+  `docker build --target benchmark-gpu` plus a `docker run --gpus all`
+  four-way run (SF0.01, freshly generated with the `customer` table
+  included) -- Q1/Q6/Q19/Q12/Q3 all validated across all four engines with
+  zero disagreements.
 - **CI fix: `tpch-tooling-smoke` job's query-file validation step used a
   bare `{data}` -> `*.parquet` glob**, which was safe when
   `generate_tpch.py` only wrote `lineitem` files but broke once

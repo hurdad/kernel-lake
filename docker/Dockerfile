@@ -210,16 +210,17 @@ ENTRYPOINT ["/workspace/build/gpu-dev/src/cli/kernellake"]
 CMD ["--help"]
 
 # ---------------------------------------------------------------------------
-# benchmark-gpu: dev-gpu plus a JVM and PySpark, for
+# benchmark-gpu: dev-gpu plus a JVM, PySpark, and DuckDB, for
 # tools/benchmark_three_way.py's unofficial KernelLake-CPU vs.
-# KernelLake-GPU vs. PySpark comparison (see docs/ROADMAP.md). Not a
-# published image (never built with --target by CI) -- an ad-hoc local
-# tool for comparing all three engines against the same generated dataset
-# on the same hardware inside one container (`docker run --gpus all`), not
-# a deployment artifact. Built from dev-gpu specifically (not dev-cpu)
-# because it needs a real KERNELLAKE_WITH_CUDA=ON build to exercise
-# `kernellake query --backend gpu` -- the CPU-backend comparison point
-# comes from the same binary's `--backend cpu` flag, not a separate build.
+# KernelLake-GPU vs. PySpark vs. DuckDB comparison (see docs/ROADMAP.md).
+# Not a published image (never built with --target by CI) -- an ad-hoc
+# local tool for comparing all four engines against the same generated
+# dataset on the same hardware inside one container (`docker run --gpus
+# all`), not a deployment artifact. Built from dev-gpu specifically (not
+# dev-cpu) because it needs a real KERNELLAKE_WITH_CUDA=ON build to
+# exercise `kernellake query --backend gpu` -- the CPU-backend comparison
+# point comes from the same binary's `--backend cpu` flag, not a separate
+# build.
 # ---------------------------------------------------------------------------
 FROM dev-gpu AS benchmark-gpu
 
@@ -233,15 +234,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # --break-system-packages: this stage is a standalone benchmarking tool
 # image, not a Python-development environment other tooling shares with
 # apt-managed Python packages -- there is no conflicting apt-installed
-# package for pyspark/pyarrow/pandas/matplotlib to clash with here.
+# package for pyspark/pyarrow/pandas/matplotlib/duckdb to clash with here.
 # pandas: PySpark's own DataFrame.toPandas() (used to bridge a Spark SQL
 # result into a pa.Table for cross-engine comparison) requires it directly
 # -- confirmed by a real "[PACKAGE_NOT_INSTALLED] Pandas >= 2.2.0 must be
 # installed" failure before this was added. matplotlib is for
 # tools/generate_benchmark_report.py (renders the multi-scale-factor PDF
 # report from benchmark_three_way.py's --output JSON files), not the
-# benchmark script itself.
-RUN pip install --break-system-packages --no-cache-dir pyspark pyarrow pandas matplotlib
+# benchmark script itself. duckdb: benchmark_three_way.py's fourth engine
+# (tools/duckdb_compare.py's run_duckdb()), same package validate_tpch.py
+# already depends on.
+RUN pip install --break-system-packages --no-cache-dir pyspark pyarrow pandas matplotlib duckdb
 
 ENTRYPOINT ["python3", "tools/benchmark_three_way.py"]
 

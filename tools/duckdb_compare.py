@@ -31,9 +31,9 @@ def run_kernellake(kernellake_bin: str, sql: str, backend: str | None = None) ->
 
 def run_duckdb(sql: str) -> pa.Table:
     # Imported lazily: callers that only need normalize()/rows_match()/
-    # run_kernellake() (e.g. tools/benchmark_three_way.py, which compares
-    # KernelLake against PySpark, not DuckDB) shouldn't need duckdb
-    # installed just to import this module.
+    # run_kernellake() and never call run_duckdb() (e.g.
+    # tools/benchmark_three_way.py with --backends excluding duckdb)
+    # shouldn't need duckdb installed just to import this module.
     import duckdb
 
     return duckdb.sql(sql).arrow().read_all()

@@ -148,12 +148,13 @@ python3 tools/validate_tpch.py \
 This has been run at SF0.01, SF0.1, and SF1 (60,000, 600,000, and
 6,000,000 generated rows) -- Q1 and Q6 matched DuckDB exactly at every
 scale, including the full SF1 run (~105 MiB single Parquet file, zstd
-compression, 1,000,000-row row groups). Q19, Q12, and Q14 have each been
-verified at SF0.01 on both the CPU and GPU backends, exact match against
-DuckDB. Q3 has been verified at SF0.01 on the CPU backend, exact
-row-for-row and value-for-value match against DuckDB, including its
-3-way join, `ORDER BY revenue DESC, o_orderdate` multi-key sort, and
-`LIMIT 10`; not yet re-verified on the GPU backend.
+compression, 1,000,000-row row groups). Q19, Q12, Q14, and Q3 have each
+been verified at SF0.01 on both the CPU and GPU backends, exact match
+against DuckDB (Q3 including its 3-way join, `ORDER BY revenue DESC,
+o_orderdate` multi-key sort, and `LIMIT 10`) -- also cross-validated
+against PySpark via `tools/benchmark_three_way.py`'s four-way engine
+comparison (KernelLake-CPU, KernelLake-GPU, PySpark, DuckDB all agree on
+every query, real GPU hardware, SF0.01).
 
 ## 4. Benchmark
 
