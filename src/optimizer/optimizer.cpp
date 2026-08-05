@@ -410,9 +410,12 @@ LogicalPlanPtr rewrite_plan(const LogicalPlanPtr& node) {
   if (const auto* join = dynamic_cast<const LogicalJoin*>(node.get())) {
     // Nothing to simplify about the join itself (its "expression" is just
     // two column indices, not an Expression tree) -- only its two subtrees
-    // (always a bare LogicalScan each in this version, since only
-    // `read_parquet(...)` sources can appear on either side of a JOIN) can
-    // need rewriting.
+    // need rewriting. Each is either a bare LogicalScan (a plain
+    // `read_parquet(...)` source) or, for an N-way join chain, itself
+    // another LogicalJoin (the left-deep shape build_logical_plan()
+    // builds -- see docs/ARCHITECTURE.md's "Hash joins" section) -- the
+    // recursive rewrite_plan() call below handles either shape identically,
+    // dispatching on the child's actual type rather than assuming one.
     LogicalPlanPtr left = rewrite_plan(join->left());
     LogicalPlanPtr right = rewrite_plan(join->right());
     return std::make_shared<LogicalJoin>(std::move(left), std::move(right), join->left_key_index(),
