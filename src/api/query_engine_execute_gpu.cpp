@@ -75,14 +75,20 @@ QueryResult QueryEngine::execute(const PhysicalPlanPtr& physical, RmmEnvironment
                            nullptr};
 
   // A quarter of the *actually enforced* memory ceiling --
-  // resolve_query_memory_limit_bytes(), not config_.engine
-  // .query_memory_limit_bytes directly, since that field's own "0 means
-  // auto-detect from GPU VRAM" convention would otherwise make this quarter
-  // of *zero* whenever auto-detection is in effect, and RmmEnvironment's
-  // limiting_resource_adaptor (which this must stay in sync with) already
-  // resolves it the same way. Not memory.pool_max_bytes, which is dead
-  // config whenever memory.use_async_allocator is true, the default: it
-  // only sizes rmm::mr::pool_memory_resource, never constructed in that
+  // rmm_environment.query_memory_limit_bytes() (the exact value this
+  // instance's limiting_resource_adaptor was built with), not
+  // config_.engine.query_memory_limit_bytes directly (that field's own "0
+  // means auto-detect from GPU VRAM" convention would otherwise make this
+  // quarter of *zero* whenever auto-detection is in effect) and not a
+  // fresh resolve_query_memory_limit_bytes(config_) call either: for a
+  // long-lived RmmEnvironment (kernellake-server keeps one for the whole
+  // process -- see GpuExecutionCoordinator), auto-detection was resolved
+  // once, at that instance's construction, from whatever free VRAM looked
+  // like *then*; a fresh call here would read *current* free VRAM instead,
+  // which can have drifted since -- sizing this against a value the
+  // limiter doesn't actually enforce. Not memory.pool_max_bytes, which is
+  // dead config whenever memory.use_async_allocator is true, the default:
+  // it only sizes rmm::mr::pool_memory_resource, never constructed in that
   // case; see rmm_environment.cpp's build_base_resource()). Using
   // pool_max_bytes here was a real, distinct bug from the divisor below --
   // silent unless a caller happens to set both fields to the same value.
@@ -100,7 +106,7 @@ QueryResult QueryEngine::execute(const PhysicalPlanPtr& physical, RmmEnvironment
   // original columns, the derived projection columns, and hash-aggregate
   // working state all live at once within one pass -- not just the scan
   // itself.
-  const std::size_t pass_read_limit_bytes = resolve_query_memory_limit_bytes(config_) / 4;
+  const std::size_t pass_read_limit_bytes = rmm_environment.query_memory_limit_bytes() / 4;
   const std::unique_ptr<PhysicalOperator> root =
       build_operator_tree(physical, store_, pass_read_limit_bytes, config_.profiling.nvtx);
 

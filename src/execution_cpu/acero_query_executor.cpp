@@ -107,8 +107,16 @@ OpenFragment open_fragment_reader(const PhysicalFileFragment& fragment,
 // own I/O thread pool, not synchronously inline like the rest of this
 // backend's translate()/execute_physical_plan_cpu() -- the reader itself
 // (and this state) must outlive that asynchronous execution, not just the
-// synchronous scope that constructs it.
+// synchronous scope that constructs it. `mutex` guards every mutable field
+// below: nothing in Acero's own documented contract for
+// RecordBatchReaderSourceNodeOptions ("each iteration...run on a new
+// thread task") promises those tasks are serialized rather than pipelined,
+// and this state's mutation (advancing `next_fragment_index`, replacing
+// `current`) is not safe under concurrent access either way -- cheap
+// insurance against a scheduling assumption this code doesn't actually
+// need to rely on, not a response to an observed race.
 struct ScanIterationState {
+  std::mutex mutex;
   const ParquetScanNode* scan;
   ObjectStore* store;
   std::size_t next_fragment_index = 0;
@@ -168,6 +176,7 @@ std::shared_ptr<arrow::RecordBatchReader> make_streaming_scan_reader(const Parqu
         // would escape a thread-pool worker rather than propagate back to
         // execute_physical_plan_cpu()'s try/catch, crashing the process
         // instead of failing the query cleanly.
+        const std::lock_guard<std::mutex> lock(state->mutex);
         try {
           while (true) {
             if (state->current.batch_reader == nullptr) {

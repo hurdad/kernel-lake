@@ -1497,6 +1497,65 @@ and covered by passing tests -- not merely designed or stubbed.
   `config.hpp` are CPU-agnostic, but `resolve_query_memory_limit_bytes()`
   itself only compiles into GPU-enabled builds, matching where
   `RmmEnvironment` already lived).
+- **Full code+docs audit surfaced a real drift bug in the memory
+  auto-detection above, plus a doc-ordering slip and a defensive
+  thread-safety gap, all from this same session's own work.**
+  - **CLI-vs-server drift**: `query_engine_execute_gpu.cpp`'s
+    `pass_read_limit_bytes` called `resolve_query_memory_limit_bytes(config_)`
+    directly, the same function `RmmEnvironment`'s limiter uses -- fine for
+    the CLI's one-shot `execute(sql)`, where both calls happen moments
+    apart in the same query. But `kernellake-server` keeps **one**
+    `RmmEnvironment` alive for its entire process lifetime
+    (`GpuExecutionCoordinator`), reusing it across every request, while
+    `pass_read_limit_bytes` still recomputed fresh on *every* query. Free
+    VRAM at server startup (when the limiter's ceiling was actually fixed)
+    and free VRAM hours later on some later query can genuinely differ --
+    meaning pass-sizing could silently drift from the ceiling the limiter
+    actually enforces, in either direction. Fixed by having
+    `RmmEnvironment` store and expose the exact value it resolved at
+    construction (`RmmEnvironment::query_memory_limit_bytes()`), and
+    `pass_read_limit_bytes` reads that instead of re-resolving. Two new
+    regression tests,
+    `RmmEnvironment.QueryMemoryLimitBytesAccessorReflectsExplicitConfig`
+    and `.QueryMemoryLimitBytesAccessorAutoDetectsWhenConfigIsZero`.
+  - **Doc-comment misplacement**: `physical_planner.cpp`'s
+    `estimate_row_count()` had been inserted between `find_scan_schema()`'s
+    existing doc comment and `find_scan_schema()` itself, leaving
+    `find_scan_schema()` with no comment directly above it and
+    `estimate_row_count()`'s own comment sandwiched in between two
+    unrelated comments. No behavior change, purely confusing to read --
+    reordered so each function has its own comment directly above it.
+  - **Defensive thread-safety**: `acero_query_executor.cpp`'s streaming
+    scan reader mutates shared state (`ScanIterationState`) from a lambda
+    Acero runs via `RecordBatchReaderSourceNodeOptions`, whose own docs say
+    "each iteration... run on a new thread task" without stating whether
+    those tasks are guaranteed serialized or could be pipelined
+    concurrently -- not verified against every possible Acero plan shape,
+    only a simple manual test. Added a `std::mutex` guarding the whole
+    callback body as cheap insurance against a scheduling guarantee this
+    code never actually confirmed, rather than relying on it.
+  - **Resource leak in `tools/benchmark_three_way.py`**: `server_proc =
+    start_kernellake_server(...)` sat *before* the `try`/`finally` block
+    that stops PySpark, and PySpark's `SparkSession` was constructed
+    *before* that call -- if kernellake-server startup failed for any
+    reason (bad `--kernellake-server` path, GPU already busy, a slow GPU
+    init exceeding the 30s startup timeout) after Spark had already started
+    successfully, the exception propagated straight out of `main()` with
+    the JVM never stopped, leaking a running Spark process. Fixed by
+    moving both engines' startup inside the same `try` the query loop
+    already used, so the one `finally` block covers whichever of
+    Spark/kernellake-server actually started, regardless of which step
+    failed. Verified for real: pointed `--kernellake-server` at a
+    nonexistent path with `pyspark` also enabled -- Spark started (its own
+    JVM traceback confirms `DataFrameReader.parquet()` ran), then the
+    server-startup `FileNotFoundError` fired, then the process exited with
+    a single clean traceback and no secondary exception during cleanup (a
+    failing `spark.stop()` would have shown as a second, chained
+    exception). Re-ran the same command with a valid path afterward to
+    confirm the happy path is unaffected.
+
+  Verified for real: `gpu-dev` 263/263 (up from 261), `dev`/`server-dev`/
+  `otel-dev` still 181/184/184, zero regressions.
 
 ## Not yet started
 

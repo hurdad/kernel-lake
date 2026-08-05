@@ -55,6 +55,7 @@ std::uint64_t resolve_query_memory_limit_bytes(const EngineConfig& config) {
 }
 
 struct RmmEnvironment::Impl {
+  std::uint64_t query_memory_limit_bytes;
   cuda::mr::any_resource<cuda::mr::device_accessible> base_resource;
   rmm::mr::statistics_resource_adaptor stats;
   rmm::mr::limiting_resource_adaptor limiter;
@@ -62,9 +63,10 @@ struct RmmEnvironment::Impl {
 
   Impl(const EngineConfig& config, cuda::mr::any_resource<cuda::mr::device_accessible> base,
        cuda::mr::any_resource<cuda::mr::device_accessible> previous)
-      : base_resource(std::move(base)),
+      : query_memory_limit_bytes(resolve_query_memory_limit_bytes(config)),
+        base_resource(std::move(base)),
         stats(base_resource),
-        limiter(stats, resolve_query_memory_limit_bytes(config)),
+        limiter(stats, query_memory_limit_bytes),
         previous_resource(std::move(previous)) {}
 };
 
@@ -120,6 +122,10 @@ MemoryUsage RmmEnvironment::track_query(const std::function<void()>& query) {
 MemoryUsage RmmEnvironment::current_usage() const {
   const rmm::mr::statistics_resource_adaptor::counter bytes = impl_->stats.get_bytes_counter();
   return MemoryUsage{bytes.value, bytes.peak};
+}
+
+std::uint64_t RmmEnvironment::query_memory_limit_bytes() const {
+  return impl_->query_memory_limit_bytes;
 }
 
 }  // namespace kernellake

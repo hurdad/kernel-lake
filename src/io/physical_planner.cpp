@@ -88,22 +88,6 @@ std::vector<NamedExpression> remap_named(const std::vector<NamedExpression>& ite
   return result;
 }
 
-// Finds the schema every expression sitting directly above a scan (or, for
-// a JOIN query, directly above the HashJoinNode) must be remapped against.
-// A HashJoinNode is a schema boundary exactly like a ParquetScanNode is --
-// its own already-narrowed, already-concatenated output_schema() is what a
-// Filter/Projection/Aggregate/Sort sitting on top of a join needs, so the
-// search stops there rather than continuing into the join's two children
-// (which have two separate, incompatible narrowed schemas).
-//
-// Known limitation: remapping above a join matches by column *name* against
-// this combined schema (same as the single-table case always has), so if
-// both JOIN sides happen to have a column with the same name, an unqualified
-// reference to it above the join could resolve to the wrong side. Not a
-// concern for the join *condition* itself (bound with each side's own
-// index, see binder.cpp), only for additional WHERE/SELECT/GROUP BY
-// references after the join -- avoid colliding column names across joined
-// tables, or select/rename them distinctly, until this is tightened.
 // Estimates a physical plan node's output row count, for choosing a hash
 // join's build side (HashJoinOperator always materializes its *right*
 // child into device memory -- see that class's own doc comment -- so the
@@ -144,6 +128,22 @@ std::optional<std::int64_t> estimate_row_count(const PhysicalPlanPtr& node) {
   return std::nullopt;
 }
 
+// Finds the schema every expression sitting directly above a scan (or, for
+// a JOIN query, directly above the HashJoinNode) must be remapped against.
+// A HashJoinNode is a schema boundary exactly like a ParquetScanNode is --
+// its own already-narrowed, already-concatenated output_schema() is what a
+// Filter/Projection/Aggregate/Sort sitting on top of a join needs, so the
+// search stops there rather than continuing into the join's two children
+// (which have two separate, incompatible narrowed schemas).
+//
+// Known limitation: remapping above a join matches by column *name* against
+// this combined schema (same as the single-table case always has), so if
+// both JOIN sides happen to have a column with the same name, an unqualified
+// reference to it above the join could resolve to the wrong side. Not a
+// concern for the join *condition* itself (bound with each side's own
+// index, see binder.cpp), only for additional WHERE/SELECT/GROUP BY
+// references after the join -- avoid colliding column names across joined
+// tables, or select/rename them distinctly, until this is tightened.
 const Schema* find_scan_schema(const PhysicalPlanNode& node) {
   if (const auto* scan = dynamic_cast<const ParquetScanNode*>(&node)) {
     return &scan->output_schema();

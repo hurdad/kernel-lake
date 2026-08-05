@@ -682,49 +682,58 @@ def main() -> int:
     for key, value in system_stats.items():
         print(f"    {key}: {value}")
 
+    # Declared before the try block, not just before use: if either
+    # SparkSession creation/temp-view registration or kernellake-server
+    # startup below raises (e.g. a bad --kernellake-server path, the GPU
+    # already busy, a slow GPU init exceeding the startup timeout, or a
+    # bad --data glob Spark can't read), the *other* one may have already
+    # started successfully -- both must still get torn down by the same
+    # finally block rather than leaking a running JVM or server process
+    # because the exception happened before a narrower try/finally around
+    # just the query loop would have caught it.
     spark = None
-    if "pyspark" in backends:
-        from pyspark.sql import SparkSession
-
-        # spark.driver.memory: local[*] mode runs the driver and every
-        # executor thread inside one JVM process (no separate executor
-        # JVMs), so this is the one setting that actually bounds all of it.
-        # Left at PySpark's own small default, a real run against a
-        # genuinely large dataset (SF10, 60M rows, local[*] spreading the
-        # scan across every CPU core at once) hit a real
-        # "java.lang.OutOfMemoryError: Java heap space" failure -- confirmed
-        # by an actual run, not a hypothetical concern. args.driver_memory
-        # is left tunable rather than hardcoded, since the right value
-        # scales with both the dataset size and the host's available RAM.
-        spark = (
-            SparkSession.builder.appName("kernellake-benchmark-three-way")
-            .master("local[*]")
-            .config("spark.ui.showConsoleProgress", "false")
-            .config("spark.driver.memory", args.spark_driver_memory)
-            .getOrCreate()
-        )
-        spark.sparkContext.setLogLevel("WARN")
-        spark.read.parquet(args.data).createOrReplaceTempView("lineitem")
-        if args.part_data:
-            spark.read.parquet(args.part_data).createOrReplaceTempView("part")
-        if args.orders_data:
-            spark.read.parquet(args.orders_data).createOrReplaceTempView("orders")
-        if args.customer_data:
-            spark.read.parquet(args.customer_data).createOrReplaceTempView("customer")
-
     server_proc = None
     server_conn = None
     server_cursor = None
-    if "kernellake-gpu-server" in backends:
-        print(f"=== Starting kernellake-server on port {args.server_port} ===")
-        server_proc = start_kernellake_server(args.kernellake_server, args.server_port)
-        import adbc_driver_flightsql.dbapi as flightsql
-
-        server_conn = flightsql.connect(f"grpc://127.0.0.1:{args.server_port}")
-        server_cursor = server_conn.cursor()
-
     results = []
     try:
+        if "pyspark" in backends:
+            from pyspark.sql import SparkSession
+
+            # spark.driver.memory: local[*] mode runs the driver and every
+            # executor thread inside one JVM process (no separate executor
+            # JVMs), so this is the one setting that actually bounds all of it.
+            # Left at PySpark's own small default, a real run against a
+            # genuinely large dataset (SF10, 60M rows, local[*] spreading the
+            # scan across every CPU core at once) hit a real
+            # "java.lang.OutOfMemoryError: Java heap space" failure -- confirmed
+            # by an actual run, not a hypothetical concern. args.driver_memory
+            # is left tunable rather than hardcoded, since the right value
+            # scales with both the dataset size and the host's available RAM.
+            spark = (
+                SparkSession.builder.appName("kernellake-benchmark-three-way")
+                .master("local[*]")
+                .config("spark.ui.showConsoleProgress", "false")
+                .config("spark.driver.memory", args.spark_driver_memory)
+                .getOrCreate()
+            )
+            spark.sparkContext.setLogLevel("WARN")
+            spark.read.parquet(args.data).createOrReplaceTempView("lineitem")
+            if args.part_data:
+                spark.read.parquet(args.part_data).createOrReplaceTempView("part")
+            if args.orders_data:
+                spark.read.parquet(args.orders_data).createOrReplaceTempView("orders")
+            if args.customer_data:
+                spark.read.parquet(args.customer_data).createOrReplaceTempView("customer")
+
+        if "kernellake-gpu-server" in backends:
+            print(f"=== Starting kernellake-server on port {args.server_port} ===")
+            server_proc = start_kernellake_server(args.kernellake_server, args.server_port)
+            import adbc_driver_flightsql.dbapi as flightsql
+
+            server_conn = flightsql.connect(f"grpc://127.0.0.1:{args.server_port}")
+            server_cursor = server_conn.cursor()
+
         for query_number in query_numbers:
             results.append(
                 benchmark_one_query(

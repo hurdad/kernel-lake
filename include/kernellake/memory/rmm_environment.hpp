@@ -71,6 +71,19 @@ class RmmEnvironment {
 
   [[nodiscard]] MemoryUsage current_usage() const;
 
+  // The byte count actually enforced by this instance's
+  // limiting_resource_adaptor -- resolved once, at construction, via
+  // resolve_query_memory_limit_bytes(). Callers needing to size anything
+  // relative to the real ceiling (e.g. query_engine_execute_gpu.cpp's
+  // pass_read_limit_bytes) must read it from here, not by calling
+  // resolve_query_memory_limit_bytes() again themselves: for a
+  // long-lived RmmEnvironment (kernellake-server keeps one for the whole
+  // process, reused across every query -- see
+  // GpuExecutionCoordinator), free VRAM at query time can differ from
+  // free VRAM when this instance was constructed, and a fresh call would
+  // silently drift from the ceiling this instance actually enforces.
+  [[nodiscard]] std::uint64_t query_memory_limit_bytes() const;
+
  private:
   struct Impl;
   std::unique_ptr<Impl> impl_;

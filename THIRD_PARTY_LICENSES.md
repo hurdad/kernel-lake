@@ -86,8 +86,10 @@ artifact, verified against each package's own installed
 
 | Tool | License | Notes |
 | --- | --- | --- |
-| DuckDB (Python package) | MIT | Used only by `tools/validate_against_duckdb.py` and `tools/validate_tpch.py` as an out-of-process correctness oracle, invoked via `pip install duckdb`; never linked into or distributed with the `kernellake` binary |
-| PyArrow | Apache-2.0 | Used by the same validation tools and by `tools/generate_tpch.py`, same out-of-process relationship |
+| DuckDB (Python package) | MIT | Used by `tools/validate_against_duckdb.py`/`tools/validate_tpch.py` (out-of-process correctness oracle) and `tools/benchmark_three_way.py` (a benchmarked engine, via the shared `tools/duckdb_compare.py`), invoked via `pip install duckdb`; never linked into or distributed with the `kernellake` binary |
+| PyArrow | Apache-2.0 | Used by the same validation/benchmark tools and by `tools/generate_tpch.py`, same out-of-process relationship |
+| PySpark | Apache-2.0 | Used only by `tools/benchmark_three_way.py` as a benchmarked engine (`local[*]` mode); requires a JVM on `PATH`, itself out of scope for this table |
+| adbc-driver-flightsql / adbc-driver-manager | Apache-2.0 | Used only by `tools/benchmark_three_way.py` as an Arrow Flight SQL client, connecting to a `kernellake-server` process over the network -- not linked into either binary |
 
 ## Compatibility
 
@@ -97,8 +99,8 @@ License 2.0 and with each other; none impose copyleft or
 source-disclosure obligations on KernelLake's own code. No source code
 has been copied from any of these dependencies into KernelLake's own
 source tree -- they are consumed exclusively as system packages, CMake
-`FetchContent` vendored builds, or (for DuckDB/PyArrow) separate
-out-of-process tools.
+`FetchContent` vendored builds, or (for DuckDB/PyArrow/PySpark/
+adbc-driver-flightsql) separate out-of-process tools.
 
 ## TPC-H
 
