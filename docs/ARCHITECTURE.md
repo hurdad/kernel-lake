@@ -1094,18 +1094,35 @@ preset turns it on), so it adds no new required dependency for anyone not
 using it. `KernelLakeFlightSqlServer`
 (`include/kernellake/server/flight_sql_server.hpp`,
 `src/server/flight_sql_server.cpp`) subclasses
-`arrow::flight::sql::FlightSqlServerBase` and implements just
-`GetFlightInfoStatement`/`DoGetStatement` -- Arrow 25.0.0 declares the rest
-of that base class's RPCs virtual with default `NotImplemented` bodies, not
+`arrow::flight::sql::FlightSqlServerBase` and implements
+`GetFlightInfoStatement`/`DoGetStatement` plus prepared-statement support
+(`CreatePreparedStatement`/`ClosePreparedStatement`/
+`GetFlightInfoPreparedStatement`) -- Arrow 25.0.0 declares the rest of
+that base class's RPCs virtual with default `NotImplemented` bodies, not
 pure virtual, so a minimal override compiles and serves real queries
-without touching prepared statements, catalog/schema/table listing, or
-`SqlInfo`. The two implemented RPCs deliberately execute the query
-*eagerly* inside `GetFlightInfoStatement` (the first RPC a client makes)
-and buffer the `QueryResult` in an in-process handle-keyed registry that
-`DoGetStatement` (the second RPC) streams from and then erases -- avoiding
-the need to keep a live cursor open across two separate gRPC calls that may
-not even land on the same connection, at the cost of buffering the whole
-result in host memory between the two calls. Every `KernelLakeError`
+without touching catalog/schema/table listing or `SqlInfo`. Prepared
+statements were added after confirming with a real
+`org.apache.arrow:flight-sql-jdbc-driver` (the driver DBeaver and most
+JDBC-based BI tools use) that the JDBC driver routes *every* query
+through the prepared-statement RPCs internally, with no fallback to the
+plain-statement path -- without them, no JDBC-based client could run a
+single query, `GetSqlInfo` or not. KernelLake has no bound-parameter ("?")
+support, so a "prepared statement" here is just a named, pre-bound
+`PhysicalPlanPtr`: `CreatePreparedStatement` runs `QueryEngine::explain()`
+(parse/bind/plan, no execution yet, so a genuine syntax/binding error
+surfaces at prepare time like a real prepared statement) and stores the
+result; `GetFlightInfoPreparedStatement` executes that stored plan
+through the same eager-execute-and-buffer path (and the same ticket
+format) `GetFlightInfoStatement` uses, so the existing `DoGetStatement`
+serves both kinds of query results -- no separate
+`DoGetPreparedStatement` needed. Both RPC pairs execute the query
+*eagerly* inside `GetFlightInfoStatement`/`GetFlightInfoPreparedStatement`
+(the first RPC a client makes) and buffer the `QueryResult` in an
+in-process handle-keyed registry that `DoGetStatement` (the second RPC)
+streams from and then erases -- avoiding the need to keep a live cursor
+open across two separate gRPC calls that may not even land on the same
+connection, at the cost of buffering the whole result in host memory
+between the two calls. Every `KernelLakeError`
 subclass thrown by `QueryEngine` is translated to a matching generic
 `arrow::Status` code (`Invalid` for `SqlError`/`BindingError`/
 `PlanningError`/`OptimizationError`, `IOError` for `StorageError`,

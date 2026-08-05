@@ -40,11 +40,10 @@ const LogicalScan* find_scan(const LogicalPlanPtr& node) {
   return nullptr;
 }
 
-// These three tests select only a strict subset of a two-column schema so
-// the wrapping LogicalProjection is never itself an identity projection
-// (which the redundant-projection rule would otherwise remove, as verified
-// separately by Optimizer.RemovesRedundantIdentityProjection) -- keeping
-// each test isolated to the one rule it targets.
+// These three tests select only a strict subset of a two-column schema;
+// keeping them isolated to a subset (rather than the full schema) has no
+// bearing on the optimizer itself anymore -- see
+// Optimizer.KeepsIdentityProjectionForColumnPruningToSeeLater below for why.
 Schema two_column_schema() {
   return Schema({Field{"a", int64_type(false)}, Field{"b", int64_type(false)}});
 }
@@ -171,14 +170,31 @@ TEST(Optimizer, SimplifiesBetweenIntoComparisons) {
   EXPECT_EQ(binary->op(), BinaryOperator::And);
 }
 
-TEST(Optimizer, RemovesRedundantIdentityProjection) {
+// Regression test: an identity projection (its items exactly reproduce the
+// child's own schema, in the same order) used to be elided right here in the
+// optimizer, before annotate_scan()'s column-pruning pass ever ran over the
+// rewritten tree -- silently discarding the only record of which columns the
+// query's actual output needed. A Filter/Sort/Aggregate sitting under the
+// elided projection would then only mark its own referenced columns as
+// required, and the scan would drop every other selected column with no
+// error at all: `SELECT id, amount FROM t WHERE id < 3` (id, amount are the
+// table's only two columns, selected in schema order -- exactly this
+// pattern, and also exactly what `SELECT * ... WHERE ...` desugars to)
+// returned only the `id` column, confirmed for real on both backends. Fixed
+// by keeping the identity projection in the logical tree so annotate_scan
+// can see it like any other projection; the equivalent optimization (skip
+// materializing a pass-through-only ProjectionNode at execution time) now
+// happens later, in physical_planner.cpp, once column pruning has already
+// run -- see PhysicalPlannerTest.ElidesIdentityProjectionAfterColumnPruning
+// and .RegressionKeepsEveryColumnWhenSelectListMatchesSchemaOrder.
+TEST(Optimizer, KeepsIdentityProjectionForColumnPruningToSeeLater) {
   Schema schema({Field{"a", int64_type(false)}});
   auto scan = std::make_shared<LogicalScan>(std::vector<std::string>{"/x.parquet"}, schema);
   auto column = std::make_shared<ColumnExpression>("a", 0, int64_type(false));
   auto projection = std::make_shared<LogicalProjection>(scan, std::vector<NamedExpression>{{column, "a"}});
 
   LogicalPlanPtr optimized = optimize(projection);
-  EXPECT_NE(dynamic_cast<const LogicalScan*>(optimized.get()), nullptr);
+  ASSERT_NE(dynamic_cast<const LogicalProjection*>(optimized.get()), nullptr);
 }
 
 TEST(Optimizer, PushesLimitThroughProjectionToScan) {

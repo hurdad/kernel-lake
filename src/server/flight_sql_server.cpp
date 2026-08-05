@@ -12,6 +12,7 @@
 #include "kernellake/common/errors.hpp"
 #include "kernellake/observability/query_tracing.hpp"
 #include "kernellake/planner/physical_plan.hpp"
+#include "kernellake/types/arrow_adapter.hpp"
 
 namespace kernellake {
 
@@ -60,35 +61,52 @@ KernelLakeFlightSqlServer::KernelLakeFlightSqlServer(const EngineConfig& config)
 
 KernelLakeFlightSqlServer::~KernelLakeFlightSqlServer() = default;
 
-arrow::Result<std::unique_ptr<flight::FlightInfo>> KernelLakeFlightSqlServer::GetFlightInfoStatement(
-    const flight::ServerCallContext& /*context*/, const flight_sql::StatementQuery& command,
-    const flight::FlightDescriptor& descriptor) {
+arrow::Result<std::unique_ptr<flight::FlightInfo>> KernelLakeFlightSqlServer::ExecuteAndBuffer(
+    const PhysicalPlanPtr& physical, std::string_view sql, const flight::FlightDescriptor& descriptor) {
   QueryResult result;
   observability::QuerySpan span =
       observability::start_query_span("kernellake.flight_sql.get_flight_info_statement");
+  bool reserved = false;
   try {
     // Reject before doing any work if the buffered-but-unfetched result
     // registry is already full (see ServerSection::max_pending_results'
     // own comment) -- a client that never calls DoGetStatement to drain it
-    // must not be able to grow this map without bound.
+    // must not be able to grow this map without bound. The reservation
+    // (pending_count_) is incremented in the SAME critical section as the
+    // check, not just checked and inserted later once the (potentially
+    // slow) query finishes: two concurrent callers that both see
+    // results_.size() below the cap before either has inserted yet would
+    // otherwise both proceed to execute and both insert, defeating the cap
+    // under concurrent load even though it holds sequentially -- confirmed
+    // via a concurrent-caller stress test before this fix (20 of 20 calls
+    // succeeded against a cap of 2).
     {
       const std::lock_guard<std::mutex> lock(results_mutex_);
-      if (results_.size() >= config_.server.max_pending_results) {
+      if (results_.size() + pending_count_ >= config_.server.max_pending_results) {
         throw OutOfMemoryError(fmt::format(
             "too many buffered query results awaiting fetch (limit: {}); fetch or abandon existing "
             "results before issuing more statements",
             config_.server.max_pending_results));
       }
+      ++pending_count_;
+      reserved = true;
     }
-    const PhysicalPlanPtr physical = engine_.explain(command.query);
     result = config_.engine.backend == "cpu" ? engine_.execute_cpu(physical)
                                              : gpu_coordinator_->execute(engine_, physical);
-    span.finish(result, command.query, config_.engine.backend);
+    span.finish(result, sql, config_.engine.backend);
   } catch (const KernelLakeError& e) {
-    span.finish_error(e, command.query, config_.engine.backend);
+    span.finish_error(e, sql, config_.engine.backend);
+    if (reserved) {
+      const std::lock_guard<std::mutex> lock(results_mutex_);
+      --pending_count_;
+    }
     return ToFlightStatus(e);
   } catch (const std::exception& e) {
-    span.finish_error(e, command.query, config_.engine.backend);
+    span.finish_error(e, sql, config_.engine.backend);
+    if (reserved) {
+      const std::lock_guard<std::mutex> lock(results_mutex_);
+      --pending_count_;
+    }
     return arrow::Status::UnknownError(e.what());
   }
 
@@ -101,6 +119,7 @@ arrow::Result<std::unique_ptr<flight::FlightInfo>> KernelLakeFlightSqlServer::Ge
   std::shared_ptr<arrow::Schema> schema = result.schema;
   {
     const std::lock_guard<std::mutex> lock(results_mutex_);
+    --pending_count_;
     handle = "q-" + std::to_string(next_handle_++);
     results_.emplace(handle, std::move(result));
   }
@@ -111,6 +130,82 @@ arrow::Result<std::unique_ptr<flight::FlightInfo>> KernelLakeFlightSqlServer::Ge
   ARROW_ASSIGN_OR_RAISE(flight::FlightInfo info, flight::FlightInfo::Make(*schema, descriptor, {endpoint},
                                                                           total_records, /*total_bytes=*/-1));
   return std::make_unique<flight::FlightInfo>(std::move(info));
+}
+
+arrow::Result<std::unique_ptr<flight::FlightInfo>> KernelLakeFlightSqlServer::GetFlightInfoStatement(
+    const flight::ServerCallContext& /*context*/, const flight_sql::StatementQuery& command,
+    const flight::FlightDescriptor& descriptor) {
+  PhysicalPlanPtr physical;
+  try {
+    physical = engine_.explain(command.query);
+  } catch (const KernelLakeError& e) {
+    return ToFlightStatus(e);
+  } catch (const std::exception& e) {
+    return arrow::Status::UnknownError(e.what());
+  }
+  return ExecuteAndBuffer(physical, command.query, descriptor);
+}
+
+arrow::Result<flight_sql::ActionCreatePreparedStatementResult> KernelLakeFlightSqlServer::CreatePreparedStatement(
+    const flight::ServerCallContext& /*context*/,
+    const flight_sql::ActionCreatePreparedStatementRequest& request) {
+  PhysicalPlanPtr physical;
+  try {
+    physical = engine_.explain(request.query);
+  } catch (const KernelLakeError& e) {
+    return ToFlightStatus(e);
+  } catch (const std::exception& e) {
+    return arrow::Status::UnknownError(e.what());
+  }
+
+  std::string handle;
+  {
+    const std::lock_guard<std::mutex> lock(results_mutex_);
+    // Same class of guard as GetFlightInfoStatement's results_ cap (see its
+    // own comment): a client that never calls ClosePreparedStatement must
+    // not be able to grow prepared_ without bound.
+    if (prepared_.size() >= config_.server.max_pending_results) {
+      return arrow::Status::OutOfMemory(fmt::format(
+          "too many prepared statements awaiting close (limit: {}); close existing prepared "
+          "statements before creating more",
+          config_.server.max_pending_results));
+    }
+    handle = "p-" + std::to_string(next_handle_++);
+    prepared_.emplace(handle, PreparedStatementEntry{request.query, physical});
+  }
+
+  flight_sql::ActionCreatePreparedStatementResult result;
+  result.dataset_schema = to_arrow_schema(physical->output_schema());
+  result.parameter_schema = nullptr;  // KernelLake's SQL grammar has no bound-parameter ("?") support.
+  result.prepared_statement_handle = std::move(handle);
+  return result;
+}
+
+arrow::Status KernelLakeFlightSqlServer::ClosePreparedStatement(
+    const flight::ServerCallContext& /*context*/,
+    const flight_sql::ActionClosePreparedStatementRequest& request) {
+  const std::lock_guard<std::mutex> lock(results_mutex_);
+  prepared_.erase(request.prepared_statement_handle);
+  return arrow::Status::OK();
+}
+
+arrow::Result<std::unique_ptr<flight::FlightInfo>> KernelLakeFlightSqlServer::GetFlightInfoPreparedStatement(
+    const flight::ServerCallContext& /*context*/, const flight_sql::PreparedStatementQuery& command,
+    const flight::FlightDescriptor& descriptor) {
+  PhysicalPlanPtr physical;
+  std::string sql;
+  {
+    const std::lock_guard<std::mutex> lock(results_mutex_);
+    const auto it = prepared_.find(command.prepared_statement_handle);
+    if (it == prepared_.end()) {
+      return arrow::Status::KeyError("no prepared statement for handle '" +
+                                     command.prepared_statement_handle +
+                                     "' (already closed, or the server restarted)");
+    }
+    physical = it->second.physical;
+    sql = it->second.sql;
+  }
+  return ExecuteAndBuffer(physical, sql, descriptor);
 }
 
 arrow::Result<std::unique_ptr<flight::FlightDataStream>> KernelLakeFlightSqlServer::DoGetStatement(

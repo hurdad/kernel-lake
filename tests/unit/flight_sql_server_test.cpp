@@ -15,9 +15,11 @@
 #include <arrow/io/file.h>
 #include <parquet/arrow/writer.h>
 
+#include <atomic>
 #include <filesystem>
 #include <map>
 #include <thread>
+#include <vector>
 
 #include "kernellake/common/config.hpp"
 #include "kernellake/server/flight_sql_server.hpp"
@@ -189,6 +191,76 @@ TEST(FlightSqlServerPendingResultsCapTest, RejectsNewStatementsOncePendingResult
   ASSERT_TRUE(server->Shutdown().ok());
   serve_thread.join();
   fs::remove_all(dir);
+}
+
+// Diagnostic: GetFlightInfoStatement's max_pending_results cap is enforced
+// via a check-then-act pattern -- lock, read results_.size(), unlock, run
+// the (potentially slow) query, lock again, insert -- with the actual query
+// execution happening *outside* the lock in between. Concurrent callers
+// that all pass the check before any of them has inserted yet could all
+// proceed to insert, growing results_ past the configured cap. This test
+// fires many concurrent Execute() calls at a server configured with a
+// small cap and counts how many succeed, to check empirically whether the
+// cap is really enforced under concurrency or only under sequential calls
+// (as RejectsNewStatementsOncePendingResultsCapIsReached above already
+// covers).
+TEST(FlightSqlServerPendingResultsCapTest, CapIsEnforcedUnderConcurrentCallers) {
+  const fs::path dir = fs::temp_directory_path() / "kernellake_pending_results_cap_concurrency_test";
+  fs::create_directories(dir);
+  const std::string path = (dir / "sales.parquet").string();
+
+  arrow::Int64Builder id_builder;
+  for (int64_t i = 0; i < 5000; ++i) ASSERT_TRUE(id_builder.Append(i).ok());
+  std::shared_ptr<arrow::Array> id_array;
+  ASSERT_TRUE(id_builder.Finish(&id_array).ok());
+  const auto schema = arrow::schema({arrow::field("id", arrow::int64(), false)});
+  const auto table = arrow::Table::Make(schema, {id_array});
+  auto sink = arrow::io::FileOutputStream::Open(path).ValueOrDie();
+  ASSERT_TRUE(parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), sink, /*chunk_size=*/100).ok());
+
+  constexpr std::uint32_t kCap = 2;
+  auto server = std::make_unique<KernelLakeFlightSqlServer>(cpu_backend_server_config(kCap));
+  auto location = flight::Location::ForGrpcTcp("127.0.0.1", 0);
+  ASSERT_TRUE(location.ok()) << location.status().ToString();
+  const flight::FlightServerOptions options(*location);
+  ASSERT_TRUE(server->Init(options).ok());
+
+  std::thread serve_thread([&server] {
+    const arrow::Status status = server->Serve();
+    EXPECT_TRUE(status.ok() || status.IsCancelled()) << status.ToString();
+  });
+
+  const std::string sql = "SELECT id FROM read_parquet('" + path + "') ORDER BY id DESC";
+
+  constexpr int kConcurrentCallers = 20;
+  std::vector<std::thread> callers;
+  std::atomic<int> succeeded{0};
+  callers.reserve(kConcurrentCallers);
+  for (int i = 0; i < kConcurrentCallers; ++i) {
+    callers.emplace_back([&] {
+      auto client_location = flight::Location::ForGrpcTcp("127.0.0.1", server->port());
+      ASSERT_TRUE(client_location.ok()) << client_location.status().ToString();
+      auto flight_client = flight::FlightClient::Connect(*client_location);
+      ASSERT_TRUE(flight_client.ok()) << flight_client.status().ToString();
+      flight_sql::FlightSqlClient client(std::move(*flight_client));
+      const flight::FlightCallOptions call_options;
+      auto info = client.Execute(call_options, sql);
+      if (info.ok()) ++succeeded;
+    });
+  }
+  for (std::thread& t : callers) t.join();
+
+  ASSERT_TRUE(server->Shutdown().ok());
+  serve_thread.join();
+  fs::remove_all(dir);
+
+  // None of these calls ever drain via DoGet(), so every successful one
+  // left a permanent entry in results_ -- with the cap actually enforced,
+  // at most kCap of the kConcurrentCallers calls should have succeeded.
+  EXPECT_LE(succeeded.load(), static_cast<int>(kCap))
+      << succeeded.load() << " of " << kConcurrentCallers
+      << " concurrent Execute() calls succeeded against a max_pending_results cap of " << kCap
+      << " -- the cap is not actually enforced under concurrent load.";
 }
 
 }  // namespace

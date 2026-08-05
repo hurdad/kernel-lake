@@ -57,10 +57,14 @@ TEST_F(QueryEngineTest, ExplainLogicalBindsAgainstRealParquetSchema) {
       "SELECT region, SUM(amount) AS total FROM read_parquet('" + path_ + "') GROUP BY region");
   // The reprojection the planner adds on top of LogicalAggregate happens to
   // be an identity here (SELECT order already matches [group_by...,
-  // aggregates...]), so the optimizer's redundant-projection rule removes
-  // it, leaving LogicalAggregate directly at the top -- verify the schema
-  // rather than assuming a specific wrapping node survived.
-  EXPECT_EQ(plan->node_name(), "LogicalAggregate");
+  // aggregates...]) -- but identity projections are no longer elided at
+  // this (logical, pre-column-pruning) stage, since doing so used to make
+  // annotate_scan() silently lose track of which columns a query's actual
+  // output needs (see optimizer.cpp's rewrite_plan() LogicalProjection
+  // comment). The equivalent optimization now happens later, in
+  // physical_planner.cpp, once column pruning has already run -- so
+  // LogicalProjection always survives here.
+  EXPECT_EQ(plan->node_name(), "LogicalProjection");
   ASSERT_EQ(plan->output_schema().field_count(), 2u);
   EXPECT_EQ(plan->output_schema().field(0).name, "region");
   EXPECT_EQ(plan->output_schema().field(1).name, "total");

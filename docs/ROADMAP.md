@@ -1735,6 +1735,122 @@ and covered by passing tests -- not merely designed or stubbed.
   199/199 `kernellake_unit_tests` (up from 198, this round's own count,
   bundled with every other fix from this same audit session applied
   together in one container) and 81/81 `kernellake_gpu_tests`.
+- **Continued the audit into the Flight SQL server
+  (`flight_sql_server.cpp`) -- found a real concurrency bug that defeats
+  `max_pending_results`' documented cap.** `GetFlightInfoStatement`
+  enforced the cap via a check-then-act pattern: lock, read
+  `results_.size()`, unlock, run the query (potentially slow, and always
+  unlocked), lock again, insert. Concurrent callers that all observe the
+  cap not yet reached (since none of them has inserted yet) can all
+  proceed to execute and all insert, growing `results_` well past the
+  configured limit -- this isn't a contrived attack, just ordinary
+  concurrent client usage (several queries in flight at once, which any
+  real client doing more than one thing at a time will do). Confirmed
+  empirically with a real gRPC stress test (20 concurrent
+  `FlightSqlClient::Execute()` calls against a server configured with
+  `max_pending_results=2`): 20 of 20 succeeded in one run, 13 of 20 in
+  another, both far over the cap. Fixed by making the check-and-reserve
+  atomic: a new `pending_count_` member is incremented in the *same*
+  locked section as the cap check (reserving a slot before the query ever
+  runs), then decremented on failure (both catch blocks) or folded into
+  the real `results_` insert on success. One new regression test,
+  `FlightSqlServerPendingResultsCapTest.CapIsEnforcedUnderConcurrentCallers`,
+  run 10x in a row post-fix with zero failures (pre-fix it failed on the
+  first attempt). `main.cpp` (config loading, S3/observability shutdown
+  guards, error handling) and `gpu_execution_coordinator_{gpu,stub}.cpp`
+  (the GPU backend's single-flight `RmmEnvironment` serialization) were
+  also read and found already correct -- note the GPU coordinator's own
+  mutex does *not* incidentally protect against this bug either, since it
+  only serializes the query execution itself, not the surrounding
+  check/insert in `results_` (confirmed by reasoning through the
+  interleaving; the concurrency stress test above uses the CPU backend
+  and reproduces the bug independent of that mutex regardless). Verified
+  for real: `server-dev` 197/197 (up from 192), `gpu-dev` 188/188
+  `kernellake_unit_tests`, both via a real gRPC server + real
+  `FlightSqlClient` over TCP, the latter via Docker + a real RTX 5060 Ti.
+- **Investigated broad Flight SQL client compatibility (JDBC/DBeaver-style
+  tools, not just the Python ADBC path `benchmark_three_way.py` already
+  uses) -- found kernellake-server couldn't run a single query for such a
+  client, added prepared-statement support to fix it, and in the process
+  found and fixed a severe, unrelated, pre-existing correctness bug that
+  affects a huge fraction of ordinary queries on both backends.**
+  Confirmed with a real `org.apache.arrow:flight-sql-jdbc-driver` (the
+  actual driver DBeaver and most JDBC-based BI tools use) against a real
+  running `kernellake-server`: even a plain `Statement.executeQuery()` --
+  no `PreparedStatement` involved at all -- failed with
+  `CreatePreparedStatement not implemented`, because the JDBC driver
+  routes *every* query through the prepared-statement RPCs internally
+  with no fallback to the plain-statement path. `GetSqlInfo` alone (the
+  fix originally proposed before this was actually tested) would not have
+  helped: no query could run at all, making metadata negotiation moot.
+  Implemented `CreatePreparedStatement`/`ClosePreparedStatement`/
+  `GetFlightInfoPreparedStatement` in `flight_sql_server.cpp`: since
+  KernelLake has no bound-parameter ("?") support, a "prepared statement"
+  is just a named, pre-bound `PhysicalPlanPtr` (parse/bind/plan happens at
+  prepare time via the same `QueryEngine::explain()` `GetFlightInfoStatement`
+  already used, just without executing yet, so a genuine syntax/binding
+  error now surfaces at prepare time like a real prepared statement, and
+  execution skips redundant parse/bind/plan work); `GetFlightInfoPreparedStatement`
+  reuses the exact same eager-execute-and-buffer path (factored into a new
+  `ExecuteAndBuffer` helper) and the exact same `CreateStatementQueryTicket()`
+  ticket format `GetFlightInfoStatement` already used, so the existing
+  `DoGetStatement` serves both kinds of query results with no separate
+  `DoGetPreparedStatement` needed. `prepared_` (the un-executed-plan
+  registry) gets the same unbounded-growth guard as `results_`
+  (`max_pending_results`, since a client that never calls
+  `ClosePreparedStatement` is the same class of concern as one that never
+  calls `DoGet`). Verified for real with the actual JDBC driver end-to-end
+  against a real `kernellake-server` (`PreparedStatement` prepare+execute
+  returned the correct 3 rows over a real gRPC connection) and confirmed
+  no regression in the existing RPC surface; `server-dev` `kernellake_unit_tests`
+  and `gpu-dev` (Docker + real RTX 5060 Ti) both green throughout.
+  **While building the JDBC repro dataset, found a severe, unrelated bug**
+  in `optimizer.cpp`, present on both backends: `SELECT id, amount FROM t
+  WHERE id < 3` (id, amount being the table's only two columns, selected
+  in their original schema order) silently returned only the `id` column
+  on both CPU and GPU, no error at all -- confirmed via the CLI directly
+  (bypassing Flight SQL entirely) and via `explain`, which showed the scan
+  itself had been pruned to `columns: [id]`, dropping `amount`. Root
+  cause: `rewrite_plan()`'s `LogicalProjection` case elided a "no-op
+  identity projection" (its items exactly reproduce the child schema, same
+  order -- which `SELECT * ... WHERE ...` always desugars to) *before*
+  `annotate_scan()`'s column-pruning pass ever walked the rewritten tree;
+  with the projection gone, a `LogicalFilter` sitting under it only marked
+  its own referenced columns (just the `WHERE id < 3` predicate's `id`) as
+  required, silently losing all record that the query's actual output
+  also needed `amount`. This exact shape (`SELECT *`/full-column-order
+  `SELECT` plus any `WHERE`/`ORDER BY`/`GROUP BY`) is an extremely common
+  query pattern, not a contrived edge case. Fixed by moving the
+  elision from `optimizer.cpp` (before column pruning) to
+  `physical_planner.cpp`'s `LogicalProjection` conversion (after it,
+  once the scan's pruned schema and the projection's remapped items are
+  both already known) -- the optimization itself (skip materializing a
+  pass-through-only `ProjectionNode`) is still valid and still fires, it
+  just now runs late enough to be safe. Regression tests added at both
+  the newly-affected layers: `Optimizer.KeepsIdentityProjectionForColumnPruningToSeeLater`
+  (replacing the old, now-relocated `RemovesRedundantIdentityProjection`),
+  and `PhysicalPlannerTest.RegressionKeepsEveryColumnWhenSelectListMatchesSchemaOrder`
+  plus `.ElidesIdentityProjectionAfterColumnPruning` (confirming the
+  optimization still correctly fires once it's actually safe to).
+  Discovering this correctly required first learning that `convert_scan()`
+  in `physical_planner.cpp` preserves the scan's *original* field order
+  when narrowing to `required_columns()` -- `required_columns()` itself is
+  stored alphabetically sorted internally, which is a red herring for
+  reasoning about the physical scan's actual output order; three existing
+  `physical_planner_test.cpp` tests that expected a `ProjectionNode` to
+  always survive needed updating once the (now-correct, now-later)
+  elision started firing in more cases than before, and
+  `QueryEngineTest.ExplainLogicalBindsAgainstRealParquetSchema` needed
+  updating since `explain_logical()`'s optimized output for its exact
+  query shape is now `LogicalProjection` at the top instead of
+  `LogicalAggregate`. Verified for real end-to-end (not just structural
+  plan-shape checks): re-ran the exact original failing query
+  (`SELECT id, amount FROM read_parquet(...) WHERE id < 3` and
+  `SELECT * FROM ... WHERE id < 3`) against a real GPU via the CLI on both
+  backends post-fix -- both now correctly return every column with the
+  right values. `dev` 195/195 (up from 193), `server-dev` 199/199,
+  `gpu-dev` 190/190 `kernellake_unit_tests` and 76/76 `kernellake_gpu_tests`
+  (via Docker + a real RTX 5060 Ti).
 
 ## Not yet started
 

@@ -88,6 +88,29 @@ std::vector<NamedExpression> remap_named(const std::vector<NamedExpression>& ite
   return result;
 }
 
+// True if `items` is a plain, order-preserving pass-through of `child_schema`
+// (every item is a bare column reference at its own position, under its own
+// name) -- i.e. materializing a ProjectionNode for it would do nothing but
+// copy the child's output unchanged. Checked here, against `items` and
+// `child`'s schema *after* remap_named() above has already run (so this
+// necessarily runs after column pruning has already used the projection's
+// original items in optimizer.cpp's annotate_scan()) -- eliding the
+// equivalent identity LogicalProjection any earlier than this, before pruning
+// sees it, is what caused a real bug: `SELECT id, amount FROM t WHERE id < 3`
+// silently returned only `id`, since nothing was left in the logical tree to
+// tell annotate_scan the query's actual output needed `amount` too. See
+// optimizer.cpp's rewrite_plan() LogicalProjection case for the full story.
+bool is_identity_projection(const std::vector<NamedExpression>& items, const Schema& child_schema) {
+  if (items.size() != child_schema.field_count()) return false;
+  for (std::size_t i = 0; i < items.size(); ++i) {
+    const auto* column = dynamic_cast<const ColumnExpression*>(items[i].expr.get());
+    if (column == nullptr) return false;
+    if (column->column_index() != i) return false;
+    if (items[i].name != child_schema.field(i).name) return false;
+  }
+  return true;
+}
+
 // Estimates a physical plan node's output row count, for choosing a hash
 // join's build side (HashJoinOperator always materializes its *right*
 // child into device memory -- see that class's own doc comment -- so the
@@ -291,6 +314,13 @@ PhysicalPlanPtr convert(const LogicalPlanPtr& node, ObjectStore& store) {
       if (const Schema* scan_schema = find_scan_schema(*child)) {
         items = remap_named(items, *scan_schema);
       }
+    }
+    // See is_identity_projection()'s own comment: safe to elide here (unlike
+    // in optimizer.cpp) since column pruning has already run and items has
+    // already been remapped against the real (possibly narrowed) child
+    // schema above.
+    if (is_identity_projection(items, child->output_schema())) {
+      return child;
     }
     return std::make_shared<ProjectionNode>(std::move(child), std::move(items));
   }

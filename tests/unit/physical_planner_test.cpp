@@ -4,6 +4,7 @@
 #include <arrow/io/file.h>
 #include <parquet/arrow/writer.h>
 
+#include <algorithm>
 #include <filesystem>
 
 #include "kernellake/common/errors.hpp"
@@ -84,9 +85,12 @@ TEST_F(PhysicalPlannerTest, BuildsScanWithNarrowedColumnsAndSchema) {
       plan_for("SELECT region FROM read_parquet('" + path_ + "') WHERE region = 'B'");
   const auto* result = dynamic_cast<const ArrowResultNode*>(plan.get());
   ASSERT_NE(result, nullptr);
-  const auto* projection = dynamic_cast<const ProjectionNode*>(result->child().get());
-  ASSERT_NE(projection, nullptr);
-  const auto* filter = dynamic_cast<const FilterNode*>(projection->child().get());
+  // Selecting the single column that's also all the scan was pruned down to
+  // is a genuine identity projection relative to the (already-narrowed)
+  // scan schema, so it's elided here (see
+  // PhysicalPlannerTest.ElidesIdentityProjectionAfterColumnPruning) --
+  // result's child is the Filter directly, no ProjectionNode in between.
+  const auto* filter = dynamic_cast<const FilterNode*>(result->child().get());
   ASSERT_NE(filter, nullptr);
   const auto* scan = dynamic_cast<const ParquetScanNode*>(filter->child().get());
   ASSERT_NE(scan, nullptr);
@@ -101,17 +105,19 @@ TEST_F(PhysicalPlannerTest, BuildsScanWithNarrowedColumnsAndSchema) {
 TEST_F(PhysicalPlannerTest, ExpressionsAboveScanUseNarrowedColumnIndicesNotOriginalOnes) {
   // "region" is field index 2 in sales_schema(), but column pruning narrows
   // the physical scan to just this one column, putting it at index 0 in the
-  // batches the scan operator will actually produce. Every ColumnExpression
-  // above the scan (here, the filter predicate and the projection item) must
-  // be rewritten to that narrowed index -- otherwise the execution layer
-  // would index into a column that doesn't exist in the pruned batch.
+  // batches the scan operator will actually produce. The filter predicate
+  // above the scan must be rewritten to that narrowed index -- otherwise
+  // the execution layer would index into a column that doesn't exist in
+  // the pruned batch. (The projection that used to sit here too has been
+  // elided -- selecting the scan's one pruned column is a genuine identity
+  // projection relative to it; see
+  // SurvivingPlainProjectionRemapsAgainstTheNarrowedScanSchema below for a
+  // projection-remapping test using a shape where it survives.)
   const PhysicalPlanPtr plan =
       plan_for("SELECT region FROM read_parquet('" + path_ + "') WHERE region = 'B'");
   const auto* result = dynamic_cast<const ArrowResultNode*>(plan.get());
   ASSERT_NE(result, nullptr);
-  const auto* projection = dynamic_cast<const ProjectionNode*>(result->child().get());
-  ASSERT_NE(projection, nullptr);
-  const auto* filter = dynamic_cast<const FilterNode*>(projection->child().get());
+  const auto* filter = dynamic_cast<const FilterNode*>(result->child().get());
   ASSERT_NE(filter, nullptr);
 
   const auto* comparison = dynamic_cast<const BinaryExpression*>(filter->predicate().get());
@@ -119,11 +125,6 @@ TEST_F(PhysicalPlannerTest, ExpressionsAboveScanUseNarrowedColumnIndicesNotOrigi
   const auto* predicate_column = dynamic_cast<const ColumnExpression*>(comparison->left().get());
   ASSERT_NE(predicate_column, nullptr);
   EXPECT_EQ(predicate_column->column_index(), 0u);
-
-  ASSERT_EQ(projection->items().size(), 1u);
-  const auto* projection_column = dynamic_cast<const ColumnExpression*>(projection->items()[0].expr.get());
-  ASSERT_NE(projection_column, nullptr);
-  EXPECT_EQ(projection_column->column_index(), 0u);
 }
 
 TEST_F(PhysicalPlannerTest, AggregateArgumentUsesNarrowedColumnIndexWhenEarlierColumnsAreDropped) {
@@ -243,26 +244,30 @@ TEST_F(PhysicalPlannerTest, SurvivingAggregateReprojectionIsNotRemappedAgainstTh
 }
 
 TEST_F(PhysicalPlannerTest, SurvivingPlainProjectionRemapsAgainstTheNarrowedScanSchema) {
-  // amount/region reordered relative to sales_schema()'s id/amount/region,
-  // so the (non-aggregate) redundant-projection-removal rule doesn't apply
-  // and this reprojection survives too -- but unlike the aggregate case
-  // above, its child is the scan (via Filter), so it DOES need remapping.
+  // convert_scan() narrows the physical scan to required_columns() while
+  // preserving the scan's *original* field order (id, amount, region --
+  // see that function's own comment); pruned to {amount, region} (id is
+  // never referenced) that's [amount@0, region@1]. Selecting them back out
+  // in the *reverse* of that ("region, amount") means this projection is a
+  // genuine reordering, not an identity relative to the scan, so unlike
+  // the single-column tests above it survives and DOES need remapping.
   const PhysicalPlanPtr plan =
-      plan_for("SELECT amount, region FROM read_parquet('" + path_ + "') WHERE amount > 0");
+      plan_for("SELECT region, amount FROM read_parquet('" + path_ + "') WHERE amount > 0");
   const auto* result = dynamic_cast<const ArrowResultNode*>(plan.get());
   ASSERT_NE(result, nullptr);
   const auto* projection = dynamic_cast<const ProjectionNode*>(result->child().get());
   ASSERT_NE(projection, nullptr);
   ASSERT_EQ(projection->items().size(), 2u);
 
-  // Scan is narrowed to [amount, region] (id is never referenced),
-  // preserving original relative order -- amount@0, region@1.
-  const auto* amount_column = dynamic_cast<const ColumnExpression*>(projection->items()[0].expr.get());
-  ASSERT_NE(amount_column, nullptr);
-  EXPECT_EQ(amount_column->column_index(), 0u);
-  const auto* region_column = dynamic_cast<const ColumnExpression*>(projection->items()[1].expr.get());
+  // Scan is narrowed to [amount, region] (original relative order
+  // preserved), so the reordering projection maps region -> scan index 1,
+  // amount -> index 0.
+  const auto* region_column = dynamic_cast<const ColumnExpression*>(projection->items()[0].expr.get());
   ASSERT_NE(region_column, nullptr);
   EXPECT_EQ(region_column->column_index(), 1u);
+  const auto* amount_column = dynamic_cast<const ColumnExpression*>(projection->items()[1].expr.get());
+  ASSERT_NE(amount_column, nullptr);
+  EXPECT_EQ(amount_column->column_index(), 0u);
 }
 
 TEST_F(PhysicalPlannerTest, AggregateOrderBySurvivesWhenReprojectionIsNotRemoved) {
@@ -283,6 +288,50 @@ TEST_F(PhysicalPlannerTest, AggregateOrderBySurvivesWhenReprojectionIsNotRemoved
   EXPECT_EQ(key_column->column_index(), 0u);
   const auto* projection = dynamic_cast<const ProjectionNode*>(sort->child().get());
   ASSERT_NE(projection, nullptr);
+}
+
+// Regression test for a real bug: `SELECT id, amount` selects sales_schema()
+// in its exact original order (id=0, amount=1), which used to make the
+// whole LogicalProjection look like a no-op identity projection and get
+// elided in optimizer.cpp's rewrite_plan() -- before annotate_scan()'s
+// column-pruning pass ever ran over the rewritten tree. With the projection
+// gone, the WHERE clause's Filter was the only thing left annotate_scan
+// could see, so the scan's required columns silently narrowed to just
+// "id", dropping "amount" from the query's actual output with no error at
+// all. Confirmed for real against a running kernellake-server (both CPU and
+// GPU backends): `SELECT id, amount FROM t WHERE id < 3` returned rows
+// containing only the `id` value. Fixed by moving the identity-projection
+// elision from optimizer.cpp (before pruning) to physical_planner.cpp
+// (after pruning) -- see ElidesIdentityProjectionAfterColumnPruning below
+// for the case where eliding is still safe.
+TEST_F(PhysicalPlannerTest, RegressionKeepsEveryColumnWhenSelectListMatchesSchemaOrder) {
+  const PhysicalPlanPtr plan =
+      plan_for("SELECT id, amount FROM read_parquet('" + path_ + "') WHERE id < 3");
+  const auto* scan = dynamic_cast<const ParquetScanNode*>(find_leaf(plan.get()));
+  ASSERT_NE(scan, nullptr);
+  const std::vector<std::string>& columns = scan->columns();
+  ASSERT_EQ(columns.size(), 2u);
+  EXPECT_NE(std::find(columns.begin(), columns.end(), "id"), columns.end());
+  EXPECT_NE(std::find(columns.begin(), columns.end(), "amount"), columns.end());
+}
+
+// Companion test: convert_scan() narrows the scan to required_columns()
+// while preserving the scan's *original* field order (see
+// physical_planner.cpp's own comment on that -- required_columns() itself
+// is stored alphabetically sorted, but that's just an internal detail of
+// how it's collected, not the physical scan's actual output order). So
+// selecting every column in the table's original schema order (with
+// nothing to prune, since all three are used) makes this projection a
+// genuine identity relative to the scan's own output schema. This really
+// is safe to elide, confirming the optimization itself (skip a
+// pass-through-only ProjectionNode) still works, just moved to
+// physical_planner.cpp so it runs after column pruning instead of before.
+TEST_F(PhysicalPlannerTest, ElidesIdentityProjectionAfterColumnPruning) {
+  const PhysicalPlanPtr plan = plan_for("SELECT id, amount, region FROM read_parquet('" + path_ + "')");
+  const auto* result = dynamic_cast<const ArrowResultNode*>(plan.get());
+  ASSERT_NE(result, nullptr);
+  EXPECT_EQ(dynamic_cast<const ProjectionNode*>(result->child().get()), nullptr);
+  EXPECT_NE(dynamic_cast<const ParquetScanNode*>(result->child().get()), nullptr);
 }
 
 TEST_F(PhysicalPlannerTest, ExplainShowsFilesAndRowGroupCounts) {

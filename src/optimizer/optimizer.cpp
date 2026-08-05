@@ -382,26 +382,6 @@ LogicalPlanPtr insert_limit(LogicalPlanPtr node, std::int64_t limit) {
   return std::make_shared<LogicalLimit>(std::move(node), limit);
 }
 
-bool is_identity_projection(const LogicalProjection& projection, const Schema& child_schema) {
-  const std::vector<NamedExpression>& items = projection.items();
-  if (items.size() != child_schema.field_count()) {
-    return false;
-  }
-  for (std::size_t i = 0; i < items.size(); ++i) {
-    const auto* column = dynamic_cast<const ColumnExpression*>(items[i].expr.get());
-    if (column == nullptr) {
-      return false;
-    }
-    if (column->column_index() != i) {
-      return false;
-    }
-    if (items[i].name != child_schema.field(i).name) {
-      return false;
-    }
-  }
-  return true;
-}
-
 LogicalPlanPtr rewrite_plan(const LogicalPlanPtr& node) {
   if (dynamic_cast<const LogicalScan*>(node.get()) != nullptr) {
     return node;
@@ -454,11 +434,27 @@ LogicalPlanPtr rewrite_plan(const LogicalPlanPtr& node) {
     for (const NamedExpression& item : projection->items()) {
       items.push_back(NamedExpression{simplify_expression(item.expr), item.name});
     }
-    auto rebuilt = std::make_shared<LogicalProjection>(child, std::move(items));
-    if (is_identity_projection(*rebuilt, child->output_schema())) {
-      return child;
-    }
-    return rebuilt;
+    // A no-op identity projection (items exactly reproduce the child's own
+    // schema, same order) used to be elided right here -- but annotate_scan()
+    // below determines a scan's required (pruned) columns *solely* by
+    // walking whichever LogicalProjection/LogicalFilter/... nodes remain in
+    // the tree; eliding the projection before that walk silently threw away
+    // the only record of which columns the query's actual output needs; a
+    // Filter (or Sort/Aggregate) sitting under the elided projection would
+    // then only mark *its own* referenced columns as required, and the scan
+    // would silently drop every other selected column. Confirmed for real:
+    // `SELECT id, amount FROM t WHERE id < 3` (id and amount are the
+    // table's only two columns, selected in schema order -- exactly an
+    // identity projection, and also exactly what `SELECT *  ... WHERE ...`
+    // desugars to) returned only the `id` column, on both backends, with no
+    // error. The identity-projection elision itself is still a valid
+    // optimization (skip a wasted pass-through operator at execution time);
+    // it just has to happen *after* column pruning has already used the
+    // projection's items, not before -- so it now happens in
+    // physical_planner.cpp's LogicalProjection conversion instead, once the
+    // scan's pruned schema is already known. See
+    // PhysicalPlanner.ElidesIdentityProjectionAfterColumnPruning.
+    return std::make_shared<LogicalProjection>(child, std::move(items));
   }
 
   if (const auto* aggregate = dynamic_cast<const LogicalAggregate*>(node.get())) {
