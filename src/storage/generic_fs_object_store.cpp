@@ -157,6 +157,49 @@ std::vector<ObjectInfo> generic_fs_list(const std::shared_ptr<arrow::fs::FileSys
   return {ObjectInfo{prefix, static_cast<std::uint64_t>(info.size())}};
 }
 
+std::vector<ObjectInfo> generic_fs_list_recursive(const std::shared_ptr<arrow::fs::FileSystem>& fs,
+                                                  std::string_view backend_label, const Uri& prefix) {
+  const std::string path = strip_scheme(prefix);
+
+  const arrow::Result<arrow::fs::FileInfo> info_result = fs->GetFileInfo(path);
+  if (!info_result.ok()) {
+    throw StorageError(fmt::format("{}: failed to inspect '{}': {}", backend_label, prefix.value(),
+                                   info_result.status().ToString()));
+  }
+  if (info_result->type() == arrow::fs::FileType::NotFound) {
+    throw StorageError(fmt::format("{}: path does not exist: '{}'", backend_label, prefix.value()));
+  }
+  if (!info_result->IsDirectory()) {
+    throw StorageError(fmt::format(
+        "{}: expected a directory for recursive listing, got a file: '{}'", backend_label, prefix.value()));
+  }
+
+  arrow::fs::FileSelector selector;
+  selector.base_dir = path;
+  selector.recursive = true;
+  selector.allow_not_found = true;
+  const arrow::Result<arrow::fs::FileInfoVector> dir_result = fs->GetFileInfo(selector);
+  if (!dir_result.ok()) {
+    throw StorageError(fmt::format("{}: failed to list '{}': {}", backend_label, prefix.value(),
+                                   dir_result.status().ToString()));
+  }
+
+  std::vector<ObjectInfo> results;
+  for (const arrow::fs::FileInfo& entry : *dir_result) {
+    if (!entry.IsFile()) continue;
+    if (entry.extension() != "parquet") continue;
+    results.push_back(ObjectInfo{Uri(std::string(prefix.scheme()) + "://" + entry.path()),
+                                 static_cast<std::uint64_t>(entry.size())});
+  }
+  if (results.empty()) {
+    throw StorageError(
+        fmt::format("{}: directory tree contains no Parquet files: '{}'", backend_label, prefix.value()));
+  }
+  std::sort(results.begin(), results.end(),
+            [](const ObjectInfo& a, const ObjectInfo& b) { return a.uri < b.uri; });
+  return results;
+}
+
 std::unique_ptr<RandomAccessObject> generic_fs_open(const std::shared_ptr<arrow::fs::FileSystem>& fs,
                                                     std::string_view backend_label, const Uri& uri) {
   const std::string path = strip_scheme(uri);

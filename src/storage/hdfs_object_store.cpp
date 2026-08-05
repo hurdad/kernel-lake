@@ -45,6 +45,10 @@ std::vector<ObjectInfo> HdfsObjectStore::list(const Uri& prefix) {
   return detail::generic_fs_list(fs_, "hdfs", strip_authority(prefix));
 }
 
+std::vector<ObjectInfo> HdfsObjectStore::list_recursive(const Uri& prefix) {
+  return detail::generic_fs_list_recursive(fs_, "hdfs", strip_authority(prefix));
+}
+
 std::unique_ptr<RandomAccessObject> HdfsObjectStore::open(const Uri& uri) {
   return detail::generic_fs_open(fs_, "hdfs", strip_authority(uri));
 }

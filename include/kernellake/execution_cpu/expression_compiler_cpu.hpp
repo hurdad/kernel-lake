@@ -1,10 +1,21 @@
 #pragma once
 
 #include <arrow/compute/expression.h>
+#include <arrow/datum.h>
 
 #include "kernellake/expression/expression.hpp"
 
 namespace kernellake {
+
+// Converts a LiteralExpression into an arrow::Datum-wrapped scalar of the
+// matching Arrow type. Exposed (not just compile_expression_cpu()'s own
+// internal use for AST literal nodes) so other CPU-backend code needing a
+// one-off constant Arrow value from a KernelLake literal -- e.g. materializing
+// a Hive partition column's per-fragment constant value, see
+// acero_query_executor.cpp -- doesn't duplicate this type-mapping table.
+// Throws ExecutionError for TypeId::Decimal (not yet supported on this
+// backend, same restriction as compile_expression_cpu()'s CAST handling).
+[[nodiscard]] arrow::Datum literal_to_arrow_datum(const LiteralExpression& literal);
 
 // Compiles a kernellake::Expression tree into an arrow::compute::Expression
 // for Arrow Acero's Filter/Project nodes -- the CPU execution backend's

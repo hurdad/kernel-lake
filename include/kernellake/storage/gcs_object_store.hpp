@@ -12,6 +12,7 @@ class GcsObjectStore final : public ObjectStore {
   explicit GcsObjectStore(const GcsSection& config);
 
   [[nodiscard]] std::vector<ObjectInfo> list(const Uri& prefix) override;
+  [[nodiscard]] std::vector<ObjectInfo> list_recursive(const Uri& prefix) override;
   [[nodiscard]] std::unique_ptr<RandomAccessObject> open(const Uri& uri) override;
 
  private:

@@ -38,7 +38,9 @@ std::int64_t as_int64(const LiteralStorage& value) {
   return 0;
 }
 
-arrow::Datum literal_datum(const LiteralExpression& literal) {
+}  // namespace
+
+arrow::Datum literal_to_arrow_datum(const LiteralExpression& literal) {
   const DataType& type = literal.result_type();
   const std::shared_ptr<arrow::DataType> arrow_type = to_arrow_type(type);
   if (literal.is_null()) {
@@ -73,6 +75,8 @@ arrow::Datum literal_datum(const LiteralExpression& literal) {
   }
   throw ExecutionError("unreachable: unknown KernelLake TypeId in CPU expression compiler");
 }
+
+namespace {
 
 std::string binary_function_name(BinaryOperator op) {
   switch (op) {
@@ -113,7 +117,7 @@ arrow::compute::Expression compile_expression_cpu(const Expression& expr) {
     return arrow::compute::field_ref(column->name());
   }
   if (const auto* literal = dynamic_cast<const LiteralExpression*>(&expr)) {
-    return arrow::compute::literal(literal_datum(*literal));
+    return arrow::compute::literal(literal_to_arrow_datum(*literal));
   }
   if (const auto* binary = dynamic_cast<const BinaryExpression*>(&expr)) {
     return arrow::compute::call(

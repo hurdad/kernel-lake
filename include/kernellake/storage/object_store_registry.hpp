@@ -24,6 +24,10 @@ class ObjectStoreRegistry final : public ObjectStore {
     return backend_for(prefix.scheme()).list(prefix);
   }
 
+  [[nodiscard]] std::vector<ObjectInfo> list_recursive(const Uri& prefix) override {
+    return backend_for(prefix.scheme()).list_recursive(prefix);
+  }
+
   [[nodiscard]] std::unique_ptr<RandomAccessObject> open(const Uri& uri) override {
     return backend_for(uri.scheme()).open(uri);
   }

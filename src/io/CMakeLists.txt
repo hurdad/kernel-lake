@@ -2,6 +2,7 @@ add_library(kernellake_io STATIC
   parquet_metadata.cpp
   parquet_pruning.cpp
   physical_planner.cpp
+  table_resolution.cpp
 )
 
 target_include_directories(kernellake_io PUBLIC

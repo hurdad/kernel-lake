@@ -3,32 +3,25 @@
 #include <chrono>
 
 #include "kernellake/common/errors.hpp"
-#include "kernellake/io/parquet_metadata.hpp"
 #include "kernellake/io/physical_planner.hpp"
+#include "kernellake/io/table_resolution.hpp"
 #include "kernellake/optimizer/optimizer.hpp"
 #include "kernellake/planner/logical_planner.hpp"
 #include "kernellake/sql/parser.hpp"
-#include "kernellake/storage/file_discovery.hpp"
 
 namespace kernellake {
 
 QueryEngine::QueryEngine(EngineConfig config) : config_(std::move(config)), store_(config_.storage) {}
 
 namespace {
-Schema inspect_source_schema(ObjectStore& store, const std::vector<std::string>& paths,
+ResolvedTable inspect_source(ObjectStore& store, const std::vector<std::string>& paths,
                              double* elapsed_seconds_out) {
   const auto start = std::chrono::steady_clock::now();
-  const std::vector<ObjectInfo> files = discover_parquet_files(store, paths);
-  std::vector<FileMetadata> metadata;
-  metadata.reserve(files.size());
-  for (const ObjectInfo& file : files) {
-    metadata.push_back(inspect_parquet_file(store, file.uri));
-  }
-  validate_schema_compatibility(metadata);
+  ResolvedTable resolved = resolve_table(store, paths);
   if (elapsed_seconds_out != nullptr) {
     *elapsed_seconds_out += std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
   }
-  return metadata.front().schema;
+  return resolved;
 }
 }  // namespace
 
@@ -38,21 +31,26 @@ LogicalPlanPtr QueryEngine::plan_logical(std::string_view sql,
 
   if (ast.join.has_value()) {
     std::vector<Schema> join_schemas;
+    std::vector<std::vector<PartitionColumn>> partition_columns_per_source;
     join_schemas.reserve(ast.join->steps.size() + 1);
-    join_schemas.push_back(
-        inspect_source_schema(store_, ast.join->first.paths, metadata_inspection_seconds_out));
+    partition_columns_per_source.reserve(ast.join->steps.size() + 1);
+    const ResolvedTable first = inspect_source(store_, ast.join->first.paths, metadata_inspection_seconds_out);
+    join_schemas.push_back(first.schema);
+    partition_columns_per_source.push_back(first.partition_columns);
     for (const sql::AstJoinStep& step : ast.join->steps) {
-      join_schemas.push_back(
-          inspect_source_schema(store_, step.source.paths, metadata_inspection_seconds_out));
+      const ResolvedTable resolved =
+          inspect_source(store_, step.source.paths, metadata_inspection_seconds_out);
+      join_schemas.push_back(resolved.schema);
+      partition_columns_per_source.push_back(resolved.partition_columns);
     }
     const BoundQuery bound = bind_query(ast, join_schemas);
-    LogicalPlanPtr logical = build_logical_plan(bound, join_schemas);
+    LogicalPlanPtr logical = build_logical_plan(bound, join_schemas, std::move(partition_columns_per_source));
     return optimize(logical);
   }
 
-  const Schema source_schema = inspect_source_schema(store_, ast.from.paths, metadata_inspection_seconds_out);
-  const BoundQuery bound = bind_query(ast, source_schema);
-  LogicalPlanPtr logical = build_logical_plan(bound, source_schema);
+  const ResolvedTable resolved = inspect_source(store_, ast.from.paths, metadata_inspection_seconds_out);
+  const BoundQuery bound = bind_query(ast, resolved.schema);
+  LogicalPlanPtr logical = build_logical_plan(bound, resolved.schema, resolved.partition_columns);
   return optimize(logical);
 }
 

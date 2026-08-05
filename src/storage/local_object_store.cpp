@@ -144,6 +144,38 @@ std::vector<ObjectInfo> LocalObjectStore::list(const Uri& prefix) {
   return {ObjectInfo{Uri(fs::absolute(path).string()), static_cast<std::uint64_t>(fs::file_size(path))}};
 }
 
+std::vector<ObjectInfo> LocalObjectStore::list_recursive(const Uri& prefix) {
+  const fs::path path(prefix.value());
+  check_within_root(path, local_root_, prefix.value());
+
+  std::error_code ec;
+  if (!fs::exists(path, ec)) {
+    fail_missing(prefix.value());
+  }
+  if (!fs::is_directory(path, ec)) {
+    throw StorageError(
+        fmt::format("expected a directory for recursive listing, got a file: '{}'", prefix.value()));
+  }
+
+  // Default fs::recursive_directory_iterator options don't follow directory
+  // symlinks, matching list()'s own lack of a per-entry check_within_root()
+  // call above (that check validates the requested root only) -- the real
+  // boundary enforcement happens at open() time regardless of what list()
+  // discovers, same reasoning as the existing (non-recursive) list().
+  std::vector<ObjectInfo> results;
+  for (const auto& entry : fs::recursive_directory_iterator(path)) {
+    if (!entry.is_regular_file()) continue;
+    if (entry.path().extension() != ".parquet") continue;
+    results.push_back(ObjectInfo{Uri(entry.path().string()), static_cast<std::uint64_t>(entry.file_size())});
+  }
+  if (results.empty()) {
+    throw StorageError(fmt::format("directory tree contains no Parquet files: '{}'", prefix.value()));
+  }
+  std::sort(results.begin(), results.end(),
+            [](const ObjectInfo& a, const ObjectInfo& b) { return a.uri < b.uri; });
+  return results;
+}
+
 std::unique_ptr<RandomAccessObject> LocalObjectStore::open(const Uri& uri) {
   check_within_root(fs::path(uri.value()), local_root_, uri.value());
   arrow::Result<std::shared_ptr<arrow::io::ReadableFile>> result = arrow::io::ReadableFile::Open(uri.value());

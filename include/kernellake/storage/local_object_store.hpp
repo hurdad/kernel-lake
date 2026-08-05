@@ -29,6 +29,7 @@ class LocalObjectStore final : public ObjectStore {
   explicit LocalObjectStore(std::string local_root = "/") : local_root_(std::move(local_root)) {}
 
   [[nodiscard]] std::vector<ObjectInfo> list(const Uri& prefix) override;
+  [[nodiscard]] std::vector<ObjectInfo> list_recursive(const Uri& prefix) override;
   [[nodiscard]] std::unique_ptr<RandomAccessObject> open(const Uri& uri) override;
 
  private:

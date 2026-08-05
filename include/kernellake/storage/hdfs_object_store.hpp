@@ -23,6 +23,7 @@ class HdfsObjectStore final : public ObjectStore {
   explicit HdfsObjectStore(const HdfsSection& config);
 
   [[nodiscard]] std::vector<ObjectInfo> list(const Uri& prefix) override;
+  [[nodiscard]] std::vector<ObjectInfo> list_recursive(const Uri& prefix) override;
   [[nodiscard]] std::unique_ptr<RandomAccessObject> open(const Uri& uri) override;
 
  private:

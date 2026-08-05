@@ -60,6 +60,14 @@ class ObjectStore {
   // silently, per KernelLake's "explicit errors for missing paths" rule.
   [[nodiscard]] virtual std::vector<ObjectInfo> list(const Uri& prefix) = 0;
 
+  // Like list(), but `prefix` must be a directory and every Parquet file
+  // anywhere in its subtree is returned (not just its immediate children) --
+  // needed to discover files nested under Hive-style partition directories
+  // (e.g. "region=US/date=2026-01-01/part-0.parquet"), see
+  // kernellake/io/table_resolution.hpp. Throws StorageError if `prefix`
+  // isn't a directory, or if nothing matches.
+  [[nodiscard]] virtual std::vector<ObjectInfo> list_recursive(const Uri& prefix) = 0;
+
   [[nodiscard]] virtual std::unique_ptr<RandomAccessObject> open(const Uri& uri) = 0;
 };
 

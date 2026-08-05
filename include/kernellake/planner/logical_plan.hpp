@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "kernellake/expression/expression.hpp"
+#include "kernellake/types/partition_column.hpp"
 #include "kernellake/types/schema.hpp"
 
 namespace kernellake {
@@ -56,12 +57,23 @@ struct PushablePredicate {
 
 class LogicalScan final : public LogicalPlanNode {
  public:
-  LogicalScan(std::vector<std::string> source_paths, Schema schema)
+  LogicalScan(std::vector<std::string> source_paths, Schema schema,
+              std::vector<PartitionColumn> partition_columns = {})
       : source_paths_(std::move(source_paths)),
         schema_(std::move(schema)),
-        required_columns_(all_field_names(schema_)) {}
+        required_columns_(all_field_names(schema_)),
+        partition_columns_(std::move(partition_columns)) {}
 
   [[nodiscard]] const std::vector<std::string>& source_paths() const noexcept { return source_paths_; }
+  // Columns whose values come from each file's location (Hive-style
+  // `key=value` directory segments today) rather than being physically
+  // present in it -- a suffix of output_schema()'s fields, in the same
+  // order. Empty for a plain, non-partitioned source (the common case,
+  // and the only one before this was added). See
+  // kernellake/io/table_resolution.hpp for how these get discovered.
+  [[nodiscard]] const std::vector<PartitionColumn>& partition_columns() const noexcept {
+    return partition_columns_;
+  }
   [[nodiscard]] const Schema& output_schema() const override { return schema_; }
   [[nodiscard]] std::string_view node_name() const noexcept override { return "LogicalScan"; }
   [[nodiscard]] std::vector<LogicalPlanPtr> children() const override { return {}; }
@@ -97,6 +109,7 @@ class LogicalScan final : public LogicalPlanNode {
   Schema schema_;
   std::vector<std::string> required_columns_;
   std::vector<PushablePredicate> pushable_predicates_;
+  std::vector<PartitionColumn> partition_columns_;
 };
 
 // ---------------------------------------------------------------------------

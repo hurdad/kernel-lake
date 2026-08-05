@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <filesystem>
+#include <map>
 
 #include "kernellake/execution_gpu/parquet_scan_operator.hpp"
 #include "kernellake/memory/rmm_environment.hpp"
@@ -113,6 +114,46 @@ TEST_F(ParquetScanOperatorTest, ReadsOnlySelectedRowGroup) {
   EXPECT_EQ(total_rows, 5u);
   for (std::int64_t id : all_ids) EXPECT_GE(id, 5);
   scan.close(context);
+}
+
+TEST_F(ParquetScanOperatorTest, MaterializesPartitionColumnsPerFragment) {
+  RmmEnvironment env(default_config());
+  // Two "fragments" over the same file, one per row group, each assigned a
+  // different constant partition value -- simulating two Hive partition
+  // directories (e.g. period_code=100/part-0.parquet,
+  // period_code=200/part-0.parquet) without needing two physical files,
+  // since PhysicalFileFragment doesn't care whether two fragments share an
+  // underlying path. Exercises the per-fragment reader path (see
+  // ParquetScanOperator's own class comment on why partition_columns
+  // forces that mode) and confirms each fragment's own constant value is
+  // attached only to that fragment's own rows, never mixed across
+  // fragments.
+  std::vector<PhysicalFileFragment> fragments = {
+      PhysicalFileFragment{Uri(path_), 5, 2, {0}, {1}, {}, {std::int64_t{100}}},
+      PhysicalFileFragment{Uri(path_), 5, 2, {1}, {0}, {}, {std::int64_t{200}}},
+  };
+  std::vector<PartitionColumn> partition_columns = {PartitionColumn{"period_code", int64_type(false)}};
+  Schema schema({Field{"id", int64_type(false)}, Field{"period_code", int64_type(false)}});
+
+  LocalObjectStore store;
+  ParquetScanOperator scan(1, fragments, {"id"}, std::make_shared<const Schema>(schema), store,
+                           /*pass_read_limit_bytes=*/0, partition_columns);
+  ExecutionContext context = make_context();
+  scan.open(context);
+
+  std::map<std::int64_t, std::int64_t> period_by_id;
+  while (std::optional<DeviceBatch> batch = scan.next(context)) {
+    ASSERT_EQ(batch->column_count(), 2u);
+    const std::vector<std::int64_t> ids = copy_to_host<std::int64_t>(batch->view().column(0));
+    const std::vector<std::int64_t> periods = copy_to_host<std::int64_t>(batch->view().column(1));
+    ASSERT_EQ(ids.size(), periods.size());
+    for (std::size_t i = 0; i < ids.size(); ++i) period_by_id[ids[i]] = periods[i];
+  }
+  scan.close(context);
+
+  ASSERT_EQ(period_by_id.size(), 10u);
+  for (std::int64_t id = 0; id < 5; ++id) EXPECT_EQ(period_by_id.at(id), 100);
+  for (std::int64_t id = 5; id < 10; ++id) EXPECT_EQ(period_by_id.at(id), 200);
 }
 
 TEST_F(ParquetScanOperatorTest, EmptyFragmentListProducesNoBatches) {

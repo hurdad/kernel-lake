@@ -64,7 +64,7 @@ std::unique_ptr<PhysicalOperator> build(const PhysicalPlanPtr& node, ObjectStore
   if (const auto* scan = dynamic_cast<const ParquetScanNode*>(node.get())) {
     return instrument(std::make_unique<ParquetScanOperator>(
         next_id++, scan->fragments(), scan->columns(), std::make_shared<const Schema>(scan->output_schema()),
-        store, pass_read_limit_bytes));
+        store, pass_read_limit_bytes, scan->partition_columns()));
   }
   if (const auto* join = dynamic_cast<const HashJoinNode*>(node.get())) {
     // Built as two separate statements, not two arguments of the same

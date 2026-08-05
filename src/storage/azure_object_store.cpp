@@ -68,6 +68,10 @@ std::vector<ObjectInfo> AzureObjectStore::list(const Uri& prefix) {
   return detail::generic_fs_list(fs_, "azure", prefix);
 }
 
+std::vector<ObjectInfo> AzureObjectStore::list_recursive(const Uri& prefix) {
+  return detail::generic_fs_list_recursive(fs_, "azure", prefix);
+}
+
 std::unique_ptr<RandomAccessObject> AzureObjectStore::open(const Uri& uri) {
   return detail::generic_fs_open(fs_, "azure", uri);
 }

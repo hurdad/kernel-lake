@@ -48,6 +48,11 @@ std::vector<std::pair<std::string, std::string>> LogicalScan::explain_attributes
   if (required_columns_.size() != column_names.size()) {
     attrs.emplace_back("required_columns", join_names(required_columns_));
   }
+  if (!partition_columns_.empty()) {
+    std::vector<std::string> partition_names;
+    for (const PartitionColumn& column : partition_columns_) partition_names.push_back(column.name);
+    attrs.emplace_back("partition_columns", join_names(partition_names));
+  }
   if (!pushable_predicates_.empty()) {
     std::ostringstream out;
     out << "[";

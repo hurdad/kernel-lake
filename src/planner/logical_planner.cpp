@@ -231,15 +231,18 @@ LogicalPlanPtr finish_logical_plan(LogicalPlanPtr plan, const BoundQuery& query)
 
 }  // namespace
 
-LogicalPlanPtr build_logical_plan(const BoundQuery& query, const Schema& source_schema) {
+LogicalPlanPtr build_logical_plan(const BoundQuery& query, const Schema& source_schema,
+                                  std::vector<PartitionColumn> partition_columns) {
   if (query.join.has_value()) {
     throw PlanningError("unreachable: build_logical_plan(source_schema) called for a JOIN query");
   }
-  LogicalPlanPtr plan = std::make_shared<LogicalScan>(query.source_paths, source_schema);
+  LogicalPlanPtr plan =
+      std::make_shared<LogicalScan>(query.source_paths, source_schema, std::move(partition_columns));
   return finish_logical_plan(std::move(plan), query);
 }
 
-LogicalPlanPtr build_logical_plan(const BoundQuery& query, const std::vector<Schema>& join_schemas) {
+LogicalPlanPtr build_logical_plan(const BoundQuery& query, const std::vector<Schema>& join_schemas,
+                                  std::vector<std::vector<PartitionColumn>> partition_columns_per_source) {
   if (!query.join.has_value()) {
     throw PlanningError("unreachable: build_logical_plan(join_schemas) called without a JOIN clause");
   }
@@ -247,6 +250,11 @@ LogicalPlanPtr build_logical_plan(const BoundQuery& query, const std::vector<Sch
     throw PlanningError(
         "unreachable: build_logical_plan(join_schemas) called with the wrong number of schemas for this "
         "JOIN chain");
+  }
+  if (!partition_columns_per_source.empty() && partition_columns_per_source.size() != join_schemas.size()) {
+    throw PlanningError(
+        "unreachable: build_logical_plan(join_schemas) called with a mismatched partition_columns_per_source "
+        "count");
   }
   // Builds a left-deep chain of LogicalJoin nodes, one per step, e.g.
   // LogicalJoin(LogicalJoin(Scan(0), Scan(1)), Scan(2)) for 3 sources --
@@ -256,10 +264,16 @@ LogicalPlanPtr build_logical_plan(const BoundQuery& query, const std::vector<Sch
   // comment), which is exactly what LogicalJoin's own left_key_index
   // expects for a `left` child that is itself a nested LogicalJoin, not
   // just a plain LogicalScan -- no remapping needed here.
-  LogicalPlanPtr plan = std::make_shared<LogicalScan>(query.join->first_source_paths, join_schemas[0]);
+  auto partition_columns_for = [&](std::size_t index) -> std::vector<PartitionColumn> {
+    return partition_columns_per_source.empty() ? std::vector<PartitionColumn>{}
+                                                : partition_columns_per_source[index];
+  };
+  LogicalPlanPtr plan = std::make_shared<LogicalScan>(query.join->first_source_paths, join_schemas[0],
+                                                      partition_columns_for(0));
   for (std::size_t i = 0; i < query.join->steps.size(); ++i) {
     const BoundJoinStep& step = query.join->steps[i];
-    auto right_scan = std::make_shared<LogicalScan>(step.source_paths, join_schemas[i + 1]);
+    auto right_scan =
+        std::make_shared<LogicalScan>(step.source_paths, join_schemas[i + 1], partition_columns_for(i + 1));
     plan = std::make_shared<LogicalJoin>(std::move(plan), std::move(right_scan), step.combined_key_index,
                                          step.source_key_index);
   }

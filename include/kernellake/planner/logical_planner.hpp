@@ -13,14 +13,22 @@ namespace kernellake {
 // matching bind_query() overload.
 //
 // The single-table overload; only valid when `!query.join.has_value()`.
-[[nodiscard]] LogicalPlanPtr build_logical_plan(const BoundQuery& query, const Schema& source_schema);
+// `partition_columns` (empty by default, for a plain non-partitioned
+// source and every existing caller that predates Hive-style partition
+// discovery) is threaded straight onto the resulting LogicalScan -- see
+// kernellake/io/table_resolution.hpp for how it's discovered.
+[[nodiscard]] LogicalPlanPtr build_logical_plan(const BoundQuery& query, const Schema& source_schema,
+                                                std::vector<PartitionColumn> partition_columns = {});
 
 // The JOIN-chain overload; only valid when `query.join.has_value()`.
 // `join_schemas` must have exactly `query.join->steps.size() + 1` entries,
 // one per FROM-clause source in left-to-right order (matching the schemas
 // passed to bind_query()'s own JOIN overload) -- builds a left-deep chain
 // of LogicalJoin(..., LogicalScan(...)) nodes, one join per step.
-[[nodiscard]] LogicalPlanPtr build_logical_plan(const BoundQuery& query,
-                                                const std::vector<Schema>& join_schemas);
+// `partition_columns_per_source`, if non-empty, must have the same length
+// as `join_schemas` and is threaded onto each corresponding LogicalScan.
+[[nodiscard]] LogicalPlanPtr build_logical_plan(
+    const BoundQuery& query, const std::vector<Schema>& join_schemas,
+    std::vector<std::vector<PartitionColumn>> partition_columns_per_source = {});
 
 }  // namespace kernellake

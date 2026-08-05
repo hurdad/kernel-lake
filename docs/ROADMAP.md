@@ -1851,6 +1851,107 @@ and covered by passing tests -- not merely designed or stubbed.
   right values. `dev` 195/195 (up from 193), `server-dev` 199/199,
   `gpu-dev` 190/190 `kernellake_unit_tests` and 76/76 `kernellake_gpu_tests`
   (via Docker + a real RTX 5060 Ti).
+- **Hive-style partition discovery** (Phase 2 of the lakehouse roadmap --
+  Unity Catalog as the metadata/governance layer, KernelLake staying a
+  compute engine; see the roadmap plan for the full 5-phase sequencing:
+  Parquet directories (done) -> Hive partitioning (this) -> Iceberg REST
+  catalogs -> Delta Lake (via an extended `delta-txn-service`) -> Unity
+  Catalog). `read_parquet('s3://bucket/table/')` now auto-detects a
+  Hive-style directory layout (`region=US/date=2026-01-01/part-0.parquet`)
+  with **no new SQL syntax** -- partition columns are discovered, type-
+  inferred (integer/ISO-date/string), appended to the schema, and fully
+  queryable (`SELECT`, `WHERE`, `GROUP BY`) on both backends, verified
+  against a real GPU. A plain, non-partitioned source is completely
+  unaffected (same code path, zero behavior change), confirmed by the full
+  existing test suite passing unchanged throughout.
+  - **New seam**: `resolve_table()`/`ResolvedTable`
+    (`include/kernellake/io/table_resolution.hpp`,
+    `src/io/table_resolution.cpp`) sits between file discovery and
+    schema/physical-plan construction, replacing direct
+    `discover_parquet_files()`/`inspect_parquet_file()` calls at both
+    existing call sites (`query_engine.cpp`'s schema inspection,
+    `physical_planner.cpp`'s `convert_scan()`). This is the one place
+    every later phase (Iceberg/Delta/Unity Catalog) will plug into instead
+    of reinventing name-to-file resolution.
+  - **Recursive directory listing** (`ObjectStore::list_recursive()`) had
+    to be added across all five backends first: the existing `list()`
+    only lists a directory's *immediate* children
+    (`fs::directory_iterator`, not recursive), so a Hive-partitioned
+    source would otherwise resolve to zero files. `arrow::fs::FileSelector`
+    already has a `recursive` flag, so this was close to free for the four
+    Arrow-fs-backed stores (S3/GCS/Azure/HDFS) via one new shared helper,
+    `generic_fs_list_recursive()`; only `LocalObjectStore` needed real new
+    logic (`fs::recursive_directory_iterator`).
+  - **Hive detection/parsing** (in `resolve_table()`): every discovered
+    file's path must yield the exact same sequence of `key=value`
+    directory segments immediately above the file, or none at all -- a mix
+    (some files partitioned, some not, or different keys/depth) is
+    rejected outright (`StorageError`) rather than guessed at, matching
+    the project's existing "explicit errors over silent partial behavior"
+    rule. A partition column colliding with an existing physical column
+    name is also rejected. Type inference per column: integer if every
+    observed value parses as one, else a valid ISO-8601 calendar date,
+    else string.
+  - **Planning-layer plumbing**: `PartitionColumn`/`PartitionTransform`
+    live in a new shared header,
+    `include/kernellake/types/partition_column.hpp` (in `kernellake_types`,
+    not `kernellake_io`, specifically to avoid a circular dependency --
+    `kernellake_io` already depends on `kernellake_planner`, which needed
+    to reference these same types for `LogicalScan::partition_columns()`).
+    `LogicalScan`, `build_logical_plan()` (both overloads, single-table and
+    N-way join), `PhysicalFileFragment` (per-fragment partition values),
+    and `ParquetScanNode` (which columns to physically read from the file
+    vs. which are required-but-partition-derived) all thread this through;
+    `physical_planner.cpp`'s `convert_scan()` splits a query's required
+    columns into "physical" (handed to cudf's/Arrow's Parquet reader) and
+    "partition" (never handed to either reader, since they don't exist in
+    the file) sets.
+  - **Execution-layer materialization** -- the actual "append a constant
+    column per fragment" work, on both backends:
+    - CPU (Acero, `acero_query_executor.cpp`): straightforward, since this
+      backend already reads one fragment's `RecordBatchReader` at a time
+      -- `append_partition_columns()` appends a constant-value `Array`
+      (via `arrow::MakeArrayFromScalar`) built from a newly-exposed
+      `literal_to_arrow_datum()` (moved out of
+      `expression_compiler_cpu.cpp`'s anonymous namespace, reusing its
+      existing literal-to-Arrow-scalar type mapping rather than
+      duplicating it).
+    - GPU (cudf, `parquet_scan_operator.cpp`) needed a real design
+      decision, not just a port of the CPU approach: cudf's
+      `chunked_parquet_reader`, when given every fragment at once (this
+      operator's normal fast path), can legitimately batch rows from
+      *multiple* source files into a single returned chunk when they fit
+      within `pass_read_limit_bytes` together -- and there is no way to
+      recover, after the fact, which of a chunk's rows came from which
+      file, which a per-file constant partition value absolutely needs to
+      know. Fixed by having the operator switch to a **per-fragment
+      reading mode** (one `chunked_parquet_reader` per fragment,
+      sequential -- exactly like the CPU backend) whenever
+      `partition_columns` is non-empty, trading away cross-file pass
+      batching specifically for partitioned scans (still fully
+      pass-based/streaming *within* one large partition's own file) in
+      exchange for provable per-row-range correctness, rather than
+      guessing at a chunk-to-file boundary the API doesn't expose. The
+      plain non-partitioned fast path is completely untouched.
+  - New tests: `TableResolutionTest` (8 cases: plain/partitioned schema
+    detection, int/date/string type inference, multi-level partitioning,
+    three distinct rejection cases), `ParquetScanOperatorTest.
+    MaterializesPartitionColumnsPerFragment` (two fragments sharing one
+    underlying file with different assigned partition values, confirming
+    no cross-fragment mix-up). Verified for real end-to-end on both
+    backends against a real GPU (RTX 5060 Ti via Docker): `SELECT`,
+    `SELECT *`, `WHERE`, and `GROUP BY` all correctly resolved/executed
+    over real Hive-partitioned directories, including two-level
+    (`region=.../yr=.../`) partitioning spanning multiple fragments with
+    an aggregate query. `dev` 203/203, `server-dev` 207/207, `gpu-dev`
+    200/200 `kernellake_unit_tests` and 77/77 `kernellake_gpu_tests`, zero
+    regressions throughout.
+  - Deferred (not needed for this phase, tracked for Iceberg/Unity
+    Catalog): generalizing the SQL grammar/AST beyond `read_parquet(...)`
+    for new named-source kinds, and the `ObjectStoreRegistry`
+    dynamic-credential seam for vended cloud credentials -- see the
+    lakehouse roadmap plan for why both are Phase 3+ concerns, not Phase 2
+    ones.
 
 ## Not yet started
 

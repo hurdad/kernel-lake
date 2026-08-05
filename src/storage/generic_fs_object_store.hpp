@@ -37,6 +37,13 @@ namespace kernellake::detail {
 [[nodiscard]] std::vector<ObjectInfo> generic_fs_list(const std::shared_ptr<arrow::fs::FileSystem>& fs,
                                                       std::string_view backend_label, const Uri& prefix);
 
+// Like generic_fs_list(), but `prefix` must be a directory and every
+// Parquet file anywhere in its subtree is returned, via
+// arrow::fs::FileSelector::recursive -- see ObjectStore::list_recursive()'s
+// own doc comment.
+[[nodiscard]] std::vector<ObjectInfo> generic_fs_list_recursive(
+    const std::shared_ptr<arrow::fs::FileSystem>& fs, std::string_view backend_label, const Uri& prefix);
+
 [[nodiscard]] std::unique_ptr<RandomAccessObject> generic_fs_open(
     const std::shared_ptr<arrow::fs::FileSystem>& fs, std::string_view backend_label, const Uri& uri);
 

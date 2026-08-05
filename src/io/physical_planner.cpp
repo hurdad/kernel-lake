@@ -7,7 +7,7 @@
 #include "kernellake/common/errors.hpp"
 #include "kernellake/io/parquet_metadata.hpp"
 #include "kernellake/io/parquet_pruning.hpp"
-#include "kernellake/storage/file_discovery.hpp"
+#include "kernellake/io/table_resolution.hpp"
 
 namespace kernellake {
 
@@ -183,34 +183,49 @@ const Schema* find_scan_schema(const PhysicalPlanNode& node) {
 }
 
 PhysicalPlanPtr convert_scan(const LogicalScan& scan, ObjectStore& store) {
-  const std::vector<ObjectInfo> files = discover_parquet_files(store, scan.source_paths());
-  std::vector<FileMetadata> metadata;
-  metadata.reserve(files.size());
-  for (const ObjectInfo& file : files) {
-    metadata.push_back(inspect_parquet_file(store, file.uri));
-  }
-  validate_schema_compatibility(metadata);
+  const ResolvedTable resolved = resolve_table(store, scan.source_paths());
 
   std::vector<PhysicalFileFragment> fragments;
-  for (const FileMetadata& meta : metadata) {
+  fragments.reserve(resolved.files.size());
+  for (const ResolvedFile& file : resolved.files) {
+    const FileMetadata& meta = file.metadata;
     const ScanDecision decision = evaluate_pruning(meta, scan.pushable_predicates());
     if (decision.selected_row_groups.empty() && !meta.row_groups.empty()) {
       continue;  // Every row group was proven unnecessary: skip the file entirely.
     }
-    fragments.push_back(
-        PhysicalFileFragment{meta.path, meta.row_count, static_cast<int>(meta.row_groups.size()),
-                             decision.selected_row_groups, decision.skipped_row_groups, decision.reasons});
+    fragments.push_back(PhysicalFileFragment{meta.path, meta.row_count,
+                                             static_cast<int>(meta.row_groups.size()),
+                                             decision.selected_row_groups, decision.skipped_row_groups,
+                                             decision.reasons, file.partition_values});
   }
 
   // Narrow the schema (and the matching column list) to required_columns(),
   // preserving the scan's original field order rather than
   // required_columns()'s alphabetical order (see LogicalScan/optimizer.cpp).
+  // A required *partition* column (never physically present in the file --
+  // see LogicalScan::partition_columns()) goes into narrowed_partitions
+  // instead of narrowed_columns, so it's never handed to cudf's/Arrow's
+  // Parquet reader as a column to read; the scan operator materializes it
+  // as a per-fragment constant from PhysicalFileFragment::partition_values
+  // instead.
   const std::vector<std::string>& required = scan.required_columns();
   std::vector<Field> narrowed_fields;
   std::vector<std::string> narrowed_columns;
+  std::vector<PartitionColumn> narrowed_partitions;
   for (const Field& field : scan.output_schema().fields()) {
-    if (std::find(required.begin(), required.end(), field.name) != required.end()) {
-      narrowed_fields.push_back(field);
+    if (std::find(required.begin(), required.end(), field.name) == required.end()) {
+      continue;
+    }
+    narrowed_fields.push_back(field);
+    bool matched_partition = false;
+    for (const PartitionColumn& column : scan.partition_columns()) {
+      if (column.name == field.name) {
+        narrowed_partitions.push_back(column);
+        matched_partition = true;
+        break;
+      }
+    }
+    if (!matched_partition) {
       narrowed_columns.push_back(field.name);
     }
   }
@@ -223,13 +238,15 @@ PhysicalPlanPtr convert_scan(const LogicalScan& scan, ObjectStore& store) {
   // built from zero selected columns reports num_rows() == 0 regardless of
   // how many rows the underlying row groups actually contain, so the GPU
   // scan operator would silently produce no batches at all. Keeping one
-  // arbitrary real column (the schema's first field) selected in this case
-  // preserves row-count fidelity through cudf::table; nothing above the
-  // scan references it (that's exactly why required_columns() was empty),
-  // so it's inert for every consumer except row counting. Real Parquet
-  // files always have at least one column, so the guard below is only for
-  // a pathological zero-field schema, not the common case.
-  if (narrowed_columns.empty() && !scan.output_schema().fields().empty()) {
+  // arbitrary real *physical* column (the schema's first field -- always
+  // physical, never a partition column, since resolve_table() always
+  // appends partition columns after every physical one) selected in this
+  // case preserves row-count fidelity through cudf::table; nothing above
+  // the scan references it (that's exactly why required_columns() was
+  // empty), so it's inert for every consumer except row counting. Real
+  // Parquet files always have at least one column, so the guard below is
+  // only for a pathological zero-field schema, not the common case.
+  if (narrowed_columns.empty() && narrowed_partitions.empty() && !scan.output_schema().fields().empty()) {
     const Field& fallback = scan.output_schema().fields().front();
     narrowed_fields.push_back(fallback);
     narrowed_columns.push_back(fallback.name);
@@ -237,7 +254,8 @@ PhysicalPlanPtr convert_scan(const LogicalScan& scan, ObjectStore& store) {
 
   return std::make_shared<ParquetScanNode>(std::move(fragments), std::move(narrowed_columns),
                                            Schema(std::move(narrowed_fields)),
-                                           static_cast<int>(metadata.size()));
+                                           static_cast<int>(resolved.files.size()),
+                                           std::move(narrowed_partitions));
 }
 
 PhysicalPlanPtr convert(const LogicalPlanPtr& node, ObjectStore& store) {

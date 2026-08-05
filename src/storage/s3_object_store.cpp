@@ -70,6 +70,10 @@ std::vector<ObjectInfo> S3ObjectStore::list(const Uri& prefix) {
   return detail::generic_fs_list(fs_, "s3", prefix);
 }
 
+std::vector<ObjectInfo> S3ObjectStore::list_recursive(const Uri& prefix) {
+  return detail::generic_fs_list_recursive(fs_, "s3", prefix);
+}
+
 std::unique_ptr<RandomAccessObject> S3ObjectStore::open(const Uri& uri) {
   return detail::generic_fs_open(fs_, "s3", uri);
 }

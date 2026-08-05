@@ -33,6 +33,11 @@ class PhysicalPlanNode {
 };
 
 // One file's pruning outcome, ready for the scan operator to act on.
+// `partition_values` (empty for a plain, non-partitioned source) is parallel
+// to ParquetScanNode::partition_columns() -- constant values this fragment's
+// every row gets for those columns, since they're derived from the file's
+// location and never physically present in it. See
+// kernellake/io/table_resolution.hpp.
 struct PhysicalFileFragment {
   Uri file;
   std::int64_t file_row_count = 0;
@@ -40,19 +45,32 @@ struct PhysicalFileFragment {
   std::vector<int> selected_row_groups;
   std::vector<int> skipped_row_groups;
   std::vector<std::string> pruning_reasons;
+  std::vector<LiteralStorage> partition_values;
 };
 
 class ParquetScanNode final : public PhysicalPlanNode {
  public:
   ParquetScanNode(std::vector<PhysicalFileFragment> fragments, std::vector<std::string> columns,
-                  Schema schema, int files_considered)
+                  Schema schema, int files_considered,
+                  std::vector<PartitionColumn> partition_columns = {})
       : fragments_(std::move(fragments)),
         columns_(std::move(columns)),
         schema_(std::move(schema)),
-        files_considered_(files_considered) {}
+        files_considered_(files_considered),
+        partition_columns_(std::move(partition_columns)) {}
 
   [[nodiscard]] const std::vector<PhysicalFileFragment>& fragments() const noexcept { return fragments_; }
+  // Physical columns to actually read from each fragment's Parquet file --
+  // never includes a partition column (see partition_columns() below),
+  // since those don't exist in the file itself and cudf's/Arrow's Parquet
+  // readers would fail to find them.
   [[nodiscard]] const std::vector<std::string>& columns() const noexcept { return columns_; }
+  // Columns whose values must be materialized as a constant per fragment
+  // (from PhysicalFileFragment::partition_values) rather than read from the
+  // file -- a suffix of output_schema()'s fields not covered by columns().
+  [[nodiscard]] const std::vector<PartitionColumn>& partition_columns() const noexcept {
+    return partition_columns_;
+  }
   [[nodiscard]] int files_considered() const noexcept { return files_considered_; }
   [[nodiscard]] std::size_t files_scanned() const noexcept { return fragments_.size(); }
 
@@ -66,6 +84,7 @@ class ParquetScanNode final : public PhysicalPlanNode {
   std::vector<std::string> columns_;
   Schema schema_;
   int files_considered_;
+  std::vector<PartitionColumn> partition_columns_;
 };
 
 // A two-table INNER equi-join (see LogicalJoin). `left_key_index`/

@@ -96,6 +96,10 @@ std::vector<ObjectInfo> GcsObjectStore::list(const Uri& prefix) {
   return detail::generic_fs_list(fs_, "gcs", prefix);
 }
 
+std::vector<ObjectInfo> GcsObjectStore::list_recursive(const Uri& prefix) {
+  return detail::generic_fs_list_recursive(fs_, "gcs", prefix);
+}
+
 std::unique_ptr<RandomAccessObject> GcsObjectStore::open(const Uri& uri) {
   return detail::generic_fs_open(fs_, "gcs", uri);
 }

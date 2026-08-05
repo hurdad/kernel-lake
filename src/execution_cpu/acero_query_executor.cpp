@@ -1,6 +1,7 @@
 #include "kernellake/execution_cpu/acero_query_executor.hpp"
 
 #include <arrow/acero/api.h>
+#include <arrow/array/util.h>
 #include <arrow/compute/api_aggregate.h>
 #include <arrow/compute/initialize.h>
 #include <arrow/util/iterator.h>
@@ -101,6 +102,50 @@ OpenFragment open_fragment_reader(const PhysicalFileFragment& fragment,
   return opened;
 }
 
+// Builds a length-`length` constant-value array for one Hive partition
+// column, reusing expression_compiler_cpu.hpp's literal-to-Arrow-scalar
+// conversion (the same type mapping the AST literal-node path already uses)
+// rather than duplicating a second DataType-to-Arrow-scalar table here.
+std::shared_ptr<arrow::Array> make_partition_constant_array(const LiteralStorage& value, const DataType& type,
+                                                             std::int64_t length) {
+  const LiteralExpression literal(value, type);
+  const arrow::Datum datum = literal_to_arrow_datum(literal);
+  const arrow::Result<std::shared_ptr<arrow::Array>> result =
+      arrow::MakeArrayFromScalar(*datum.scalar(), length);
+  if (!result.ok()) {
+    throw StorageError(fmt::format("failed to materialize Hive partition column constant: {}",
+                                   result.status().ToString()));
+  }
+  return *result;
+}
+
+// Appends one constant-value column per entry in `partition_columns` (using
+// the parallel `partition_values`, see PhysicalFileFragment's own doc
+// comment) to `batch` -- these columns are derived from the fragment's file
+// location (e.g. "region=US/part-0.parquet"), never physically present in
+// the Parquet file itself, so open_fragment_reader() never reads them; they
+// only exist from here on. A no-op (returns `batch` unchanged) for a plain,
+// non-partitioned scan.
+std::shared_ptr<arrow::RecordBatch> append_partition_columns(
+    std::shared_ptr<arrow::RecordBatch> batch, const std::vector<PartitionColumn>& partition_columns,
+    const std::vector<LiteralStorage>& partition_values) {
+  std::shared_ptr<arrow::RecordBatch> result = std::move(batch);
+  for (std::size_t i = 0; i < partition_columns.size(); ++i) {
+    const std::shared_ptr<arrow::Array> column =
+        make_partition_constant_array(partition_values[i], partition_columns[i].type, result->num_rows());
+    const std::shared_ptr<arrow::Field> field =
+        arrow::field(partition_columns[i].name, to_arrow_type(partition_columns[i].type), /*nullable=*/false);
+    const arrow::Result<std::shared_ptr<arrow::RecordBatch>> appended =
+        result->AddColumn(result->num_columns(), field, column);
+    if (!appended.ok()) {
+      throw StorageError(fmt::format("failed to append Hive partition column '{}': {}",
+                                     partition_columns[i].name, appended.status().ToString()));
+    }
+    result = *appended;
+  }
+  return result;
+}
+
 // Iteration state for make_streaming_scan_reader()'s lazy, cross-fragment
 // RecordBatchReader -- shared_ptr since Acero's "record_batch_reader_source"
 // node (see its own doc comment) runs each ReadNext() call as a task on its
@@ -164,7 +209,21 @@ std::shared_ptr<arrow::RecordBatchReader> make_streaming_scan_reader(const Parqu
   state->store = &store;
   state->current = open_fragment_reader(fragments.front(), scan.columns(), store);
   state->next_fragment_index = 1;
-  const std::shared_ptr<arrow::Schema> schema = state->current.batch_reader->schema();
+  std::shared_ptr<arrow::Schema> schema = state->current.batch_reader->schema();
+  // Hive partition columns (see LogicalScan::partition_columns()) are never
+  // physically present in the file, so open_fragment_reader() never reads
+  // them -- append their fields here (always non-nullable: a partition
+  // value is either present from the file's own path, or the file wouldn't
+  // have matched this scan's fragment list at all) so the reader's declared
+  // schema matches what append_partition_columns() below actually adds to
+  // every batch.
+  if (!scan.partition_columns().empty()) {
+    arrow::FieldVector fields = schema->fields();
+    for (const PartitionColumn& column : scan.partition_columns()) {
+      fields.push_back(arrow::field(column.name, to_arrow_type(column.type), /*nullable=*/false));
+    }
+    schema = arrow::schema(std::move(fields));
+  }
 
   arrow::Iterator<std::shared_ptr<arrow::RecordBatch>> iterator =
       arrow::MakeFunctionIterator([state]() -> arrow::Result<std::shared_ptr<arrow::RecordBatch>> {
@@ -193,6 +252,12 @@ std::shared_ptr<arrow::RecordBatchReader> make_streaming_scan_reader(const Parqu
             if (batch == nullptr) {
               state->current = OpenFragment{};
               continue;  // this fragment is exhausted; try the next one
+            }
+            if (!state->scan->partition_columns().empty()) {
+              const std::vector<PhysicalFileFragment>& fragments = state->scan->fragments();
+              const PhysicalFileFragment& current_fragment = fragments[state->next_fragment_index - 1];
+              batch = append_partition_columns(std::move(batch), state->scan->partition_columns(),
+                                               current_fragment.partition_values);
             }
             return batch;
           }
