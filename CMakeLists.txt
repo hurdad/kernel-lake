@@ -104,6 +104,14 @@ find_package(PkgConfig REQUIRED)
 pkg_check_modules(UUID REQUIRED IMPORTED_TARGET uuid)
 include(LinkArrowBundledCloudDeps)
 
+# Iceberg REST catalog support (src/iceberg/): libcurl for the REST/OAuth2
+# HTTP calls, avro-c for reading manifest-list/manifest files. Unconditional,
+# like the S3/GCS/Azure/HDFS object stores above -- not gated behind a build
+# option, since it needs no special hardware/infra the way
+# KERNELLAKE_WITH_CUDA/BUILD_SERVER/ENABLE_OTEL do.
+pkg_check_modules(CURL REQUIRED IMPORTED_TARGET libcurl)
+include(ThirdPartyAvro)
+
 if(KERNELLAKE_BUILD_TESTS)
   find_package(GTest REQUIRED)
 endif()

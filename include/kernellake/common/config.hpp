@@ -7,6 +7,7 @@
 
 #include <cstdint>
 #include <string>
+#include <unordered_map>
 
 namespace kernellake {
 
@@ -137,6 +138,35 @@ struct StorageSection {
   HdfsSection hdfs;
 };
 
+// One named Iceberg REST catalog (see src/iceberg/rest_catalog_client.cpp).
+// `read_iceberg('catalog.namespace.table')`'s leading `catalog` component
+// looks this up by name -- a real deployment commonly has more than one
+// (e.g. "prod"/"staging"), so this is a map, not a single section, unlike
+// S3/GCS/Azure/HDFS above (KernelLake talks to exactly one of each of
+// those per query, chosen by URI scheme, never by a name the query spells
+// out itself).
+struct IcebergCatalogSection {
+  std::string catalog_uri;  // e.g. "http://localhost:8181"
+  std::string warehouse;    // optional; some REST catalog servers require it
+  std::string prefix;       // REST catalog API's "{prefix}" path segment; "" (root) by default
+  // "none" | "bearer_token" | "oauth2_client_credentials" (mirrors the
+  // credentials_kind convention already used by S3Section/GcsSection/etc.
+  // above). "bearer_token" covers a pre-obtained static token (the common
+  // case for Polaris/Nessie deployments that front their own auth);
+  // "oauth2_client_credentials" performs the REST Catalog spec's own
+  // POST /v1/oauth/tokens client_credentials flow and refreshes the token
+  // as it nears expiry.
+  std::string credentials_kind = "none";
+  std::string bearer_token;         // for "bearer_token"
+  std::string oauth2_client_id;     // for "oauth2_client_credentials"
+  std::string oauth2_client_secret;  // for "oauth2_client_credentials"
+  std::string oauth2_scope;         // optional; for "oauth2_client_credentials"
+};
+
+struct IcebergSection {
+  std::unordered_map<std::string, IcebergCatalogSection> catalogs;
+};
+
 struct LoggingSection {
   std::string level = "info";
   bool json = false;
@@ -264,6 +294,7 @@ struct EngineConfig {
   EngineSection engine;
   MemorySection memory;
   StorageSection storage;
+  IcebergSection iceberg;
   LoggingSection logging;
   ProfilingSection profiling;
   BenchmarkSection benchmark;

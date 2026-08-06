@@ -1952,6 +1952,263 @@ and covered by passing tests -- not merely designed or stubbed.
     dynamic-credential seam for vended cloud credentials -- see the
     lakehouse roadmap plan for why both are Phase 3+ concerns, not Phase 2
     ones.
+- **Iceberg REST catalog config, client, manifest reading, schema
+  translation, table resolution, and SQL surface** (Phase 3 of the
+  lakehouse roadmap -- see "Hive-style partition discovery" above for the
+  full 5-phase sequencing; see "read_iceberg(...) SQL surface" below for
+  where this phase completes). `SELECT ... FROM
+  read_iceberg('catalog.namespace.table')` now works end to end, real file
+  resolution, row-group pruning and all.
+  - **Config**: `iceberg.catalogs` (`include/kernellake/common/config.hpp`'s
+    `IcebergSection`/`IcebergCatalogSection`) is a name-keyed map -- unlike
+    `storage.{s3,gcs,azure,hdfs}`'s one-section-per-scheme shape, a real
+    deployment commonly has more than one REST catalog (e.g.
+    "prod"/"staging"), addressed by the leading component of a future
+    `read_iceberg('catalog.namespace.table')`. Three `credentials_kind`s:
+    `none`, `bearer_token` (a pre-obtained static token, the common case
+    for Polaris/Nessie deployments fronting their own auth), and
+    `oauth2_client_credentials` (the REST Catalog spec's own
+    `POST /v1/oauth/tokens` flow). `validate_config()` checks `catalog_uri`
+    is non-empty and each kind's required fields are present.
+  - **Build**: `pkg_check_modules(CURL REQUIRED IMPORTED_TARGET libcurl)`
+    (top-level `CMakeLists.txt`) and `cmake/ThirdPartyAvro.cmake`
+    (hand-declared `Avro::avro` `IMPORTED` target via `find_library`/
+    `find_path`, since avro-c ships neither a pkg-config file nor a CMake
+    config package) are both unconditional, like the existing S3/GCS/
+    Azure/HDFS deps -- not gated behind a build option.
+  - **`IcebergRestCatalogClient`** (`include/kernellake/iceberg/
+    rest_catalog_client.hpp`, `src/iceberg/rest_catalog_client.cpp`, new
+    `kernellake_iceberg` static library): the first and only consumer of
+    libcurl in the codebase so far, so it also establishes the
+    RAII-wrapped-`CURL*`/`curl_slist*` pattern and write-callback
+    convention future HTTP use can reuse. `load_table_metadata(namespace,
+    table)` performs the REST Catalog spec's `GET .../namespaces/{ns}/
+    tables/{table}` (multi-level namespaces joined by U+001F then
+    URL-encoded as one path segment, per spec) and extracts just enough of
+    the response -- `location`, `format-version`, `current-snapshot-id`,
+    and each snapshot's `manifest-list` path -- for a future manifest
+    reader to locate and read the current snapshot; schema/partition-spec
+    translation into `kernellake::Schema` is intentionally deferred to that
+    later integration. `oauth2_client_credentials` mode fetches and caches
+    the bearer token (30s expiry safety margin, re-fetched on demand
+    rather than proactively refreshed in the background).
+  - New tests: `rest_catalog_client_test.cpp`, including a purpose-built
+    single-connection-at-a-time loopback HTTP stub (raw sockets, not a
+    mocking framework -- none exists in this test tree) exercising the
+    real client against a real (local) HTTP server: bearer-token and
+    oauth2-client-credentials auth, multi-level namespace encoding, the
+    `prefix` config option, non-2xx responses, malformed/incomplete JSON,
+    and connection failure, plus pure-unit coverage of
+    `IcebergTableMetadata::current_manifest_list()`'s edge cases (no
+    current snapshot, unknown snapshot id).
+  - **`manifest_reader.cpp`** (`include/kernellake/iceberg/
+    manifest_reader.hpp`, same `kernellake_iceberg` library): the first
+    avro-c consumer, reading both manifest-list and manifest Avro Object
+    Container Files off bytes an `ObjectStore` already fetched (no temp
+    file: `fmemopen()` wraps the in-memory buffer as the `FILE*` avro-c's
+    file-container reader requires) via avro-c's *generic* value API
+    against the file's own embedded writer schema -- so it needs no
+    hardcoded copy of the Iceberg spec's manifest schemas itself.
+    `read_manifest_list()` extracts each entry's `manifest_path`/
+    `manifest_length`/`content`/`added_snapshot_id` (per-manifest
+    `partitions` summary stats not extracted, no pruning at that
+    granularity yet). `read_manifest()` extracts each data/delete file
+    entry's `status`/`file_path`/`file_format`/`record_count`/
+    `file_size_in_bytes`, plus its `partition` struct's field values
+    decoded generically by Avro type and *position* (int/long/string/null
+    -- the only types Iceberg partition transforms produce at this layer;
+    this reader has no partition-spec/schema of its own yet to interpret
+    field *meaning* against, so a caller matches values back to spec
+    fields by index). Column-level stats (`value_counts`,
+    `lower_bounds`/`upper_bounds`, etc.) are decoded by avro-c along with
+    everything else in each record but not extracted -- nothing consumes
+    them yet.
+  - New tests: `manifest_reader_test.cpp`, round-tripping through real
+    Avro Object Container Files -- a small `AvroFixtureWriter` test helper
+    uses avro-c's own writer API (simplified stand-in schemas: same field
+    names/nesting this reader looks up, minus attributes it doesn't read)
+    to produce real fixture bytes, covering ordered multi-entry
+    manifest-lists, data-file entries with typed (string/int) and null
+    partition values, malformed/empty input, and the `ObjectStore`-backed
+    entry point end to end via a real `LocalObjectStore` + temp directory.
+  - **Verification**: `dev` 227/227, `server-dev` 231/231
+    `kernellake_unit_tests`, zero regressions; `gpu-dev` not re-verified
+    this session (this environment's `gpu-dev` preset needs `nvcc` at
+    `/usr/local/cuda/bin/nvcc`, not present in this shell -- pre-existing
+    and unrelated to this change, which has no CUDA dependency of its
+    own). Additionally run under ASan+UBSan+LeakSanitizer (a from-scratch
+    build, not one of the checked-in presets): every test passes and the
+    only leak found is inside system libavro-c 1.12.0 itself
+    (`avro_file_reader_fp()`'s internal `avro_reader_memory()`, ~40 bytes),
+    strictly on the malformed/truncated-input error path (2 allocations,
+    matching the 2 tests that feed it corrupt bytes) -- never on a
+    successful open, and with no handle in the public API to free it
+    ourselves; documented at the call site
+    (`src/iceberg/manifest_reader.cpp`'s `open_avro_reader()`) rather than
+    worked around.
+  - **Schema translation** (`include/kernellake/iceberg/
+    schema_translation.hpp`, `src/iceberg/schema_translation.cpp`, same
+    library): `iceberg_schema_to_kernellake_schema()` maps an Iceberg
+    table's current-schema fields to a `kernellake::Schema` --
+    `IcebergRestCatalogClient::load_table_metadata()` was extended to
+    extract those fields in the first place (v2's `schemas` array +
+    `current-schema-id`, falling back to v1's bare `schema` field for
+    older/compat servers). Iceberg `required` becomes `nullable = false`;
+    every supported primitive (boolean/int/long/float/double/date/
+    timestamp/timestamptz/string/decimal(P,S)) maps directly, with
+    `timestamp` and `timestamptz` both landing on kernellake's single
+    Timestamp type since it has no timezone-aware/naive distinction of its
+    own to map onto. Everything else -- time, uuid, fixed[N], binary, and
+    every nested type (list/map/struct) -- throws rather than guessing at
+    a lossy mapping; a struct/list/map field's raw JSON `type` (an object,
+    not a string) is preserved via `dump()` on the way in specifically so
+    that error message can show the caller what it actually saw.
+  - New tests: `schema_translation_test.cpp` (every supported primitive,
+    field order/naming preserved, required-vs-optional nullability,
+    decimal precision/scale parsing, and rejection of time/uuid/nested
+    types and malformed decimals) plus three new
+    `rest_catalog_client_test.cpp` cases covering the v2 multi-schema
+    selection, the v1 fallback, and an unmatched `current-schema-id`
+    throwing. `dev` 239/239, `server-dev` 243/243 `kernellake_unit_tests`,
+    zero regressions.
+  - **`resolve_iceberg_table()`** (`include/kernellake/iceberg/
+    iceberg_table_resolution.hpp`, `src/iceberg/iceberg_table_resolution.cpp`,
+    same library): the piece that actually turns a catalog client +
+    manifest reader + schema translation into a `ResolvedTable` -- the same
+    shape `kernellake::resolve_table()` (plain/Hive Parquet,
+    `kernellake/io/table_resolution.hpp`) produces, so both plug into the
+    identical downstream seam (`convert_scan()` etc.) once a caller wires
+    one in. Pipeline: `load_table_metadata()` -> current snapshot's
+    manifest list -> each data manifest's entries -> live
+    (status ADDED/EXISTING) data files -> `inspect_parquet_file()` per file
+    for row-group statistics. Three real design calls, each documented at
+    the call site rather than only here:
+    - The table's *current* Iceberg schema (translated) is authoritative,
+      not any individual file's own Parquet footer schema -- correct per
+      Iceberg's schema-evolution model, but every live file's physical
+      schema is required to match it *exactly* for now; genuine
+      cross-snapshot schema evolution (added/renamed/widened columns)
+      isn't reconciled yet and throws StorageError naming the offending
+      file and field, rather than attempting a reconciliation this
+      resolver doesn't do.
+    - A live delete manifest (manifest-list `content == 1`) throws rather
+      than being silently skipped: ignoring it would mean returning rows
+      the snapshot says are deleted -- a correctness bug, not a missing
+      feature.
+    - `ResolvedTable::partition_columns` is always empty from this path
+      (unlike the Hive-partitioning path): Iceberg's partition columns are
+      already ordinary schema columns present in every data file (for the
+      identity-transform case this targets first), not values that must be
+      reconstructed from something absent in the file the way Hive's
+      directory-encoded partitions are -- so no column materialization is
+      needed for correctness. Partition *pruning* (skipping whole files by
+      their manifest-recorded values without opening them) is a pure
+      optimization, not yet implemented.
+  - New tests: `iceberg_table_resolution_test.cpp` -- genuine end-to-end
+    integration, not structural: a fake HTTP REST catalog (the same
+    loopback-socket stub pattern as `rest_catalog_client_test.cpp`, real
+    Avro manifest-list/manifest fixtures (avro-c's own writer API, same
+    pattern as `manifest_reader_test.cpp`), and real Parquet data files
+    (Arrow's Parquet writer, same pattern as `table_resolution_test.cpp`),
+    all wired through a real `LocalObjectStore`. Covers: live files
+    resolved with correct schema/row counts, DELETED-status entries
+    correctly excluded, a live delete manifest throwing, a non-PARQUET
+    data file throwing, a data file whose physical schema doesn't match
+    the table's current schema throwing, and a table with no current
+    snapshot resolving to zero files (a real, valid empty-table state, not
+    an error).
+  - **Verification**: `dev` 245/245, `server-dev` 249/249
+    `kernellake_unit_tests`, zero regressions; also re-run under the same
+    from-scratch ASan+UBSan+LeakSanitizer build used for the manifest
+    reader -- all tests pass, and the only leak is the same
+    already-diagnosed libavro-c 1.12.0 error-path leak from the manifest
+    reader's own malformed-input tests, nothing new from this file's
+    heavier avro-c/socket/Parquet-writer use.
+  - **`read_iceberg('catalog.namespace.table')` SQL surface** -- the last
+    piece of Phase 3, landing this session: `SELECT ... FROM
+    read_iceberg('prod.db.orders')` now parses, binds, and physically plans
+    end to end, including a two-table JOIN mixing a `read_parquet(...)` and
+    a `read_iceberg(...)` source. The user-facing syntax was a deliberate
+    choice, made after asking rather than unilaterally: mirrors
+    `read_parquet(...)`'s existing function-call shape exactly, needing the
+    smallest possible grammar surface (the alternative -- a bare
+    `FROM prod.db.orders` identifier, closer to Trino/Spark -- would have
+    needed real hyrise/sql-parser FROM-clause grammar changes to
+    disambiguate from a future non-Iceberg named table).
+    - **Zero AST/binder/`LogicalScan` changes.** `read_iceberg(...)`'s
+      single string argument is re-encoded by the SQL preprocessor (see
+      `preprocess_from_read_parquet()`'s now-generalized doc comment,
+      `src/sql/parser.cpp`) as a single source path
+      `"iceberg://catalog.namespace.table"` -- reusing `kernellake::Uri`'s
+      existing scheme-dispatch idiom (the same one `ObjectStoreRegistry`
+      already uses for S3/GCS/Azure/HDFS) instead of threading a new
+      "source kind" concept through `AstParquetSource`, `BoundQuery`/
+      `BoundJoin`, and `LogicalScan`, all of which stay exactly as they
+      were before this phase.
+    - **`TableSourceResolver`** (`kernellake/io/table_resolution.hpp`, new
+      abstract interface, plus `resolve_table_or_delegate()`): the one real
+      architectural addition, needed because `kernellake_iceberg` already
+      depends on `kernellake_io` (for `inspect_parquet_file()`), so
+      `kernellake_io` can't depend back on `kernellake_iceberg` without a
+      cycle. The interface -- `can_resolve()`/`resolve()` -- lives in
+      `kernellake_io` with no new dependency of its own;
+      `kernellake::iceberg::IcebergSourceResolver`
+      (`include/kernellake/iceberg/iceberg_source_resolver.hpp`) implements
+      it, parsing the `iceberg://` marker, splitting
+      `catalog.namespace.table` (>=3 non-empty dot-separated parts
+      required), looking up the catalog by name in
+      `EngineConfig::iceberg.catalogs`, and calling
+      `resolve_iceberg_table()`. `QueryEngine` (`src/api/query_engine.cpp`)
+      constructs one and passes it into both of `kernellake_io`'s own
+      `resolve_table()` call sites -- `plan_logical()`'s schema-discovery
+      step and `physical_planner.cpp`'s `convert_scan()` (now taking an
+      `extra_resolver` parameter, threaded through its whole recursive
+      `convert()` walk) -- via `resolve_table_or_delegate()`, so a source
+      `resolve_table()` itself can't handle still resolves consistently at
+      both places. Delta Lake/Unity Catalog integration (see above) is
+      expected to plug in through this exact same seam.
+      `IcebergRestCatalogClient` is constructed fresh per resolve call, not
+      cached across queries -- simpler and correct, at the cost of
+      repeating the `oauth2_client_credentials` handshake per query for
+      that `credentials_kind`; a documented, deliberate MVP simplification,
+      not a permanent design decision.
+    - New tests: `sql_parser_test.cpp` (parses `read_iceberg(...)`, rejects
+      more than one argument, a mixed `read_parquet`/`read_iceberg` JOIN),
+      `iceberg_source_resolver_test.cpp` (scheme dispatch, unknown catalog,
+      malformed qualified names), and the capstone --
+      `query_engine_iceberg_test.cpp` -- a real `QueryEngine` (constructed
+      exactly as the CLI/Flight SQL server would) running
+      `explain_logical()`/`explain()` over `read_iceberg(...)` SQL text
+      end to end against a fake HTTP REST catalog and real Avro/Parquet
+      fixtures, verifying the resulting logical schema and that a real
+      `ParquetScanNode` comes out the other end.
+    - **Verification**: `dev` 256/256, `server-dev` 260/260
+      `kernellake_unit_tests`, zero regressions (confirmed the existing
+      `read_parquet(...)`-only suite is entirely unaffected -- the whole
+      point of the zero-AST-change design); `gpu-dev` not re-verified this
+      session (same pre-existing `nvcc` path gap noted earlier in this
+      phase, unrelated to this change). Re-run under the same from-scratch
+      ASan+UBSan+LeakSanitizer build used earlier in this phase: all 256
+      tests pass, only the same already-diagnosed libavro-c 1.12.0
+      error-path leak, nothing new.
+    - Not yet done, tracked as a later phase: interpreting partition
+      values against named, transform-aware partition-spec fields
+      (bucket/truncate/year/month/day/hour) for partition-level pruning
+      (a pure optimization, not a correctness gap -- see
+      `resolve_iceberg_table()`'s own comment on why partition columns
+      aren't needed for correct results today), and caching
+      `IcebergRestCatalogClient`/its OAuth2 token across queries against
+      the same catalog.
+
+  **Phase 3 (Iceberg REST catalogs) is now functionally complete for the
+  MVP's scope**: config, REST catalog client (bearer/OAuth2 auth), Avro
+  manifest reading, Iceberg-to-`kernellake::Schema` translation, real file
+  resolution with row-group pruning, and a working `read_iceberg(...)` SQL
+  surface, all tested end to end against real fixtures. Row-level deletes,
+  schema evolution across files, and partition-spec-aware pruning remain
+  explicit, documented non-goals for now -- see the entries above for
+  exactly where each one throws instead of guessing. Phase 4 (Delta Lake)
+  is next per the roadmap plan.
 
 ## Not yet started
 

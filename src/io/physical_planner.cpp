@@ -182,8 +182,8 @@ const Schema* find_scan_schema(const PhysicalPlanNode& node) {
   return nullptr;
 }
 
-PhysicalPlanPtr convert_scan(const LogicalScan& scan, ObjectStore& store) {
-  const ResolvedTable resolved = resolve_table(store, scan.source_paths());
+PhysicalPlanPtr convert_scan(const LogicalScan& scan, ObjectStore& store, TableSourceResolver* extra_resolver) {
+  const ResolvedTable resolved = resolve_table_or_delegate(store, scan.source_paths(), extra_resolver);
 
   std::vector<PhysicalFileFragment> fragments;
   fragments.reserve(resolved.files.size());
@@ -258,13 +258,13 @@ PhysicalPlanPtr convert_scan(const LogicalScan& scan, ObjectStore& store) {
                                            std::move(narrowed_partitions));
 }
 
-PhysicalPlanPtr convert(const LogicalPlanPtr& node, ObjectStore& store) {
+PhysicalPlanPtr convert(const LogicalPlanPtr& node, ObjectStore& store, TableSourceResolver* extra_resolver) {
   if (const auto* scan = dynamic_cast<const LogicalScan*>(node.get())) {
-    return convert_scan(*scan, store);
+    return convert_scan(*scan, store, extra_resolver);
   }
   if (const auto* join = dynamic_cast<const LogicalJoin*>(node.get())) {
-    PhysicalPlanPtr left_child = convert(join->left(), store);
-    PhysicalPlanPtr right_child = convert(join->right(), store);
+    PhysicalPlanPtr left_child = convert(join->left(), store, extra_resolver);
+    PhysicalPlanPtr right_child = convert(join->right(), store, extra_resolver);
     // The join key's index was assigned against each side's *original*
     // (pre-narrowing) schema; translate by name to that side's actual
     // narrowed physical schema, exactly like remap_columns does for any
@@ -298,14 +298,14 @@ PhysicalPlanPtr convert(const LogicalPlanPtr& node, ObjectStore& store) {
                                           *right_key_narrowed);
   }
   if (const auto* filter = dynamic_cast<const LogicalFilter*>(node.get())) {
-    PhysicalPlanPtr child = convert(filter->child(), store);
+    PhysicalPlanPtr child = convert(filter->child(), store, extra_resolver);
     const Schema* scan_schema = find_scan_schema(*child);
     ExpressionPtr predicate =
         scan_schema ? remap_columns(filter->predicate(), *scan_schema) : filter->predicate();
     return std::make_shared<FilterNode>(std::move(child), std::move(predicate));
   }
   if (const auto* projection = dynamic_cast<const LogicalProjection*>(node.get())) {
-    PhysicalPlanPtr child = convert(projection->child(), store);
+    PhysicalPlanPtr child = convert(projection->child(), store, extra_resolver);
     // A LogicalProjection is the one node with two structurally different
     // roles: the non-aggregate path's final projection, sitting directly
     // on LogicalFilter/LogicalScan with items that reference the
@@ -343,7 +343,7 @@ PhysicalPlanPtr convert(const LogicalPlanPtr& node, ObjectStore& store) {
     return std::make_shared<ProjectionNode>(std::move(child), std::move(items));
   }
   if (const auto* aggregate = dynamic_cast<const LogicalAggregate*>(node.get())) {
-    PhysicalPlanPtr child = convert(aggregate->child(), store);
+    PhysicalPlanPtr child = convert(aggregate->child(), store, extra_resolver);
     const Schema* scan_schema = find_scan_schema(*child);
     std::vector<NamedExpression> aggregates =
         scan_schema ? remap_named(aggregate->aggregates(), *scan_schema) : aggregate->aggregates();
@@ -355,7 +355,7 @@ PhysicalPlanPtr convert(const LogicalPlanPtr& node, ObjectStore& store) {
     return std::make_shared<HashAggregateNode>(std::move(child), std::move(group_by), std::move(aggregates));
   }
   if (const auto* sort = dynamic_cast<const LogicalSort*>(node.get())) {
-    PhysicalPlanPtr child = convert(sort->child(), store);
+    PhysicalPlanPtr child = convert(sort->child(), store, extra_resolver);
     std::vector<LogicalSort::Key> keys = sort->keys();
     // logical_planner.cpp places a non-aggregate ORDER BY's Sort directly
     // on the scan/filter chain -- its child is *always* exactly a
@@ -388,15 +388,16 @@ PhysicalPlanPtr convert(const LogicalPlanPtr& node, ObjectStore& store) {
     return std::make_shared<SortNode>(std::move(child), std::move(keys));
   }
   if (const auto* limit = dynamic_cast<const LogicalLimit*>(node.get())) {
-    return std::make_shared<LimitNode>(convert(limit->child(), store), limit->limit());
+    return std::make_shared<LimitNode>(convert(limit->child(), store, extra_resolver), limit->limit());
   }
   throw PlanningError("physical planner encountered an unrecognized logical plan node");
 }
 
 }  // namespace
 
-PhysicalPlanPtr build_physical_plan(const LogicalPlanPtr& logical_plan, ObjectStore& store) {
-  return std::make_shared<ArrowResultNode>(convert(logical_plan, store));
+PhysicalPlanPtr build_physical_plan(const LogicalPlanPtr& logical_plan, ObjectStore& store,
+                                    TableSourceResolver* extra_resolver) {
+  return std::make_shared<ArrowResultNode>(convert(logical_plan, store, extra_resolver));
 }
 
 }  // namespace kernellake

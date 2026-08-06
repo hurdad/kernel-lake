@@ -197,4 +197,12 @@ ResolvedTable resolve_table(ObjectStore& store, const std::vector<std::string>& 
   return ResolvedTable{std::move(resolved_files), std::move(schema), std::move(partition_columns)};
 }
 
+ResolvedTable resolve_table_or_delegate(ObjectStore& store, const std::vector<std::string>& sources,
+                                        TableSourceResolver* extra_resolver) {
+  if (extra_resolver != nullptr && extra_resolver->can_resolve(sources)) {
+    return extra_resolver->resolve(store, sources);
+  }
+  return resolve_table(store, sources);
+}
+
 }  // namespace kernellake

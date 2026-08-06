@@ -3,6 +3,7 @@
 #include <chrono>
 
 #include "kernellake/common/errors.hpp"
+#include "kernellake/iceberg/iceberg_source_resolver.hpp"
 #include "kernellake/io/physical_planner.hpp"
 #include "kernellake/io/table_resolution.hpp"
 #include "kernellake/optimizer/optimizer.hpp"
@@ -15,9 +16,9 @@ QueryEngine::QueryEngine(EngineConfig config) : config_(std::move(config)), stor
 
 namespace {
 ResolvedTable inspect_source(ObjectStore& store, const std::vector<std::string>& paths,
-                             double* elapsed_seconds_out) {
+                             TableSourceResolver* extra_resolver, double* elapsed_seconds_out) {
   const auto start = std::chrono::steady_clock::now();
-  ResolvedTable resolved = resolve_table(store, paths);
+  ResolvedTable resolved = resolve_table_or_delegate(store, paths, extra_resolver);
   if (elapsed_seconds_out != nullptr) {
     *elapsed_seconds_out += std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
   }
@@ -28,18 +29,23 @@ ResolvedTable inspect_source(ObjectStore& store, const std::vector<std::string>&
 LogicalPlanPtr QueryEngine::plan_logical(std::string_view sql,
                                          double* metadata_inspection_seconds_out) const {
   const sql::AstSelectStatement ast = sql::parse_sql(sql);
+  // Constructed fresh per call -- see IcebergSourceResolver's own comment
+  // on why this doesn't cache an IcebergRestCatalogClient across queries
+  // yet. Cheap regardless: just a copy of config_.iceberg's catalog map.
+  iceberg::IcebergSourceResolver iceberg_resolver(config_.iceberg);
 
   if (ast.join.has_value()) {
     std::vector<Schema> join_schemas;
     std::vector<std::vector<PartitionColumn>> partition_columns_per_source;
     join_schemas.reserve(ast.join->steps.size() + 1);
     partition_columns_per_source.reserve(ast.join->steps.size() + 1);
-    const ResolvedTable first = inspect_source(store_, ast.join->first.paths, metadata_inspection_seconds_out);
+    const ResolvedTable first =
+        inspect_source(store_, ast.join->first.paths, &iceberg_resolver, metadata_inspection_seconds_out);
     join_schemas.push_back(first.schema);
     partition_columns_per_source.push_back(first.partition_columns);
     for (const sql::AstJoinStep& step : ast.join->steps) {
       const ResolvedTable resolved =
-          inspect_source(store_, step.source.paths, metadata_inspection_seconds_out);
+          inspect_source(store_, step.source.paths, &iceberg_resolver, metadata_inspection_seconds_out);
       join_schemas.push_back(resolved.schema);
       partition_columns_per_source.push_back(resolved.partition_columns);
     }
@@ -48,7 +54,8 @@ LogicalPlanPtr QueryEngine::plan_logical(std::string_view sql,
     return optimize(logical);
   }
 
-  const ResolvedTable resolved = inspect_source(store_, ast.from.paths, metadata_inspection_seconds_out);
+  const ResolvedTable resolved =
+      inspect_source(store_, ast.from.paths, &iceberg_resolver, metadata_inspection_seconds_out);
   const BoundQuery bound = bind_query(ast, resolved.schema);
   LogicalPlanPtr logical = build_logical_plan(bound, resolved.schema, resolved.partition_columns);
   return optimize(logical);
@@ -59,7 +66,8 @@ LogicalPlanPtr QueryEngine::explain_logical(std::string_view sql) const {
 }
 
 PhysicalPlanPtr QueryEngine::explain(std::string_view sql) const {
-  return build_physical_plan(plan_logical(sql), store_);
+  iceberg::IcebergSourceResolver iceberg_resolver(config_.iceberg);
+  return build_physical_plan(plan_logical(sql), store_, &iceberg_resolver);
 }
 
 }  // namespace kernellake

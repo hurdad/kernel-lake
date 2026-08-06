@@ -218,6 +218,34 @@ EngineConfig parse_config(const std::string& yaml_text) {
   hdfs_opts.replication = read_or(hdfs, "replication", hdfs_opts.replication);
   hdfs_opts.default_block_size = read_or(hdfs, "default_block_size", hdfs_opts.default_block_size);
 
+  // iceberg.catalogs is a map keyed by catalog name (read_iceberg('name.ns.table')'s
+  // leading component looks it up), unlike storage.{s3,gcs,azure,hdfs}'s
+  // single-section-per-scheme shape above -- each entry gets its own
+  // sub-object read the same way those do.
+  const YAML::Node iceberg_catalogs = root["iceberg"]["catalogs"];
+  if (iceberg_catalogs) {
+    for (const auto& entry : iceberg_catalogs) {
+      std::string name;
+      try {
+        name = entry.first.as<std::string>();
+      } catch (const YAML::Exception& e) {
+        throw ConfigurationError(fmt::format("invalid iceberg.catalogs entry name: {}", e.what()));
+      }
+      const YAML::Node catalog_node = entry.second;
+      IcebergCatalogSection catalog;
+      catalog.catalog_uri = read_or(catalog_node, "catalog_uri", catalog.catalog_uri);
+      catalog.warehouse = read_or(catalog_node, "warehouse", catalog.warehouse);
+      catalog.prefix = read_or(catalog_node, "prefix", catalog.prefix);
+      catalog.credentials_kind = read_or(catalog_node, "credentials_kind", catalog.credentials_kind);
+      catalog.bearer_token = read_or(catalog_node, "bearer_token", catalog.bearer_token);
+      catalog.oauth2_client_id = read_or(catalog_node, "oauth2_client_id", catalog.oauth2_client_id);
+      catalog.oauth2_client_secret =
+          read_or(catalog_node, "oauth2_client_secret", catalog.oauth2_client_secret);
+      catalog.oauth2_scope = read_or(catalog_node, "oauth2_scope", catalog.oauth2_scope);
+      config.iceberg.catalogs.emplace(std::move(name), std::move(catalog));
+    }
+  }
+
   const YAML::Node logging = root["logging"];
   config.logging.level = read_or(logging, "level", config.logging.level);
   config.logging.json = read_or(logging, "json", config.logging.json);
@@ -401,6 +429,34 @@ void validate_config(const EngineConfig& config) {
     throw ConfigurationError(
         fmt::format("storage.azure.dfs_storage_scheme '{}' is unsupported (expected 'https' or 'http')",
                     config.storage.azure.options.dfs_storage_scheme));
+  }
+
+  static constexpr std::array<const char*, 3> kIcebergCredentialsKinds = {"none", "bearer_token",
+                                                                          "oauth2_client_credentials"};
+  for (const auto& [name, catalog] : config.iceberg.catalogs) {
+    if (catalog.catalog_uri.empty()) {
+      throw ConfigurationError(
+          fmt::format("iceberg.catalogs.{}.catalog_uri must not be empty", name));
+    }
+    if (std::find(kIcebergCredentialsKinds.begin(), kIcebergCredentialsKinds.end(),
+                  catalog.credentials_kind) == kIcebergCredentialsKinds.end()) {
+      throw ConfigurationError(fmt::format(
+          "iceberg.catalogs.{}.credentials_kind '{}' is unsupported (expected 'none', 'bearer_token', or "
+          "'oauth2_client_credentials')",
+          name, catalog.credentials_kind));
+    }
+    if (catalog.credentials_kind == "bearer_token" && catalog.bearer_token.empty()) {
+      throw ConfigurationError(fmt::format(
+          "iceberg.catalogs.{}.bearer_token must not be empty when credentials_kind is 'bearer_token'",
+          name));
+    }
+    if (catalog.credentials_kind == "oauth2_client_credentials" &&
+        (catalog.oauth2_client_id.empty() || catalog.oauth2_client_secret.empty())) {
+      throw ConfigurationError(fmt::format(
+          "iceberg.catalogs.{}.oauth2_client_id and oauth2_client_secret must both be set when "
+          "credentials_kind is 'oauth2_client_credentials'",
+          name));
+    }
   }
 
   static constexpr std::array<const char*, 7> kLogLevels = {"trace",   "debug", "info",    "warn",

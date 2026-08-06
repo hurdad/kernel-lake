@@ -51,4 +51,32 @@ struct ResolvedTable {
 // behavior" rule as discover_parquet_files() itself.
 [[nodiscard]] ResolvedTable resolve_table(ObjectStore& store, const std::vector<std::string>& sources);
 
+// Pluggable resolution for a source shape this library doesn't itself
+// understand (currently: Iceberg's `iceberg://catalog.namespace.table`
+// marker -- see kernellake::sql::parse_sql()'s `read_iceberg(...)`
+// preprocessing and kernellake::iceberg::IcebergSourceResolver). Lives here
+// as an abstract interface, not a concrete class, specifically so this
+// library never needs to depend on kernellake_iceberg (which already
+// depends on this one, for inspect_parquet_file()) -- a real implementation
+// is constructed and injected by a higher layer (kernellake_api's
+// QueryEngine) that can see both. Delta Lake/Unity Catalog integration
+// (see docs/ROADMAP.md) is expected to plug in the same way.
+class TableSourceResolver {
+ public:
+  virtual ~TableSourceResolver() = default;
+
+  [[nodiscard]] virtual bool can_resolve(const std::vector<std::string>& sources) const = 0;
+  [[nodiscard]] virtual ResolvedTable resolve(ObjectStore& store, const std::vector<std::string>& sources) = 0;
+};
+
+// Delegates to `extra_resolver` when it's non-null and claims `sources`
+// (via can_resolve()); falls back to the plain resolve_table() above
+// otherwise. Both of this library's own resolve_table() call sites
+// (QueryEngine::plan_logical()'s schema discovery, physical_planner.cpp's
+// convert_scan()) go through this instead of calling resolve_table()
+// directly, so a source kind resolve_table() can't handle itself still
+// resolves consistently at both places.
+[[nodiscard]] ResolvedTable resolve_table_or_delegate(ObjectStore& store, const std::vector<std::string>& sources,
+                                                      TableSourceResolver* extra_resolver);
+
 }  // namespace kernellake

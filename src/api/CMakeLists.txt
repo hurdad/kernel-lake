@@ -19,6 +19,7 @@ target_link_libraries(kernellake_api PUBLIC
   kernellake_optimizer
   kernellake_storage
   kernellake_io
+  kernellake_iceberg
   kernellake_execution_cpu
   Arrow::arrow_static
 )

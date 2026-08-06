@@ -14,6 +14,12 @@ add_executable(kernellake_unit_tests
   parquet_metadata_test.cpp
   parquet_pruning_test.cpp
   table_resolution_test.cpp
+  rest_catalog_client_test.cpp
+  manifest_reader_test.cpp
+  schema_translation_test.cpp
+  iceberg_table_resolution_test.cpp
+  iceberg_source_resolver_test.cpp
+  query_engine_iceberg_test.cpp
   physical_planner_test.cpp
   query_engine_test.cpp
   query_engine_execute_cpu_test.cpp
@@ -31,6 +37,7 @@ target_link_libraries(kernellake_unit_tests PRIVATE
   kernellake_optimizer
   kernellake_storage
   kernellake_io
+  kernellake_iceberg
   kernellake_api
   kernellake_generator
   GTest::gtest

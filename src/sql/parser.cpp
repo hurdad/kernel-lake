@@ -173,49 +173,70 @@ std::optional<std::pair<std::vector<std::string>, std::size_t>> try_parse_read_p
 
 // hyrise/sql-parser's FROM-clause grammar only accepts table names, joins,
 // and subqueries -- it has no notion of a table-valued function call like
-// `read_parquet('...')`. We find every occurrence of that one specific
-// shape ourselves, extract its string-literal path arguments, and
-// substitute a distinct placeholder identifier for each occurrence before
-// handing the query to the parser -- this leaves the surrounding syntax
-// (JOIN/ON/aliases/commas) completely untouched, so hsql's own grammar
-// still does the real work of parsing table references and join structure.
-// This is a deliberate, narrow, documented preprocessing step -- not
-// general SQL-string rewriting -- and any FROM clause whose shape isn't
-// recognized after this substitution fails clearly in parse_sql() below
-// rather than being silently reinterpreted.
+// `read_parquet('...')` or `read_iceberg('...')`. We find every occurrence
+// of either specific shape ourselves, extract its string-literal
+// argument(s), and substitute a distinct placeholder identifier for each
+// occurrence before handing the query to the parser -- this leaves the
+// surrounding syntax (JOIN/ON/aliases/commas) completely untouched, so
+// hsql's own grammar still does the real work of parsing table references
+// and join structure. This is a deliberate, narrow, documented
+// preprocessing step -- not general SQL-string rewriting -- and any FROM
+// clause whose shape isn't recognized after this substitution fails
+// clearly in parse_sql() below rather than being silently reinterpreted.
+//
+// `read_iceberg('catalog.namespace.table')` takes exactly one string
+// argument (unlike read_parquet's comma-separated path list), which this
+// preprocessor re-encodes as a single path "iceberg://catalog.namespace.table"
+// -- reusing kernellake::Uri's existing scheme-dispatch idiom (the same one
+// ObjectStoreRegistry already uses for S3/GCS/Azure/HDFS) so that
+// AstParquetSource, the binder, and LogicalScan need no "source kind"
+// concept of their own; only IcebergSourceResolver
+// (kernellake/iceberg/iceberg_source_resolver.hpp) ever looks at the
+// prefix. Splitting "catalog.namespace.table" into its parts, and
+// validating the catalog name against configured catalogs, happens there
+// too -- not here, matching how a read_parquet(...) path's own syntax
+// isn't validated at this layer either.
 namespace {
 Preprocessed preprocess_from_read_parquet(const std::string& sql) {
-  static constexpr std::string_view kFunctionName = "read_parquet";
+  static constexpr std::string_view kParquetFunctionName = "read_parquet";
+  static constexpr std::string_view kIcebergFunctionName = "read_iceberg";
 
   std::string rewritten;
   std::vector<PlaceholderSource> sources;
   std::size_t pos = 0;
   while (pos < sql.size()) {
-    if (!starts_with_ci(sql, pos, kFunctionName)) {
+    const bool is_parquet = starts_with_ci(sql, pos, kParquetFunctionName);
+    const bool is_iceberg = !is_parquet && starts_with_ci(sql, pos, kIcebergFunctionName);
+    if (!is_parquet && !is_iceberg) {
       rewritten += sql[pos];
       ++pos;
       continue;
     }
+    const std::string_view function_name = is_parquet ? kParquetFunctionName : kIcebergFunctionName;
     std::optional<std::pair<std::vector<std::string>, std::size_t>> parsed =
-        try_parse_read_parquet_args(sql, pos + kFunctionName.size());
-    if (!parsed) {
+        try_parse_read_parquet_args(sql, pos + function_name.size());
+    if (!parsed || (is_iceberg && parsed->first.size() != 1)) {
       // Doesn't have the shape this preprocessor understands (e.g. a
-      // non-string argument) -- leave the text untouched; hsql's own
-      // grammar will reject it with a normal parse error.
+      // non-string argument, or more than one argument to read_iceberg) --
+      // leave the text untouched; hsql's own grammar will reject it with a
+      // normal parse error.
       rewritten += sql[pos];
       ++pos;
       continue;
     }
     std::string placeholder = "kernellake_parquet_source_" + std::to_string(sources.size());
     rewritten += placeholder;
-    sources.push_back(PlaceholderSource{placeholder, std::move(parsed->first)});
+    std::vector<std::string> paths = is_iceberg ? std::vector<std::string>{"iceberg://" + parsed->first.front()}
+                                                : std::move(parsed->first);
+    sources.push_back(PlaceholderSource{placeholder, std::move(paths)});
     pos = parsed->second;
   }
 
   if (sources.empty()) {
     throw SqlError(
         "KernelLake requires at least one data source of the form "
-        "read_parquet('path' [, 'path2', ...]); no such clause was found in the query");
+        "read_parquet('path' [, 'path2', ...]) or read_iceberg('catalog.namespace.table'); no such clause "
+        "was found in the query");
   }
   // Generous relative to any real query (TPC-H's own deepest join, Q8,
   // needs 7) -- purely a guard against a pathological number of joined
@@ -224,7 +245,8 @@ Preprocessed preprocess_from_read_parquet(const std::string& sql) {
   constexpr std::size_t kMaxJoinSources = 12;
   if (sources.size() > kMaxJoinSources) {
     throw SqlError(
-        fmt::format("KernelLake supports at most {} read_parquet(...) sources in a JOIN chain, got {}",
+        fmt::format("KernelLake supports at most {} read_parquet(...)/read_iceberg(...) sources in a JOIN "
+                    "chain, got {}",
                     kMaxJoinSources, sources.size()));
   }
   return Preprocessed{std::move(rewritten), std::move(sources)};
@@ -517,7 +539,7 @@ AstExprPtr convert_expr(const hsql::Expr* e) {
 // and required alias.
 AstParquetSource convert_join_source(const hsql::TableRef* ref, const Preprocessed& preprocessed) {
   if (ref == nullptr || ref->type != hsql::kTableName || ref->name == nullptr) {
-    unsupported("JOIN sides must each be a single read_parquet(...) source, not a subquery or nested join");
+    unsupported("JOIN sides must each be a single read_parquet(...)/read_iceberg(...) source, not a subquery or nested join");
   }
   if (ref->alias == nullptr || ref->alias->name == nullptr) {
     unsupported("both sides of a JOIN must be aliased, e.g. read_parquet('a.parquet') AS a");
@@ -527,7 +549,7 @@ AstParquetSource convert_join_source(const hsql::TableRef* ref, const Preprocess
       return AstParquetSource{source.paths, std::string(ref->alias->name)};
     }
   }
-  unsupported("JOIN source does not reference a read_parquet(...) call");
+  unsupported("JOIN source does not reference a read_parquet(...)/read_iceberg(...) call");
 }
 
 // hsql parses a multi-way JOIN left-associatively: `A JOIN B ON c1 JOIN C
@@ -612,8 +634,8 @@ AstSelectStatement parse_sql(std::string_view sql_view) {
       stmt->fromTable->name != nullptr) {
     if (preprocessed.sources.size() != 1 || stmt->fromTable->name != preprocessed.sources[0].placeholder) {
       unsupported(
-          "joins and subqueries (only a single FROM read_parquet(...) source, or a two-table JOIN, "
-          "is supported)");
+          "joins and subqueries (only a single FROM read_parquet(...)/read_iceberg(...) source, or a "
+          "two-table JOIN, is supported)");
     }
     out.from.paths = preprocessed.sources[0].paths;
     if (stmt->fromTable->alias != nullptr && stmt->fromTable->alias->name != nullptr) {
@@ -627,13 +649,13 @@ AstSelectStatement parse_sql(std::string_view sql_view) {
     // the JOIN chain the parser understood (this project has no other FROM
     // shape a source could legitimately appear in).
     if (preprocessed.sources.size() != clause.steps.size() + 1) {
-      unsupported("a JOIN requires exactly one read_parquet(...) source per table in the chain");
+      unsupported("a JOIN requires exactly one read_parquet(...)/read_iceberg(...) source per table in the chain");
     }
     out.join = std::move(clause);
   } else {
     unsupported(
-        "joins and subqueries (only a single FROM read_parquet(...) source, or a two-table JOIN, is "
-        "supported)");
+        "joins and subqueries (only a single FROM read_parquet(...)/read_iceberg(...) source, or a "
+        "two-table JOIN, is supported)");
   }
 
   if (stmt->selectList == nullptr || stmt->selectList->empty()) {

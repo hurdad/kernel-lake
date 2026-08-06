@@ -89,6 +89,26 @@ TEST(SqlParser, RejectsMissingReadParquetSource) {
   EXPECT_THROW((void)(parse_sql("SELECT a FROM sales")), SqlError);
 }
 
+TEST(SqlParser, ParsesReadIcebergSource) {
+  const auto stmt = parse_sql("SELECT a FROM read_iceberg('prod.db.orders') WHERE a > 0");
+  ASSERT_EQ(stmt.from.paths.size(), 1u);
+  EXPECT_EQ(stmt.from.paths[0], "iceberg://prod.db.orders");
+}
+
+TEST(SqlParser, RejectsReadIcebergWithMultipleArguments) {
+  EXPECT_THROW((void)(parse_sql("SELECT a FROM read_iceberg('prod.db.orders', 'extra')")), SqlError);
+}
+
+TEST(SqlParser, ParsesJoinBetweenParquetAndIcebergSources) {
+  const auto stmt = parse_sql(
+      "SELECT a.x, b.y FROM read_parquet('/x.parquet') AS a "
+      "JOIN read_iceberg('prod.db.orders') AS b ON a.order_id = b.order_id");
+  ASSERT_TRUE(stmt.join.has_value());
+  EXPECT_EQ(stmt.join->first.paths[0], "/x.parquet");
+  ASSERT_EQ(stmt.join->steps.size(), 1u);
+  EXPECT_EQ(stmt.join->steps[0].source.paths[0], "iceberg://prod.db.orders");
+}
+
 TEST(SqlParser, RejectsJoinsWithoutAliases) {
   // Both sides of a JOIN must be aliased -- unqualified column references
   // like `a.order_id` would otherwise have no way to pick a side.
