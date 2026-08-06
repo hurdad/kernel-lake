@@ -110,7 +110,8 @@ jobs:
             python3 python3-pip \
             libgtest-dev libbenchmark-dev libspdlog-dev nlohmann-json3-dev libyaml-cpp-dev \
             libxml2-dev uuid-dev clang-tidy-18 \
-            libavro-dev libcurl4-openssl-dev
+            libavro-dev libcurl4-openssl-dev \
+            libgrpc++-dev protobuf-compiler-grpc
       - name: Install Apache Arrow / Parquet C++
         run: |
           wget -O /tmp/arrow-apt-source.deb \
@@ -152,7 +153,8 @@ jobs:
             python3 python3-pip \
             libgtest-dev libbenchmark-dev libspdlog-dev nlohmann-json3-dev libyaml-cpp-dev \
             libxml2-dev uuid-dev \
-            libavro-dev libcurl4-openssl-dev
+            libavro-dev libcurl4-openssl-dev \
+            libgrpc++-dev protobuf-compiler-grpc
       - name: Install Apache Arrow / Parquet C++
         run: |
           wget -O /tmp/arrow-apt-source.deb \
@@ -182,7 +184,8 @@ jobs:
             python3 python3-pip \
             libgtest-dev libbenchmark-dev libspdlog-dev nlohmann-json3-dev libyaml-cpp-dev \
             libxml2-dev uuid-dev \
-            libavro-dev libcurl4-openssl-dev
+            libavro-dev libcurl4-openssl-dev \
+            libgrpc++-dev protobuf-compiler-grpc
       - name: Install Apache Arrow / Parquet C++
         run: |
           wget -O /tmp/arrow-apt-source.deb \
