@@ -23,7 +23,13 @@ class DeltaSourceResolver final : public TableSourceResolver {
   explicit DeltaSourceResolver(DeltaSection config) : config_(std::move(config)) {}
 
   [[nodiscard]] bool can_resolve(const std::vector<std::string>& sources) const override;
-  [[nodiscard]] ResolvedTable resolve(ObjectStore& store, const std::vector<std::string>& sources) override;
+  // `predicates` is currently unused: resolve_delta_table() doesn't do
+  // file-level predicate pruning of its own yet (Delta's partition columns
+  // are always identity-transform, so this would be a cheap follow-up --
+  // see docs/ROADMAP.md). Still accepted, to satisfy the
+  // TableSourceResolver interface.
+  [[nodiscard]] ResolvedTable resolve(ObjectStore& store, const std::vector<std::string>& sources,
+                                      const std::vector<PushablePredicate>& predicates) override;
 
  private:
   DeltaSection config_;

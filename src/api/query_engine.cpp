@@ -21,7 +21,13 @@ namespace {
 ResolvedTable inspect_source(ObjectStore& store, const std::vector<std::string>& paths,
                              TableSourceResolver* extra_resolver, double* elapsed_seconds_out) {
   const auto start = std::chrono::steady_clock::now();
-  ResolvedTable resolved = resolve_table_or_delegate(store, paths, extra_resolver);
+  // Empty predicates: this call is schema/partition-column discovery for
+  // binding, run before the optimizer has computed any pushable predicates
+  // (the WHERE clause isn't bound against a schema yet at this point) --
+  // see TableSourceResolver::resolve()'s own doc comment. Physical
+  // planning's own resolve (convert_scan(), src/io/physical_planner.cpp)
+  // passes the real ones once they exist.
+  ResolvedTable resolved = resolve_table_or_delegate(store, paths, extra_resolver, {});
   if (elapsed_seconds_out != nullptr) {
     *elapsed_seconds_out += std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
   }

@@ -19,7 +19,8 @@ bool DeltaSourceResolver::can_resolve(const std::vector<std::string>& sources) c
   return sources.size() == 1 && Uri(sources[0]).scheme() == kScheme;
 }
 
-ResolvedTable DeltaSourceResolver::resolve(ObjectStore& store, const std::vector<std::string>& sources) {
+ResolvedTable DeltaSourceResolver::resolve(ObjectStore& store, const std::vector<std::string>& sources,
+                                           const std::vector<PushablePredicate>& /*predicates*/) {
   const std::string& source = sources.at(0);
   const std::size_t scheme_end = source.find("://");
   const std::string table_uri = source.substr(scheme_end + 3);

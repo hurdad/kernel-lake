@@ -4,6 +4,7 @@
 
 #include "kernellake/common/errors.hpp"
 #include "kernellake/iceberg/manifest_reader.hpp"
+#include "kernellake/iceberg/partition_pruning.hpp"
 #include "kernellake/iceberg/schema_translation.hpp"
 #include "kernellake/io/parquet_metadata.hpp"
 
@@ -29,8 +30,8 @@ bool is_live_status(int32_t status) {
 }  // namespace
 
 ResolvedTable resolve_iceberg_table(ObjectStore& store, IcebergRestCatalogClient& catalog,
-                                    const std::vector<std::string>& namespace_parts,
-                                    const std::string& table) {
+                                    const std::vector<std::string>& namespace_parts, const std::string& table,
+                                    const std::vector<PushablePredicate>& predicates) {
   const IcebergTableMetadata table_metadata = catalog.load_table_metadata(namespace_parts, table);
   const Schema schema = iceberg_schema_to_kernellake_schema(table_metadata.schema_fields);
 
@@ -57,6 +58,14 @@ ResolvedTable resolve_iceberg_table(ObjectStore& store, IcebergRestCatalogClient
           manifest_entry.manifest_path));
     }
 
+    // The partition spec this manifest's data files were written under --
+    // nullptr when the table's own metadata carries no "partition-specs"
+    // at all (older/compat REST server, or an unpartitioned table), in
+    // which case partition pruning simply never applies below (never a
+    // correctness issue, see IcebergTableMetadata::find_partition_spec()'s
+    // own comment).
+    const IcebergPartitionSpec* spec = table_metadata.find_partition_spec(manifest_entry.partition_spec_id);
+
     for (ManifestDataFileEntry& data_file : read_manifest(store, Uri(manifest_entry.manifest_path))) {
       if (!is_live_status(data_file.status)) {
         continue;  // DELETED: superseded by a later snapshot, not part of this read.
@@ -65,6 +74,10 @@ ResolvedTable resolve_iceberg_table(ObjectStore& store, IcebergRestCatalogClient
         throw StorageError(fmt::format(
             "iceberg table resolution: data file '{}' has format '{}' -- only PARQUET is supported",
             data_file.file_path, data_file.file_format));
+      }
+      if (spec != nullptr &&
+          partition_values_prove_empty(table_metadata, *spec, data_file.partition_values, predicates)) {
+        continue;  // Proven empty by partition pruning -- never opened at all.
       }
       live_data_files.push_back(std::move(data_file));
     }

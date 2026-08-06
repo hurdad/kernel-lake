@@ -35,15 +35,42 @@ struct IcebergSchemaField {
   std::string type;
 };
 
+// One field of a partition spec's "fields" array
+// (https://iceberg.apache.org/spec/#partition-specs): `source_id` is the
+// schema field this partition column is derived from (matched against
+// IcebergSchemaField::id, not by name -- a partition field's own `name`
+// defaults to `{source-field-name}_{transform}` but can be renamed
+// independently); `transform` is the raw transform string ("identity",
+// "year", "month", "day", "hour", "bucket[N]", "truncate[W]", "void") --
+// see kernellake/iceberg/partition_pruning.hpp for which of these this
+// project can actually use for pruning today.
+struct IcebergPartitionField {
+  int32_t source_id = 0;
+  int32_t field_id = 0;
+  std::string name;
+  std::string transform;
+};
+
+// One entry of table metadata's "partition-specs" array. A table can have
+// multiple partition specs over its history (spec evolution) -- each
+// manifest-list entry records which spec-id its manifest's data files were
+// partitioned under (ManifestListEntry::partition_spec_id,
+// kernellake/iceberg/manifest_reader.hpp), so a manifest written under an
+// older spec is still interpreted correctly via
+// IcebergTableMetadata::find_partition_spec().
+struct IcebergPartitionSpec {
+  int32_t spec_id = 0;
+  std::vector<IcebergPartitionField> fields;
+};
+
 // The subset of a REST Catalog "LoadTableResult" -> table metadata JSON
 // this client extracts: enough for a manifest reader
 // (src/iceberg/manifest_reader.cpp) to locate and read the current
-// snapshot's manifest list, and for schema_translation.hpp to build a
-// kernellake::Schema for the table's current columns. Partition-spec
-// translation (interpreting a manifest entry's positional `partition`
-// values against named partition-spec fields and their transform, e.g.
-// bucket/truncate/day) is a separate, later integration step, not
-// attempted here.
+// snapshot's manifest list, for schema_translation.hpp to build a
+// kernellake::Schema for the table's current columns, and for
+// partition_pruning.hpp to interpret a manifest entry's positional
+// `partition` values against named partition-spec fields and their
+// transform (e.g. bucket/truncate/day).
 struct IcebergTableMetadata {
   std::string location;
   int32_t format_version = 0;
@@ -53,12 +80,24 @@ struct IcebergTableMetadata {
   // "schemas"/"current-schema-id" pair, falling back to a bare v1
   // "schema" field if "schemas" is absent (older/compat REST servers).
   std::vector<IcebergSchemaField> schema_fields;
+  // Populated from v2 table metadata's "partition-specs" array; left empty
+  // for older/compat servers that only send v1's bare "partition-spec"
+  // (no spec-id wrapper) -- partition pruning then simply never applies to
+  // such a table (a missed optimization, never a correctness issue, same
+  // "degrade to always-scan" rule as missing column statistics).
+  std::vector<IcebergPartitionSpec> partition_specs;
 
   // The manifest-list path for current_snapshot_id, or nullopt if the table
   // has no current snapshot (freshly created, no commits yet) or --
   // shouldn't happen against a spec-compliant server, but guarded against
   // rather than assumed -- current_snapshot_id doesn't appear in snapshots.
   [[nodiscard]] std::optional<std::string> current_manifest_list() const;
+
+  // Looks up the partition spec matching `spec_id`, or nullptr if none is
+  // found (no "partition-specs" in the source metadata, or -- shouldn't
+  // happen against a spec-compliant server -- a manifest referencing a
+  // spec-id this table's metadata doesn't list).
+  [[nodiscard]] const IcebergPartitionSpec* find_partition_spec(int32_t spec_id) const;
 };
 
 // A client for one named Iceberg REST catalog (see IcebergCatalogSection,

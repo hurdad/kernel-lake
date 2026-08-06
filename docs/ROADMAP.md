@@ -2191,23 +2191,78 @@ and covered by passing tests -- not merely designed or stubbed.
       ASan+UBSan+LeakSanitizer build used earlier in this phase: all 256
       tests pass, only the same already-diagnosed libavro-c 1.12.0
       error-path leak, nothing new.
-    - Not yet done, tracked as a later phase: interpreting partition
-      values against named, transform-aware partition-spec fields
-      (bucket/truncate/year/month/day/hour) for partition-level pruning
-      (a pure optimization, not a correctness gap -- see
-      `resolve_iceberg_table()`'s own comment on why partition columns
-      aren't needed for correct results today), and caching
-      `IcebergRestCatalogClient`/its OAuth2 token across queries against
-      the same catalog.
+    - Not yet done: caching `IcebergRestCatalogClient`/its OAuth2 token
+      across queries against the same catalog (a later session closed
+      the other item that used to be listed here, interpreting partition
+      values against named, transform-aware partition-spec fields for
+      partition-level pruning -- see "Partition-spec-aware file pruning"
+      below).
 
   **Phase 3 (Iceberg REST catalogs) is now functionally complete for the
   MVP's scope**: config, REST catalog client (bearer/OAuth2 auth), Avro
   manifest reading, Iceberg-to-`kernellake::Schema` translation, real file
-  resolution with row-group pruning, and a working `read_iceberg(...)` SQL
-  surface, all tested end to end against real fixtures. Row-level deletes,
-  schema evolution across files, and partition-spec-aware pruning remain
-  explicit, documented non-goals for now -- see the entries above for
-  exactly where each one throws instead of guessing.
+  resolution with row-group and partition-spec-aware pruning, and a
+  working `read_iceberg(...)` SQL surface, all tested end to end against
+  real fixtures. Row-level deletes and schema evolution across files
+  remain explicit, documented non-goals for now -- see the entries above
+  for exactly where each one throws instead of guessing.
+
+- **Partition-spec-aware file pruning, landing this session** (closes
+  Phase 3's own former "not yet done" entry above). `IcebergTableMetadata`
+  (`kernellake/iceberg/rest_catalog_client.hpp`) now also parses v2 table
+  metadata's `partition-specs` array (`IcebergPartitionSpec`/
+  `IcebergPartitionField`: spec-id, and each field's source-id/field-id/
+  name/transform) -- empty, and pruning simply never applies, for
+  older/compat servers that only send v1's bare `partition-spec`.
+  `kernellake/iceberg/partition_pruning.hpp`'s
+  `partition_values_prove_empty()` is the file-level analog of
+  `evaluate_pruning()`'s row-group min/max pruning
+  (`kernellake/io/parquet_pruning.hpp`), applied one step earlier in
+  `resolve_iceberg_table()` -- a file proven empty is skipped before
+  `inspect_parquet_file()` is ever called on it at all, unlike row-group
+  pruning which needs the footer already read.
+  - **Supported transforms: identity, year, month, day, hour** -- all
+    monotonic (non-decreasing) functions of their source column, so the
+    file's own (already-transformed) partition value can be compared
+    against `transform(predicate literal)` using the exact same
+    per-operator range logic `evaluate_pruning()` uses for a real
+    `[min, max]` row-group range, just degenerated to a single point
+    `[V, V]`. `!=` only prunes for `identity`: a coarsening transform's
+    partition value matching `transform(literal)` doesn't mean every
+    row's *source* value equals the literal (e.g. a `day`-partitioned
+    timestamp column packs many distinct timestamps into one partition),
+    so only `identity` (no coarsening at all) preserves the guarantee
+    `!=` pruning needs. Verified with hand-computed reference dates
+    exercising both the post-epoch and pre-epoch (negative
+    remaining-days) branches of the new `civil_from_days()` calendar
+    decomposition (the exact inverse of `date_util.cpp`'s
+    `parse_iso_date()`), plus floor-vs-truncating-division edge cases for
+    negative microsecond timestamps.
+  - **`bucket[N]` and `truncate[W]` are deliberately not evaluated at
+    all** -- a predicate against either always falls through to "must
+    scan". Correctly computing Iceberg's bucket hash (a specific murmur3
+    variant over a type-specific byte encoding) or truncate's per-type
+    truncation rules needs its own careful, independently-verified
+    implementation; getting either wrong would silently skip files that
+    still contain matching rows -- a real correctness bug, not just a
+    missed optimization -- so this is left an explicit, documented
+    non-goal rather than a best-effort guess. A natural follow-up, not
+    attempted this session.
+  - **Verification**: a new `partition_pruning_test.cpp` (17 direct unit
+    tests covering every transform, both the prune and no-prune side of
+    each operator, and every defensive fallback path -- unmatched column,
+    missing schema field, null partition value, null literal, mismatched
+    field/value counts); two new `rest_catalog_client_test.cpp` tests for
+    `partition-specs` JSON parsing; and one new
+    `iceberg_table_resolution_test.cpp` end-to-end test
+    (`PartitionPruningSkipsFilesWithoutOpeningThem`) that points a
+    would-be-pruned file's manifest entry at a Parquet path that's never
+    written to disk at all -- proven to actually catch a regression, not
+    just pass by construction, by temporarily disabling the prune check
+    and confirming the test fails with exactly the expected "file not
+    found" error before re-enabling it. `dev` 310/310, `otel-dev`
+    313/313, `server-dev` 314/314, all green; format and
+    `run-clang-tidy-18 -warnings-as-errors='*'` both clean.
 
 - **Delta Lake support, now functionally complete for the MVP's scope
   (gRPC client to delta-txn-service)** (Phase 4 of the lakehouse roadmap).

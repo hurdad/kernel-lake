@@ -192,7 +192,8 @@ const Schema* find_scan_schema(const PhysicalPlanNode& node) {
 
 PhysicalPlanPtr convert_scan(const LogicalScan& scan, ObjectStore& store,
                              TableSourceResolver* extra_resolver) {
-  const ResolvedTable resolved = resolve_table_or_delegate(store, scan.source_paths(), extra_resolver);
+  const ResolvedTable resolved =
+      resolve_table_or_delegate(store, scan.source_paths(), extra_resolver, scan.pushable_predicates());
 
   std::vector<PhysicalFileFragment> fragments;
   fragments.reserve(resolved.files.size());

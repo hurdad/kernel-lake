@@ -23,7 +23,8 @@ TEST(DeltaSourceResolver, CanResolveOnlyClaimsDeltaSchemeSources) {
 TEST(DeltaSourceResolver, ThrowsWhenGrpcEndpointIsNotConfigured) {
   DeltaSourceResolver resolver{DeltaSection{}};  // grpc_endpoint left empty
   LocalObjectStore store;
-  EXPECT_THROW((void)(resolver.resolve(store, {"delta://s3://bucket/warehouse/orders"})), ConfigurationError);
+  EXPECT_THROW((void)(resolver.resolve(store, {"delta://s3://bucket/warehouse/orders"}, {})),
+               ConfigurationError);
 }
 
 }  // namespace

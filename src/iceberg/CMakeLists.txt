@@ -2,6 +2,7 @@ add_library(kernellake_iceberg STATIC
   rest_catalog_client.cpp
   manifest_reader.cpp
   schema_translation.cpp
+  partition_pruning.cpp
   iceberg_table_resolution.cpp
   iceberg_source_resolver.cpp
 )

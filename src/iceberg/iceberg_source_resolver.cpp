@@ -61,7 +61,8 @@ bool IcebergSourceResolver::can_resolve(const std::vector<std::string>& sources)
   return sources.size() == 1 && Uri(sources[0]).scheme() == kScheme;
 }
 
-ResolvedTable IcebergSourceResolver::resolve(ObjectStore& store, const std::vector<std::string>& sources) {
+ResolvedTable IcebergSourceResolver::resolve(ObjectStore& store, const std::vector<std::string>& sources,
+                                             const std::vector<PushablePredicate>& predicates) {
   const std::string& source = sources.at(0);
   const std::size_t scheme_end = source.find("://");
   const QualifiedName name = parse_qualified_name(source.substr(scheme_end + 3));
@@ -78,7 +79,7 @@ ResolvedTable IcebergSourceResolver::resolve(ObjectStore& store, const std::vect
   // against this catalog. A deliberate MVP simplification, not a permanent
   // design decision -- see docs/ROADMAP.md.
   IcebergRestCatalogClient client(it->second);
-  return resolve_iceberg_table(store, client, name.namespace_parts, name.table);
+  return resolve_iceberg_table(store, client, name.namespace_parts, name.table, predicates);
 }
 
 }  // namespace kernellake::iceberg

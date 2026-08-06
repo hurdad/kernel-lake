@@ -197,6 +197,60 @@ TEST(IcebergRestCatalogClient, LoadTableMetadataParsesCurrentSchemaFromV2Schemas
   EXPECT_FALSE(metadata.schema_fields[1].required);
 }
 
+constexpr const char* kLoadTableResultWithPartitionSpecsJson = R"json({
+  "metadata": {
+    "format-version": 2,
+    "location": "s3://warehouse/db/orders",
+    "current-schema-id": 0,
+    "schemas": [{"schema-id": 0, "fields": [
+      {"id": 1, "name": "id", "required": true, "type": "long"},
+      {"id": 2, "name": "ts", "required": false, "type": "timestamp"}
+    ]}],
+    "partition-specs": [
+      {"spec-id": 0, "fields": []},
+      {"spec-id": 1, "fields": [
+        {"source-id": 2, "field-id": 1000, "name": "ts_day", "transform": "day"}
+      ]}
+    ]
+  }
+})json";
+
+TEST(IcebergRestCatalogClient, LoadTableMetadataParsesPartitionSpecs) {
+  LoopbackHttpServer server;
+  server.respond({http_ok_json(kLoadTableResultWithPartitionSpecsJson)});
+
+  IcebergRestCatalogClient client(catalog_config(server.base_url()));
+  const IcebergTableMetadata metadata = client.load_table_metadata({"db"}, "orders");
+  server.join();
+
+  ASSERT_EQ(metadata.partition_specs.size(), 2u);
+  const IcebergPartitionSpec* spec0 = metadata.find_partition_spec(0);
+  ASSERT_NE(spec0, nullptr);
+  EXPECT_TRUE(spec0->fields.empty());
+
+  const IcebergPartitionSpec* spec1 = metadata.find_partition_spec(1);
+  ASSERT_NE(spec1, nullptr);
+  ASSERT_EQ(spec1->fields.size(), 1u);
+  EXPECT_EQ(spec1->fields[0].source_id, 2);
+  EXPECT_EQ(spec1->fields[0].field_id, 1000);
+  EXPECT_EQ(spec1->fields[0].name, "ts_day");
+  EXPECT_EQ(spec1->fields[0].transform, "day");
+
+  EXPECT_EQ(metadata.find_partition_spec(99), nullptr);
+}
+
+TEST(IcebergRestCatalogClient, LoadTableMetadataLeavesPartitionSpecsEmptyWhenAbsent) {
+  LoopbackHttpServer server;
+  server.respond({http_ok_json(kLoadTableResultJson)});
+
+  IcebergRestCatalogClient client(catalog_config(server.base_url()));
+  const IcebergTableMetadata metadata = client.load_table_metadata({"db"}, "orders");
+  server.join();
+
+  EXPECT_TRUE(metadata.partition_specs.empty());
+  EXPECT_EQ(metadata.find_partition_spec(0), nullptr);
+}
+
 TEST(IcebergRestCatalogClient, LoadTableMetadataFallsBackToV1SchemaField) {
   constexpr const char* kV1Json = R"({
     "metadata": {

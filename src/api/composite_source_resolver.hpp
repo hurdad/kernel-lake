@@ -26,11 +26,12 @@ class CompositeSourceResolver final : public TableSourceResolver {
     return first_.can_resolve(sources) || second_.can_resolve(sources);
   }
 
-  [[nodiscard]] ResolvedTable resolve(ObjectStore& store, const std::vector<std::string>& sources) override {
+  [[nodiscard]] ResolvedTable resolve(ObjectStore& store, const std::vector<std::string>& sources,
+                                      const std::vector<PushablePredicate>& predicates) override {
     if (first_.can_resolve(sources)) {
-      return first_.resolve(store, sources);
+      return first_.resolve(store, sources, predicates);
     }
-    return second_.resolve(store, sources);
+    return second_.resolve(store, sources, predicates);
   }
 
  private:

@@ -122,6 +122,30 @@ constexpr const char* kManifestSchemaJson = R"({
   ]
 })";
 
+// Same shape as kManifestSchemaJson, but with one populated partition
+// field -- for the partition-pruning test below, which needs a real
+// (non-empty) manifest "partition" struct to decode a value from.
+constexpr const char* kManifestSchemaWithRegionPartitionJson = R"({
+  "type": "record",
+  "name": "manifest_entry",
+  "fields": [
+    {"name": "status", "type": "int"},
+    {"name": "data_file", "type": {
+      "type": "record",
+      "name": "r2",
+      "fields": [
+        {"name": "file_path", "type": "string"},
+        {"name": "file_format", "type": "string"},
+        {"name": "record_count", "type": "long"},
+        {"name": "file_size_in_bytes", "type": "long"},
+        {"name": "partition", "type": {"type": "record", "name": "r102", "fields": [
+          {"name": "region", "type": "string"}
+        ]}}
+      ]
+    }}
+  ]
+})";
+
 // Small avro-c writer helper -- same shape as manifest_reader_test.cpp's
 // AvroFixtureWriter, duplicated for the same "no shared test-utility
 // target" reason as LoopbackHttpServer above.
@@ -206,6 +230,38 @@ class IcebergTableResolutionTest : public ::testing::Test {
     ASSERT_TRUE(write_status.ok()) << write_status.ToString();
   }
 
+  // "id: long, amount: double, region: string" -- for the
+  // partition-pruning test below, where an identity-transform partition
+  // column is (correctly, per Iceberg semantics -- see
+  // iceberg_table_resolution.hpp's own comment) physically present in the
+  // data file itself, unlike Delta's partition columns.
+  void write_data_file_with_region(const fs::path& path, int64_t id_start, int64_t count,
+                                   const std::string& region) {
+    arrow::Int64Builder id_builder;
+    arrow::DoubleBuilder amount_builder;
+    arrow::StringBuilder region_builder;
+    for (int64_t i = 0; i < count; ++i) {
+      ASSERT_TRUE(id_builder.Append(id_start + i).ok());
+      ASSERT_TRUE(amount_builder.Append(static_cast<double>(id_start + i)).ok());
+      ASSERT_TRUE(region_builder.Append(region).ok());
+    }
+    std::shared_ptr<arrow::Array> id_array;
+    std::shared_ptr<arrow::Array> amount_array;
+    std::shared_ptr<arrow::Array> region_array;
+    ASSERT_TRUE(id_builder.Finish(&id_array).ok());
+    ASSERT_TRUE(amount_builder.Finish(&amount_array).ok());
+    ASSERT_TRUE(region_builder.Finish(&region_array).ok());
+    const auto schema = arrow::schema({arrow::field("id", arrow::int64(), false),
+                                       arrow::field("amount", arrow::float64(), true),
+                                       arrow::field("region", arrow::utf8(), true)});
+    const auto table = arrow::Table::Make(schema, {id_array, amount_array, region_array});
+    auto sink_result = arrow::io::FileOutputStream::Open(path.string());
+    ASSERT_TRUE(sink_result.ok()) << sink_result.status().ToString();
+    const arrow::Status write_status =
+        parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), *sink_result, /*chunk_size=*/count);
+    ASSERT_TRUE(write_status.ok()) << write_status.ToString();
+  }
+
   fs::path write_manifest(const std::string& name, const std::vector<std::pair<std::string, int64_t>>& files,
                           int32_t status) {
     AvroFixtureWriter writer(kManifestSchemaJson);
@@ -219,6 +275,33 @@ class IcebergTableResolutionTest : public ::testing::Test {
         set_string_field(data_file, "file_format", "PARQUET");
         set_long_field(data_file, "record_count", count);
         set_long_field(data_file, "file_size_in_bytes", 1000);
+      });
+    }
+    const fs::path manifest_path = dir_ / name;
+    writer.write(manifest_path, rows);
+    return manifest_path;
+  }
+
+  // One data file per (path, record_count, region) triple, `region` set
+  // as the manifest entry's single partition value (see
+  // kManifestSchemaWithRegionPartitionJson above) -- for the
+  // partition-pruning test below.
+  fs::path write_manifest_with_region_partition(
+      const std::string& name, const std::vector<std::tuple<std::string, int64_t, std::string>>& files) {
+    AvroFixtureWriter writer(kManifestSchemaWithRegionPartitionJson);
+    std::vector<std::function<void(avro_value_t&)>> rows;
+    for (const auto& [path, count, region] : files) {
+      rows.push_back([path, count, region](avro_value_t& v) {
+        set_int_field(v, "status", /*ADDED=*/1);
+        avro_value_t data_file;
+        avro_value_get_by_name(&v, "data_file", &data_file, nullptr);
+        set_string_field(data_file, "file_path", path);
+        set_string_field(data_file, "file_format", "PARQUET");
+        set_long_field(data_file, "record_count", count);
+        set_long_field(data_file, "file_size_in_bytes", 1000);
+        avro_value_t partition;
+        avro_value_get_by_name(&data_file, "partition", &partition, nullptr);
+        set_string_field(partition, "region", region);
       });
     }
     const fs::path manifest_path = dir_ / name;
@@ -280,7 +363,7 @@ TEST_F(IcebergTableResolutionTest, ResolvesLiveDataFilesWithCurrentSchema) {
   config.catalog_uri = server.base_url();
   IcebergRestCatalogClient catalog(config);
 
-  const ResolvedTable resolved = resolve_iceberg_table(store_, catalog, {"db"}, "orders");
+  const ResolvedTable resolved = resolve_iceberg_table(store_, catalog, {"db"}, "orders", {});
   server.join();
 
   EXPECT_TRUE(resolved.partition_columns.empty());
@@ -318,7 +401,7 @@ TEST_F(IcebergTableResolutionTest, SkipsDeletedStatusEntries) {
   config.catalog_uri = server.base_url();
   IcebergRestCatalogClient catalog(config);
 
-  const ResolvedTable resolved = resolve_iceberg_table(store_, catalog, {"db"}, "orders");
+  const ResolvedTable resolved = resolve_iceberg_table(store_, catalog, {"db"}, "orders", {});
   server.join();
 
   ASSERT_EQ(resolved.files.size(), 1u);
@@ -339,7 +422,7 @@ TEST_F(IcebergTableResolutionTest, ThrowsOnLiveDeleteManifest) {
   config.catalog_uri = server.base_url();
   IcebergRestCatalogClient catalog(config);
 
-  EXPECT_THROW((void)(resolve_iceberg_table(store_, catalog, {"db"}, "orders")), StorageError);
+  EXPECT_THROW((void)(resolve_iceberg_table(store_, catalog, {"db"}, "orders", {})), StorageError);
   server.join();
 }
 
@@ -366,7 +449,7 @@ TEST_F(IcebergTableResolutionTest, ThrowsOnNonParquetDataFile) {
   config.catalog_uri = server.base_url();
   IcebergRestCatalogClient catalog(config);
 
-  EXPECT_THROW((void)(resolve_iceberg_table(store_, catalog, {"db"}, "orders")), StorageError);
+  EXPECT_THROW((void)(resolve_iceberg_table(store_, catalog, {"db"}, "orders", {})), StorageError);
   server.join();
 }
 
@@ -393,7 +476,7 @@ TEST_F(IcebergTableResolutionTest, ThrowsWhenDataFileSchemaDoesNotMatchTableSche
   config.catalog_uri = server.base_url();
   IcebergRestCatalogClient catalog(config);
 
-  EXPECT_THROW((void)(resolve_iceberg_table(store_, catalog, {"db"}, "orders")), StorageError);
+  EXPECT_THROW((void)(resolve_iceberg_table(store_, catalog, {"db"}, "orders", {})), StorageError);
   server.join();
 }
 
@@ -416,11 +499,63 @@ TEST_F(IcebergTableResolutionTest, TableWithNoCurrentSnapshotResolvesToZeroFiles
   config.catalog_uri = server.base_url();
   IcebergRestCatalogClient catalog(config);
 
-  const ResolvedTable resolved = resolve_iceberg_table(store_, catalog, {"db"}, "orders");
+  const ResolvedTable resolved = resolve_iceberg_table(store_, catalog, {"db"}, "orders", {});
   server.join();
 
   EXPECT_TRUE(resolved.files.empty());
   ASSERT_EQ(resolved.schema.field_count(), 1u);
+}
+
+// Proves partition pruning actually skips a file, not just that it
+// *would*: the "EU" data file's path points at a Parquet file that's
+// never written to disk at all -- if resolve_iceberg_table() called
+// inspect_parquet_file() on it (i.e. pruning silently didn't run), this
+// would throw a real "failed to open" StorageError instead of succeeding
+// with just the "US" file's results.
+TEST_F(IcebergTableResolutionTest, PartitionPruningSkipsFilesWithoutOpeningThem) {
+  write_data_file_with_region(dir_ / "data-us.parquet", 0, 5, "US");
+  const fs::path nonexistent_eu_file = dir_ / "data-eu-never-written.parquet";
+
+  const fs::path manifest = write_manifest_with_region_partition(
+      "m0.avro", {{(dir_ / "data-us.parquet").string(), 5, "US"}, {nonexistent_eu_file.string(), 3, "EU"}});
+  const fs::path manifest_list = write_manifest_list("snap-42.avro", {{manifest.string(), 0}});
+
+  const std::string json = fmt::format(R"json({{
+    "metadata": {{
+      "format-version": 2,
+      "location": "{0}",
+      "current-schema-id": 0,
+      "schemas": [{{"schema-id": 0, "fields": [
+        {{"id": 1, "name": "id", "required": true, "type": "long"}},
+        {{"id": 2, "name": "amount", "required": false, "type": "double"}},
+        {{"id": 3, "name": "region", "required": false, "type": "string"}}
+      ]}}],
+      "current-snapshot-id": 42,
+      "snapshots": [{{"snapshot-id": 42, "manifest-list": "{1}"}}],
+      "partition-specs": [
+        {{"spec-id": 0, "fields": [
+          {{"source-id": 3, "field-id": 1000, "name": "region", "transform": "identity"}}
+        ]}}
+      ]
+    }}
+  }})json",
+                                       dir_.string(), manifest_list.string());
+
+  LoopbackHttpServer server;
+  server.respond({http_ok_json(json)});
+
+  IcebergCatalogSection config;
+  config.catalog_uri = server.base_url();
+  IcebergRestCatalogClient catalog(config);
+
+  const std::vector<PushablePredicate> predicates = {
+      PushablePredicate{"region", BinaryOperator::Equal,
+                        std::make_shared<LiteralExpression>(LiteralExpression::make_string("US"))}};
+  const ResolvedTable resolved = resolve_iceberg_table(store_, catalog, {"db"}, "orders", predicates);
+  server.join();
+
+  ASSERT_EQ(resolved.files.size(), 1u);
+  EXPECT_EQ(resolved.files[0].metadata.row_count, 5);
 }
 
 }  // namespace

@@ -236,9 +236,10 @@ ResolvedTable resolve_table(ObjectStore& store, const std::vector<std::string>& 
 }
 
 ResolvedTable resolve_table_or_delegate(ObjectStore& store, const std::vector<std::string>& sources,
-                                        TableSourceResolver* extra_resolver) {
+                                        TableSourceResolver* extra_resolver,
+                                        const std::vector<PushablePredicate>& predicates) {
   if (extra_resolver != nullptr && extra_resolver->can_resolve(sources)) {
-    return extra_resolver->resolve(store, sources);
+    return extra_resolver->resolve(store, sources, predicates);
   }
   return resolve_table(store, sources);
 }

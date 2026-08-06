@@ -159,6 +159,34 @@ std::vector<IcebergSchemaField> parse_schema_fields(const nlohmann::json& schema
   return fields;
 }
 
+std::vector<IcebergPartitionSpec> parse_partition_specs(const nlohmann::json& metadata_json,
+                                                        const std::string& url) {
+  std::vector<IcebergPartitionSpec> specs;
+  if (!metadata_json.contains("partition-specs") || metadata_json.at("partition-specs").is_null()) {
+    return specs;
+  }
+  for (const nlohmann::json& spec_json : metadata_json.at("partition-specs")) {
+    try {
+      IcebergPartitionSpec spec;
+      spec.spec_id = spec_json.at("spec-id").get<int32_t>();
+      for (const nlohmann::json& field_json : spec_json.at("fields")) {
+        IcebergPartitionField field;
+        field.source_id = field_json.at("source-id").get<int32_t>();
+        field.field_id = field_json.at("field-id").get<int32_t>();
+        field.name = field_json.at("name").get<std::string>();
+        field.transform = field_json.at("transform").get<std::string>();
+        spec.fields.push_back(std::move(field));
+      }
+      specs.push_back(std::move(spec));
+    } catch (const nlohmann::json::exception& e) {
+      throw StorageError(fmt::format(
+          "iceberg rest catalog: a 'partition-specs' entry from '{}' is missing a required field: {}", url,
+          e.what()));
+    }
+  }
+  return specs;
+}
+
 }  // namespace
 
 std::optional<std::string> IcebergTableMetadata::current_manifest_list() const {
@@ -171,6 +199,15 @@ std::optional<std::string> IcebergTableMetadata::current_manifest_list() const {
     }
   }
   return std::nullopt;
+}
+
+const IcebergPartitionSpec* IcebergTableMetadata::find_partition_spec(int32_t spec_id) const {
+  for (const IcebergPartitionSpec& spec : partition_specs) {
+    if (spec.spec_id == spec_id) {
+      return &spec;
+    }
+  }
+  return nullptr;
 }
 
 IcebergRestCatalogClient::IcebergRestCatalogClient(IcebergCatalogSection config)
@@ -294,6 +331,8 @@ IcebergTableMetadata IcebergRestCatalogClient::load_table_metadata(
   } else if (metadata_json.contains("schema")) {
     metadata.schema_fields = parse_schema_fields(metadata_json.at("schema"), url);
   }
+
+  metadata.partition_specs = parse_partition_specs(metadata_json, url);
 
   return metadata;
 }

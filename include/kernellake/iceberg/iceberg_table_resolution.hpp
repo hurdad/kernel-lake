@@ -42,12 +42,22 @@ namespace kernellake::iceberg {
 // in the table's schema (present in every data file, for the common
 // identity-transform case this resolver targets first) rather than values
 // that must be reconstructed from something absent in the file -- so no
-// partition-column materialization is needed for correctness. Partition
-// pruning (skipping whole files by their manifest-recorded partition
-// values, without opening them) is a pure optimization not yet
-// implemented, tracked separately.
+// partition-column materialization is needed for correctness.
+//
+// `predicates` (the WHERE clause's pushable predicates -- empty at
+// schema-discovery time, real once the optimizer has run, see
+// TableSourceResolver::resolve()'s own doc comment) drives file-level
+// partition pruning: a data file whose manifest-recorded partition values
+// (matched against the manifest-list entry's own partition_spec_id, so
+// spec evolution across snapshots is handled correctly) prove no
+// predicate could match is skipped entirely -- inspect_parquet_file() is
+// never called on it at all, unlike row-group pruning (evaluate_pruning(),
+// kernellake/io/parquet_pruning.hpp) which needs a file already open to
+// read its footer first. See kernellake/iceberg/partition_pruning.hpp for
+// exactly which transforms this can prove anything for.
 [[nodiscard]] ResolvedTable resolve_iceberg_table(ObjectStore& store, IcebergRestCatalogClient& catalog,
                                                   const std::vector<std::string>& namespace_parts,
-                                                  const std::string& table);
+                                                  const std::string& table,
+                                                  const std::vector<PushablePredicate>& predicates);
 
 }  // namespace kernellake::iceberg

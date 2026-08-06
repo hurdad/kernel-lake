@@ -20,7 +20,7 @@ TEST(IcebergSourceResolver, CanResolveOnlyClaimsIcebergSchemeSources) {
 TEST(IcebergSourceResolver, ThrowsOnUnknownCatalog) {
   IcebergSourceResolver resolver{IcebergSection{}};
   LocalObjectStore store;
-  EXPECT_THROW((void)(resolver.resolve(store, {"iceberg://prod.db.orders"})), ConfigurationError);
+  EXPECT_THROW((void)(resolver.resolve(store, {"iceberg://prod.db.orders"}, {})), ConfigurationError);
 }
 
 TEST(IcebergSourceResolver, ThrowsOnTooFewQualifiedNameParts) {
@@ -33,7 +33,7 @@ TEST(IcebergSourceResolver, ThrowsOnTooFewQualifiedNameParts) {
   // "prod.orders" has only 2 dot-separated parts (catalog + table, no
   // namespace level) -- rejected rather than guessed at as an empty
   // namespace.
-  EXPECT_THROW((void)(resolver.resolve(store, {"iceberg://prod.orders"})), StorageError);
+  EXPECT_THROW((void)(resolver.resolve(store, {"iceberg://prod.orders"}, {})), StorageError);
 }
 
 TEST(IcebergSourceResolver, ThrowsOnEmptyQualifiedNamePart) {
@@ -43,7 +43,7 @@ TEST(IcebergSourceResolver, ThrowsOnEmptyQualifiedNamePart) {
   catalogs.catalogs["prod"] = catalog;
   IcebergSourceResolver resolver{catalogs};
   LocalObjectStore store;
-  EXPECT_THROW((void)(resolver.resolve(store, {"iceberg://prod..orders"})), StorageError);
+  EXPECT_THROW((void)(resolver.resolve(store, {"iceberg://prod..orders"}, {})), StorageError);
 }
 
 }  // namespace

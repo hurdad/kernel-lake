@@ -18,7 +18,11 @@ class IcebergSourceResolver final : public TableSourceResolver {
   explicit IcebergSourceResolver(IcebergSection catalogs) : catalogs_(std::move(catalogs)) {}
 
   [[nodiscard]] bool can_resolve(const std::vector<std::string>& sources) const override;
-  [[nodiscard]] ResolvedTable resolve(ObjectStore& store, const std::vector<std::string>& sources) override;
+  // `predicates` is forwarded to resolve_iceberg_table() for file-level
+  // partition pruning -- see partition_pruning.hpp and
+  // TableSourceResolver::resolve()'s own doc comment.
+  [[nodiscard]] ResolvedTable resolve(ObjectStore& store, const std::vector<std::string>& sources,
+                                      const std::vector<PushablePredicate>& predicates) override;
 
  private:
   IcebergSection catalogs_;
