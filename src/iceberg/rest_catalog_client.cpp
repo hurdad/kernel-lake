@@ -80,7 +80,7 @@ std::string encode_namespace(CURL* handle, const std::vector<std::string>& names
 // GET when post_body is null, POST (form-encoded) otherwise -- covers both
 // requests this client makes (table-metadata GET, oauth2 token POST).
 std::string http_request(const std::string& url, const std::string& bearer_token,
-                          const std::string* post_body) {
+                         const std::string* post_body) {
   CurlEasyPtr handle = make_curl_easy();
   std::string response_body;
 
@@ -117,7 +117,7 @@ std::string http_request(const std::string& url, const std::string& bearer_token
   curl_easy_getinfo(handle.get(), CURLINFO_RESPONSE_CODE, &status_code);
   if (status_code < 200 || status_code >= 300) {
     throw StorageError(fmt::format("iceberg rest catalog: request to '{}' returned HTTP {}: {}", url,
-                                    status_code, response_body));
+                                   status_code, response_body));
   }
   return response_body;
 }
@@ -131,7 +131,8 @@ nlohmann::json parse_json_response(const std::string& url, const std::string& bo
   }
 }
 
-std::vector<IcebergSchemaField> parse_schema_fields(const nlohmann::json& schema_json, const std::string& url) {
+std::vector<IcebergSchemaField> parse_schema_fields(const nlohmann::json& schema_json,
+                                                    const std::string& url) {
   std::vector<IcebergSchemaField> fields;
   if (!schema_json.contains("fields")) {
     throw StorageError(fmt::format("iceberg rest catalog: schema from '{}' is missing 'fields'", url));
@@ -150,8 +151,9 @@ std::vector<IcebergSchemaField> parse_schema_fields(const nlohmann::json& schema
       field.type = type_json.is_string() ? type_json.get<std::string>() : type_json.dump();
       fields.push_back(std::move(field));
     } catch (const nlohmann::json::exception& e) {
-      throw StorageError(fmt::format(
-          "iceberg rest catalog: a schema field from '{}' is missing a required attribute: {}", url, e.what()));
+      throw StorageError(
+          fmt::format("iceberg rest catalog: a schema field from '{}' is missing a required attribute: {}",
+                      url, e.what()));
     }
   }
   return fields;
@@ -171,7 +173,8 @@ std::optional<std::string> IcebergTableMetadata::current_manifest_list() const {
   return std::nullopt;
 }
 
-IcebergRestCatalogClient::IcebergRestCatalogClient(IcebergCatalogSection config) : config_(std::move(config)) {}
+IcebergRestCatalogClient::IcebergRestCatalogClient(IcebergCatalogSection config)
+    : config_(std::move(config)) {}
 
 std::string IcebergRestCatalogClient::fetch_oauth2_token() {
   const double now =
@@ -186,8 +189,8 @@ std::string IcebergRestCatalogClient::fetch_oauth2_token() {
   {
     const CurlEasyPtr encoder = make_curl_easy();
     body = fmt::format("grant_type=client_credentials&client_id={}&client_secret={}",
-                        url_encode(encoder.get(), config_.oauth2_client_id),
-                        url_encode(encoder.get(), config_.oauth2_client_secret));
+                       url_encode(encoder.get(), config_.oauth2_client_id),
+                       url_encode(encoder.get(), config_.oauth2_client_secret));
     if (!config_.oauth2_scope.empty()) {
       body += fmt::format("&scope={}", url_encode(encoder.get(), config_.oauth2_scope));
     }
@@ -227,16 +230,17 @@ IcebergTableMetadata IcebergRestCatalogClient::load_table_metadata(
   }
 
   const std::string url = config_.prefix.empty()
-                               ? fmt::format("{}/v1/namespaces/{}/tables/{}", config_.catalog_uri,
-                                             encoded_namespace, encoded_table)
-                               : fmt::format("{}/v1/{}/namespaces/{}/tables/{}", config_.catalog_uri,
-                                             config_.prefix, encoded_namespace, encoded_table);
+                              ? fmt::format("{}/v1/namespaces/{}/tables/{}", config_.catalog_uri,
+                                            encoded_namespace, encoded_table)
+                              : fmt::format("{}/v1/{}/namespaces/{}/tables/{}", config_.catalog_uri,
+                                            config_.prefix, encoded_namespace, encoded_table);
 
   const nlohmann::json response =
       parse_json_response(url, http_request(url, bearer_token_for_request(), /*post_body=*/nullptr));
 
   if (!response.contains("metadata")) {
-    throw StorageError(fmt::format("iceberg rest catalog: LoadTableResult from '{}' is missing 'metadata'", url));
+    throw StorageError(
+        fmt::format("iceberg rest catalog: LoadTableResult from '{}' is missing 'metadata'", url));
   }
   const nlohmann::json& metadata_json = response.at("metadata");
 
@@ -261,9 +265,9 @@ IcebergTableMetadata IcebergRestCatalogClient::load_table_metadata(
         snapshot.manifest_list = snapshot_json.at("manifest-list").get<std::string>();
         metadata.snapshots.push_back(std::move(snapshot));
       } catch (const nlohmann::json::exception& e) {
-        throw StorageError(fmt::format(
-            "iceberg rest catalog: a 'snapshots' entry from '{}' is missing a required field: {}", url,
-            e.what()));
+        throw StorageError(
+            fmt::format("iceberg rest catalog: a 'snapshots' entry from '{}' is missing a required field: {}",
+                        url, e.what()));
       }
     }
   }

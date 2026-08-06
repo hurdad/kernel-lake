@@ -109,7 +109,8 @@ jobs:
             build-essential cmake ninja-build git pkg-config wget ca-certificates lsb-release gnupg \
             python3 python3-pip \
             libgtest-dev libbenchmark-dev libspdlog-dev nlohmann-json3-dev libyaml-cpp-dev \
-            libxml2-dev uuid-dev clang-tidy-18
+            libxml2-dev uuid-dev clang-tidy-18 \
+            libavro-dev libcurl4-openssl-dev
       - name: Install Apache Arrow / Parquet C++
         run: |
           wget -O /tmp/arrow-apt-source.deb \
@@ -150,7 +151,8 @@ jobs:
             build-essential cmake ninja-build git pkg-config wget ca-certificates lsb-release gnupg \
             python3 python3-pip \
             libgtest-dev libbenchmark-dev libspdlog-dev nlohmann-json3-dev libyaml-cpp-dev \
-            libxml2-dev uuid-dev
+            libxml2-dev uuid-dev \
+            libavro-dev libcurl4-openssl-dev
       - name: Install Apache Arrow / Parquet C++
         run: |
           wget -O /tmp/arrow-apt-source.deb \
@@ -179,7 +181,8 @@ jobs:
             build-essential cmake ninja-build git pkg-config wget ca-certificates lsb-release gnupg \
             python3 python3-pip \
             libgtest-dev libbenchmark-dev libspdlog-dev nlohmann-json3-dev libyaml-cpp-dev \
-            libxml2-dev uuid-dev
+            libxml2-dev uuid-dev \
+            libavro-dev libcurl4-openssl-dev
       - name: Install Apache Arrow / Parquet C++
         run: |
           wget -O /tmp/arrow-apt-source.deb \
@@ -254,7 +257,8 @@ jobs:
             build-essential cmake ninja-build git pkg-config wget ca-certificates lsb-release gnupg \
             python3 python3-pip \
             libgtest-dev libbenchmark-dev libspdlog-dev nlohmann-json3-dev libyaml-cpp-dev \
-            libxml2-dev uuid-dev clang-tidy-18
+            libxml2-dev uuid-dev clang-tidy-18 \
+            libavro-dev libcurl4-openssl-dev
       - name: Install Apache Arrow / Parquet / Flight SQL C++
         run: |
           wget -O /tmp/arrow-apt-source.deb \
@@ -310,7 +314,8 @@ jobs:
             build-essential cmake ninja-build git pkg-config wget ca-certificates lsb-release gnupg \
             python3 python3-pip \
             libgtest-dev libbenchmark-dev libspdlog-dev nlohmann-json3-dev libyaml-cpp-dev \
-            libxml2-dev uuid-dev clang-tidy-18
+            libxml2-dev uuid-dev clang-tidy-18 \
+            libavro-dev libcurl4-openssl-dev
       - name: Install Apache Arrow / Parquet C++
         run: |
           wget -O /tmp/arrow-apt-source.deb \

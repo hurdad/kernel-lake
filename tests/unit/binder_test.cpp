@@ -332,8 +332,7 @@ TEST(Binder, MixingSignedAndUnsignedIntegerTypesInComparisonIsRejected) {
 }
 
 TEST(Binder, MixingSignedAndUnsignedIntegerTypesInArithmeticIsRejected) {
-  const auto stmt = sql::parse_sql(
-      "SELECT signed_count + unsigned_count FROM read_parquet('/x.parquet')");
+  const auto stmt = sql::parse_sql("SELECT signed_count + unsigned_count FROM read_parquet('/x.parquet')");
   EXPECT_THROW((void)(bind_query(stmt, unsigned_counters_schema())), BindingError);
 }
 
@@ -342,14 +341,12 @@ TEST(Binder, UnaryNegateOnUnsignedColumnIsRejected) {
   // unsigned x that silently two's-complement-wraps instead of producing a
   // negative value (confirmed against a real GPU: `0u - 5u` (UINT32) ==
   // 4294967291) -- must fail cleanly at bind time instead.
-  const auto stmt =
-      sql::parse_sql("SELECT -unsigned_count FROM read_parquet('/x.parquet')");
+  const auto stmt = sql::parse_sql("SELECT -unsigned_count FROM read_parquet('/x.parquet')");
   EXPECT_THROW((void)(bind_query(stmt, unsigned_counters_schema())), BindingError);
 }
 
 TEST(Binder, UnaryNegateOnSignedColumnStillWorks) {
-  const auto stmt =
-      sql::parse_sql("SELECT -signed_count FROM read_parquet('/x.parquet')");
+  const auto stmt = sql::parse_sql("SELECT -signed_count FROM read_parquet('/x.parquet')");
   EXPECT_NO_THROW((void)(bind_query(stmt, unsigned_counters_schema())));
 }
 

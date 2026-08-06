@@ -21,10 +21,11 @@ bool has_glob_chars(const std::string& path) {
 }
 
 std::vector<ObjectInfo> sorted_deduped(std::vector<ObjectInfo> files) {
-  std::sort(files.begin(), files.end(), [](const ObjectInfo& a, const ObjectInfo& b) { return a.uri < b.uri; });
+  std::sort(files.begin(), files.end(),
+            [](const ObjectInfo& a, const ObjectInfo& b) { return a.uri < b.uri; });
   files.erase(std::unique(files.begin(), files.end(),
-                         [](const ObjectInfo& a, const ObjectInfo& b) { return a.uri == b.uri; }),
-             files.end());
+                          [](const ObjectInfo& a, const ObjectInfo& b) { return a.uri == b.uri; }),
+              files.end());
   return files;
 }
 

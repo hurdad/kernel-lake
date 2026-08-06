@@ -226,8 +226,9 @@ Preprocessed preprocess_from_read_parquet(const std::string& sql) {
     }
     std::string placeholder = "kernellake_parquet_source_" + std::to_string(sources.size());
     rewritten += placeholder;
-    std::vector<std::string> paths = is_iceberg ? std::vector<std::string>{"iceberg://" + parsed->first.front()}
-                                                : std::move(parsed->first);
+    std::vector<std::string> paths = is_iceberg
+                                         ? std::vector<std::string>{"iceberg://" + parsed->first.front()}
+                                         : std::move(parsed->first);
     sources.push_back(PlaceholderSource{placeholder, std::move(paths)});
     pos = parsed->second;
   }
@@ -539,7 +540,9 @@ AstExprPtr convert_expr(const hsql::Expr* e) {
 // and required alias.
 AstParquetSource convert_join_source(const hsql::TableRef* ref, const Preprocessed& preprocessed) {
   if (ref == nullptr || ref->type != hsql::kTableName || ref->name == nullptr) {
-    unsupported("JOIN sides must each be a single read_parquet(...)/read_iceberg(...) source, not a subquery or nested join");
+    unsupported(
+        "JOIN sides must each be a single read_parquet(...)/read_iceberg(...) source, not a subquery or "
+        "nested join");
   }
   if (ref->alias == nullptr || ref->alias->name == nullptr) {
     unsupported("both sides of a JOIN must be aliased, e.g. read_parquet('a.parquet') AS a");
@@ -649,7 +652,8 @@ AstSelectStatement parse_sql(std::string_view sql_view) {
     // the JOIN chain the parser understood (this project has no other FROM
     // shape a source could legitimately appear in).
     if (preprocessed.sources.size() != clause.steps.size() + 1) {
-      unsupported("a JOIN requires exactly one read_parquet(...)/read_iceberg(...) source per table in the chain");
+      unsupported(
+          "a JOIN requires exactly one read_parquet(...)/read_iceberg(...) source per table in the chain");
     }
     out.join = std::move(clause);
   } else {

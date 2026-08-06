@@ -42,8 +42,8 @@ class TableResolutionTest : public ::testing::Test {
     const auto table = arrow::Table::Make(schema, {id_array, amount_array});
     auto sink_result = arrow::io::FileOutputStream::Open(path.string());
     ASSERT_TRUE(sink_result.ok()) << sink_result.status().ToString();
-    const arrow::Status write_status = parquet::arrow::WriteTable(*table, arrow::default_memory_pool(),
-                                                                   *sink_result, /*chunk_size=*/count);
+    const arrow::Status write_status =
+        parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), *sink_result, /*chunk_size=*/count);
     ASSERT_TRUE(write_status.ok()) << write_status.ToString();
   }
 

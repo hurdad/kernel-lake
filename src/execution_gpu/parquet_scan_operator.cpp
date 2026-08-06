@@ -87,7 +87,7 @@ void ParquetScanOperator::open(ExecutionContext& context) {
 void ParquetScanOperator::open_current_fragment(ExecutionContext& context) {
   const PhysicalFileFragment& fragment = fragments_[current_fragment_index_];
   const std::vector<cudf::size_type> row_groups(fragment.selected_row_groups.begin(),
-                                                 fragment.selected_row_groups.end());
+                                                fragment.selected_row_groups.end());
 
   try {
     if (fragment.file.scheme() == "file") {
@@ -103,19 +103,19 @@ void ParquetScanOperator::open_current_fragment(ExecutionContext& context) {
       std::vector<std::unique_ptr<cudf::io::datasource>> sources;
       sources.push_back(std::make_unique<ObjectStoreDatasource>(store_.open(fragment.file)));
 
-      cudf::io::parquet_reader_options options = cudf::io::parquet_reader_options::builder()
-                                                     .column_names(columns_)
-                                                     .row_groups(std::vector<std::vector<cudf::size_type>>{row_groups})
-                                                     .build();
+      cudf::io::parquet_reader_options options =
+          cudf::io::parquet_reader_options::builder()
+              .column_names(columns_)
+              .row_groups(std::vector<std::vector<cudf::size_type>>{row_groups})
+              .build();
       reader_ = std::make_unique<cudf::io::chunked_parquet_reader>(
           /*chunk_read_limit=*/0, pass_read_limit_bytes_, std::move(sources),
           /*parquet_metadatas=*/std::vector<cudf::io::parquet::FileMetaData>{}, options, context.stream,
           context.memory_resource);
     }
   } catch (const std::exception& e) {
-    throw StorageError(
-        fmt::format("failed to open Parquet source '{}' for partitioned scanning: {}",
-                    fragment.file.value(), e.what()));
+    throw StorageError(fmt::format("failed to open Parquet source '{}' for partitioned scanning: {}",
+                                   fragment.file.value(), e.what()));
   }
 }
 

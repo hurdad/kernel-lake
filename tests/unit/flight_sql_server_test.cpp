@@ -216,7 +216,8 @@ TEST(FlightSqlServerPendingResultsCapTest, CapIsEnforcedUnderConcurrentCallers) 
   const auto schema = arrow::schema({arrow::field("id", arrow::int64(), false)});
   const auto table = arrow::Table::Make(schema, {id_array});
   auto sink = arrow::io::FileOutputStream::Open(path).ValueOrDie();
-  ASSERT_TRUE(parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), sink, /*chunk_size=*/100).ok());
+  ASSERT_TRUE(
+      parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), sink, /*chunk_size=*/100).ok());
 
   constexpr std::uint32_t kCap = 2;
   auto server = std::make_unique<KernelLakeFlightSqlServer>(cpu_backend_server_config(kCap));

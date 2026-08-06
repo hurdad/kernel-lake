@@ -9,14 +9,10 @@ namespace {
 
 TEST(SchemaTranslation, TranslatesEveryPrimitiveType) {
   const std::vector<IcebergSchemaField> fields = {
-      {1, "a_bool", true, "boolean"},
-      {2, "an_int", true, "int"},
-      {3, "a_long", true, "long"},
-      {4, "a_float", true, "float"},
-      {5, "a_double", true, "double"},
-      {6, "a_date", true, "date"},
-      {7, "a_timestamp", true, "timestamp"},
-      {8, "a_timestamptz", true, "timestamptz"},
+      {1, "a_bool", true, "boolean"},        {2, "an_int", true, "int"},
+      {3, "a_long", true, "long"},           {4, "a_float", true, "float"},
+      {5, "a_double", true, "double"},       {6, "a_date", true, "date"},
+      {7, "a_timestamp", true, "timestamp"}, {8, "a_timestamptz", true, "timestamptz"},
       {9, "a_string", true, "string"},
   };
   const Schema schema = iceberg_schema_to_kernellake_schema(fields);
@@ -75,8 +71,7 @@ TEST(SchemaTranslation, ThrowsOnUnsupportedUuidType) {
 }
 
 TEST(SchemaTranslation, ThrowsOnNestedStructType) {
-  const std::vector<IcebergSchemaField> fields = {
-      {1, "nested", true, R"({"type":"struct","fields":[]})"}};
+  const std::vector<IcebergSchemaField> fields = {{1, "nested", true, R"({"type":"struct","fields":[]})"}};
   EXPECT_THROW((void)(iceberg_schema_to_kernellake_schema(fields)), StorageError);
 }
 

@@ -29,7 +29,8 @@ bool is_live_status(int32_t status) {
 }  // namespace
 
 ResolvedTable resolve_iceberg_table(ObjectStore& store, IcebergRestCatalogClient& catalog,
-                                     const std::vector<std::string>& namespace_parts, const std::string& table) {
+                                    const std::vector<std::string>& namespace_parts,
+                                    const std::string& table) {
   const IcebergTableMetadata table_metadata = catalog.load_table_metadata(namespace_parts, table);
   const Schema schema = iceberg_schema_to_kernellake_schema(table_metadata.schema_fields);
 
@@ -41,7 +42,8 @@ ResolvedTable resolve_iceberg_table(ObjectStore& store, IcebergRestCatalogClient
     return ResolvedTable{{}, schema, {}};
   }
 
-  const std::vector<ManifestListEntry> manifest_list_entries = read_manifest_list(store, Uri(*manifest_list_path));
+  const std::vector<ManifestListEntry> manifest_list_entries =
+      read_manifest_list(store, Uri(*manifest_list_path));
 
   std::vector<ManifestDataFileEntry> live_data_files;
   for (const ManifestListEntry& manifest_entry : manifest_list_entries) {

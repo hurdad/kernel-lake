@@ -305,8 +305,7 @@ TEST_F(PhysicalPlannerTest, AggregateOrderBySurvivesWhenReprojectionIsNotRemoved
 // (after pruning) -- see ElidesIdentityProjectionAfterColumnPruning below
 // for the case where eliding is still safe.
 TEST_F(PhysicalPlannerTest, RegressionKeepsEveryColumnWhenSelectListMatchesSchemaOrder) {
-  const PhysicalPlanPtr plan =
-      plan_for("SELECT id, amount FROM read_parquet('" + path_ + "') WHERE id < 3");
+  const PhysicalPlanPtr plan = plan_for("SELECT id, amount FROM read_parquet('" + path_ + "') WHERE id < 3");
   const auto* scan = dynamic_cast<const ParquetScanNode*>(find_leaf(plan.get()));
   ASSERT_NE(scan, nullptr);
   const std::vector<std::string>& columns = scan->columns();

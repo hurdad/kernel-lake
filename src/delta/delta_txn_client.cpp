@@ -17,7 +17,8 @@ namespace {
 std::string read_file(const std::string& path) {
   std::ifstream stream(path, std::ios::binary);
   if (!stream) {
-    throw ConfigurationError(fmt::format("delta txn client: couldn't open delta.tls_ca_cert_path '{}'", path));
+    throw ConfigurationError(
+        fmt::format("delta txn client: couldn't open delta.tls_ca_cert_path '{}'", path));
   }
   std::ostringstream contents;
   contents << stream.rdbuf();
@@ -139,8 +140,8 @@ DeltaActiveFileListing DeltaTxnClient::list_active_files(const std::string& tabl
     while (reader->Read(&response)) {
       if (response.has_header()) {
         if (!response.header().has_metadata()) {
-          throw StorageError(fmt::format(
-              "delta txn client: ListActiveFiles('{}') header is missing metadata", table_uri));
+          throw StorageError(
+              fmt::format("delta txn client: ListActiveFiles('{}') header is missing metadata", table_uri));
         }
         listing.table = translate_table_metadata(response.header().metadata(), response.header().version());
         header_seen = true;
@@ -152,8 +153,8 @@ DeltaActiveFileListing DeltaTxnClient::list_active_files(const std::string& tabl
     }
     const grpc::Status status = reader->Finish();
     if (!status.ok()) {
-      throw StorageError(fmt::format(
-          "delta txn client: ListActiveFiles('{}') failed: {}", table_uri, status.error_message()));
+      throw StorageError(fmt::format("delta txn client: ListActiveFiles('{}') failed: {}", table_uri,
+                                     status.error_message()));
     }
     if (!header_seen) {
       throw StorageError(fmt::format(

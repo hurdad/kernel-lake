@@ -66,7 +66,8 @@ class TableSourceResolver {
   virtual ~TableSourceResolver() = default;
 
   [[nodiscard]] virtual bool can_resolve(const std::vector<std::string>& sources) const = 0;
-  [[nodiscard]] virtual ResolvedTable resolve(ObjectStore& store, const std::vector<std::string>& sources) = 0;
+  [[nodiscard]] virtual ResolvedTable resolve(ObjectStore& store,
+                                              const std::vector<std::string>& sources) = 0;
 };
 
 // Delegates to `extra_resolver` when it's non-null and claims `sources`
@@ -76,7 +77,8 @@ class TableSourceResolver {
 // convert_scan()) go through this instead of calling resolve_table()
 // directly, so a source kind resolve_table() can't handle itself still
 // resolves consistently at both places.
-[[nodiscard]] ResolvedTable resolve_table_or_delegate(ObjectStore& store, const std::vector<std::string>& sources,
+[[nodiscard]] ResolvedTable resolve_table_or_delegate(ObjectStore& store,
+                                                      const std::vector<std::string>& sources,
                                                       TableSourceResolver* extra_resolver);
 
 }  // namespace kernellake

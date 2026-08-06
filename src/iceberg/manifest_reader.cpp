@@ -24,8 +24,7 @@ struct AvroFileReaderDeleter {
 
 // avro_file_reader_t is already a pointer typedef (to an opaque struct), so
 // unique_ptr's template argument is the pointee type it points at.
-using AvroFileReaderPtr =
-    std::unique_ptr<std::remove_pointer_t<avro_file_reader_t>, AvroFileReaderDeleter>;
+using AvroFileReaderPtr = std::unique_ptr<std::remove_pointer_t<avro_file_reader_t>, AvroFileReaderDeleter>;
 
 struct AvroValueIfaceDeleter {
   void operator()(avro_value_iface_t* iface) const { avro_value_iface_decref(iface); }
@@ -225,7 +224,8 @@ std::vector<ManifestListEntry> read_manifest_list_bytes(const std::string& avro_
   const AvroValueIfacePtr iface(avro_generic_class_from_schema(schema));
   avro_schema_decref(schema);
   if (!iface) {
-    throw StorageError(fmt::format("iceberg {}: couldn't build a value class from the writer schema", kDebugName));
+    throw StorageError(
+        fmt::format("iceberg {}: couldn't build a value class from the writer schema", kDebugName));
   }
 
   avro_value_t value;
@@ -256,7 +256,8 @@ std::vector<ManifestDataFileEntry> read_manifest_bytes(const std::string& avro_b
   const AvroValueIfacePtr iface(avro_generic_class_from_schema(schema));
   avro_schema_decref(schema);
   if (!iface) {
-    throw StorageError(fmt::format("iceberg {}: couldn't build a value class from the writer schema", kDebugName));
+    throw StorageError(
+        fmt::format("iceberg {}: couldn't build a value class from the writer schema", kDebugName));
   }
 
   avro_value_t value;

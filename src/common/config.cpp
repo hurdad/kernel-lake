@@ -441,8 +441,7 @@ void validate_config(const EngineConfig& config) {
                                                                           "oauth2_client_credentials"};
   for (const auto& [name, catalog] : config.iceberg.catalogs) {
     if (catalog.catalog_uri.empty()) {
-      throw ConfigurationError(
-          fmt::format("iceberg.catalogs.{}.catalog_uri must not be empty", name));
+      throw ConfigurationError(fmt::format("iceberg.catalogs.{}.catalog_uri must not be empty", name));
     }
     if (std::find(kIcebergCredentialsKinds.begin(), kIcebergCredentialsKinds.end(),
                   catalog.credentials_kind) == kIcebergCredentialsKinds.end()) {
@@ -458,10 +457,10 @@ void validate_config(const EngineConfig& config) {
     }
     if (catalog.credentials_kind == "oauth2_client_credentials" &&
         (catalog.oauth2_client_id.empty() || catalog.oauth2_client_secret.empty())) {
-      throw ConfigurationError(fmt::format(
-          "iceberg.catalogs.{}.oauth2_client_id and oauth2_client_secret must both be set when "
-          "credentials_kind is 'oauth2_client_credentials'",
-          name));
+      throw ConfigurationError(
+          fmt::format("iceberg.catalogs.{}.oauth2_client_id and oauth2_client_secret must both be set when "
+                      "credentials_kind is 'oauth2_client_credentials'",
+                      name));
     }
   }
 

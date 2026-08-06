@@ -157,10 +157,10 @@ struct IcebergCatalogSection {
   // POST /v1/oauth/tokens client_credentials flow and refreshes the token
   // as it nears expiry.
   std::string credentials_kind = "none";
-  std::string bearer_token;         // for "bearer_token"
-  std::string oauth2_client_id;     // for "oauth2_client_credentials"
+  std::string bearer_token;          // for "bearer_token"
+  std::string oauth2_client_id;      // for "oauth2_client_credentials"
   std::string oauth2_client_secret;  // for "oauth2_client_credentials"
-  std::string oauth2_scope;         // optional; for "oauth2_client_credentials"
+  std::string oauth2_scope;          // optional; for "oauth2_client_credentials"
 };
 
 struct IcebergSection {

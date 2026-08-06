@@ -146,7 +146,8 @@ arrow::Result<std::unique_ptr<flight::FlightInfo>> KernelLakeFlightSqlServer::Ge
   return ExecuteAndBuffer(physical, command.query, descriptor);
 }
 
-arrow::Result<flight_sql::ActionCreatePreparedStatementResult> KernelLakeFlightSqlServer::CreatePreparedStatement(
+arrow::Result<flight_sql::ActionCreatePreparedStatementResult>
+KernelLakeFlightSqlServer::CreatePreparedStatement(
     const flight::ServerCallContext& /*context*/,
     const flight_sql::ActionCreatePreparedStatementRequest& request) {
   PhysicalPlanPtr physical;
@@ -165,10 +166,10 @@ arrow::Result<flight_sql::ActionCreatePreparedStatementResult> KernelLakeFlightS
     // own comment): a client that never calls ClosePreparedStatement must
     // not be able to grow prepared_ without bound.
     if (prepared_.size() >= config_.server.max_pending_results) {
-      return arrow::Status::OutOfMemory(fmt::format(
-          "too many prepared statements awaiting close (limit: {}); close existing prepared "
-          "statements before creating more",
-          config_.server.max_pending_results));
+      return arrow::Status::OutOfMemory(
+          fmt::format("too many prepared statements awaiting close (limit: {}); close existing prepared "
+                      "statements before creating more",
+                      config_.server.max_pending_results));
     }
     handle = "p-" + std::to_string(next_handle_++);
     prepared_.emplace(handle, PreparedStatementEntry{request.query, physical});

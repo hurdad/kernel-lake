@@ -47,7 +47,7 @@ namespace kernellake::iceberg {
 // values, without opening them) is a pure optimization not yet
 // implemented, tracked separately.
 [[nodiscard]] ResolvedTable resolve_iceberg_table(ObjectStore& store, IcebergRestCatalogClient& catalog,
-                                                   const std::vector<std::string>& namespace_parts,
-                                                   const std::string& table);
+                                                  const std::vector<std::string>& namespace_parts,
+                                                  const std::string& table);
 
 }  // namespace kernellake::iceberg

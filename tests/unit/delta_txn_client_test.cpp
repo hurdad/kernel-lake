@@ -48,7 +48,9 @@ class FakeDeltaTxnService final : public ::delta::txn::v1::DeltaTxnService::Serv
   }
 
  private:
-  static std::string extract_api_key(grpc::ServerContext* context) { return extract_header(context, "x-api-key"); }
+  static std::string extract_api_key(grpc::ServerContext* context) {
+    return extract_header(context, "x-api-key");
+  }
 
   static std::string extract_header(grpc::ServerContext* context, const char* name) {
     const auto it = context->client_metadata().find(name);

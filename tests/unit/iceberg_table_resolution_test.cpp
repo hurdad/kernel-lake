@@ -86,7 +86,8 @@ class LoopbackHttpServer {
 
 std::string http_ok_json(const std::string& json_body) {
   return fmt::format(
-      "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+      "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: "
+      "close\r\n\r\n{}",
       json_body.size(), json_body);
 }
 
@@ -175,8 +176,8 @@ class IcebergTableResolutionTest : public ::testing::Test {
   void SetUp() override {
     dir_ = fs::temp_directory_path() /
            fs::path("kernellake_iceberg_table_resolution_test_" +
-                     std::to_string(::testing::UnitTest::GetInstance()->random_seed()) + "_" +
-                     ::testing::UnitTest::GetInstance()->current_test_info()->name());
+                    std::to_string(::testing::UnitTest::GetInstance()->random_seed()) + "_" +
+                    ::testing::UnitTest::GetInstance()->current_test_info()->name());
     fs::create_directories(dir_);
   }
 
@@ -200,13 +201,13 @@ class IcebergTableResolutionTest : public ::testing::Test {
     const auto table = arrow::Table::Make(schema, {id_array, amount_array});
     auto sink_result = arrow::io::FileOutputStream::Open(path.string());
     ASSERT_TRUE(sink_result.ok()) << sink_result.status().ToString();
-    const arrow::Status write_status = parquet::arrow::WriteTable(*table, arrow::default_memory_pool(),
-                                                                   *sink_result, /*chunk_size=*/count);
+    const arrow::Status write_status =
+        parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), *sink_result, /*chunk_size=*/count);
     ASSERT_TRUE(write_status.ok()) << write_status.ToString();
   }
 
   fs::path write_manifest(const std::string& name, const std::vector<std::pair<std::string, int64_t>>& files,
-                           int32_t status) {
+                          int32_t status) {
     AvroFixtureWriter writer(kManifestSchemaJson);
     std::vector<std::function<void(avro_value_t&)>> rows;
     for (const auto& [path, count] : files) {
@@ -226,7 +227,7 @@ class IcebergTableResolutionTest : public ::testing::Test {
   }
 
   fs::path write_manifest_list(const std::string& name,
-                                const std::vector<std::pair<std::string, int32_t>>& manifests) {
+                               const std::vector<std::pair<std::string, int32_t>>& manifests) {
     AvroFixtureWriter writer(kManifestListSchemaJson);
     std::vector<std::function<void(avro_value_t&)>> rows;
     for (const auto& [path, content] : manifests) {
@@ -257,7 +258,7 @@ class IcebergTableResolutionTest : public ::testing::Test {
         "snapshots": [{{"snapshot-id": 42, "manifest-list": "{1}"}}]
       }}
     }})json",
-        dir_.string(), manifest_list_path);
+                       dir_.string(), manifest_list_path);
   }
 
   fs::path dir_;
@@ -267,9 +268,9 @@ class IcebergTableResolutionTest : public ::testing::Test {
 TEST_F(IcebergTableResolutionTest, ResolvesLiveDataFilesWithCurrentSchema) {
   write_data_file(dir_ / "data-0.parquet", 0, 5);
   write_data_file(dir_ / "data-1.parquet", 5, 3);
-  const fs::path manifest =
-      write_manifest("m0.avro", {{(dir_ / "data-0.parquet").string(), 5}, {(dir_ / "data-1.parquet").string(), 3}},
-                     /*status=*/1);
+  const fs::path manifest = write_manifest(
+      "m0.avro", {{(dir_ / "data-0.parquet").string(), 5}, {(dir_ / "data-1.parquet").string(), 3}},
+      /*status=*/1);
   const fs::path manifest_list = write_manifest_list("snap-42.avro", {{manifest.string(), 0}});
 
   LoopbackHttpServer server;
@@ -305,7 +306,8 @@ TEST_F(IcebergTableResolutionTest, SkipsDeletedStatusEntries) {
       "m0.avro", {{(dir_ / "data-0.parquet").string(), 5}, {(dir_ / "data-1.parquet").string(), 3}},
       /*status=*/2 /* DELETED */);
   // Second manifest re-adds only data-0 as live.
-  const fs::path manifest2 = write_manifest("m1.avro", {{(dir_ / "data-0.parquet").string(), 5}}, /*status=*/1);
+  const fs::path manifest2 =
+      write_manifest("m1.avro", {{(dir_ / "data-0.parquet").string(), 5}}, /*status=*/1);
   const fs::path manifest_list =
       write_manifest_list("snap-42.avro", {{manifest.string(), 0}, {manifest2.string(), 0}});
 
@@ -347,14 +349,14 @@ TEST_F(IcebergTableResolutionTest, ThrowsOnNonParquetDataFile) {
   // "PARQUET"), reusing the same writer machinery.
   AvroFixtureWriter writer(kManifestSchemaJson);
   writer.write(manifest, {[](avro_value_t& v) {
-                  set_int_field(v, "status", 1);
-                  avro_value_t data_file;
-                  avro_value_get_by_name(&v, "data_file", &data_file, nullptr);
-                  set_string_field(data_file, "file_path", "s3://warehouse/db/orders/data/part-0.orc");
-                  set_string_field(data_file, "file_format", "ORC");
-                  set_long_field(data_file, "record_count", 5);
-                  set_long_field(data_file, "file_size_in_bytes", 1000);
-                }});
+                 set_int_field(v, "status", 1);
+                 avro_value_t data_file;
+                 avro_value_get_by_name(&v, "data_file", &data_file, nullptr);
+                 set_string_field(data_file, "file_path", "s3://warehouse/db/orders/data/part-0.orc");
+                 set_string_field(data_file, "file_format", "ORC");
+                 set_long_field(data_file, "record_count", 5);
+                 set_long_field(data_file, "file_size_in_bytes", 1000);
+               }});
   const fs::path manifest_list = write_manifest_list("snap-42.avro", {{manifest.string(), 0}});
 
   LoopbackHttpServer server;

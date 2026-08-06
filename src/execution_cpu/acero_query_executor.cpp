@@ -107,14 +107,14 @@ OpenFragment open_fragment_reader(const PhysicalFileFragment& fragment,
 // conversion (the same type mapping the AST literal-node path already uses)
 // rather than duplicating a second DataType-to-Arrow-scalar table here.
 std::shared_ptr<arrow::Array> make_partition_constant_array(const LiteralStorage& value, const DataType& type,
-                                                             std::int64_t length) {
+                                                            std::int64_t length) {
   const LiteralExpression literal(value, type);
   const arrow::Datum datum = literal_to_arrow_datum(literal);
   const arrow::Result<std::shared_ptr<arrow::Array>> result =
       arrow::MakeArrayFromScalar(*datum.scalar(), length);
   if (!result.ok()) {
-    throw StorageError(fmt::format("failed to materialize Hive partition column constant: {}",
-                                   result.status().ToString()));
+    throw StorageError(
+        fmt::format("failed to materialize Hive partition column constant: {}", result.status().ToString()));
   }
   return *result;
 }

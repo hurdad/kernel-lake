@@ -93,7 +93,8 @@ class LoopbackHttpServer {
 
 std::string http_ok_json(const std::string& json_body) {
   return fmt::format(
-      "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+      "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: "
+      "close\r\n\r\n{}",
       json_body.size(), json_body);
 }
 
@@ -179,8 +180,8 @@ class QueryEngineIcebergTest : public ::testing::Test {
   void SetUp() override {
     dir_ = fs::temp_directory_path() /
            fs::path("kernellake_query_engine_iceberg_test_" +
-                     std::to_string(::testing::UnitTest::GetInstance()->random_seed()) + "_" +
-                     ::testing::UnitTest::GetInstance()->current_test_info()->name());
+                    std::to_string(::testing::UnitTest::GetInstance()->random_seed()) + "_" +
+                    ::testing::UnitTest::GetInstance()->current_test_info()->name());
     fs::create_directories(dir_);
   }
 
@@ -215,25 +216,25 @@ class QueryEngineIcebergTest : public ::testing::Test {
 
     AvroFixtureWriter manifest_writer(kManifestSchemaJson);
     const fs::path manifest_path = dir_ / "m0.avro";
-    manifest_writer.write(
-        manifest_path, {[this](avro_value_t& v) {
-                          set_int_field(v, "status", 1);
-                          avro_value_t data_file;
-                          avro_value_get_by_name(&v, "data_file", &data_file, nullptr);
-                          set_string_field(data_file, "file_path", (dir_ / "data-0.parquet").string());
-                          set_string_field(data_file, "file_format", "PARQUET");
-                          set_long_field(data_file, "record_count", 5);
-                          set_long_field(data_file, "file_size_in_bytes", 1000);
-                        },
-                        [this](avro_value_t& v) {
-                          set_int_field(v, "status", 1);
-                          avro_value_t data_file;
-                          avro_value_get_by_name(&v, "data_file", &data_file, nullptr);
-                          set_string_field(data_file, "file_path", (dir_ / "data-1.parquet").string());
-                          set_string_field(data_file, "file_format", "PARQUET");
-                          set_long_field(data_file, "record_count", 5);
-                          set_long_field(data_file, "file_size_in_bytes", 1000);
-                        }});
+    manifest_writer.write(manifest_path,
+                          {[this](avro_value_t& v) {
+                             set_int_field(v, "status", 1);
+                             avro_value_t data_file;
+                             avro_value_get_by_name(&v, "data_file", &data_file, nullptr);
+                             set_string_field(data_file, "file_path", (dir_ / "data-0.parquet").string());
+                             set_string_field(data_file, "file_format", "PARQUET");
+                             set_long_field(data_file, "record_count", 5);
+                             set_long_field(data_file, "file_size_in_bytes", 1000);
+                           },
+                           [this](avro_value_t& v) {
+                             set_int_field(v, "status", 1);
+                             avro_value_t data_file;
+                             avro_value_get_by_name(&v, "data_file", &data_file, nullptr);
+                             set_string_field(data_file, "file_path", (dir_ / "data-1.parquet").string());
+                             set_string_field(data_file, "file_format", "PARQUET");
+                             set_long_field(data_file, "record_count", 5);
+                             set_long_field(data_file, "file_size_in_bytes", 1000);
+                           }});
 
     AvroFixtureWriter list_writer(kManifestListSchemaJson);
     const fs::path list_path = dir_ / "snap-42.avro";
@@ -258,7 +259,7 @@ class QueryEngineIcebergTest : public ::testing::Test {
         "snapshots": [{{"snapshot-id": 42, "manifest-list": "{1}"}}]
       }}
     }})json",
-        dir_.string(), list_path.string());
+                       dir_.string(), list_path.string());
   }
 
   EngineConfig config_with_catalog(const std::string& catalog_uri) {
@@ -309,8 +310,8 @@ TEST_F(QueryEngineIcebergTest, ExplainLogicalThrowsOnUnknownColumn) {
   server.respond({load_table_result});
 
   QueryEngine engine(config_with_catalog(server.base_url()));
-  EXPECT_THROW(
-      (void)(engine.explain_logical("SELECT nonexistent FROM read_iceberg('prod.db.orders')")), BindingError);
+  EXPECT_THROW((void)(engine.explain_logical("SELECT nonexistent FROM read_iceberg('prod.db.orders')")),
+               BindingError);
   server.join();
 }
 

@@ -170,8 +170,8 @@ std::vector<ObjectInfo> generic_fs_list_recursive(const std::shared_ptr<arrow::f
     throw StorageError(fmt::format("{}: path does not exist: '{}'", backend_label, prefix.value()));
   }
   if (!info_result->IsDirectory()) {
-    throw StorageError(fmt::format(
-        "{}: expected a directory for recursive listing, got a file: '{}'", backend_label, prefix.value()));
+    throw StorageError(fmt::format("{}: expected a directory for recursive listing, got a file: '{}'",
+                                   backend_label, prefix.value()));
   }
 
   arrow::fs::FileSelector selector;

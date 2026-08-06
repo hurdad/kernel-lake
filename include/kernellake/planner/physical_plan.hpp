@@ -51,8 +51,7 @@ struct PhysicalFileFragment {
 class ParquetScanNode final : public PhysicalPlanNode {
  public:
   ParquetScanNode(std::vector<PhysicalFileFragment> fragments, std::vector<std::string> columns,
-                  Schema schema, int files_considered,
-                  std::vector<PartitionColumn> partition_columns = {})
+                  Schema schema, int files_considered, std::vector<PartitionColumn> partition_columns = {})
       : fragments_(std::move(fragments)),
         columns_(std::move(columns)),
         schema_(std::move(schema)),

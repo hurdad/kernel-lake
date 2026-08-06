@@ -111,8 +111,15 @@ RUN wget -O /tmp/arrow-apt-source.deb \
 # libxml2 (Azure SDK's bundled XML request/response parsing) and libuuid
 # (Azure SDK's request-ID generation). Confirmed by a real link failure
 # without these two packages installed.
+#
+# Iceberg REST catalog support (src/iceberg/, docs/ROADMAP.md Phase 3) adds
+# two more unconditional dependencies here for the same reason: libavro-dev
+# (avro-c, for reading manifest-list/manifest Avro Object Container Files --
+# see cmake/ThirdPartyAvro.cmake) and libcurl4-openssl-dev (the REST/OAuth2
+# HTTP calls).
 RUN apt-get update && apt-get install -y --no-install-recommends \
       libxml2-dev uuid-dev \
+      libavro-dev libcurl4-openssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # kernellake-server (KERNELLAKE_BUILD_SERVER) + OpenTelemetry export

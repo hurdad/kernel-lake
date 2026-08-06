@@ -40,7 +40,8 @@ QualifiedName parse_qualified_name(const std::string& text) {
   }
   parts.push_back(current);
 
-  const bool has_empty_part = std::any_of(parts.begin(), parts.end(), [](const std::string& p) { return p.empty(); });
+  const bool has_empty_part =
+      std::any_of(parts.begin(), parts.end(), [](const std::string& p) { return p.empty(); });
   if (parts.size() < 3 || has_empty_part) {
     throw StorageError(fmt::format(
         "read_iceberg(...): '{}' isn't a valid catalog.namespace.table reference (need at least 3 "

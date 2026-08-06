@@ -92,7 +92,8 @@ class KernelLakeFlightSqlServer : public arrow::flight::sql::FlightSqlServerBase
   // reserve, executes on the configured backend, buffers the result in
   // results_, and builds the returned FlightInfo/ticket.
   arrow::Result<std::unique_ptr<arrow::flight::FlightInfo>> ExecuteAndBuffer(
-      const PhysicalPlanPtr& physical, std::string_view sql, const arrow::flight::FlightDescriptor& descriptor);
+      const PhysicalPlanPtr& physical, std::string_view sql,
+      const arrow::flight::FlightDescriptor& descriptor);
 
   EngineConfig config_;
   QueryEngine engine_;

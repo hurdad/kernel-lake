@@ -80,7 +80,7 @@ class IcebergRestCatalogClient final {
   // StorageError on any transport failure, non-2xx HTTP response, or
   // malformed/incomplete response JSON.
   [[nodiscard]] IcebergTableMetadata load_table_metadata(const std::vector<std::string>& namespace_parts,
-                                                          const std::string& table);
+                                                         const std::string& table);
 
  private:
   [[nodiscard]] std::string bearer_token_for_request();

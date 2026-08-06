@@ -182,7 +182,8 @@ const Schema* find_scan_schema(const PhysicalPlanNode& node) {
   return nullptr;
 }
 
-PhysicalPlanPtr convert_scan(const LogicalScan& scan, ObjectStore& store, TableSourceResolver* extra_resolver) {
+PhysicalPlanPtr convert_scan(const LogicalScan& scan, ObjectStore& store,
+                             TableSourceResolver* extra_resolver) {
   const ResolvedTable resolved = resolve_table_or_delegate(store, scan.source_paths(), extra_resolver);
 
   std::vector<PhysicalFileFragment> fragments;
@@ -193,10 +194,9 @@ PhysicalPlanPtr convert_scan(const LogicalScan& scan, ObjectStore& store, TableS
     if (decision.selected_row_groups.empty() && !meta.row_groups.empty()) {
       continue;  // Every row group was proven unnecessary: skip the file entirely.
     }
-    fragments.push_back(PhysicalFileFragment{meta.path, meta.row_count,
-                                             static_cast<int>(meta.row_groups.size()),
-                                             decision.selected_row_groups, decision.skipped_row_groups,
-                                             decision.reasons, file.partition_values});
+    fragments.push_back(PhysicalFileFragment{
+        meta.path, meta.row_count, static_cast<int>(meta.row_groups.size()), decision.selected_row_groups,
+        decision.skipped_row_groups, decision.reasons, file.partition_values});
   }
 
   // Narrow the schema (and the matching column list) to required_columns(),
@@ -252,10 +252,9 @@ PhysicalPlanPtr convert_scan(const LogicalScan& scan, ObjectStore& store, TableS
     narrowed_columns.push_back(fallback.name);
   }
 
-  return std::make_shared<ParquetScanNode>(std::move(fragments), std::move(narrowed_columns),
-                                           Schema(std::move(narrowed_fields)),
-                                           static_cast<int>(resolved.files.size()),
-                                           std::move(narrowed_partitions));
+  return std::make_shared<ParquetScanNode>(
+      std::move(fragments), std::move(narrowed_columns), Schema(std::move(narrowed_fields)),
+      static_cast<int>(resolved.files.size()), std::move(narrowed_partitions));
 }
 
 PhysicalPlanPtr convert(const LogicalPlanPtr& node, ObjectStore& store, TableSourceResolver* extra_resolver) {

@@ -85,7 +85,8 @@ class AvroFixtureWriter {
   std::string write(const fs::path& path, const std::vector<std::function<void(avro_value_t&)>>& rows) {
     avro_file_writer_t writer = nullptr;
     if (avro_file_writer_create(path.c_str(), schema_, &writer) != 0) {
-      throw std::runtime_error(std::string("test fixture: avro_file_writer_create failed: ") + avro_strerror());
+      throw std::runtime_error(std::string("test fixture: avro_file_writer_create failed: ") +
+                               avro_strerror());
     }
     avro_value_t value;
     avro_generic_value_new(iface_, &value);
@@ -147,8 +148,8 @@ class ManifestReaderTest : public ::testing::Test {
   void SetUp() override {
     dir_ = fs::temp_directory_path() /
            fs::path("kernellake_manifest_reader_test_" +
-                     std::to_string(::testing::UnitTest::GetInstance()->random_seed()) + "_" +
-                     ::testing::UnitTest::GetInstance()->current_test_info()->name());
+                    std::to_string(::testing::UnitTest::GetInstance()->random_seed()) + "_" +
+                    ::testing::UnitTest::GetInstance()->current_test_info()->name());
     fs::create_directories(dir_);
   }
 
@@ -159,23 +160,24 @@ class ManifestReaderTest : public ::testing::Test {
 
 TEST_F(ManifestReaderTest, ReadsManifestListEntriesInOrder) {
   AvroFixtureWriter writer(kManifestListSchemaJson);
-  const std::string bytes = writer.write(dir_ / "snap-1.avro",
-      {
-          [](avro_value_t& v) {
-            set_string_field(v, "manifest_path", "s3://warehouse/db/orders/metadata/m0.avro");
-            set_long_field(v, "manifest_length", 1234);
-            set_int_field(v, "partition_spec_id", 0);
-            set_int_field(v, "content", 0);
-            set_long_field(v, "added_snapshot_id", 42);
-          },
-          [](avro_value_t& v) {
-            set_string_field(v, "manifest_path", "s3://warehouse/db/orders/metadata/m1.avro");
-            set_long_field(v, "manifest_length", 5678);
-            set_int_field(v, "partition_spec_id", 0);
-            set_int_field(v, "content", 1);
-            set_long_field(v, "added_snapshot_id", 42);
-          },
-      });
+  const std::string bytes =
+      writer.write(dir_ / "snap-1.avro",
+                   {
+                       [](avro_value_t& v) {
+                         set_string_field(v, "manifest_path", "s3://warehouse/db/orders/metadata/m0.avro");
+                         set_long_field(v, "manifest_length", 1234);
+                         set_int_field(v, "partition_spec_id", 0);
+                         set_int_field(v, "content", 0);
+                         set_long_field(v, "added_snapshot_id", 42);
+                       },
+                       [](avro_value_t& v) {
+                         set_string_field(v, "manifest_path", "s3://warehouse/db/orders/metadata/m1.avro");
+                         set_long_field(v, "manifest_length", 5678);
+                         set_int_field(v, "partition_spec_id", 0);
+                         set_int_field(v, "content", 1);
+                         set_long_field(v, "added_snapshot_id", 42);
+                       },
+                   });
 
   const std::vector<ManifestListEntry> entries = read_manifest_list_bytes(bytes);
   ASSERT_EQ(entries.size(), 2u);
@@ -189,22 +191,23 @@ TEST_F(ManifestReaderTest, ReadsManifestListEntriesInOrder) {
 
 TEST_F(ManifestReaderTest, ReadsManifestDataFileEntriesWithPartitionValues) {
   AvroFixtureWriter writer(kManifestSchemaJson);
-  const std::string bytes = writer.write(dir_ / "m0.avro",
-      {
-          [](avro_value_t& v) {
-            set_int_field(v, "status", 1);
-            avro_value_t data_file;
-            avro_value_get_by_name(&v, "data_file", &data_file, nullptr);
-            set_string_field(data_file, "file_path", "s3://warehouse/db/orders/data/region=US/part-0.parquet");
-            set_string_field(data_file, "file_format", "PARQUET");
-            set_long_field(data_file, "record_count", 1000);
-            set_long_field(data_file, "file_size_in_bytes", 999999);
-            avro_value_t partition;
-            avro_value_get_by_name(&data_file, "partition", &partition, nullptr);
-            set_optional_string_field(partition, "region", "US");
-            set_optional_int_field(partition, "day", 19000);
-          },
-      });
+  const std::string bytes = writer.write(
+      dir_ / "m0.avro", {
+                            [](avro_value_t& v) {
+                              set_int_field(v, "status", 1);
+                              avro_value_t data_file;
+                              avro_value_get_by_name(&v, "data_file", &data_file, nullptr);
+                              set_string_field(data_file, "file_path",
+                                               "s3://warehouse/db/orders/data/region=US/part-0.parquet");
+                              set_string_field(data_file, "file_format", "PARQUET");
+                              set_long_field(data_file, "record_count", 1000);
+                              set_long_field(data_file, "file_size_in_bytes", 999999);
+                              avro_value_t partition;
+                              avro_value_get_by_name(&data_file, "partition", &partition, nullptr);
+                              set_optional_string_field(partition, "region", "US");
+                              set_optional_int_field(partition, "day", 19000);
+                            },
+                        });
 
   const std::vector<ManifestDataFileEntry> entries = read_manifest_bytes(bytes);
   ASSERT_EQ(entries.size(), 1u);
@@ -223,27 +226,28 @@ TEST_F(ManifestReaderTest, ReadsManifestDataFileEntriesWithPartitionValues) {
 
 TEST_F(ManifestReaderTest, DecodesNullPartitionFieldAsMonostate) {
   AvroFixtureWriter writer(kManifestSchemaJson);
-  const std::string bytes = writer.write(dir_ / "m0.avro",
-      {
-          [](avro_value_t& v) {
-            set_int_field(v, "status", 1);
-            avro_value_t data_file;
-            avro_value_get_by_name(&v, "data_file", &data_file, nullptr);
-            set_string_field(data_file, "file_path", "s3://warehouse/db/orders/data/part-0.parquet");
-            set_string_field(data_file, "file_format", "PARQUET");
-            set_long_field(data_file, "record_count", 1);
-            set_long_field(data_file, "file_size_in_bytes", 1);
-            avro_value_t partition;
-            avro_value_get_by_name(&data_file, "partition", &partition, nullptr);
-            avro_value_t region_field;
-            avro_value_get_by_name(&partition, "region", &region_field, nullptr);
-            avro_value_t branch;
-            avro_value_set_branch(&region_field, 0, &branch);  // null branch
-            avro_value_t day_field;
-            avro_value_get_by_name(&partition, "day", &day_field, nullptr);
-            avro_value_set_branch(&day_field, 0, &branch);
-          },
-      });
+  const std::string bytes = writer.write(
+      dir_ / "m0.avro", {
+                            [](avro_value_t& v) {
+                              set_int_field(v, "status", 1);
+                              avro_value_t data_file;
+                              avro_value_get_by_name(&v, "data_file", &data_file, nullptr);
+                              set_string_field(data_file, "file_path",
+                                               "s3://warehouse/db/orders/data/part-0.parquet");
+                              set_string_field(data_file, "file_format", "PARQUET");
+                              set_long_field(data_file, "record_count", 1);
+                              set_long_field(data_file, "file_size_in_bytes", 1);
+                              avro_value_t partition;
+                              avro_value_get_by_name(&data_file, "partition", &partition, nullptr);
+                              avro_value_t region_field;
+                              avro_value_get_by_name(&partition, "region", &region_field, nullptr);
+                              avro_value_t branch;
+                              avro_value_set_branch(&region_field, 0, &branch);  // null branch
+                              avro_value_t day_field;
+                              avro_value_get_by_name(&partition, "day", &day_field, nullptr);
+                              avro_value_set_branch(&day_field, 0, &branch);
+                            },
+                        });
 
   const std::vector<ManifestDataFileEntry> entries = read_manifest_bytes(bytes);
   ASSERT_EQ(entries.size(), 1u);
@@ -263,16 +267,15 @@ TEST_F(ManifestReaderTest, ThrowsOnEmptyBytes) {
 TEST_F(ManifestReaderTest, ReadsManifestListThroughObjectStore) {
   AvroFixtureWriter writer(kManifestListSchemaJson);
   const fs::path path = dir_ / "snap-1.avro";
-  writer.write(path,
-      {
-          [](avro_value_t& v) {
-            set_string_field(v, "manifest_path", "s3://warehouse/db/orders/metadata/m0.avro");
-            set_long_field(v, "manifest_length", 1234);
-            set_int_field(v, "partition_spec_id", 0);
-            set_int_field(v, "content", 0);
-            set_long_field(v, "added_snapshot_id", 42);
-          },
-      });
+  writer.write(path, {
+                         [](avro_value_t& v) {
+                           set_string_field(v, "manifest_path", "s3://warehouse/db/orders/metadata/m0.avro");
+                           set_long_field(v, "manifest_length", 1234);
+                           set_int_field(v, "partition_spec_id", 0);
+                           set_int_field(v, "content", 0);
+                           set_long_field(v, "added_snapshot_id", 42);
+                         },
+                     });
 
   LocalObjectStore store;
   const std::vector<ManifestListEntry> entries = read_manifest_list(store, Uri(path.string()));

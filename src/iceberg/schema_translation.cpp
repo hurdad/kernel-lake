@@ -38,8 +38,9 @@ std::optional<std::pair<std::int32_t, std::int32_t>> parse_decimal(const std::st
   const auto precision_result =
       std::from_chars(precision_str.data(), precision_str.data() + precision_str.size(), precision);
   const auto scale_result = std::from_chars(scale_str.data(), scale_str.data() + scale_str.size(), scale);
-  if (precision_result.ec != std::errc{} || precision_result.ptr != precision_str.data() + precision_str.size() ||
-      scale_result.ec != std::errc{} || scale_result.ptr != scale_str.data() + scale_str.size()) {
+  if (precision_result.ec != std::errc{} ||
+      precision_result.ptr != precision_str.data() + precision_str.size() || scale_result.ec != std::errc{} ||
+      scale_result.ptr != scale_str.data() + scale_str.size()) {
     return std::nullopt;
   }
   return std::make_pair(precision, scale);
