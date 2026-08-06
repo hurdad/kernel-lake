@@ -2209,8 +2209,9 @@ and covered by passing tests -- not merely designed or stubbed.
   explicit, documented non-goals for now -- see the entries above for
   exactly where each one throws instead of guessing.
 
-- **Delta Lake support, started (gRPC client to delta-txn-service)**
-  (Phase 4 of the lakehouse roadmap). Supersedes this file's own earlier
+- **Delta Lake support, now functionally complete for the MVP's scope
+  (gRPC client to delta-txn-service)** (Phase 4 of the lakehouse roadmap).
+  Supersedes this file's own earlier
   "Not yet started" entry for Delta, which assumed the only path in was
   vendoring `delta-kernel-rs` (or `delta-rs`, what it turned out to use)
   directly into this C++ project via a Rust toolchain -- the actual path
@@ -2311,12 +2312,72 @@ and covered by passing tests -- not merely designed or stubbed.
     server, and a trace-context test proving a real, well-formed
     `traceparent` header end to end), zero regressions on the KernelLake
     side.
-  - Not yet done: `resolve_delta_table()`, Delta-schema-string ->
-    `kernellake::Schema` translation, a `DeltaSourceResolver`
-    (`TableSourceResolver` implementation, same seam Iceberg's own
-    resolver plugs into), and the `read_delta(...)` SQL surface itself --
-    this phase currently ends at "can fetch real table state and file
-    lists from delta-txn-service," not yet "can query a Delta table."
+  - **Schema translation, table resolution, and the `read_delta(...)` SQL
+    surface, landing this session** (this phase's own former "not yet
+    done" list, now closed): `kernellake/delta/schema_translation.hpp`
+    translates a Delta table's `schema_string` (Spark-schema-compatible
+    JSON) into a `kernellake::Schema`, the same primitive-type coverage
+    and "throw on binary/void/nested types" rule as the Iceberg
+    translation. `resolve_delta_table()`
+    (`kernellake/delta/delta_table_resolution.hpp`) is the Delta
+    equivalent of `resolve_iceberg_table()`: one
+    `DeltaTxnClient::list_active_files()` call, then splits
+    `DeltaTableInfo::partition_columns` out of the full schema (those
+    columns are never physically present in a data file's own Parquet
+    footer, exactly like Hive-style partitioning) and appends them back to
+    the end of `ResolvedTable::schema`, same field-ordering convention
+    `resolve_table()`/`resolve_iceberg_table()` both already use. Each
+    `AddFile.path` is table-root-relative (delta-rs's own
+    `LogicalFileView::path()`, confirmed by reading the vendored crate
+    source directly), not an absolute URI, so it's joined with the
+    table's own `table_uri` before being handed to
+    `inspect_parquet_file()` -- an absolute-URI `AddFile.path` (valid but
+    rare per the Delta protocol spec) is used as-is instead.
+    `DeltaSourceResolver` (`kernellake/delta/delta_source_resolver.hpp`)
+    is the `TableSourceResolver` for `read_delta('<table_uri>')`, encoded
+    by `parser.cpp`'s preprocessing as source path
+    `"delta://<table_uri>"` -- reusing the same `Uri::scheme()` dispatch
+    idiom as `read_iceberg(...)`; since `<table_uri>` is itself already a
+    full URI, the encoded source legitimately contains a second "://" of
+    its own, and `Uri::scheme()` only looking at the first occurrence is
+    exactly what makes that compose correctly with no extra escaping.
+    `QueryEngine` combines `IcebergSourceResolver` and
+    `DeltaSourceResolver` behind `resolve_table_or_delegate()`'s single
+    `extra_resolver` slot via a small new `CompositeSourceResolver`
+    (`src/api/composite_source_resolver.hpp`, an internal, src/-local
+    header) -- safe because their `can_resolve()` checks are mutually
+    exclusive Uri schemes, so both source kinds now work in the same
+    query or JOIN.
+  - **A real pre-existing bug found and fixed while wiring this up**:
+    `QueryEngine::execute()` (`query_engine_execute_stub.cpp`/
+    `query_engine_execute_gpu.cpp`) called `build_physical_plan()` with no
+    `extra_resolver` at all (that parameter defaults to `nullptr`) --
+    meaning `SELECT ... FROM read_iceberg(...)` could `explain()` (which
+    already builds and passes its own resolver) but not actually
+    *execute*, since physical-plan-time re-resolution would fall through
+    to plain `resolve_table()` and fail on the "iceberg://"/"delta://"
+    source it doesn't understand. This predates Delta entirely -- it was
+    already broken for `read_iceberg(...)`, just never exercised by an
+    end-to-end execute() test until this session's
+    `query_engine_delta_test.cpp` added one specifically to prove the fix
+    (`QueryEngineDeltaTest.ExecuteRunsQueryEndToEndOverRealDataFiles`,
+    which fails at physical-plan time without the fix). Both `execute()`
+    call sites now construct and pass the same `CompositeSourceResolver`
+    `explain()` does.
+  - **Verification**: 23 new tests (`delta_schema_translation_test.cpp`,
+    `delta_table_resolution_test.cpp` -- against a real in-process fake
+    delta-txn-service and real Parquet fixtures, `delta_source_resolver_test.cpp`,
+    `query_engine_delta_test.cpp` -- the capstone end-to-end test,
+    including a real `execute()` proving the bug fix above). `dev`
+    290/290, `otel-dev` 293/293, `server-dev` 294/294, all green; format
+    and `run-clang-tidy-18 -warnings-as-errors='*'` both clean.
+  - Not yet done: row-level deletes/change-data-feed, `MERGE`/`UPDATE`/
+    `DELETE` writes (this phase is read-only, matching delta-txn-service's
+    own `Commit` RPC not being called from KernelLake at all), and schema
+    evolution across files (a data file's physical schema must currently
+    match the table's *current* schema exactly, same limitation and
+    rationale as the Iceberg path's own "reading files written under a
+    different (evolved) schema version isn't supported yet").
 
 ## Not yet started
 

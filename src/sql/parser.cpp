@@ -214,10 +214,20 @@ std::optional<std::pair<std::vector<std::string>, std::size_t>> try_parse_read_p
 // validating the catalog name against configured catalogs, happens there
 // too -- not here, matching how a read_parquet(...) path's own syntax
 // isn't validated at this layer either.
+//
+// `read_delta('<table_uri>')` follows the exact same one-string-argument
+// shape, re-encoded as "delta://<table_uri>" -- only DeltaSourceResolver
+// (kernellake/delta/delta_source_resolver.hpp) ever looks at that prefix.
+// Unlike Iceberg's catalog-qualified name, `<table_uri>` is itself already
+// a full URI (e.g. "s3://bucket/warehouse/orders"), so the encoded source
+// legitimately contains a second "://" of its own; Uri::scheme() only
+// looks at the first occurrence, so this composes correctly without any
+// extra escaping here.
 namespace {
 Preprocessed preprocess_from_read_parquet(const std::string& sql) {
   static constexpr std::string_view kParquetFunctionName = "read_parquet";
   static constexpr std::string_view kIcebergFunctionName = "read_iceberg";
+  static constexpr std::string_view kDeltaFunctionName = "read_delta";
 
   std::string rewritten;
   std::vector<PlaceholderSource> sources;
@@ -225,28 +235,35 @@ Preprocessed preprocess_from_read_parquet(const std::string& sql) {
   while (pos < sql.size()) {
     const bool is_parquet = starts_with_ci(sql, pos, kParquetFunctionName);
     const bool is_iceberg = !is_parquet && starts_with_ci(sql, pos, kIcebergFunctionName);
-    if (!is_parquet && !is_iceberg) {
+    const bool is_delta = !is_parquet && !is_iceberg && starts_with_ci(sql, pos, kDeltaFunctionName);
+    if (!is_parquet && !is_iceberg && !is_delta) {
       rewritten += sql[pos];
       ++pos;
       continue;
     }
-    const std::string_view function_name = is_parquet ? kParquetFunctionName : kIcebergFunctionName;
+    const std::string_view function_name =
+        is_parquet ? kParquetFunctionName : (is_iceberg ? kIcebergFunctionName : kDeltaFunctionName);
     std::optional<std::pair<std::vector<std::string>, std::size_t>> parsed =
         try_parse_read_parquet_args(sql, pos + function_name.size());
-    if (!parsed || (is_iceberg && parsed->first.size() != 1)) {
+    if (!parsed || ((is_iceberg || is_delta) && parsed->first.size() != 1)) {
       // Doesn't have the shape this preprocessor understands (e.g. a
-      // non-string argument, or more than one argument to read_iceberg) --
-      // leave the text untouched; hsql's own grammar will reject it with a
-      // normal parse error.
+      // non-string argument, or more than one argument to
+      // read_iceberg(...)/read_delta(...)) -- leave the text untouched;
+      // hsql's own grammar will reject it with a normal parse error.
       rewritten += sql[pos];
       ++pos;
       continue;
     }
     std::string placeholder = "kernellake_parquet_source_" + std::to_string(sources.size());
     rewritten += placeholder;
-    std::vector<std::string> paths = is_iceberg
-                                         ? std::vector<std::string>{"iceberg://" + parsed->first.front()}
-                                         : std::move(parsed->first);
+    std::vector<std::string> paths;
+    if (is_iceberg) {
+      paths = {"iceberg://" + parsed->first.front()};
+    } else if (is_delta) {
+      paths = {"delta://" + parsed->first.front()};
+    } else {
+      paths = std::move(parsed->first);
+    }
     sources.push_back(PlaceholderSource{placeholder, std::move(paths)});
     pos = parsed->second;
   }
@@ -254,8 +271,8 @@ Preprocessed preprocess_from_read_parquet(const std::string& sql) {
   if (sources.empty()) {
     throw SqlError(
         "KernelLake requires at least one data source of the form "
-        "read_parquet('path' [, 'path2', ...]) or read_iceberg('catalog.namespace.table'); no such clause "
-        "was found in the query");
+        "read_parquet('path' [, 'path2', ...]), read_iceberg('catalog.namespace.table'), or "
+        "read_delta('table_uri'); no such clause was found in the query");
   }
   // Generous relative to any real query (TPC-H's own deepest join, Q8,
   // needs 7) -- purely a guard against a pathological number of joined
@@ -263,10 +280,10 @@ Preprocessed preprocess_from_read_parquet(const std::string& sql) {
   // kMaxParenDepth above.
   constexpr std::size_t kMaxJoinSources = 12;
   if (sources.size() > kMaxJoinSources) {
-    throw SqlError(
-        fmt::format("KernelLake supports at most {} read_parquet(...)/read_iceberg(...) sources in a JOIN "
-                    "chain, got {}",
-                    kMaxJoinSources, sources.size()));
+    throw SqlError(fmt::format(
+        "KernelLake supports at most {} read_parquet(...)/read_iceberg(...)/read_delta(...) sources in a "
+        "JOIN chain, got {}",
+        kMaxJoinSources, sources.size()));
   }
   return Preprocessed{std::move(rewritten), std::move(sources)};
 }
@@ -559,7 +576,8 @@ AstExprPtr convert_expr(const hsql::Expr* e) {
 AstParquetSource convert_join_source(const hsql::TableRef* ref, const Preprocessed& preprocessed) {
   if (ref == nullptr || ref->type != hsql::kTableName || ref->name == nullptr) {
     unsupported(
-        "JOIN sides must each be a single read_parquet(...)/read_iceberg(...) source, not a subquery or "
+        "JOIN sides must each be a single read_parquet(...)/read_iceberg(...)/read_delta(...) source, not a "
+        "subquery or "
         "nested join");
   }
   if (ref->alias == nullptr || ref->alias->name == nullptr) {
@@ -570,7 +588,7 @@ AstParquetSource convert_join_source(const hsql::TableRef* ref, const Preprocess
       return AstParquetSource{source.paths, std::string(ref->alias->name)};
     }
   }
-  unsupported("JOIN source does not reference a read_parquet(...)/read_iceberg(...) call");
+  unsupported("JOIN source does not reference a read_parquet(...)/read_iceberg(...)/read_delta(...) call");
 }
 
 // hsql parses a multi-way JOIN left-associatively: `A JOIN B ON c1 JOIN C
@@ -655,7 +673,8 @@ AstSelectStatement parse_sql(std::string_view sql_view) {
       stmt->fromTable->name != nullptr) {
     if (preprocessed.sources.size() != 1 || stmt->fromTable->name != preprocessed.sources[0].placeholder) {
       unsupported(
-          "joins and subqueries (only a single FROM read_parquet(...)/read_iceberg(...) source, or a "
+          "joins and subqueries (only a single FROM read_parquet(...)/read_iceberg(...)/read_delta(...) "
+          "source, or a "
           "two-table JOIN, is supported)");
     }
     out.from.paths = preprocessed.sources[0].paths;
@@ -671,12 +690,14 @@ AstSelectStatement parse_sql(std::string_view sql_view) {
     // shape a source could legitimately appear in).
     if (preprocessed.sources.size() != clause.steps.size() + 1) {
       unsupported(
-          "a JOIN requires exactly one read_parquet(...)/read_iceberg(...) source per table in the chain");
+          "a JOIN requires exactly one read_parquet(...)/read_iceberg(...)/read_delta(...) source per table "
+          "in the chain");
     }
     out.join = std::move(clause);
   } else {
     unsupported(
-        "joins and subqueries (only a single FROM read_parquet(...)/read_iceberg(...) source, or a "
+        "joins and subqueries (only a single FROM read_parquet(...)/read_iceberg(...)/read_delta(...) "
+        "source, or a "
         "two-table JOIN, is supported)");
   }
 

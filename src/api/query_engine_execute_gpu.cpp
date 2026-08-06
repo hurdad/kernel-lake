@@ -6,14 +6,18 @@
 #include <chrono>
 
 #include "kernellake/api/query_engine.hpp"
+#include "kernellake/delta/delta_source_resolver.hpp"
 #include "kernellake/execution_gpu/arrow_bridge.hpp"
 #include "kernellake/execution_gpu/cuda_utils.hpp"
 #include "kernellake/execution_gpu/execution_context.hpp"
 #include "kernellake/execution_gpu/operator_builder.hpp"
+#include "kernellake/iceberg/iceberg_source_resolver.hpp"
 #include "kernellake/io/physical_planner.hpp"
 #include "kernellake/memory/rmm_environment.hpp"
 #include "kernellake/planner/physical_plan.hpp"
 #include "kernellake/types/arrow_adapter.hpp"
+
+#include "composite_source_resolver.hpp"
 
 namespace kernellake {
 
@@ -39,7 +43,16 @@ QueryResult QueryEngine::execute(std::string_view sql) const {
 
   double metadata_inspection_seconds = 0.0;
   const LogicalPlanPtr logical = plan_logical(sql, &metadata_inspection_seconds);
-  const PhysicalPlanPtr physical = build_physical_plan(logical, store_);
+  // Real execution re-resolves independently of plan_logical()'s own
+  // schema-discovery resolve, same as explain() -- see
+  // QueryEngine::explain()'s own comment (query_engine.cpp) for why.
+  // Without this, `SELECT ... FROM read_iceberg(...)`/`read_delta(...)`
+  // would plan fine but fail at physical-plan time here, since
+  // build_physical_plan()'s `extra_resolver` defaults to nullptr.
+  iceberg::IcebergSourceResolver iceberg_resolver(config_.iceberg);
+  delta::DeltaSourceResolver delta_resolver(config_.delta);
+  CompositeSourceResolver resolver(iceberg_resolver, delta_resolver);
+  const PhysicalPlanPtr physical = build_physical_plan(logical, store_, &resolver);
 
   QueryResult result;
   if (config_.engine.backend == "cpu") {

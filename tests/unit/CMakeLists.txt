@@ -21,6 +21,10 @@ add_executable(kernellake_unit_tests
   iceberg_source_resolver_test.cpp
   query_engine_iceberg_test.cpp
   delta_txn_client_test.cpp
+  delta_schema_translation_test.cpp
+  delta_table_resolution_test.cpp
+  delta_source_resolver_test.cpp
+  query_engine_delta_test.cpp
   physical_planner_test.cpp
   query_engine_test.cpp
   query_engine_execute_cpu_test.cpp

@@ -74,7 +74,7 @@ message ListActiveFilesRequest {
 // The stream always begins with exactly one `header` message, followed by
 // zero or more `batch` messages (each carrying a server-chosen-size chunk
 // of files, not necessarily one file per message -- see
-// DEFAULT_FILE_BATCH_SIZE in the server implementation) until the stream
+// FILE_BATCH_SIZE in the server implementation) until the stream
 // closes. A oneof (rather than "first message happens to have version set,
 // rest don't") makes that framing a compile-time-checked client contract
 // instead of an implicit, undocumented convention.
