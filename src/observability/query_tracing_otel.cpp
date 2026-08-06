@@ -12,6 +12,8 @@
 #include "kernellake/observability/query_tracing.hpp"
 
 #include <opentelemetry/context/context.h>
+#include <opentelemetry/context/propagation/text_map_propagator.h>
+#include <opentelemetry/context/runtime_context.h>
 #include <opentelemetry/exporters/otlp/otlp_grpc_exporter_factory.h>
 #include <opentelemetry/exporters/otlp/otlp_grpc_exporter_options.h>
 #include <opentelemetry/exporters/otlp/otlp_grpc_log_record_exporter_factory.h>
@@ -38,6 +40,8 @@
 #include <opentelemetry/sdk/trace/simple_processor_factory.h>
 #include <opentelemetry/sdk/trace/tracer_provider.h>
 #include <opentelemetry/sdk/trace/tracer_provider_factory.h>
+#include <opentelemetry/trace/context.h>
+#include <opentelemetry/trace/propagation/http_trace_context.h>
 #include <spdlog/spdlog.h>
 
 #include <string>
@@ -251,6 +255,16 @@ void shutdown() {
 
 struct QuerySpan::Impl {
   opentelemetry::nostd::shared_ptr<trace_api::Span> span;
+  // Keeps this span "current" (opentelemetry::context::RuntimeContext::
+  // GetCurrent()) for as long as the QuerySpan itself is alive, so a
+  // ClientSpan started anywhere underneath a query's execution (e.g.
+  // DeltaTxnClient's gRPC calls) picks it up as its parent by default --
+  // see StartSpanOptions's own doc comment: "If the parent field is not
+  // set, the newly created Span will inherit the parent of the currently
+  // active Span." Detaches automatically (Token's destructor) whenever
+  // this Impl is destroyed, restoring whatever context was active before
+  // this query started.
+  opentelemetry::nostd::unique_ptr<opentelemetry::context::Token> context_token;
 };
 
 QuerySpan::QuerySpan(QuerySpan&&) noexcept = default;
@@ -271,6 +285,9 @@ QuerySpan start_query_span(std::string_view operation_name) {
   span.impl_ = std::make_unique<QuerySpan::Impl>();
   span.impl_->span =
       trace_api::Provider::GetTracerProvider()->GetTracer(g_tracer_name)->StartSpan(to_otel(operation_name));
+  opentelemetry::context::Context ctx = opentelemetry::context::RuntimeContext::GetCurrent();
+  ctx = trace_api::SetSpan(ctx, span.impl_->span);
+  span.impl_->context_token = opentelemetry::context::RuntimeContext::Attach(ctx);
   return span;
 }
 
@@ -362,6 +379,94 @@ void QuerySpan::finish_error(const std::exception& e, std::string_view sql, std:
   span.AddEvent("exception", {{"exception.message", std::string(e.what())}});
   span.SetStatus(trace_api::StatusCode::kError, e.what());
   span.End();
+}
+
+struct ClientSpan::Impl {
+  opentelemetry::nostd::shared_ptr<trace_api::Span> span;
+  // Same purpose as QuerySpan::Impl::context_token: keeps this span
+  // "current" for as long as this ClientSpan is alive, so any further
+  // nested ClientSpan (there are none today, but the whole point of using
+  // RuntimeContext rather than a bespoke parent-tracking mechanism is that
+  // this generalizes for free) parents correctly too.
+  opentelemetry::nostd::unique_ptr<opentelemetry::context::Token> context_token;
+};
+
+ClientSpan::ClientSpan(ClientSpan&&) noexcept = default;
+ClientSpan& ClientSpan::operator=(ClientSpan&&) noexcept = default;
+
+ClientSpan::~ClientSpan() {
+  if (impl_ && impl_->span && impl_->span->IsRecording()) {
+    impl_->span->End();
+  }
+}
+
+ClientSpan start_client_span(std::string_view operation_name) {
+  if (!g_enabled) {
+    return ClientSpan();
+  }
+
+  ClientSpan span;
+  span.impl_ = std::make_unique<ClientSpan::Impl>();
+  span.impl_->span =
+      trace_api::Provider::GetTracerProvider()->GetTracer(g_tracer_name)->StartSpan(to_otel(operation_name));
+  opentelemetry::context::Context ctx = opentelemetry::context::RuntimeContext::GetCurrent();
+  ctx = trace_api::SetSpan(ctx, span.impl_->span);
+  span.impl_->context_token = opentelemetry::context::RuntimeContext::Attach(ctx);
+  return span;
+}
+
+namespace {
+
+// Adapts ClientSpan::inject()'s std::function setter to OTel's
+// TextMapCarrier interface (what HttpTraceContext::Inject() needs) --
+// Get()/Keys() are never actually called by an *injecting* propagator
+// (both only matter for Extract(), delta-txn-service's own side of this,
+// see that project's telemetry/trace_context.rs), so they're trivial
+// stubs rather than real accessors into anything.
+class SetterTextMapCarrier : public opentelemetry::context::propagation::TextMapCarrier {
+ public:
+  explicit SetterTextMapCarrier(const std::function<void(std::string_view, std::string_view)>& setter)
+      : setter_(setter) {}
+
+  opentelemetry::nostd::string_view Get(opentelemetry::nostd::string_view /*key*/) const noexcept override {
+    return "";
+  }
+
+  void Set(opentelemetry::nostd::string_view key, opentelemetry::nostd::string_view value) noexcept override {
+    setter_(std::string_view(key.data(), key.size()), std::string_view(value.data(), value.size()));
+  }
+
+ private:
+  const std::function<void(std::string_view, std::string_view)>& setter_;
+};
+
+}  // namespace
+
+void ClientSpan::inject(const std::function<void(std::string_view, std::string_view)>& setter) const {
+  if (!impl_) {
+    return;
+  }
+  SetterTextMapCarrier carrier(setter);
+  opentelemetry::context::Context ctx;
+  ctx = trace_api::SetSpan(ctx, impl_->span);
+  trace_api::propagation::HttpTraceContext{}.Inject(carrier, ctx);
+}
+
+void ClientSpan::finish_ok() {
+  if (!impl_) {
+    return;
+  }
+  impl_->span->SetStatus(trace_api::StatusCode::kOk);
+  impl_->span->End();
+}
+
+void ClientSpan::finish_error(std::string_view error_message) {
+  if (!impl_) {
+    return;
+  }
+  impl_->span->AddEvent("exception", {{"exception.message", std::string(error_message)}});
+  impl_->span->SetStatus(trace_api::StatusCode::kError, to_otel(error_message));
+  impl_->span->End();
 }
 
 }  // namespace kernellake::observability

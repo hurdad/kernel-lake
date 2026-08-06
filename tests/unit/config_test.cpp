@@ -140,6 +140,28 @@ TEST(Config, RejectsIcebergCatalogOauth2MissingClientCredentials) {
   EXPECT_THROW((void)(validate_config(config)), ConfigurationError);
 }
 
+TEST(Config, ParsesDeltaSection) {
+  const std::string yaml = R"(
+delta:
+  grpc_endpoint: delta-txn.internal:50051
+  use_tls: true
+  tls_ca_cert_path: /etc/ssl/ca.pem
+  api_key: secret-key
+)";
+  const EngineConfig config = parse_config(yaml);
+  EXPECT_EQ(config.delta.grpc_endpoint, "delta-txn.internal:50051");
+  EXPECT_TRUE(config.delta.use_tls);
+  EXPECT_EQ(config.delta.tls_ca_cert_path, "/etc/ssl/ca.pem");
+  EXPECT_EQ(config.delta.api_key, "secret-key");
+}
+
+TEST(Config, DeltaSectionDefaultsToUnconfigured) {
+  const EngineConfig config = default_config();
+  EXPECT_TRUE(config.delta.grpc_endpoint.empty());
+  EXPECT_FALSE(config.delta.use_tls);
+  EXPECT_TRUE(config.delta.api_key.empty());
+}
+
 TEST(Config, LoadConfigFileRejectsMissingPath) {
   EXPECT_THROW((void)(load_config_file("/nonexistent/kernellake.yaml")), ConfigurationError);
 }

@@ -167,6 +167,27 @@ struct IcebergSection {
   std::unordered_map<std::string, IcebergCatalogSection> catalogs;
 };
 
+// Delta Lake read support (src/delta/) talks to a separate, standalone
+// delta-txn-service (a Rust gRPC service -- deliberately kept out of this
+// project's own build, see cmake/ThirdPartyDeltaTxnProto.cmake) as a
+// client, for both table inspection (GetTable) and active-file listing
+// (ListActiveFiles). Unlike IcebergSection, this is a single section, not
+// a name-keyed map: delta-txn-service's own README describes it as "a
+// centralized Delta commit coordinator" -- one deployment per environment,
+// not one per catalog the way Iceberg REST catalogs commonly are -- and a
+// Delta table is addressed directly by its storage URI
+// (`read_delta('s3://bucket/table')`), with no catalog/namespace concept
+// of its own to key a map by. `grpc_endpoint` empty means "not
+// configured": validate_config() below only requires it be checked at the
+// point read_delta(...) is actually used, matching how storage.s3/etc.
+// aren't required just because they're present in the schema.
+struct DeltaSection {
+  std::string grpc_endpoint;  // e.g. "delta-txn.internal:50051"; empty = not configured
+  bool use_tls = false;
+  std::string tls_ca_cert_path;  // optional; empty uses the system default trust store
+  std::string api_key;           // sent as the "x-api-key" gRPC metadata header; empty = no auth
+};
+
 struct LoggingSection {
   std::string level = "info";
   bool json = false;
@@ -295,6 +316,7 @@ struct EngineConfig {
   MemorySection memory;
   StorageSection storage;
   IcebergSection iceberg;
+  DeltaSection delta;
   LoggingSection logging;
   ProfilingSection profiling;
   BenchmarkSection benchmark;

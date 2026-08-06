@@ -20,6 +20,7 @@ add_executable(kernellake_unit_tests
   iceberg_table_resolution_test.cpp
   iceberg_source_resolver_test.cpp
   query_engine_iceberg_test.cpp
+  delta_txn_client_test.cpp
   physical_planner_test.cpp
   query_engine_test.cpp
   query_engine_execute_cpu_test.cpp
@@ -38,6 +39,7 @@ target_link_libraries(kernellake_unit_tests PRIVATE
   kernellake_storage
   kernellake_io
   kernellake_iceberg
+  kernellake_delta
   kernellake_api
   kernellake_generator
   GTest::gtest
@@ -75,9 +77,15 @@ endif()
 # kernellake_unit_tests is built (and run) under both the CPU-only `dev`
 # preset and the GPU-enabled `gpu-dev` preset. QueryEngine::execute()'s
 # actual behavior differs between the two (see query_engine_test.cpp), so
-# tests need to know which one they were compiled against.
+# tests need to know which one they were compiled against. Same idea for
+# KERNELLAKE_ENABLE_OTEL: ClientSpan::inject() (kernellake/observability/
+# query_tracing.hpp) only actually sends a traceparent header when this
+# build has real OTel wired in (see delta_txn_client_test.cpp) -- a no-op
+# under the stub build otherwise, which is itself worth asserting on, not
+# just skipping.
 target_compile_definitions(kernellake_unit_tests PRIVATE
   $<$<BOOL:${KERNELLAKE_WITH_CUDA}>:KERNELLAKE_WITH_CUDA>
+  $<$<BOOL:${KERNELLAKE_ENABLE_OTEL}>:KERNELLAKE_ENABLE_OTEL>
 )
 
 include(GoogleTest)

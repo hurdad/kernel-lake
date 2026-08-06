@@ -246,6 +246,12 @@ EngineConfig parse_config(const std::string& yaml_text) {
     }
   }
 
+  const YAML::Node delta = root["delta"];
+  config.delta.grpc_endpoint = read_or(delta, "grpc_endpoint", config.delta.grpc_endpoint);
+  config.delta.use_tls = read_or(delta, "use_tls", config.delta.use_tls);
+  config.delta.tls_ca_cert_path = read_or(delta, "tls_ca_cert_path", config.delta.tls_ca_cert_path);
+  config.delta.api_key = read_or(delta, "api_key", config.delta.api_key);
+
   const YAML::Node logging = root["logging"];
   config.logging.level = read_or(logging, "level", config.logging.level);
   config.logging.json = read_or(logging, "json", config.logging.json);

@@ -112,6 +112,22 @@ include(LinkArrowBundledCloudDeps)
 pkg_check_modules(CURL REQUIRED IMPORTED_TARGET libcurl)
 include(ThirdPartyAvro)
 
+# Delta Lake support (src/delta/): a gRPC *client* talking to the separate
+# delta-txn-service (github.com/<org>/delta-txn-service, a standalone Rust
+# service -- deliberately kept out of this repo/build, see
+# cmake/ThirdPartyDeltaTxnProto.cmake's own comment) for both table
+# inspection (GetTable) and active-file listing (ListActiveFiles) reads.
+# Unconditional like the Iceberg block above: reading a Delta table is
+# ordinary query-engine functionality, not something specific to
+# KERNELLAKE_BUILD_SERVER (that flag is about whether *this* process hosts
+# an inbound Flight SQL server, unrelated to it making outbound gRPC calls
+# as a client). find_package(gRPC) used to live in the KERNELLAKE_BUILD_SERVER
+# block below purely because nothing outside it needed gRPC yet; moved here
+# since that's no longer true, not duplicated in both places.
+find_package(Protobuf REQUIRED)
+find_package(gRPC REQUIRED)
+include(ThirdPartyDeltaTxnProto)
+
 if(KERNELLAKE_BUILD_TESTS)
   find_package(GTest REQUIRED)
 endif()
@@ -128,7 +144,7 @@ endif()
 if(KERNELLAKE_BUILD_SERVER)
   find_package(ArrowFlight REQUIRED)
   find_package(ArrowFlightSql REQUIRED)
-  find_package(gRPC REQUIRED)
+  # gRPC itself is found unconditionally above now (src/delta/ needs it too).
 endif()
 
 if(KERNELLAKE_ENABLE_OTEL)

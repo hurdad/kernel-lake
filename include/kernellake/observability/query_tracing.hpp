@@ -1,6 +1,7 @@
 #pragma once
 
 #include <exception>
+#include <functional>
 #include <memory>
 #include <string_view>
 
@@ -67,6 +68,54 @@ class QuerySpan {
 // disabled/not built -- finish()/finish_error() are then no-ops, so call
 // sites never need an `if (otel_enabled)` branch.
 [[nodiscard]] QuerySpan start_query_span(std::string_view operation_name);
+
+// RAII handle for one outbound-call span (e.g. one gRPC call to
+// delta-txn-service) -- a *child* span, not a whole-query span like
+// QuerySpan. Unlike QuerySpan, this exposes inject(): encoding this span's
+// own context as W3C trace-context headers so the receiving service can
+// link its own spans as this one's children, completing the distributed
+// trace across the process boundary rather than leaving it as two
+// disconnected trees. Exactly one of finish_ok()/finish_error() should be
+// called before destruction; the destructor ends the span unfinished
+// (status Unset) as a safety net if neither was.
+class ClientSpan {
+ public:
+  ClientSpan(ClientSpan&&) noexcept;
+  ClientSpan& operator=(ClientSpan&&) noexcept;
+  ClientSpan(const ClientSpan&) = delete;
+  ClientSpan& operator=(const ClientSpan&) = delete;
+  ~ClientSpan();
+
+  // Calls `setter(key, value)` once per W3C trace-context header this
+  // span's context encodes as -- currently just "traceparent" ("tracestate"
+  // only when the propagator actually has one to send). No-op (setter never
+  // called) when disabled/not built, so callers never need an
+  // `if (otel_enabled)` branch here either -- e.g.
+  //   span.inject([&](std::string_view k, std::string_view v) {
+  //     context.AddMetadata(std::string(k), std::string(v));
+  //   });
+  void inject(const std::function<void(std::string_view, std::string_view)>& setter) const;
+
+  // Sets status Ok and ends the span.
+  void finish_ok();
+
+  // Records `error_message` on the span as an exception event, sets status
+  // Error with it as the description, and ends the span.
+  void finish_error(std::string_view error_message);
+
+ private:
+  friend ClientSpan start_client_span(std::string_view);
+  ClientSpan() = default;
+  struct Impl;
+  std::unique_ptr<Impl> impl_;  // null when disabled or not built with otel
+};
+
+// Starts a child span named `operation_name` (e.g.
+// "delta_txn.ListActiveFiles"), parented to whatever span is currently
+// active (see start_query_span() -- the whole-query span, typically).
+// Always returns a valid ClientSpan, even when tracing is disabled/not
+// built.
+[[nodiscard]] ClientSpan start_client_span(std::string_view operation_name);
 
 }  // namespace observability
 }  // namespace kernellake

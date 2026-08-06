@@ -1,0 +1,383 @@
+// Vendored, byte-for-byte, from delta-txn-service's proto/delta_txn.proto
+// (a separate, standalone Rust gRPC service that owns Delta Lake log
+// commits and reads -- see cmake/ThirdPartyDeltaTxnProto.cmake and
+// src/delta/ for how this project consumes it as a gRPC *client* only).
+// KernelLake deliberately vendors just this .proto file rather than the
+// whole service or a Rust toolchain -- see docs/ROADMAP.md's lakehouse
+// roadmap, Phase 4. Kept in sync by hand: if delta-txn-service's own copy
+// changes, re-copy it here (there is no build-time fetch/submodule link
+// between the two repos).
+syntax = "proto3";
+
+package delta.txn.v1;
+
+// ======================================================
+// Service
+// ======================================================
+
+// A native Delta Lake transaction coordinator: owns _delta_log commits
+// only (see Commit below) and read access to a table's current state
+// (GetTable, ListActiveFiles) -- never writes data files itself. See
+// README.md for the full picture (why this exists, what it deliberately
+// does *not* do, deployment/config).
+service DeltaTxnService {
+  // Unary: returns a table's current version, schema, and protocol. No
+  // file listing -- see ListActiveFiles for that. Takes no lock and
+  // reflects whatever snapshot happens to be visible at the moment the
+  // server opens the table; Delta readers never block on writers.
+  rpc GetTable(GetTableRequest) returns (GetTableResponse);
+
+  // Unary: atomically applies `actions` to a table, with optional
+  // optimistic-concurrency enforcement via `expected_version`. See
+  // CommitRequest's own field comments for the exact semantics.
+  rpc Commit(CommitRequest) returns (CommitResponse);
+
+  // Streams every currently-active (i.e. not yet removed) data file for a
+  // table's latest version -- the read-side counterpart to Commit's
+  // AddFile/RemoveFile actions. A server-streaming response, not a single
+  // unary message, since a real Delta table's active file set (unlike
+  // GetTable's own small metadata payload) can be large enough to blow
+  // past gRPC's default 4 MiB message limit; a reader consumes the file
+  // list incrementally instead. See ListActiveFilesResponse's own comment
+  // for the exact framing.
+  rpc ListActiveFiles(ListActiveFilesRequest) returns (stream ListActiveFilesResponse);
+}
+
+// ======================================================
+// Table inspection
+// ======================================================
+
+message GetTableRequest {
+  // The table's storage location (e.g. "s3://bucket/path/to/table",
+  // "file:///data/table") -- Delta has no separate catalog/namespace
+  // concept of its own; the URI *is* the table's identity. Checked against
+  // the server's optional DELTA_TXN_ALLOWED_TABLE_PREFIXES allowlist, if
+  // one is configured, before anything is opened.
+  string table_uri = 1;
+}
+
+message GetTableResponse {
+  int64 version = 1;
+  TableMetadata metadata = 2;
+  Protocol protocol = 3;
+}
+
+// ======================================================
+// Active file listing
+// ======================================================
+
+message ListActiveFilesRequest {
+  // Same meaning/validation as GetTableRequest.table_uri above.
+  string table_uri = 1;
+}
+
+// The stream always begins with exactly one `header` message, followed by
+// zero or more `batch` messages (each carrying a server-chosen-size chunk
+// of files, not necessarily one file per message -- see
+// DEFAULT_FILE_BATCH_SIZE in the server implementation) until the stream
+// closes. A oneof (rather than "first message happens to have version set,
+// rest don't") makes that framing a compile-time-checked client contract
+// instead of an implicit, undocumented convention.
+message ListActiveFilesResponse {
+  oneof payload {
+    ListActiveFilesHeader header = 1;
+    ListActiveFilesBatch batch = 2;
+  }
+}
+
+// Always the first message on a ListActiveFiles stream, and only ever the
+// first -- same table-level info GetTableResponse carries, so a client
+// that only calls ListActiveFiles never needs a separate GetTable round
+// trip just to learn the schema.
+message ListActiveFilesHeader {
+  int64 version = 1;
+  TableMetadata metadata = 2;
+  Protocol protocol = 3;
+}
+
+// One server-chosen-size chunk of the table's active file set. A client
+// should accumulate `files` across every batch message on the stream,
+// not assume any particular batch size or file ordering.
+message ListActiveFilesBatch {
+  repeated AddFile files = 1;
+}
+
+// ======================================================
+// Commit
+// ======================================================
+
+message CommitRequest {
+  // Same meaning/validation as GetTableRequest.table_uri above.
+  string table_uri = 1;
+
+  // Optimistic concurrency check: if set, the commit is rejected (gRPC
+  // ABORTED status -- see the server's DeltaTxnError::VersionConflict)
+  // unless the table's *current* version equals exactly this value at the
+  // moment the server checks (before it attempts the actual write). Unset
+  // means no check at all -- the commit is attempted against whatever the
+  // table's current state turns out to be, with only delta-rs's own
+  // internal optimistic-concurrency retry (against a freshly re-read
+  // snapshot, up to its own retry limit) as protection. Most callers
+  // should set this, using a version previously observed via GetTable or
+  // a prior Commit's own response.
+  optional int64 expected_version = 2;
+
+  // Applied as a single ordered transaction -- order matters (e.g. a
+  // Remove before an Add for the same logical file path is a different
+  // outcome than the reverse). At least one action is expected in
+  // practice, though this message doesn't itself enforce non-emptiness.
+  repeated Action actions = 3;
+
+  // Deliberately unused today -- present for future use (e.g. request-level
+  // tracing/audit metadata distinct from any individual CommitInfo action
+  // within `actions`). Not read or validated by the current server
+  // implementation.
+  map<string, string> app_metadata = 4;
+}
+
+message CommitResponse {
+  // The version the commit actually landed at (delta-rs's own commit
+  // protocol may retry against a newer base version than whatever the
+  // caller's expected_version was, if that field was unset or the retry
+  // succeeded against a concurrent-but-non-conflicting change) -- not
+  // necessarily `expected_version + 1`.
+  int64 committed_version = 1;
+}
+
+// ======================================================
+// Delta Actions
+// ======================================================
+
+// One entry of a Delta transaction, mirroring the Delta Lake protocol's
+// own action log entry shapes (https://github.com/delta-io/delta/blob/master/PROTOCOL.md)
+// -- exactly one of these fields is set per Action, enforced by the oneof.
+message Action {
+  oneof action {
+    AddFile add = 1;
+    RemoveFile remove = 2;
+    Protocol protocol = 3;
+    TableMetadata meta_data = 4;
+    CommitInfo commit_info = 5;
+  }
+}
+
+// ======================================================
+// Enums
+// ======================================================
+
+// Mirrors Delta's own commit-history "operation" concept (what shows up
+// in `DESCRIBE HISTORY`-style tooling) -- recorded into a commit's
+// CommitInfo action via CommitInfo.operation below. Does *not* currently
+// affect the server's own internal conflict-detection isolation-level
+// choice, which is a separate, hardcoded value -- see delta-txn-service's
+// own commit.rs doc comment for the details of that gap.
+enum CommitOperation {
+  COMMIT_OPERATION_UNSPECIFIED = 0;
+
+  COMMIT_OPERATION_WRITE = 1;
+  COMMIT_OPERATION_MERGE = 2;
+  COMMIT_OPERATION_UPDATE = 3;
+  COMMIT_OPERATION_DELETE = 4;
+  COMMIT_OPERATION_OPTIMIZE = 5;
+  COMMIT_OPERATION_VACUUM = 6;
+  COMMIT_OPERATION_RESTORE = 7;
+  COMMIT_OPERATION_CONVERT = 8;
+}
+
+// Whether an Add/Remove action represents an actual change to the table's
+// logical data (vs. a metadata-only operation like a file rewrite during
+// OPTIMIZE that doesn't change what rows the table logically contains).
+// Affects Delta's own conflict-checking and change-data-feed behavior --
+// see Delta's PROTOCOL.md for the full semantics. Deliberately has no
+// implicit default: DATA_CHANGE_UNSPECIFIED is rejected by the server
+// rather than assumed to mean true or false (see grpc::mapping::
+// map_data_change).
+enum DataChange {
+  DATA_CHANGE_UNSPECIFIED = 0;
+  DATA_CHANGE_TRUE = 1;
+  DATA_CHANGE_FALSE = 2;
+}
+
+// ======================================================
+// Add / Remove
+// ======================================================
+
+// A file being added to the table's logical content -- either as part of
+// a Commit request (a client-supplied write), or as one entry of a
+// ListActiveFiles response (server-reported, read off the table's actual
+// current log state). See ListActiveFiles's own note: on that read path,
+// `data_change` is always reported true and `tags` always empty, since
+// neither concept is exposed by the read API delta-rs itself provides.
+message AddFile {
+  // Storage path for this file -- typically relative to the table's own
+  // root (table_uri), per Delta convention, though the protocol also
+  // permits an absolute URI; this service does not itself normalize or
+  // validate which form a given path uses.
+  string path = 1;
+
+  int64 size = 2;
+  // Milliseconds since the Unix epoch, matching Delta's own log encoding.
+  int64 modification_time = 3;
+
+  // Partition values encoded as strings (Delta spec) -- e.g. for a table
+  // partitioned by an integer `year` column, the value here is the
+  // literal string "2026", not a typed int. A key present in this map
+  // with an empty string value is NOT the same as a null partition value
+  // (there is no way to represent "this partition column was null" via
+  // this specific wire field -- see grpc::mapping::map_string_map's own
+  // comment on this asymmetry between the write and read paths).
+  map<string, string> partition_values = 4;
+
+  DataChange data_change = 5;
+
+  // Optional; a file with no recorded statistics (older/simpler writers,
+  // or genuinely no stats available) has this unset, not a FileStats with
+  // all-zero fields.
+  FileStats stats = 6;
+
+  // Writer-supplied opaque key-value metadata attached to this specific
+  // file. Never populated on a ListActiveFiles response (see this
+  // message's own top comment); only meaningful on the Commit write path.
+  map<string, string> tags = 7;
+}
+
+message RemoveFile {
+  // Must match the `path` of a previously-added, currently-active file
+  // exactly for this Remove to have its intended effect -- not validated
+  // by this service itself (delta-rs's own commit logic is what actually
+  // interprets this against the table's current file set).
+  string path = 1;
+  // Milliseconds since the Unix epoch. Unset means "not recorded" (Delta
+  // permits this for certain operations), not "zero"/epoch.
+  optional int64 deletion_timestamp = 2;
+  DataChange data_change = 3;
+}
+
+// ======================================================
+// Protocol & Metadata
+// ======================================================
+
+// Delta's protocol-version action -- the minimum reader/writer protocol
+// versions required to correctly read/write this table. Included in every
+// GetTable/ListActiveFiles response so a client can check compatibility
+// before attempting to interpret a table's data; also usable as a Commit
+// action to explicitly upgrade a table's protocol version.
+message Protocol {
+  int32 min_reader_version = 1;
+  int32 min_writer_version = 2;
+}
+
+message TableMetadata {
+  // Expected to be a GUID per the Delta spec -- not validated as one by
+  // this service or (as far as this project's own audit checked)
+  // delta-rs's own Metadata deserialization; a non-GUID id is accepted
+  // and written through as-is.
+  string id = 1;
+  string name = 2;
+  string description = 3;
+
+  // Serialized Arrow / Spark schema JSON (Delta-compatible) -- see
+  // kernel-lake's own schema_translation.hpp (or equivalent for any other
+  // client) for how a client is expected to parse this into its own
+  // native schema representation. Not validated for well-formedness by
+  // this service on the Commit write path beyond what delta-rs's own
+  // Metadata deserialization requires.
+  string schema_string = 4;
+
+  // Column names this table is partitioned by, in partition-spec order
+  // (outermost first) -- each name here should also appear as a top-level
+  // field in the schema `schema_string` describes.
+  repeated string partition_columns = 5;
+
+  // Table-level configuration properties (Delta's own key-value config
+  // mechanism, e.g. "delta.logRetentionDuration") -- passed through
+  // opaquely; this service doesn't interpret or validate any specific key.
+  map<string, string> configuration = 6;
+
+  // Milliseconds since the Unix epoch. 0 is treated as "not set" (see
+  // grpc::mapping::map_metadata), not a literal 1970-01-01 timestamp --
+  // there is no way to explicitly record a created_time of exactly the
+  // Unix epoch through this field.
+  int64 created_time = 7;
+}
+
+// ======================================================
+// CommitInfo
+// ======================================================
+
+// Ordinary commit-history metadata (what tooling like `DESCRIBE HISTORY`
+// surfaces) -- informational, not interpreted by delta-rs's own commit
+// logic beyond being recorded into the log. Optional: a Commit's `actions`
+// list is not required to include one.
+message CommitInfo {
+  // Free text; joined with engine_version as "name/version" in the
+  // resulting log entry (Delta's own log convention has a single
+  // engineInfo string, not separate name/version fields) -- see
+  // grpc::mapping::map_engine_info.
+  string engine_name = 1;
+  string engine_version = 2;
+
+  // See CommitOperation's own comment on what this does (and doesn't)
+  // affect.
+  CommitOperation operation = 3;
+
+  // Operation-specific parameters as a flat string-to-string bag (e.g. a
+  // DELETE's predicate, if a client chooses to record one here) --
+  // recorded into the log for audit/history purposes only; this service
+  // does not read these back out to actually parameterize delta-rs's own
+  // commit behavior (see delta-txn-service's commit.rs doc comment).
+  map<string, string> operation_parameters = 4;
+
+  // Arbitrary caller-supplied metadata, serialized to a single JSON string
+  // in the log (Delta's own log format represents commitInfo.userMetadata
+  // as one opaque string, not a structured map) -- see
+  // grpc::mapping::map_user_metadata.
+  map<string, string> user_metadata = 5;
+
+  // Milliseconds since the Unix epoch. 0 is treated as "not set", same
+  // convention as TableMetadata.created_time above.
+  int64 timestamp = 6;
+}
+
+// ======================================================
+// File Statistics
+// ======================================================
+
+// Mirrors Delta's own per-file stats JSON shape (numRecords/minValues/
+// maxValues/nullCount) -- see grpc::mapping::map_file_stats/
+// map_stats_json_to_pb for the exact (de)serialization.
+message FileStats {
+  int64 num_records = 1;
+
+  // Keyed by column name (not field id) -- a column absent from this map
+  // has no recorded statistics for it at all, distinct from a column
+  // present with every ColumnStats field left at its default/unset.
+  map<string, ColumnStats> columns = 2;
+}
+
+// One column's statistics for one file. min_value/max_value are each a
+// oneof over the handful of scalar types Delta's stats JSON can represent
+// (int/double/string/bool) -- a column of any other logical type (e.g. a
+// timestamp) is expected to be encoded as whichever of these its writer
+// chose to represent it as (Delta's stats JSON itself has no separate
+// timestamp/date scalar kind either).
+message ColumnStats {
+  oneof min_value {
+    int64 min_int = 1;
+    double min_double = 2;
+    string min_string = 3;
+    bool min_bool = 4;
+  }
+
+  oneof max_value {
+    int64 max_int = 5;
+    double max_double = 6;
+    string max_string = 7;
+    bool max_bool = 8;
+  }
+
+  // 0 both when genuinely zero nulls were observed, and when null-count
+  // wasn't recorded for this column at all -- this message has no way to
+  // distinguish "zero nulls, verified" from "unknown."
+  int64 null_count = 9;
+}

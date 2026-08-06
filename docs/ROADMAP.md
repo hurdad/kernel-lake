@@ -2207,8 +2207,116 @@ and covered by passing tests -- not merely designed or stubbed.
   surface, all tested end to end against real fixtures. Row-level deletes,
   schema evolution across files, and partition-spec-aware pruning remain
   explicit, documented non-goals for now -- see the entries above for
-  exactly where each one throws instead of guessing. Phase 4 (Delta Lake)
-  is next per the roadmap plan.
+  exactly where each one throws instead of guessing.
+
+- **Delta Lake support, started (gRPC client to delta-txn-service)**
+  (Phase 4 of the lakehouse roadmap). Supersedes this file's own earlier
+  "Not yet started" entry for Delta, which assumed the only path in was
+  vendoring `delta-kernel-rs` (or `delta-rs`, what it turned out to use)
+  directly into this C++ project via a Rust toolchain -- the actual path
+  taken avoids that entirely: KernelLake talks to a separate, standalone
+  Rust gRPC service, `delta-txn-service`
+  (a sibling repo, not part of this one), purely as a *client*, the same
+  way it's already a client of S3/GCS/Azure/HDFS/Iceberg REST catalogs.
+  No Rust toolchain, no `delta-kernel-rs`/`delta-rs` dependency, anywhere
+  in this repo's own build.
+  - **Two RPCs consumed**: `GetTable` (version/schema/protocol) and the
+    new `ListActiveFiles` (server-streaming active-file listing -- didn't
+    exist before this session; added to delta-txn-service specifically
+    for this, since it previously only supported writes). Both added to
+    delta-txn-service's own proto and Rust implementation as part of this
+    work, not pre-existing.
+  - **Config**: `DeltaSection` (`include/kernellake/common/config.hpp`) --
+    a single section, not a name-keyed map like `IcebergSection`:
+    delta-txn-service is architecturally "a centralized coordinator," one
+    deployment per environment, and a Delta table is addressed directly
+    by its own storage URI with no catalog/namespace concept to key a map
+    by. `grpc_endpoint` empty means not configured.
+  - **Proto vendoring + C++ codegen**: `proto/delta_txn.proto` is a
+    hand-copied (not submodule/fetch-linked) copy of delta-txn-service's
+    own proto file -- see that file's own header comment for the sync
+    convention. `cmake/ThirdPartyDeltaTxnProto.cmake` runs `protoc` +
+    `grpc_cpp_plugin` at build time to generate real C++ client stubs
+    into the build directory (never checked in). `gRPC`/`Protobuf`
+    `find_package` calls moved from `KERNELLAKE_BUILD_SERVER`-gated to
+    unconditional (a Delta *client* is ordinary query-engine
+    functionality, not server-only, unlike the Flight SQL server that
+    previously was gRPC's only consumer here).
+  - **`DeltaTxnClient`** (`include/kernellake/delta/delta_txn_client.hpp`,
+    `src/delta/delta_txn_client.cpp`, new `kernellake_delta` static
+    library): pimpl'd (matches `IcebergRestCatalogClient`'s own
+    convention) so consumers never see a grpc++/generated-proto type.
+    `get_table()`/`list_active_files()` translate straight into plain
+    `DeltaTableInfo`/`DeltaActiveFile` structs -- schema translation
+    (Delta's own JSON schema string -> `kernellake::Schema`) and the
+    actual `resolve_delta_table()`/`read_delta(...)` SQL-surface
+    integration (the Iceberg-phase equivalent of
+    `resolve_iceberg_table()`/`IcebergSourceResolver`) are **not**
+    part of this slice -- this client can fetch real table state and
+    file lists end to end, but nothing in the SQL grammar/binder/
+    physical planner calls it yet. That's the next piece.
+  - **Distributed tracing, both sides**: `kernellake::observability`
+    gained `ClientSpan` (a new, more general sibling to the existing
+    whole-query `QuerySpan`) -- creates a real child span per outbound
+    call and injects its W3C `traceparent`/`tracestate` context into gRPC
+    metadata, working in both the stub (`KERNELLAKE_ENABLE_OTEL=OFF`,
+    the default -- `inject()` is a no-op) and real
+    (`KERNELLAKE_ENABLE_OTEL=ON`) builds; `QuerySpan` was also changed to
+    attach itself as the ambient `RuntimeContext`, so a `ClientSpan`
+    started during query execution correctly nests under it. On
+    delta-txn-service's own side, a real gap was found and fixed while
+    wiring this up: the service already had `tracing_opentelemetry`
+    wired in, but never actually created a span around any request, so
+    there was nothing to export regardless -- a new `TraceContextLayer`
+    (mirroring the existing `GrpcMetricsLayer`'s tower-`Layer` shape) now
+    extracts an incoming `traceparent` and creates the actual per-request
+    span everything else runs inside.
+  - **A real concurrency bug found and fixed in delta-txn-service**
+    (prompted by an explicit request to audit for races): `TableLockManager
+    ::remove_if_unused()`'s ref-count-then-remove was two separate,
+    non-atomic steps -- a concurrent `lock_for()` for the same table_uri
+    could resurrect an entry moments before it was removed anyway,
+    letting two concurrent commits to the same table end up on two
+    different mutexes with no mutual exclusion between them at all. Not a
+    data-corruption risk (Delta's own atomic-conditional-put commit
+    protocol is the real backstop), but it defeated the whole reason
+    that lock exists. Fixed via `DashMap`'s `Entry` API (one atomic
+    check-and-remove under the same shard lock `lock_for()` itself uses)
+    and backed by two new `#[tokio::test(flavor = "multi_thread")]`
+    stress tests that both reliably failed against the old
+    implementation.
+  - **A full audit of delta-txn-service's own pre-existing code**
+    surfaced two more real, documented-but-not-yet-fixed findings (see
+    each file's own doc comment for the full detail, and README.md's
+    "Metrics"/"Concurrency model" sections for the operator-facing
+    summary): `commit.rs` always uses `DeltaOperation::Write` for
+    delta-rs's own conflict-checking regardless of what `CommitOperation`
+    a client actually requested (affects conflict-checking precision for
+    non-Write operations, not correctness); `telemetry/metrics.rs`'s
+    `grpc.server.errors` counter only reliably catches pre-flight
+    rejections, not real application-level failures, since gRPC's actual
+    status arrives in HTTP/2 trailers this middleware never inspects.
+    Every Rust source file plus both proto files (delta-txn-service's own
+    and KernelLake's vendored copy) were also given substantially more
+    explanatory comments as part of this same audit pass.
+  - **Verification**: every delta-txn-service change was verified via a
+    real `docker build` (the repo's own Dockerfile already runs
+    `cargo test --release` as a build step) -- not just written and
+    assumed correct, since this sandbox has no Rust toolchain of its own
+    to compile against directly; two early API-usage mistakes (a method
+    that turned out to be `pub(crate)` not `pub`, a missing extension-
+    trait import) were each caught this way and fixed before landing.
+    `dev` 267/267, `server-dev` and `otel-dev` equally green (including a
+    new `DeltaTxnClient` test suite exercising a real in-process gRPC
+    server, and a trace-context test proving a real, well-formed
+    `traceparent` header end to end), zero regressions on the KernelLake
+    side.
+  - Not yet done: `resolve_delta_table()`, Delta-schema-string ->
+    `kernellake::Schema` translation, a `DeltaSourceResolver`
+    (`TableSourceResolver` implementation, same seam Iceberg's own
+    resolver plugs into), and the `read_delta(...)` SQL surface itself --
+    this phase currently ends at "can fetch real table state and file
+    lists from delta-txn-service," not yet "can query a Delta table."
 
 ## Not yet started
 
@@ -2333,16 +2441,6 @@ and covered by passing tests -- not merely designed or stubbed.
   `src/api/query_engine_execute_gpu.cpp` -- needs a real `gpu-dev` build
   (libcudf/RMM), not available in this environment; every other
   CPU/server/otel-buildable file is now covered (see "Done" above)
-- Delta Lake read support (`read_delta(...)` alongside `read_parquet(...)`)
-  -- explicitly deferred as its own follow-up plan, not forgotten. Reading
-  `_delta_log/*.json` plus checkpoint Parquet files is required to
-  correctly identify a Delta table's active file set (globbing `*.parquet`
-  directly is wrong: it would include tombstoned/removed files and miss
-  schema evolution); no mature native C++ Delta implementation exists
-  (`delta-kernel-rs`'s C FFI, used by DuckDB's own Delta extension, is the
-  closest) and there is no Rust toolchain in this project's dev environment
-  yet, which makes this a genuinely new class of dependency deserving its
-  own spike rather than a fourth line item bolted onto the two epics above.
 - CPU execution backend's Parquet scan is single-threaded, unlike Acero
   itself. `acero_query_executor.cpp`'s `read_scan_table()` (every
   `ParquetScanNode` is translated to a `"table_source"` Declaration fed by

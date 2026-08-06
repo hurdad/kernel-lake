@@ -41,4 +41,22 @@ void QuerySpan::finish(const QueryResult& /*result*/, std::string_view /*sql*/,
 void QuerySpan::finish_error(const std::exception& /*e*/, std::string_view /*sql*/,
                              std::string_view /*backend*/) {}
 
+// Never constructed; exists only so unique_ptr<Impl>'s special members
+// below have a complete type to compile against.
+struct ClientSpan::Impl {};
+
+ClientSpan::ClientSpan(ClientSpan&&) noexcept = default;
+ClientSpan& ClientSpan::operator=(ClientSpan&&) noexcept = default;
+ClientSpan::~ClientSpan() = default;
+
+ClientSpan start_client_span(std::string_view /*operation_name*/) {
+  return ClientSpan();
+}
+
+void ClientSpan::inject(const std::function<void(std::string_view, std::string_view)>& /*setter*/) const {}
+
+void ClientSpan::finish_ok() {}
+
+void ClientSpan::finish_error(std::string_view /*error_message*/) {}
+
 }  // namespace kernellake::observability
