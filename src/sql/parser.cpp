@@ -19,9 +19,13 @@ namespace kernellake::sql {
 namespace {
 
 bool starts_with_ci(std::string_view sql, std::size_t pos, std::string_view lower_literal) {
-  if (pos + lower_literal.size() > sql.size()) return false;
+  if (pos + lower_literal.size() > sql.size()) {
+    return false;
+  }
   for (std::size_t i = 0; i < lower_literal.size(); ++i) {
-    if (std::tolower(static_cast<unsigned char>(sql[pos + i])) != lower_literal[i]) return false;
+    if (std::tolower(static_cast<unsigned char>(sql[pos + i])) != lower_literal[i]) {
+      return false;
+    }
   }
   return true;
 }
@@ -77,7 +81,9 @@ void check_sql_within_limits(std::string_view sql) {
   }
   int join_count = 0;
   for (std::size_t pos = 0; pos < sql.size(); ++pos) {
-    if (starts_with_ci(sql, pos, "join")) ++join_count;
+    if (starts_with_ci(sql, pos, "join")) {
+      ++join_count;
+    }
   }
   if (join_count > kMaxJoinKeywords) {
     throw SqlError(
@@ -96,7 +102,9 @@ struct Preprocessed {
 };
 
 std::size_t skip_whitespace(std::string_view sql, std::size_t pos) {
-  while (pos < sql.size() && std::isspace(static_cast<unsigned char>(sql[pos]))) ++pos;
+  while (pos < sql.size() && std::isspace(static_cast<unsigned char>(sql[pos]))) {
+    ++pos;
+  }
   return pos;
 }
 
@@ -110,12 +118,16 @@ std::size_t skip_whitespace(std::string_view sql, std::size_t pos) {
 // string never closes.
 std::optional<std::pair<std::string, std::size_t>> try_parse_quoted_string(std::string_view sql,
                                                                            std::size_t pos) {
-  if (pos >= sql.size() || sql[pos] != '\'') return std::nullopt;
+  if (pos >= sql.size() || sql[pos] != '\'') {
+    return std::nullopt;
+  }
   std::string content;
   std::size_t i = pos + 1;
   while (i < sql.size()) {
     const char c = sql[i];
-    if (c == '\'') return std::make_pair(std::move(content), i + 1);
+    if (c == '\'') {
+      return std::make_pair(std::move(content), i + 1);
+    }
     if (c == '\\' && i + 1 < sql.size()) {
       content += c;
       content += sql[i + 1];
@@ -150,13 +162,17 @@ std::optional<std::pair<std::string, std::size_t>> try_parse_quoted_string(std::
 std::optional<std::pair<std::vector<std::string>, std::size_t>> try_parse_read_parquet_args(
     std::string_view sql, std::size_t start) {
   std::size_t pos = skip_whitespace(sql, start);
-  if (pos >= sql.size() || sql[pos] != '(') return std::nullopt;
+  if (pos >= sql.size() || sql[pos] != '(') {
+    return std::nullopt;
+  }
   pos = skip_whitespace(sql, pos + 1);
 
   std::vector<std::string> paths;
   while (true) {
     std::optional<std::pair<std::string, std::size_t>> literal = try_parse_quoted_string(sql, pos);
-    if (!literal) return std::nullopt;
+    if (!literal) {
+      return std::nullopt;
+    }
     paths.push_back(std::move(literal->first));
     pos = skip_whitespace(sql, literal->second);
     if (pos < sql.size() && sql[pos] == ',') {
@@ -165,7 +181,9 @@ std::optional<std::pair<std::vector<std::string>, std::size_t>> try_parse_read_p
     }
     break;
   }
-  if (pos >= sql.size() || sql[pos] != ')') return std::nullopt;
+  if (pos >= sql.size() || sql[pos] != ')') {
+    return std::nullopt;
+  }
   return std::make_pair(std::move(paths), pos + 1);
 }
 

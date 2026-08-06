@@ -186,8 +186,12 @@ std::vector<ObjectInfo> generic_fs_list_recursive(const std::shared_ptr<arrow::f
 
   std::vector<ObjectInfo> results;
   for (const arrow::fs::FileInfo& entry : *dir_result) {
-    if (!entry.IsFile()) continue;
-    if (entry.extension() != "parquet") continue;
+    if (!entry.IsFile()) {
+      continue;
+    }
+    if (entry.extension() != "parquet") {
+      continue;
+    }
     results.push_back(ObjectInfo{Uri(std::string(prefix.scheme()) + "://" + entry.path()),
                                  static_cast<std::uint64_t>(entry.size())});
   }

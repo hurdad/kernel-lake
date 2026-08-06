@@ -164,8 +164,12 @@ std::vector<ObjectInfo> LocalObjectStore::list_recursive(const Uri& prefix) {
   // discovers, same reasoning as the existing (non-recursive) list().
   std::vector<ObjectInfo> results;
   for (const auto& entry : fs::recursive_directory_iterator(path)) {
-    if (!entry.is_regular_file()) continue;
-    if (entry.path().extension() != ".parquet") continue;
+    if (!entry.is_regular_file()) {
+      continue;
+    }
+    if (entry.path().extension() != ".parquet") {
+      continue;
+    }
     results.push_back(ObjectInfo{Uri(entry.path().string()), static_cast<std::uint64_t>(entry.file_size())});
   }
   if (results.empty()) {

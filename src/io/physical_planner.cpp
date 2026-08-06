@@ -101,12 +101,20 @@ std::vector<NamedExpression> remap_named(const std::vector<NamedExpression>& ite
 // tell annotate_scan the query's actual output needed `amount` too. See
 // optimizer.cpp's rewrite_plan() LogicalProjection case for the full story.
 bool is_identity_projection(const std::vector<NamedExpression>& items, const Schema& child_schema) {
-  if (items.size() != child_schema.field_count()) return false;
+  if (items.size() != child_schema.field_count()) {
+    return false;
+  }
   for (std::size_t i = 0; i < items.size(); ++i) {
     const auto* column = dynamic_cast<const ColumnExpression*>(items[i].expr.get());
-    if (column == nullptr) return false;
-    if (column->column_index() != i) return false;
-    if (items[i].name != child_schema.field(i).name) return false;
+    if (column == nullptr) {
+      return false;
+    }
+    if (column->column_index() != i) {
+      return false;
+    }
+    if (items[i].name != child_schema.field(i).name) {
+      return false;
+    }
   }
   return true;
 }

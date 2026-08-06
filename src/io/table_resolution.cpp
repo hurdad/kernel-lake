@@ -21,23 +21,33 @@ std::vector<std::string> split_path_segments(const std::string& path) {
   std::string current;
   for (const char c : path) {
     if (c == '/') {
-      if (!current.empty()) segments.push_back(current);
+      if (!current.empty()) {
+        segments.push_back(current);
+      }
       current.clear();
     } else {
       current += c;
     }
   }
-  if (!current.empty()) segments.push_back(current);
+  if (!current.empty()) {
+    segments.push_back(current);
+  }
   return segments;
 }
 
 std::optional<std::pair<std::string, std::string>> parse_key_value_segment(const std::string& segment) {
   const std::size_t eq = segment.find('=');
-  if (eq == std::string::npos || eq == 0) return std::nullopt;
+  if (eq == std::string::npos || eq == 0) {
+    return std::nullopt;
+  }
   const std::string key = segment.substr(0, eq);
-  if (std::isdigit(static_cast<unsigned char>(key[0]))) return std::nullopt;
+  if (std::isdigit(static_cast<unsigned char>(key[0]))) {
+    return std::nullopt;
+  }
   for (const char c : key) {
-    if (!std::isalnum(static_cast<unsigned char>(c)) && c != '_') return std::nullopt;
+    if (!std::isalnum(static_cast<unsigned char>(c)) && c != '_') {
+      return std::nullopt;
+    }
   }
   return std::make_pair(key, segment.substr(eq + 1));
 }
@@ -49,13 +59,17 @@ std::optional<std::pair<std::string, std::string>> parse_key_value_segment(const
 // partition columns to appear in.
 std::vector<std::pair<std::string, std::string>> extract_partition_segments(const std::string& path) {
   std::vector<std::string> segments = split_path_segments(path);
-  if (segments.empty()) return {};
+  if (segments.empty()) {
+    return {};
+  }
   segments.pop_back();  // the filename itself is never a partition segment.
 
   std::vector<std::pair<std::string, std::string>> pairs;
   for (auto it = segments.rbegin(); it != segments.rend(); ++it) {
     std::optional<std::pair<std::string, std::string>> parsed = parse_key_value_segment(*it);
-    if (!parsed) break;
+    if (!parsed) {
+      break;
+    }
     pairs.push_back(std::move(*parsed));
   }
   std::reverse(pairs.begin(), pairs.end());
@@ -63,21 +77,33 @@ std::vector<std::pair<std::string, std::string>> extract_partition_segments(cons
 }
 
 bool looks_like_int64(const std::string& value) {
-  if (value.empty()) return false;
+  if (value.empty()) {
+    return false;
+  }
   std::size_t start = 0;
-  if (value[0] == '-') start = 1;
-  if (start >= value.size()) return false;
+  if (value[0] == '-') {
+    start = 1;
+  }
+  if (start >= value.size()) {
+    return false;
+  }
   for (std::size_t i = start; i < value.size(); ++i) {
-    if (!std::isdigit(static_cast<unsigned char>(value[i]))) return false;
+    if (!std::isdigit(static_cast<unsigned char>(value[i]))) {
+      return false;
+    }
   }
   return true;
 }
 
 bool looks_like_iso_date(const std::string& value) {
-  if (value.size() != 10) return false;
+  if (value.size() != 10) {
+    return false;
+  }
   for (std::size_t i = 0; i < value.size(); ++i) {
     if (i == 4 || i == 7) {
-      if (value[i] != '-') return false;
+      if (value[i] != '-') {
+        return false;
+      }
     } else if (!std::isdigit(static_cast<unsigned char>(value[i]))) {
       return false;
     }
@@ -89,10 +115,16 @@ DataType infer_partition_type(const std::vector<std::string>& values) {
   bool all_int = true;
   bool all_date = true;
   for (const std::string& value : values) {
-    if (!looks_like_int64(value)) all_int = false;
-    if (!looks_like_iso_date(value)) all_date = false;
+    if (!looks_like_int64(value)) {
+      all_int = false;
+    }
+    if (!looks_like_iso_date(value)) {
+      all_date = false;
+    }
   }
-  if (all_int) return int64_type(false);
+  if (all_int) {
+    return int64_type(false);
+  }
   if (all_date) {
     // Digit-shaped isn't the same as a real calendar date ("2026-13-40"
     // matches looks_like_iso_date's shape check but isn't a valid date) --
@@ -127,7 +159,9 @@ ResolvedTable resolve_table(ObjectStore& store, const std::vector<std::string>& 
 
   std::vector<FileMetadata> metadata;
   metadata.reserve(files.size());
-  for (const ObjectInfo& file : files) metadata.push_back(inspect_parquet_file(store, file.uri));
+  for (const ObjectInfo& file : files) {
+    metadata.push_back(inspect_parquet_file(store, file.uri));
+  }
   validate_schema_compatibility(metadata);
 
   // Detect Hive-style partitioning: every file's path must yield the exact
@@ -142,7 +176,9 @@ ResolvedTable resolve_table(ObjectStore& store, const std::vector<std::string>& 
   }
   std::vector<std::string> partition_keys;
   if (!per_file_segments.empty()) {
-    for (const auto& [key, value] : per_file_segments.front()) partition_keys.push_back(key);
+    for (const auto& [key, value] : per_file_segments.front()) {
+      partition_keys.push_back(key);
+    }
   }
   for (std::size_t i = 0; i < per_file_segments.size(); ++i) {
     const std::vector<std::pair<std::string, std::string>>& segments = per_file_segments[i];
@@ -180,7 +216,9 @@ ResolvedTable resolve_table(ObjectStore& store, const std::vector<std::string>& 
   }
 
   std::vector<Field> fields = metadata.front().schema.fields();
-  for (const PartitionColumn& column : partition_columns) fields.push_back(Field{column.name, column.type});
+  for (const PartitionColumn& column : partition_columns) {
+    fields.push_back(Field{column.name, column.type});
+  }
   Schema schema(std::move(fields));
 
   std::vector<ResolvedFile> resolved_files;

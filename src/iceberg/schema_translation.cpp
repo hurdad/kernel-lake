@@ -50,14 +50,30 @@ DataType translate_type(const IcebergSchemaField& field) {
   const bool nullable = !field.required;
   const std::string& type = field.type;
 
-  if (type == "boolean") return boolean_type(nullable);
-  if (type == "int") return int32_type(nullable);
-  if (type == "long") return int64_type(nullable);
-  if (type == "float") return float32_type(nullable);
-  if (type == "double") return float64_type(nullable);
-  if (type == "date") return date32_type(nullable);
-  if (type == "timestamp" || type == "timestamptz") return timestamp_type(nullable);
-  if (type == "string") return string_type(nullable);
+  if (type == "boolean") {
+    return boolean_type(nullable);
+  }
+  if (type == "int") {
+    return int32_type(nullable);
+  }
+  if (type == "long") {
+    return int64_type(nullable);
+  }
+  if (type == "float") {
+    return float32_type(nullable);
+  }
+  if (type == "double") {
+    return float64_type(nullable);
+  }
+  if (type == "date") {
+    return date32_type(nullable);
+  }
+  if (type == "timestamp" || type == "timestamptz") {
+    return timestamp_type(nullable);
+  }
+  if (type == "string") {
+    return string_type(nullable);
+  }
 
   if (const std::optional<std::pair<std::int32_t, std::int32_t>> decimal = parse_decimal(type);
       decimal.has_value()) {
