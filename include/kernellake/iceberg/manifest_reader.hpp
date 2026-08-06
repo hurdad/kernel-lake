@@ -50,6 +50,19 @@ struct ManifestDataFileEntry {
   int64_t record_count = 0;
   int64_t file_size_in_bytes = 0;
   std::vector<PartitionFieldValue> partition_values;
+  // v2 table metadata's data_file.content: 0 = DATA, 1 = POSITION_DELETES,
+  // 2 = EQUALITY_DELETES -- present on every data_file record in a v2
+  // table (both data and delete manifests), but only actually meaningful
+  // to inspect from within a delete manifest (ManifestListEntry::content
+  // == 1); a data manifest's entries are always 0 and this reader never
+  // needs to check it there. Optional in the underlying Avro schema (v1
+  // manifests, and every existing test fixture's own manifest schema,
+  // predate this field) -- defaults to 0 (DATA) when absent, which is the
+  // only value that would ever legitimately appear in a schema old enough
+  // not to have the field at all (v1 has no row-level deletes, so no
+  // manifest a v1-shaped schema could describe would ever need content=1
+  // or 2 in the first place).
+  int32_t content = 0;
 };
 
 // Reads a manifest-list Avro Object Container File's bytes (already fully

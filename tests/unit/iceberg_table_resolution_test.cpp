@@ -146,6 +146,30 @@ constexpr const char* kManifestSchemaWithRegionPartitionJson = R"({
   ]
 })";
 
+// Same shape as kManifestSchemaJson, but with data_file.content present --
+// for the row-level-delete tests below, which need to write POSITION/
+// EQUALITY_DELETES entries (data_file.content == 1/2) into a delete
+// manifest.
+constexpr const char* kManifestSchemaWithContentJson = R"({
+  "type": "record",
+  "name": "manifest_entry",
+  "fields": [
+    {"name": "status", "type": "int"},
+    {"name": "data_file", "type": {
+      "type": "record",
+      "name": "r2",
+      "fields": [
+        {"name": "content", "type": "int"},
+        {"name": "file_path", "type": "string"},
+        {"name": "file_format", "type": "string"},
+        {"name": "record_count", "type": "long"},
+        {"name": "file_size_in_bytes", "type": "long"},
+        {"name": "partition", "type": {"type": "record", "name": "r102", "fields": []}}
+      ]
+    }}
+  ]
+})";
+
 // Small avro-c writer helper -- same shape as manifest_reader_test.cpp's
 // AvroFixtureWriter, duplicated for the same "no shared test-utility
 // target" reason as LoopbackHttpServer above.
@@ -309,6 +333,60 @@ class IcebergTableResolutionTest : public ::testing::Test {
     return manifest_path;
   }
 
+  // A real "file_path: string, pos: long" Parquet file -- the Iceberg
+  // spec's Position Delete Files schema -- for the row-level-delete tests
+  // below. Same shape as position_delete_reader_test.cpp's own helper,
+  // duplicated per this project's usual test-file convention.
+  fs::path write_position_delete_file(const std::string& name,
+                                      const std::vector<std::pair<std::string, int64_t>>& deleted_positions) {
+    arrow::StringBuilder file_path_builder;
+    arrow::Int64Builder pos_builder;
+    for (const auto& [path, pos] : deleted_positions) {
+      EXPECT_TRUE(file_path_builder.Append(path).ok());
+      EXPECT_TRUE(pos_builder.Append(pos).ok());
+    }
+    std::shared_ptr<arrow::Array> file_path_array;
+    std::shared_ptr<arrow::Array> pos_array;
+    EXPECT_TRUE(file_path_builder.Finish(&file_path_array).ok());
+    EXPECT_TRUE(pos_builder.Finish(&pos_array).ok());
+    const auto schema = arrow::schema(
+        {arrow::field("file_path", arrow::utf8(), false), arrow::field("pos", arrow::int64(), false)});
+    const auto table = arrow::Table::Make(schema, {file_path_array, pos_array});
+    const fs::path path = dir_ / name;
+    auto sink_result = arrow::io::FileOutputStream::Open(path.string());
+    EXPECT_TRUE(sink_result.ok());
+    EXPECT_TRUE(parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), *sink_result,
+                                           /*chunk_size=*/deleted_positions.size())
+                    .ok());
+    return path;
+  }
+
+  // One delete-manifest entry per (delete_file_path, content) pair --
+  // content is 1 (POSITION_DELETES) or 2 (EQUALITY_DELETES). record_count
+  // is the delete file's own row count (unused by resolve_iceberg_table()
+  // for position deletes -- it re-reads the delete file's real content
+  // instead -- but still a required data_file field).
+  fs::path write_delete_manifest(const std::string& name,
+                                 const std::vector<std::tuple<std::string, int32_t, int64_t>>& files) {
+    AvroFixtureWriter writer(kManifestSchemaWithContentJson);
+    std::vector<std::function<void(avro_value_t&)>> rows;
+    for (const auto& [path, content, record_count] : files) {
+      rows.push_back([path, content, record_count](avro_value_t& v) {
+        set_int_field(v, "status", /*ADDED=*/1);
+        avro_value_t data_file;
+        avro_value_get_by_name(&v, "data_file", &data_file, nullptr);
+        set_int_field(data_file, "content", content);
+        set_string_field(data_file, "file_path", path);
+        set_string_field(data_file, "file_format", "PARQUET");
+        set_long_field(data_file, "record_count", record_count);
+        set_long_field(data_file, "file_size_in_bytes", 500);
+      });
+    }
+    const fs::path manifest_path = dir_ / name;
+    writer.write(manifest_path, rows);
+    return manifest_path;
+  }
+
   fs::path write_manifest_list(const std::string& name,
                                const std::vector<std::pair<std::string, int32_t>>& manifests) {
     AvroFixtureWriter writer(kManifestListSchemaJson);
@@ -408,7 +486,12 @@ TEST_F(IcebergTableResolutionTest, SkipsDeletedStatusEntries) {
   EXPECT_EQ(resolved.files[0].metadata.row_count, 5);
 }
 
-TEST_F(IcebergTableResolutionTest, ThrowsOnLiveDeleteManifest) {
+// write_manifest() (kManifestSchemaJson) has no data_file.content field at
+// all, so this delete-manifest entry decodes with content defaulting to 0
+// (DATA) -- rejected as malformed rather than silently treated as an
+// ordinary data file. Real position/equality delete handling (content ==
+// 1/2, via kManifestSchemaWithContentJson) is covered by the tests below.
+TEST_F(IcebergTableResolutionTest, ThrowsOnDeleteManifestEntryWithoutAContentField) {
   write_data_file(dir_ / "data-0.parquet", 0, 5);
   const fs::path data_manifest = write_manifest("m0.avro", {{(dir_ / "data-0.parquet").string(), 5}}, 1);
   const fs::path delete_manifest = write_manifest("del-0.avro", {{(dir_ / "data-0.parquet").string(), 5}}, 1);
@@ -504,6 +587,137 @@ TEST_F(IcebergTableResolutionTest, TableWithNoCurrentSnapshotResolvesToZeroFiles
 
   EXPECT_TRUE(resolved.files.empty());
   ASSERT_EQ(resolved.schema.field_count(), 1u);
+}
+
+TEST_F(IcebergTableResolutionTest, WholeFilePositionDeleteDropsTheFileEntirely) {
+  write_data_file(dir_ / "data-0.parquet", 0, 5);
+  write_data_file(dir_ / "data-1.parquet", 5, 3);
+  const fs::path delete_file = write_position_delete_file(
+      "delete-0.parquet", {{(dir_ / "data-0.parquet").string(), 0},
+                           {(dir_ / "data-0.parquet").string(), 1},
+                           {(dir_ / "data-0.parquet").string(), 2},
+                           {(dir_ / "data-0.parquet").string(), 3},
+                           {(dir_ / "data-0.parquet").string(), 4}});  // all 5 rows of data-0
+
+  const fs::path data_manifest = write_manifest(
+      "m0.avro", {{(dir_ / "data-0.parquet").string(), 5}, {(dir_ / "data-1.parquet").string(), 3}}, 1);
+  const fs::path delete_manifest =
+      write_delete_manifest("del-0.avro", {{delete_file.string(), /*content=*/1, /*record_count=*/5}});
+  const fs::path manifest_list =
+      write_manifest_list("snap-42.avro", {{data_manifest.string(), 0}, {delete_manifest.string(), 1}});
+
+  LoopbackHttpServer server;
+  server.respond({http_ok_json(load_table_result_json(manifest_list.string()))});
+
+  IcebergCatalogSection config;
+  config.catalog_uri = server.base_url();
+  IcebergRestCatalogClient catalog(config);
+
+  const ResolvedTable resolved = resolve_iceberg_table(store_, catalog, {"db"}, "orders", {});
+  server.join();
+
+  // data-0.parquet (fully deleted) is gone; data-1.parquet (untouched)
+  // survives.
+  ASSERT_EQ(resolved.files.size(), 1u);
+  EXPECT_EQ(resolved.files[0].metadata.row_count, 3);
+}
+
+TEST_F(IcebergTableResolutionTest, AccumulatesDeletedPositionsAcrossMultipleDeleteFiles) {
+  write_data_file(dir_ / "data-0.parquet", 0, 4);
+  // Two separate delete files (e.g. two compaction passes), each covering
+  // half the rows -- neither alone is a whole-file delete, but together
+  // they are.
+  const fs::path delete_file_1 = write_position_delete_file(
+      "delete-0.parquet", {{(dir_ / "data-0.parquet").string(), 0}, {(dir_ / "data-0.parquet").string(), 1}});
+  const fs::path delete_file_2 = write_position_delete_file(
+      "delete-1.parquet", {{(dir_ / "data-0.parquet").string(), 2}, {(dir_ / "data-0.parquet").string(), 3}});
+
+  const fs::path data_manifest = write_manifest("m0.avro", {{(dir_ / "data-0.parquet").string(), 4}}, 1);
+  const fs::path delete_manifest =
+      write_delete_manifest("del-0.avro", {{delete_file_1.string(), /*content=*/1, /*record_count=*/2},
+                                           {delete_file_2.string(), /*content=*/1, /*record_count=*/2}});
+  const fs::path manifest_list =
+      write_manifest_list("snap-42.avro", {{data_manifest.string(), 0}, {delete_manifest.string(), 1}});
+
+  LoopbackHttpServer server;
+  server.respond({http_ok_json(load_table_result_json(manifest_list.string()))});
+
+  IcebergCatalogSection config;
+  config.catalog_uri = server.base_url();
+  IcebergRestCatalogClient catalog(config);
+
+  const ResolvedTable resolved = resolve_iceberg_table(store_, catalog, {"db"}, "orders", {});
+  server.join();
+
+  EXPECT_TRUE(resolved.files.empty());
+}
+
+TEST_F(IcebergTableResolutionTest, ThrowsOnPartialPositionDelete) {
+  write_data_file(dir_ / "data-0.parquet", 0, 5);
+  // Only 2 of the file's 5 rows are deleted -- real per-row filtering
+  // isn't implemented (see resolve_iceberg_table()'s own comment), so
+  // this must fail loudly rather than silently return all 5 rows.
+  const fs::path delete_file = write_position_delete_file(
+      "delete-0.parquet", {{(dir_ / "data-0.parquet").string(), 0}, {(dir_ / "data-0.parquet").string(), 1}});
+
+  const fs::path data_manifest = write_manifest("m0.avro", {{(dir_ / "data-0.parquet").string(), 5}}, 1);
+  const fs::path delete_manifest =
+      write_delete_manifest("del-0.avro", {{delete_file.string(), /*content=*/1, /*record_count=*/2}});
+  const fs::path manifest_list =
+      write_manifest_list("snap-42.avro", {{data_manifest.string(), 0}, {delete_manifest.string(), 1}});
+
+  LoopbackHttpServer server;
+  server.respond({http_ok_json(load_table_result_json(manifest_list.string()))});
+
+  IcebergCatalogSection config;
+  config.catalog_uri = server.base_url();
+  IcebergRestCatalogClient catalog(config);
+
+  EXPECT_THROW((void)(resolve_iceberg_table(store_, catalog, {"db"}, "orders", {})), StorageError);
+  server.join();
+}
+
+TEST_F(IcebergTableResolutionTest, ThrowsOnEqualityDeleteFile) {
+  write_data_file(dir_ / "data-0.parquet", 0, 5);
+  const fs::path data_manifest = write_manifest("m0.avro", {{(dir_ / "data-0.parquet").string(), 5}}, 1);
+  // content=2 (EQUALITY_DELETES) -- the delete file's own path is never
+  // actually opened/read here; the type check happens first, from
+  // manifest metadata alone.
+  const fs::path delete_manifest = write_delete_manifest(
+      "del-0.avro", {{"s3://warehouse/db/orders/eq-delete-0.parquet", /*content=*/2, /*record_count=*/1}});
+  const fs::path manifest_list =
+      write_manifest_list("snap-42.avro", {{data_manifest.string(), 0}, {delete_manifest.string(), 1}});
+
+  LoopbackHttpServer server;
+  server.respond({http_ok_json(load_table_result_json(manifest_list.string()))});
+
+  IcebergCatalogSection config;
+  config.catalog_uri = server.base_url();
+  IcebergRestCatalogClient catalog(config);
+
+  EXPECT_THROW((void)(resolve_iceberg_table(store_, catalog, {"db"}, "orders", {})), StorageError);
+  server.join();
+}
+
+TEST_F(IcebergTableResolutionTest, ThrowsOnUnexpectedDeleteFileContentValue) {
+  write_data_file(dir_ / "data-0.parquet", 0, 5);
+  const fs::path data_manifest = write_manifest("m0.avro", {{(dir_ / "data-0.parquet").string(), 5}}, 1);
+  // Neither a recognized DATA/POSITION_DELETES/EQUALITY_DELETES value --
+  // must be rejected, not guessed at as one of the two delete kinds.
+  const fs::path delete_manifest = write_delete_manifest(
+      "del-0.avro", {{"s3://warehouse/db/orders/weird-0.parquet", /*content=*/99, /*record_count=*/1}});
+  const fs::path manifest_list =
+      write_manifest_list("snap-42.avro", {{data_manifest.string(), 0}, {delete_manifest.string(), 1}});
+
+  LoopbackHttpServer server;
+  server.respond({http_ok_json(load_table_result_json(manifest_list.string()))});
+
+  IcebergCatalogSection config;
+  config.catalog_uri = server.base_url();
+  IcebergRestCatalogClient catalog(config);
+
+  EXPECT_THROW((void)(resolve_iceberg_table(store_, catalog, {"db"}, "orders", {})), StorageError);
+  server.join();
 }
 
 // Proves partition pruning actually skips a file, not just that it

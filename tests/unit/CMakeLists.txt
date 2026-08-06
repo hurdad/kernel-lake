@@ -16,6 +16,7 @@ add_executable(kernellake_unit_tests
   table_resolution_test.cpp
   rest_catalog_client_test.cpp
   manifest_reader_test.cpp
+  position_delete_reader_test.cpp
   schema_translation_test.cpp
   partition_pruning_test.cpp
   iceberg_table_resolution_test.cpp

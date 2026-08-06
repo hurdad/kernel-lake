@@ -62,6 +62,30 @@ constexpr const char* kManifestSchemaJson = R"({
   ]
 })";
 
+// Same shape as kManifestSchemaJson, but with data_file.content present --
+// for the content-field-decoding tests below, which need to distinguish
+// "field absent from schema" (kManifestSchemaJson) from "field present,
+// value 0" (both should decode to ManifestDataFileEntry::content == 0).
+constexpr const char* kManifestSchemaWithContentJson = R"({
+  "type": "record",
+  "name": "manifest_entry",
+  "fields": [
+    {"name": "status", "type": "int"},
+    {"name": "data_file", "type": {
+      "type": "record",
+      "name": "r2",
+      "fields": [
+        {"name": "content", "type": "int"},
+        {"name": "file_path", "type": "string"},
+        {"name": "file_format", "type": "string"},
+        {"name": "record_count", "type": "long"},
+        {"name": "file_size_in_bytes", "type": "long"},
+        {"name": "partition", "type": {"type": "record", "name": "r102", "fields": []}}
+      ]
+    }}
+  ]
+})";
+
 class AvroFixtureWriter {
  public:
   explicit AvroFixtureWriter(const std::string& schema_json) {
@@ -217,6 +241,9 @@ TEST_F(ManifestReaderTest, ReadsManifestDataFileEntriesWithPartitionValues) {
   EXPECT_EQ(entry.file_format, "PARQUET");
   EXPECT_EQ(entry.record_count, 1000);
   EXPECT_EQ(entry.file_size_in_bytes, 999999);
+  // kManifestSchemaJson has no "content" field at all (predates
+  // data_file.content, like every v1 manifest) -- defaults to 0 (DATA).
+  EXPECT_EQ(entry.content, 0);
   ASSERT_EQ(entry.partition_values.size(), 2u);
   ASSERT_TRUE(std::holds_alternative<std::string>(entry.partition_values[0]));
   EXPECT_EQ(std::get<std::string>(entry.partition_values[0]), "US");
@@ -254,6 +281,25 @@ TEST_F(ManifestReaderTest, DecodesNullPartitionFieldAsMonostate) {
   ASSERT_EQ(entries[0].partition_values.size(), 2u);
   EXPECT_TRUE(std::holds_alternative<std::monostate>(entries[0].partition_values[0]));
   EXPECT_TRUE(std::holds_alternative<std::monostate>(entries[0].partition_values[1]));
+}
+
+TEST_F(ManifestReaderTest, ReadsDataFileContentFieldWhenPresent) {
+  AvroFixtureWriter writer(kManifestSchemaWithContentJson);
+  const std::string bytes =
+      writer.write(dir_ / "m0.avro", {[](avro_value_t& v) {
+                     set_int_field(v, "status", 1);
+                     avro_value_t data_file;
+                     avro_value_get_by_name(&v, "data_file", &data_file, nullptr);
+                     set_int_field(data_file, "content", 1);  // POSITION_DELETES
+                     set_string_field(data_file, "file_path", "s3://warehouse/db/orders/delete-0.parquet");
+                     set_string_field(data_file, "file_format", "PARQUET");
+                     set_long_field(data_file, "record_count", 3);
+                     set_long_field(data_file, "file_size_in_bytes", 500);
+                   }});
+
+  const std::vector<ManifestDataFileEntry> entries = read_manifest_bytes(bytes);
+  ASSERT_EQ(entries.size(), 1u);
+  EXPECT_EQ(entries[0].content, 1);
 }
 
 TEST_F(ManifestReaderTest, ThrowsOnNonAvroBytes) {

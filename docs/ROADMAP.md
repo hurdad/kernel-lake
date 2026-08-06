@@ -2201,11 +2201,58 @@ and covered by passing tests -- not merely designed or stubbed.
   **Phase 3 (Iceberg REST catalogs) is now functionally complete for the
   MVP's scope**: config, REST catalog client (bearer/OAuth2 auth), Avro
   manifest reading, Iceberg-to-`kernellake::Schema` translation, real file
-  resolution with row-group and partition-spec-aware pruning, and a
-  working `read_iceberg(...)` SQL surface, all tested end to end against
-  real fixtures. Row-level deletes and schema evolution across files
+  resolution with row-group and partition-spec-aware pruning,
+  whole-file row-level deletes, and a working `read_iceberg(...)` SQL
+  surface, all tested end to end against real fixtures. Partial
+  (per-row) deletes, equality deletes, and schema evolution across files
   remain explicit, documented non-goals for now -- see the entries above
-  for exactly where each one throws instead of guessing.
+  and below for exactly where each one throws instead of guessing.
+
+- **Whole-file row-level deletes, landing this session**. Position-delete
+  files (`data_file.content == 1` within a delete manifest -- see
+  `ManifestDataFileEntry::content`'s own comment) are now read in full,
+  not just rejected outright: `kernellake/iceberg/position_delete_reader.hpp`'s
+  `read_position_delete_counts()` opens a delete file's real content
+  (its `file_path`/`pos` columns, per the spec's own Position Delete
+  Files schema -- the first place this codebase reads full Parquet row
+  data outside the actual execution path, since this genuinely needs to
+  happen at *resolution* time, before a physical plan even exists) and
+  counts deleted positions per referenced data file, accumulated across
+  every delete manifest in the snapshot (a file can be targeted by more
+  than one, e.g. separate compaction passes). When that count reaches a
+  data file's own `record_count` -- every row deleted, the common case
+  after compaction/rewrite -- `resolve_iceberg_table()` drops the file
+  entirely, the same as an already-DELETED-status manifest entry. A
+  *partial* position delete (some, not all, rows) or any *equality*
+  delete (`content == 2`) still throws StorageError, precisely, rather
+  than guessing: real per-row filtering during an actual scan (tracking
+  which row positions within a *kept* file to skip, in both the CPU
+  Acero and GPU cudf execution backends) is a substantially larger,
+  separate piece of work -- deliberately not attempted here, see "Not
+  yet started" below.
+  - **Verification**: `position_delete_reader_test.cpp` (4 tests against
+    real Parquet delete-file fixtures) plus 6 new
+    `iceberg_table_resolution_test.cpp` end-to-end tests (whole-file
+    drop, accumulation across two separate delete files, partial-delete
+    rejection, equality-delete rejection, and malformed/unrecognized
+    `content` value rejection), plus 2 new `manifest_reader_test.cpp`
+    tests for `data_file.content` decoding (both present and -- for
+    every pre-existing manifest fixture, which predates this field --
+    absent, safely defaulting to 0/DATA). `dev` 320/320, `otel-dev`
+    323/323, `server-dev` 324/324, all green; format and
+    `run-clang-tidy-18 -warnings-as-errors='*'` both clean.
+  - **Known imprecision, not attempted**: every position-delete file in
+    the snapshot is read in full for every query against the table, even
+    one that touches none of the data files it actually references --
+    real Iceberg readers scope which delete files apply using partition
+    values and sequence numbers to skip irrelevant ones; this
+    implementation doesn't, a real (if bounded -- delete files are
+    typically much smaller than data files) performance cost, not a
+    correctness one. Matching by exact `file_path` string equality
+    (rather than reasoning about commit sequence numbers at all) is
+    safe only because Iceberg file paths are, in practice, always
+    globally unique per write; documented as a simplifying assumption,
+    not silently relied upon without acknowledgment.
 
 - **Partition-spec-aware file pruning, landing this session** (closes
   Phase 3's own former "not yet done" entry above). `IcebergTableMetadata`
@@ -2435,6 +2482,37 @@ and covered by passing tests -- not merely designed or stubbed.
     different (evolved) schema version isn't supported yet").
 
 ## Not yet started
+
+- **Iceberg per-row delete filtering and true schema evolution** -- both
+  investigated this session (see the lakehouse roadmap's own "Whole-file
+  row-level deletes" and partition-pruning entries above), and both found
+  to need real execution-engine changes, not just `resolve_iceberg_table()`
+  logic, once actually scoped out:
+  - *Partial row-level deletes / equality deletes*: needs a per-file
+    "which row positions to skip" set threaded from resolution time
+    through `PhysicalFileFragment` (the same channel `partition_values`
+    already uses) into the actual scan, plus a new per-row filtering step
+    added to *both* `ParquetScanOperator` implementations (CPU Acero,
+    `src/execution_cpu/acero_query_executor.cpp`, and GPU cudf,
+    `src/execution_gpu/parquet_scan_operator.cpp`) -- neither has any
+    row-level filtering hook today, only row-group-level pruning.
+    Equality deletes need this same per-row filtering step plus matching
+    each kept row's `equality_ids` columns against every live equality
+    delete record.
+  - *Schema evolution* (renamed/reordered/added columns, promoted types
+    across files written under different schema versions): discovered
+    that `ParquetScanNode::columns()`/`partition_columns()`
+    (`kernellake/planner/physical_plan.hpp`) are shared across an entire
+    scan node's fragments, not per-fragment -- there's no way today to
+    say "read column X from file A, but treat it as a constant for file
+    B" (needed for a column added after an older file was written).
+    Real support needs per-fragment column lists in
+    `PhysicalFileFragment`/`ParquetScanNode`, plus NULL-synthesis for a
+    missing column added in both scan operators -- field-ID-based
+    (not name-based) schema resolution.
+  Both are real, multi-session features on their own, not follow-ups to
+  squeeze into an already-scoped session -- tracked here rather than
+  attempted partially.
 
 - **GPU Parquet scan's cold-vs-warm gap is explained by cuFile running in
   compatibility mode on this dev machine, not a kernellake code issue.**

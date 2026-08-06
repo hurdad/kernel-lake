@@ -106,6 +106,35 @@ int32_t get_required_int(avro_value_t* record, const char* field_name, const cha
   return value;
 }
 
+// Like get_required_int(), but for a field the Avro *schema* itself may
+// not declare at all (not just a present-but-null value) -- v1 manifests,
+// and every pre-existing test fixture's manifest schema, predate
+// data_file.content, so avro_value_get_by_name() failing to even find the
+// field is expected, not an error; `default_value` covers that case the
+// same way a present-but-null field is already covered below.
+int32_t get_optional_int(avro_value_t* record, const char* field_name, int32_t default_value) {
+  avro_value_t field;
+  if (avro_value_get_by_name(record, field_name, &field, nullptr) != 0) {
+    return default_value;
+  }
+  avro_value_t target = field;
+  if (avro_value_get_type(&field) == AVRO_UNION) {
+    avro_value_t branch;
+    if (avro_value_get_current_branch(&field, &branch) != 0) {
+      return default_value;
+    }
+    target = branch;
+  }
+  if (avro_value_get_type(&target) == AVRO_NULL) {
+    return default_value;
+  }
+  int32_t value = 0;
+  if (avro_value_get_int(&target, &value) != 0) {
+    return default_value;
+  }
+  return value;
+}
+
 int64_t get_required_long(avro_value_t* record, const char* field_name, const char* debug_name) {
   avro_value_t field;
   if (avro_value_get_by_name(record, field_name, &field, nullptr) != 0) {
@@ -279,6 +308,7 @@ std::vector<ManifestDataFileEntry> read_manifest_bytes(const std::string& avro_b
     entry.record_count = get_required_long(&data_file, "record_count", kDebugName);
     entry.file_size_in_bytes = get_required_long(&data_file, "file_size_in_bytes", kDebugName);
     entry.partition_values = decode_partition_struct(&data_file, kDebugName);
+    entry.content = get_optional_int(&data_file, "content", /*default_value=*/0);
 
     entries.push_back(std::move(entry));
     avro_value_reset(&value);

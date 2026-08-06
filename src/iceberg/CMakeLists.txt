@@ -3,6 +3,7 @@ add_library(kernellake_iceberg STATIC
   manifest_reader.cpp
   schema_translation.cpp
   partition_pruning.cpp
+  position_delete_reader.cpp
   iceberg_table_resolution.cpp
   iceberg_source_resolver.cpp
 )

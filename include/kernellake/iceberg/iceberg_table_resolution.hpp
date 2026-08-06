@@ -32,9 +32,19 @@ namespace kernellake::iceberg {
 // silently misreading it -- see docs/ROADMAP.md's lakehouse roadmap.
 //
 // Row-level deletes (a manifest-list entry with content == 1) make silently
-// ignoring them a correctness bug, not just a missing feature -- reading a
-// table with any live delete manifest throws StorageError rather than
-// returning rows that should have been deleted.
+// ignoring them a correctness bug, not just a missing feature. Support is
+// deliberately partial, not absent: a *position*-delete file
+// (data_file.content == 1 within a delete manifest) is read in full (not
+// just its footer, see position_delete_reader.hpp) and, when the total
+// deleted-position count for one data file reaches that file's own
+// record_count -- i.e. *every* row in it is deleted, the common case after
+// a compaction/rewrite -- that data file is dropped from the read set
+// entirely, the same as a DELETED-status manifest entry already is. A
+// *partial* position delete (some, not all, rows) or any *equality*
+// delete (data_file.content == 2) still throws StorageError rather than
+// guessing: real per-row filtering (tracking which row positions within a
+// kept file to skip during the actual scan, in both the CPU and GPU
+// execution backends) isn't implemented -- see docs/ROADMAP.md.
 //
 // Partition values are not extracted here (ResolvedTable::partition_columns
 // is always empty from this path): unlike Hive-style directory
