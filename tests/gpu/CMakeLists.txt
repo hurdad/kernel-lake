@@ -19,6 +19,13 @@ add_executable(kernellake_gpu_tests
   multi_batch_integration_test.cpp
   decimal_test.cpp
   hash_join_test.cpp
+  gpu_memory_metrics_test.cpp
+  # OTel-specific: asserts real ObservableGauge/ObservableCounter callback
+  # values via kernellake_observability's own in-memory test seam -- see
+  # that file's own comment. Only compiled/linked when this build actually
+  # has OTel wired in, same condition tests/unit/CMakeLists.txt uses for
+  # query_tracing_test.cpp.
+  $<$<BOOL:${KERNELLAKE_ENABLE_OTEL}>:gpu_memory_metrics_otel_test.cpp>
 )
 
 target_link_libraries(kernellake_gpu_tests PRIVATE
@@ -31,6 +38,20 @@ target_link_libraries(kernellake_gpu_tests PRIVATE
   GTest::gtest
   GTest::gtest_main
 )
+
+if(KERNELLAKE_ENABLE_OTEL)
+  # "exporters_in_memory" is a find_package component name, not a CMake
+  # target -- these two are the actual targets it provides (mirrors
+  # tests/unit/CMakeLists.txt's own comment on the same point).
+  # in_memory_span_exporter is needed transitively by
+  # observability::init_for_testing() itself (query_tracing_test_support.cpp),
+  # not by anything gpu_memory_metrics_otel_test.cpp calls directly.
+  target_link_libraries(kernellake_gpu_tests PRIVATE
+    kernellake_observability
+    opentelemetry-cpp::in_memory_span_exporter
+    opentelemetry-cpp::in_memory_metric_exporter
+  )
+endif()
 
 # See cmake/LinkArrowBundledCloudDeps.cmake.
 kernellake_link_arrow_bundled_cloud_deps(kernellake_gpu_tests)

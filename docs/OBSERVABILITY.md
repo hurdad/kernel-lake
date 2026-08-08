@@ -97,12 +97,61 @@ tagged with a `kernellake.backend` attribute (`"cpu"`/`"gpu"`). Nothing is
 recorded for a failed query (`finish_error()` doesn't touch the histogram,
 matching the "no `elapsed_wall_seconds` to record" reasoning above).
 
-There is no other metric today -- no per-query-type counters, no gauge for
-in-flight queries, no GPU-memory-pressure metric independent of the span
-attribute above. Anything you want beyond query duration currently has to
-come from the span attributes (via a trace-to-metrics pipeline in your
-collector, e.g. Grafana Tempo's span metrics processor) rather than a
-native KernelLake metric.
+Anything you want beyond query duration and GPU memory (below) currently
+has to come from the span attributes (via a trace-to-metrics pipeline in
+your collector, e.g. Grafana Tempo's span metrics processor) rather than a
+native KernelLake metric -- no per-query-type counters, no gauge for
+in-flight queries.
+
+### 2.2.1 Metrics: GPU memory (process/device level)
+
+GPU-build-only (`KERNELLAKE_WITH_CUDA=ON`; see
+`src/memory/gpu_memory_metrics.cpp`/`gpu_memory_metrics_otel.cpp`).
+Instrumented at the RMM memory-resource layer
+(`TrackingMemoryResource`, the outermost layer of `RmmEnvironment`'s
+resource stack -- see that file's own comment) rather than in any
+individual operator, so every GPU allocation contributes automatically:
+
+| Metric | Instrument | Unit | Meaning |
+|---|---|---|---|
+| `kernellake.gpu.memory.allocated` | ObservableGauge | `By` | Current live GPU bytes allocated |
+| `kernellake.gpu.memory.peak` | ObservableGauge | `By` | Highest `allocated` value observed since process startup |
+| `kernellake.gpu.memory.allocations` | ObservableCounter | `{allocation}` | Cumulative successful allocation count |
+| `kernellake.gpu.memory.deallocations` | ObservableCounter | `{allocation}` | Cumulative deallocation count |
+| `kernellake.gpu.memory.allocated_total` | ObservableCounter | `By` | Cumulative bytes ever successfully allocated (never decreases, even as `allocated` drops back to 0) |
+| `kernellake.gpu.memory.allocation_failures` | ObservableCounter | `{allocation}` | Cumulative failed allocation attempts -- includes both genuine CUDA/RMM OOM *and* `engine.query_memory_limit_bytes` rejections (`TrackingMemoryResource` sits outside the limiter, so it sees both) |
+
+Every series carries a `gpu.device.id` attribute (int) -- never a query
+ID, request ID, trace ID, or SQL text: those are unbounded-cardinality
+identifiers that belong on spans (see the per-query note below), not on a
+metric dimension a collector/backend has to keep one active series per
+value of forever.
+
+**Why ObservableCounter, not a synchronous `Counter`:** a synchronous
+counter would mean calling into the OTel SDK from inside
+`TrackingMemoryResource::allocate()` -- i.e. the GPU allocation hot path,
+on every single query. Instead, allocation only ever touches a
+process-wide, per-device `std::atomic` struct
+(`GpuMemoryMetricsRegistry`); the OTel SDK reads a snapshot of it from its
+own periodic-export callback, on its own thread, at
+`observability.metrics.export_interval_ms` cadence -- no network activity
+and no SDK call ever happens on the allocation path itself.
+
+**Per-query GPU stats are not a metric dimension.** `QueryResult::
+peak_gpu_memory_bytes` (already a span attribute -- see 2.1 above) remains
+the way to get one query's own GPU memory story; these process-level
+metrics answer a different question ("how is the GPU doing right now/over
+time") than a per-query breakdown does. Wiring `GpuMemoryMetricsRegistry`
+into a per-query delta (mirroring how `RmmEnvironment::track_query()`
+already isolates `statistics_resource_adaptor` counters per query) is a
+natural extension if a genuine need for it shows up, not implemented here.
+
+**When telemetry is disabled, or this isn't an OTel build:** allocation
+behaves identically either way -- registration
+(`register_gpu_memory_otel_instruments()`) is independent of GPU
+allocation itself (see that function's own comment), and the
+`KERNELLAKE_ENABLE_OTEL=OFF` stub is a plain no-op, mirroring
+`query_tracing_stub.cpp`'s own pattern.
 
 ### 2.3 Logs: every existing `spdlog` call, for free
 
@@ -260,8 +309,21 @@ deployment today. Only takes effect if the deployed image was built with
 - **Per-operator spans.** Today's tracing is whole-query only -- there's
   no span for "this is the Parquet scan," "this is the hash join," etc.
   Explicitly deferred, not attempted, per `docs/ROADMAP.md`.
-- **No metric beyond query duration.** No counters, no gauges, no
-  GPU-memory or queue-depth metric independent of a span attribute.
+- **No metric beyond query duration and GPU memory (2.2.1).** No
+  per-query-type counters, no gauge for in-flight queries, no
+  queue-depth metric.
+- **No per-query GPU memory metric** (as opposed to the process/device-
+  level one in 2.2.1) -- `QueryResult::peak_gpu_memory_bytes` on the span
+  is the only per-query GPU memory signal today.
+- **No pool-capacity/used/free metrics.** KernelLake's default allocator
+  (`memory.use_async_allocator: true`, `cuda_async_memory_resource`) has
+  no fixed "capacity" to report -- it's a CUDA stream-ordered pool that
+  grows on demand (see `docs/GPU_OPTIMIZATIONS.md`'s own note on this
+  allocator's caching behavior). The `pool_memory_resource` alternative
+  (`use_async_allocator: false`) does have a real fixed
+  `pool_initial_bytes`/`pool_max_bytes` ceiling that could be exposed
+  faithfully, but isn't yet -- not invented for the async default, where
+  it wouldn't mean anything real.
 - **No ratio-based trace sampling.** Only `default`/`always`/`never`.
 - **CI coverage** for `KERNELLAKE_ENABLE_OTEL=ON` exists (`otel-build-test`
   in `.github/workflows/ci.yml`, mirroring `server-build-test`'s

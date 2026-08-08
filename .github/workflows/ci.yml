@@ -127,8 +127,8 @@ jobs:
         run: |
           files=$(find src -name '*.cpp' \
             ! -path 'src/execution_gpu/*' \
+            ! -path 'src/memory/*' \
             ! -name 'query_engine_execute_gpu.cpp' \
-            ! -name 'rmm_environment.cpp' \
             ! -path 'src/server/*' \
             ! -name 'query_tracing_otel.cpp' \
             ! -name 'query_tracing_test_support.cpp')

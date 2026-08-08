@@ -9,6 +9,8 @@
 
 #include "kernellake/common/errors.hpp"
 #include "kernellake/execution_gpu/cuda_utils.hpp"
+#include "kernellake/memory/gpu_memory_otel.hpp"
+#include "kernellake/memory/gpu_memory_tracking_resource.hpp"
 
 namespace kernellake {
 
@@ -59,6 +61,14 @@ struct RmmEnvironment::Impl {
   cuda::mr::any_resource<cuda::mr::device_accessible> base_resource;
   rmm::mr::statistics_resource_adaptor stats;
   rmm::mr::limiting_resource_adaptor limiter;
+  // Outermost layer: every allocation actually issued through
+  // set_current_device_resource() below passes through this first (and its
+  // deallocations last) -- see TrackingMemoryResource's own doc comment for
+  // why that position matters (it sees limiter rejections, not just genuine
+  // CUDA OOM). Feeds GpuMemoryMetricsRegistry, a process-wide counter store
+  // independent of this Impl's own lifetime -- see that registry's comment
+  // on why `stats` above (scoped to this instance) isn't reused for that.
+  TrackingMemoryResource tracking;
   cuda::mr::any_resource<cuda::mr::device_accessible> previous_resource;
 
   Impl(const EngineConfig& config, cuda::mr::any_resource<cuda::mr::device_accessible> base,
@@ -67,6 +77,7 @@ struct RmmEnvironment::Impl {
         base_resource(std::move(base)),
         stats(base_resource),
         limiter(stats, query_memory_limit_bytes),
+        tracking(cuda::mr::any_resource<cuda::mr::device_accessible>{limiter}, config.engine.device_id),
         previous_resource(std::move(previous)) {}
 };
 
@@ -84,6 +95,14 @@ cuda::mr::any_resource<cuda::mr::device_accessible> build_base_resource(const Me
 }  // namespace
 
 RmmEnvironment::RmmEnvironment(const EngineConfig& config) {
+  // Idempotent (internally std::call_once-guarded) -- registers the GPU
+  // memory OTel instruments against whatever global MeterProvider
+  // observability::init() already set up, the first time any
+  // RmmEnvironment is ever constructed in this process. A no-op when
+  // observability is disabled or this isn't a KERNELLAKE_ENABLE_OTEL build
+  // -- see gpu_memory_otel.hpp.
+  register_gpu_memory_otel_instruments();
+
   cuda::mr::any_resource<cuda::mr::device_accessible> base = build_base_resource(config.memory);
   // set_current_device_resource returns the *previous* resource so it can
   // be restored on destruction; construct our Impl in two steps since the
@@ -91,7 +110,7 @@ RmmEnvironment::RmmEnvironment(const EngineConfig& config) {
   // previous global resource was.
   RmmEnvironment::Impl* raw = new Impl(config, base, cuda::mr::any_resource<cuda::mr::device_accessible>{});
   impl_.reset(raw);
-  impl_->previous_resource = rmm::mr::set_current_device_resource(impl_->limiter);
+  impl_->previous_resource = rmm::mr::set_current_device_resource(impl_->tracking);
 }
 
 RmmEnvironment::~RmmEnvironment() {

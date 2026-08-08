@@ -44,11 +44,17 @@ struct MemoryUsage {
 // (restoring whatever was previously installed on destruction).
 //
 // Resource stack (outermost first, i.e. what allocations actually go
-// through): limiting_resource_adaptor (engine.query_memory_limit_bytes) ->
-// statistics_resource_adaptor (current/peak/allocation tracking) ->
-// either cuda_async_memory_resource (memory.use_async_allocator: true) or
-// pool_memory_resource over cuda_memory_resource, sized by
-// memory.pool_initial_bytes/pool_max_bytes.
+// through): TrackingMemoryResource (process-wide OTel-facing counters via
+// GpuMemoryMetricsRegistry -- see kernellake/memory/gpu_memory_metrics.hpp;
+// deliberately outermost so it also sees limiter rejections, not just
+// genuine CUDA OOM) -> limiting_resource_adaptor
+// (engine.query_memory_limit_bytes) -> statistics_resource_adaptor
+// (current/peak/allocation tracking *scoped to this instance* -- see
+// track_query()/current_usage(); a separate concern from
+// GpuMemoryMetricsRegistry's process-wide counters, which survive this
+// instance's own destruction) -> either cuda_async_memory_resource
+// (memory.use_async_allocator: true) or pool_memory_resource over
+// cuda_memory_resource, sized by memory.pool_initial_bytes/pool_max_bytes.
 //
 // Avoids global mutable execution state beyond what CUDA/RMM themselves
 // require (a single current-device-resource slot per process) -- see
