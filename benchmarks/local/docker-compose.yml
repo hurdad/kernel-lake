@@ -1,0 +1,151 @@
+# Local, single-machine KernelLake observability + benchmark stack:
+# kernellake-server + OTel Collector + Prometheus + Grafana + MinIO
+# (S3-compatible object storage, standing in for real S3 -- see
+# scripts/generate_and_upload_data.sh). Distinct from
+# benchmarks/aws/monitoring/ (that one is two *reference* copies of what
+# each of two separate real EC2 instance types actually runs, rendered by
+# Terraform -- this is one self-contained stack meant to be brought up
+# directly with `docker compose up`, no cloud account needed).
+#
+# Usage (from this directory):
+#   docker compose up -d --build
+#   ./scripts/generate_and_upload_data.sh          # once, or after `docker compose down -v`
+#   ./scripts/run_e2e.sh                            # smoke test + TPC-H benchmark + metrics check
+#   docker compose down [-v]                        # -v also drops the MinIO/Grafana/Prometheus volumes
+#
+# GPU is required by default (kernellake-server builds the `runtime-gpu`
+# Dockerfile target and requests `--gpus all`). For a GPU-less machine, set
+# KERNELLAKE_TARGET=runtime-cpu and drop/comment the `deploy.resources`
+# block below, and pass --backend cpu explicitly in scripts/run_e2e.sh's
+# own query calls (kernellake-server itself will otherwise still try to
+# construct a GpuExecutionCoordinator -- see config/kernellake.yaml's own
+# comment on engine.backend).
+services:
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      - MINIO_ROOT_USER=minioadmin
+      - MINIO_ROOT_PASSWORD=minioadmin
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # web console
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # One-shot: creates the bucket kernellake-server/scripts read/write,
+  # then exits. `docker compose up` runs it to completion before anything
+  # depends_on: condition: service_completed_successfully waits on it.
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 minioadmin minioadmin &&
+      mc mb --ignore-existing local/kernellake-bench
+      "
+
+  # All-in-one Jaeger (in-memory span storage -- SPAN_STORAGE_TYPE
+  # defaults to "memory", fine for a local dev/benchmark stack; traces are
+  # lost on `docker compose down`). Accepts OTLP natively (Jaeger >= 1.35)
+  # on 4317/4318 -- otel-collector-config.yaml's traces pipeline exports
+  # straight to it, no Jaeger-native-protocol conversion needed. Only
+  # 16686 (the query UI/API) is published to the host; its own 4317/4318
+  # stay container-internal (otel-collector's identically-numbered ports
+  # are already published for that purpose -- see below).
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+    ports:
+      - "16686:16686"  # Jaeger UI / query API
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:latest
+    command: ["--config=/etc/otel-collector-config.yaml"]
+    volumes:
+      - ./otel-collector-config.yaml:/etc/otel-collector-config.yaml:ro
+    ports:
+      - "4317:4317"   # OTLP/gRPC
+      - "4318:4318"   # OTLP/HTTP
+      - "8889:8889"   # Prometheus exporter (scraped by the prometheus service below)
+    depends_on:
+      - jaeger
+
+  prometheus:
+    image: prom/prometheus:latest
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "9090:9090"
+    depends_on:
+      - otel-collector
+
+  grafana:
+    image: grafana/grafana:latest
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    environment:
+      # Anonymous viewer access -- this is a local dev/benchmark stack, not
+      # a shared/internet-facing deployment; see
+      # benchmarks/aws/monitoring/docker-compose.yml's own identical
+      # comment for the same reasoning in that context.
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Viewer
+    depends_on:
+      - prometheus
+
+  kernellake-server:
+    build:
+      context: ../..
+      dockerfile: docker/Dockerfile
+      target: ${KERNELLAKE_TARGET:-runtime-gpu}
+    entrypoint: ["/opt/kernellake/bin/kernellake-server"]
+    command: ["--config", "/config/kernellake-server.yaml"]
+    volumes:
+      - ./config/kernellake-server.yaml:/config/kernellake-server.yaml:ro
+    environment:
+      - AWS_ACCESS_KEY_ID=minioadmin
+      - AWS_SECRET_ACCESS_KEY=minioadmin
+    ports:
+      - "31337:31337"
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+      otel-collector:
+        condition: service_started
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      # No HTTP endpoint (Flight SQL is gRPC-over-plain-TCP) and the
+      # runtime image is deliberately minimal (no curl/nc -- see
+      # docker/Dockerfile's own comment) -- bash's /dev/tcp is a builtin,
+      # needs no extra binary, and is good enough to confirm the server is
+      # actually accepting connections on its port.
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/localhost/31337"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+volumes:
+  minio-data:
+  prometheus-data:
+  grafana-data:

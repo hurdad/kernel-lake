@@ -1,0 +1,17 @@
+# Static (no service-discovery templating needed -- this is a fixed,
+# single-instance-per-service local stack, unlike
+# benchmarks/aws/monitoring/prometheus.yml.tftpl's multi-host Terraform
+# template).
+global:
+  scrape_interval: 5s
+
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  # kernellake-server's real query/GPU-memory metrics, via the OTel
+  # Collector's Prometheus exporter -- see otel-collector-config.yaml.
+  - job_name: otel-collector
+    static_configs:
+      - targets: ["otel-collector:8889"]

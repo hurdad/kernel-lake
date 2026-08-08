@@ -112,14 +112,27 @@ Instrumented at the RMM memory-resource layer
 resource stack -- see that file's own comment) rather than in any
 individual operator, so every GPU allocation contributes automatically:
 
-| Metric | Instrument | Unit | Meaning |
-|---|---|---|---|
-| `kernellake.gpu.memory.allocated` | ObservableGauge | `By` | Current live GPU bytes allocated |
-| `kernellake.gpu.memory.peak` | ObservableGauge | `By` | Highest `allocated` value observed since process startup |
-| `kernellake.gpu.memory.allocations` | ObservableCounter | `{allocation}` | Cumulative successful allocation count |
-| `kernellake.gpu.memory.deallocations` | ObservableCounter | `{allocation}` | Cumulative deallocation count |
-| `kernellake.gpu.memory.allocated_total` | ObservableCounter | `By` | Cumulative bytes ever successfully allocated (never decreases, even as `allocated` drops back to 0) |
-| `kernellake.gpu.memory.allocation_failures` | ObservableCounter | `{allocation}` | Cumulative failed allocation attempts -- includes both genuine CUDA/RMM OOM *and* `engine.query_memory_limit_bytes` rejections (`TrackingMemoryResource` sits outside the limiter, so it sees both) |
+| Metric (OTel name) | Prometheus name | Instrument | Unit | Meaning |
+|---|---|---|---|---|
+| `kernellake.gpu.memory.allocated` | `kernellake_gpu_memory_allocated_bytes` | ObservableGauge | `By` | Current live GPU bytes allocated |
+| `kernellake.gpu.memory.peak` | `kernellake_gpu_memory_peak_bytes` | ObservableGauge | `By` | Highest `allocated` value observed since process startup |
+| `kernellake.gpu.memory.allocations` | `kernellake_gpu_memory_allocations_total` | ObservableCounter | `{allocation}` | Cumulative successful allocation count |
+| `kernellake.gpu.memory.deallocations` | `kernellake_gpu_memory_deallocations_total` | ObservableCounter | `{allocation}` | Cumulative deallocation count |
+| `kernellake.gpu.memory.allocated_total` | `kernellake_gpu_memory_allocated_bytes_total` | ObservableCounter | `By` | Cumulative bytes ever successfully allocated (never decreases, even as `allocated` drops back to 0) |
+| `kernellake.gpu.memory.allocation_failures` | `kernellake_gpu_memory_allocation_failures_total` | ObservableCounter | `{allocation}` | Cumulative failed allocation attempts -- includes both genuine CUDA/RMM OOM *and* `engine.query_memory_limit_bytes` rejections (`TrackingMemoryResource` sits outside the limiter, so it sees both) |
+
+Prometheus name verified for real (`benchmarks/local/`'s stack, real GPU
+hardware, real query traffic -- not read from the OTel spec alone): the
+Collector's Prometheus exporter renders the raw dotted OTel name with
+underscores, inserts a suffix derived from the unit (`By` -> `_bytes`),
+then -- for a monotonic counter only -- strips any trailing `_total`
+already in the name and re-appends exactly one `_total` at the very end.
+That's why `allocated_total` (which already ends in `_total`) still comes
+out as `..._allocated_bytes_total`, not `..._allocated_total_bytes` or a
+doubled `..._total_total` -- the unit suffix always lands *before* the
+counter suffix, regardless of where `_total` sat in the original name.
+`gpu.device.id` becomes the Prometheus label `gpu_device_id` (dots
+sanitize to underscores in attribute names too).
 
 Every series carries a `gpu.device.id` attribute (int) -- never a query
 ID, request ID, trace ID, or SQL text: those are unbounded-cardinality
@@ -186,7 +199,9 @@ observability:
     sampler: default             # default | always | never
   metrics:
     export_interval_ms: 60000
-    export_timeout_ms: 30000
+    export_timeout_ms: 30000  # must be < export_interval_ms -- see MetricExportConfig's own comment
+                              # (config.hpp) for what happens if you get this wrong (not an error --
+                              # silently falls back to the SDK's own 60000/30000 defaults instead)
   logs:
     processor: batch            # simple | batch
     batch:

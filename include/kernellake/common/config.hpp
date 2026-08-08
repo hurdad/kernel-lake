@@ -258,7 +258,15 @@ struct LogExportConfig {
 };
 
 // Metrics always use a PeriodicExportingMetricReader (no simple/batch
-// choice) -- tuned by these two fields instead.
+// choice) -- tuned by these two fields instead. export_timeout_ms must be
+// strictly less than export_interval_ms -- confirmed for real:
+// opentelemetry-cpp's PeriodicExportingMetricReader does not reject an
+// equal-or-greater timeout with an error, it silently falls back to its
+// own built-in defaults instead (logged as a startup warning: "Invalid
+// configuration: export_timeout_millis_ should be less than
+// export_interval_millis_, using default values") -- not validated here,
+// since this project's own config.cpp has no reach into
+// opentelemetry-cpp's internals to check it ahead of time.
 struct MetricExportConfig {
   std::uint32_t export_interval_ms = 60000;
   std::uint32_t export_timeout_ms = 30000;

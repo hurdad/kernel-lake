@@ -1,0 +1,49 @@
+{
+  "title": "KernelLake GPU Memory (OTel)",
+  "uid": "kernellake-gpu-memory",
+  "schemaVersion": 39,
+  "version": 1,
+  "time": {"from": "now-1h", "to": "now"},
+  "refresh": "5s",
+  "description": "src/memory/gpu_memory_metrics_otel.cpp's kernellake.gpu.memory.* instruments (see docs/OBSERVABILITY.md §2.2.1), one series per gpu.device.id. Prometheus names verified for real against this stack (its OTel bridge inserts the unit suffix from the raw dotted name, then appends _total for counters, after stripping any pre-existing trailing _total from the base name first): kernellake_gpu_memory_allocated_bytes (gauge), kernellake_gpu_memory_peak_bytes (gauge), kernellake_gpu_memory_allocations_total / _deallocations_total / _allocation_failures_total (counters), kernellake_gpu_memory_allocated_bytes_total (counter, cumulative -- note this is the 'allocated_total' metric, not 'allocated').",
+  "panels": [
+    {
+      "id": 1,
+      "title": "Current vs. peak GPU memory allocated (bytes)",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+      "targets": [
+        {"expr": "kernellake_gpu_memory_allocated_bytes", "legendFormat": "current (gpu {{gpu_device_id}})"},
+        {"expr": "kernellake_gpu_memory_peak_bytes", "legendFormat": "peak (gpu {{gpu_device_id}})"}
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Allocation/deallocation rate (ops/sec)",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
+      "targets": [
+        {"expr": "rate(kernellake_gpu_memory_allocations_total[1m])", "legendFormat": "allocations (gpu {{gpu_device_id}})"},
+        {"expr": "rate(kernellake_gpu_memory_deallocations_total[1m])", "legendFormat": "deallocations (gpu {{gpu_device_id}})"}
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Cumulative bytes allocated over time",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8},
+      "targets": [
+        {"expr": "kernellake_gpu_memory_allocated_bytes_total", "legendFormat": "cumulative allocated (gpu {{gpu_device_id}})"}
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Allocation failures (cumulative)",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8},
+      "targets": [
+        {"expr": "kernellake_gpu_memory_allocation_failures_total", "legendFormat": "failures (gpu {{gpu_device_id}})"}
+      ]
+    }
+  ]
+}

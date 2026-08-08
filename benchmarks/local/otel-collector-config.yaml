@@ -1,0 +1,45 @@
+# OTel Collector config for the local docker-compose stack. Same
+# "OTLP in, Prometheus out" shape as benchmarks/aws/monitoring/
+# otel-collector-config.yaml (single-host version -- no multi-instance
+# label plumbing needed here).
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+exporters:
+  prometheus:
+    endpoint: 0.0.0.0:8889
+  # jaegertracing/all-in-one (see docker-compose.yml's jaeger service)
+  # accepts OTLP natively on 4317/4318 since Jaeger 1.35 -- no separate
+  # Jaeger-native-protocol exporter/converter needed, just a second OTLP
+  # target. `jaeger:4317` is container-internal only (not published to the
+  # host -- only otel-collector's own 4317 is, for kernellake-server/
+  # anything else in this stack to send OTLP to).
+  otlp_grpc/jaeger:
+    endpoint: jaeger:4317
+    tls:
+      insecure: true
+  debug:
+    verbosity: basic
+
+processors:
+  batch: {}
+
+service:
+  pipelines:
+    metrics:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [prometheus]
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlp_grpc/jaeger, debug]
+    logs:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [debug]

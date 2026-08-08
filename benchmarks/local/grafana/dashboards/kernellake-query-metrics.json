@@ -1,0 +1,38 @@
+{
+  "title": "KernelLake Query Metrics (OTel)",
+  "uid": "kernellake-query-metrics",
+  "schemaVersion": 39,
+  "version": 1,
+  "time": {"from": "now-1h", "to": "now"},
+  "refresh": "5s",
+  "description": "Adapted from benchmarks/aws/monitoring/grafana/dashboards/kernellake-query-metrics.json for this single-instance local stack (no multi-host job-label regex needed). src/observability/query_tracing_otel.cpp emits kernellake.query.duration_seconds (a histogram of QueryResult::elapsed_wall_seconds, one sample per completed query) -- the OTel Collector's Prometheus exporter renders it as kernellake_query_duration_seconds_bucket/_sum/_count.",
+  "panels": [
+    {
+      "id": 1,
+      "title": "Query throughput (queries/sec, derived from histogram _count)",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+      "targets": [{"expr": "rate(kernellake_query_duration_seconds_count{job=\"otel-collector\"}[1m])", "legendFormat": "queries/sec"}]
+    },
+    {
+      "id": 2,
+      "title": "Query latency p50/p95/p99 (seconds)",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
+      "targets": [
+        {"expr": "histogram_quantile(0.50, rate(kernellake_query_duration_seconds_bucket{job=\"otel-collector\"}[5m]))", "legendFormat": "p50"},
+        {"expr": "histogram_quantile(0.95, rate(kernellake_query_duration_seconds_bucket{job=\"otel-collector\"}[5m]))", "legendFormat": "p95"},
+        {"expr": "histogram_quantile(0.99, rate(kernellake_query_duration_seconds_bucket{job=\"otel-collector\"}[5m]))", "legendFormat": "p99"}
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Average query latency (sum/count, seconds)",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 8},
+      "targets": [
+        {"expr": "rate(kernellake_query_duration_seconds_sum{job=\"otel-collector\"}[1m]) / rate(kernellake_query_duration_seconds_count{job=\"otel-collector\"}[1m])", "legendFormat": "avg latency"}
+      ]
+    }
+  ]
+}

@@ -1,0 +1,92 @@
+# kernellake-server config for the local docker-compose stack
+# (benchmarks/local/docker-compose.yml). Mirrors config/kernellake.yaml's
+# own field-for-field shape -- see that file's comments for what every
+# field means; only the values that differ from its defaults are called
+# out below.
+engine:
+  device_id: 0
+  batch_rows: 1000000
+  result_batch_rows: 65536
+  query_memory_limit_bytes: 0  # auto-detect from free VRAM
+
+memory:
+  pool_initial_bytes: 1073741824
+  pool_max_bytes: 8589934592
+  use_async_allocator: true
+
+storage:
+  # local_root stays "/" (the default) -- read_parquet('s3://...') doesn't
+  # need it; it only matters for bare local filesystem paths, which this
+  # stack's e2e/benchmark scripts don't use (everything goes through MinIO
+  # over the s3:// scheme below).
+  local_root: /
+  s3:
+    # "explicit", not "default": MinIO isn't reachable via the AWS default
+    # credential chain (IMDS/shared-credentials-file/env-var-with-real-AWS-
+    # semantics) -- it needs a plain access key + secret pointed at this
+    # stack's own MinIO instance instead. AWS_ACCESS_KEY_ID/
+    # AWS_SECRET_ACCESS_KEY are set on the kernellake-server container in
+    # docker-compose.yml (see s3_object_store.cpp's own "explicit" handling
+    # -- it reads exactly those two env vars).
+    credentials_kind: explicit
+    region: us-east-1  # arbitrary -- MinIO ignores region, but Arrow's S3 client requires a non-empty value
+    endpoint_override: "minio:9000"
+    scheme: http
+    tls_verify_certificates: false
+
+logging:
+  level: info
+  json: false
+
+profiling:
+  nvtx: false
+  operator_metrics: true
+
+benchmark:
+  default_iterations: 5
+  warmup_iterations: 1
+  output_format: json
+  verify_results: true
+  baseline: duckdb
+
+server:
+  host: 0.0.0.0
+  port: 31337
+
+# Real OTLP/gRPC export to the otel-collector service in this same compose
+# stack (see otel-collector-config.yaml) -- requires this image to be built
+# with KERNELLAKE_ENABLE_OTEL=ON, which docker/Dockerfile's runtime-gpu/
+# runtime-cpu targets are (see that file's own top-of-file comment).
+observability:
+  enabled: true
+  otlp_protocol: grpc
+  otlp_endpoint: otel-collector:4317
+  service_name: kernellake
+  use_tls: false
+  tls_ca_cert_path: ""
+  tls_client_cert_path: ""
+  tls_client_key_path: ""
+  tracing:
+    processor: batch
+    batch:
+      max_queue_size: 2048
+      max_export_batch_size: 512
+      schedule_delay_ms: 5000
+    sampler: default
+  metrics:
+    # Short interval (default is 60s) so this stack's e2e/benchmark scripts
+    # don't have to wait a full minute after issuing a query before the
+    # GPU memory metrics they check for actually show up in Prometheus.
+    # export_timeout_ms must be strictly less than export_interval_ms --
+    # confirmed for real: setting them equal silently falls back to the
+    # OTel SDK's own default values instead (a real config bug, caught by
+    # kernellake-server's own startup warning: "export_timeout_millis_
+    # should be less than export_interval_millis_, using default values").
+    export_interval_ms: 5000
+    export_timeout_ms: 3000
+  logs:
+    processor: batch
+    batch:
+      max_queue_size: 2048
+      max_export_batch_size: 512
+      schedule_delay_ms: 5000
