@@ -39,15 +39,18 @@ picking one.
 
 ## Opportunities, roughly by expected payoff vs. effort
 
-1. **Pinned host memory for the device-to-host path.** Every output batch
+1. **Pinned host memory for the device-to-host path.** ~~Every output batch
    currently pays a pageable-memory `cudaMemcpy` inside
-   `cudf::to_arrow_host()` (`arrow_bridge.cpp`). Wiring up
-   `rmm::mr::pinned_memory_resource` (or `cudf::set_pinned_memory_resource`)
-   there would speed up that copy meaningfully, especially for large result
-   sets.
-   - Tradeoff: pinned memory is a scarcer, harder-to-size resource than
-     pool device memory -- over-allocating it hurts the whole system
-     (host RAM pressure, page-lock limits), not just this process.
+   `cudf::to_arrow_host()` (`arrow_bridge.cpp`).~~ **Measured 2026-08-08 (see
+   "Profiling results" below): not worth it as a first move.** D2H is
+   ~9.8% of wall time even for a query returning 2M rows, and ~0.1% for a
+   typical small-result aggregate -- both dwarfed by Parquet decode
+   (~43%/~33%). Revisit only after Parquet decode itself has been
+   addressed, or for a workload that's confirmed to return unusually large
+   result sets.
+   - Tradeoff (if revisited): pinned memory is a scarcer, harder-to-size
+     resource than pool device memory -- over-allocating it hurts the whole
+     system (host RAM pressure, page-lock limits), not just this process.
 
 2. **Drop the single-query mutex in `GpuExecutionCoordinator`.** The server
    currently serializes on one query at a time, so multi-stream async
@@ -72,22 +75,51 @@ picking one.
      memory-constrained today -- easy to spend time tuning a number that
      isn't the bottleneck.
 
-5. **Profile with `nsys` before acting on any of the above.** NVTX ranges
-   are already wired in (`config_.profiling.nvtx`), but there's no evidence
-   of an actual profiling session against real query shapes confirming
-   where time goes.
-   - Tradeoff: none, really -- this should come first. The D2H copy (#1)
-     is the obvious *theoretical* win but might be a small fraction of
-     wall time next to kernel execution itself; profiling first avoids
-     optimizing the wrong thing.
+5. ~~Profile with `nsys` before acting on any of the above.~~ **Done
+   2026-08-08 -- see "Profiling results" below.** Not a full `nsys`
+   kernel-level trace (the collector, `nsight-systems-target`, is installed,
+   but converting its raw output needs a separate host-side importer binary
+   that only ships in the full ~150MB `nsight-systems` package plus two more
+   missing shared libs, all needing `sudo` not available in this
+   environment) -- used the app's own `--stats` output
+   (`elapsed_wall_seconds`/`parquet_decoding_seconds`/
+   `gpu_execution_seconds`/`device_to_host_seconds`, already wired in
+   `query_engine_execute_gpu.cpp`) instead, across a small-result and a
+   large-result query on the local GPU. Sufficient to answer the question
+   this item existed to answer (is #1 worth doing) without the GUI trace.
+
+## Profiling results (2026-08-08, local RTX 5060 Ti)
+
+Two query shapes, 3 runs each, 20M-row synthetic dataset (8 files) via the
+CLI's `--stats` flag. Values are per-run averages; `compute-only` is
+`gpu_execution_seconds - parquet_decoding_seconds` (`gpu_execution_seconds`
+includes decode -- see `query_engine_execute_gpu.cpp`).
+
+| Query shape | rows out | decode | compute-only | D2H | wall | D2H % of wall |
+|---|---|---|---|---|---|---|
+| `GROUP BY` aggregate (small result) | 80 | 0.144s | 0.126s | 0.0004s | 0.437s | 0.09% |
+| `SELECT *` + filter (large result) | 2,001,849 | 0.219s | 0.102s | 0.050s | 0.507s | 9.8% |
+
+**Conclusion:** Parquet decode dominates in both cases (33-43% of wall
+time), and stays roughly flat in absolute terms regardless of result size
+(it does the same scan work either way). D2H scales with result size, as
+expected, but even at 2M rows returned it's a distant third behind decode
+and compute -- confirming the doc's original hedge that pinned memory (#1)
+"might be a small fraction of wall time next to kernel execution itself."
+The bigger, unaddressed cost in this profile is Parquet decode itself, not
+covered by any item on this list yet.
 
 ## Recommendation
 
-Start with #5 (profile) to confirm #1 (pinned memory) is actually worth
-doing before investing in it. #2 (concurrent queries) is the biggest
-structural change and should wait until there's a concrete reason
-(observed queueing under real load) to take on the RMM-sharing redesign it
-requires.
+#1 (pinned memory) is now de-prioritized based on the measurements above --
+don't start there. If pursuing further optimization, look at what's
+actually driving Parquet decode time first (not yet investigated: whether
+it's I/O-bound reading from disk/object store, or CPU/GPU decode-bound;
+`kvikio`/GPU-direct-storage configuration is one relevant angle, per
+`cmake/ThirdPartyRapids.cmake`'s own vendoring of libkvikio). #2 (concurrent
+queries) is the biggest structural change and should wait until there's a
+concrete reason (observed queueing under real load) to take on the
+RMM-sharing redesign it requires.
 
 ## Follow-up: GPU memory growing across benchmark runs
 
