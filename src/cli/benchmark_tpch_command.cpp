@@ -88,6 +88,18 @@ struct IterationMetrics {
   double wall_seconds = 0.0;
   std::int64_t rows_returned = 0;
   std::int64_t peak_gpu_memory_bytes = 0;
+  // Optional: the GPU backend's own breakdown of wall_seconds (see
+  // QueryResult's own field comments) -- null on the CPU backend, or for any
+  // field a given run genuinely couldn't measure. Surfaced per-iteration
+  // (not just aggregated) so a warm-process run can show whether these
+  // scale with data volume the way wall_seconds does, or are dominated by
+  // fixed per-query overhead -- see docs/GPU_OPTIMIZATIONS.md's profiling
+  // section for why that distinction matters (a fresh CLI process per query
+  // bakes CUDA/cudf cold-start cost into whichever operator happens to run
+  // first, misattributing it as that operator's own cost).
+  std::optional<double> parquet_decoding_seconds;
+  std::optional<double> gpu_execution_seconds;
+  std::optional<double> device_to_host_seconds;
 };
 
 double mean_of(const std::vector<double>& values) {
@@ -230,8 +242,12 @@ int run_benchmark_tpch(const std::vector<std::string_view>& args, const EngineCo
         }
       }
       const QueryResult result = engine.execute(sql);
-      return IterationMetrics{result.elapsed_wall_seconds.value_or(0.0), result.rows_returned.value_or(0),
-                              result.peak_gpu_memory_bytes.value_or(0)};
+      return IterationMetrics{result.elapsed_wall_seconds.value_or(0.0),
+                              result.rows_returned.value_or(0),
+                              result.peak_gpu_memory_bytes.value_or(0),
+                              result.parquet_decoding_seconds,
+                              result.gpu_execution_seconds,
+                              result.device_to_host_seconds};
     };
 
     for (int i = 0; i < warmup_iterations; ++i) {
@@ -284,10 +300,18 @@ int run_benchmark_tpch(const std::vector<std::string_view>& args, const EngineCo
 
     nlohmann::json iteration_array = nlohmann::json::array();
     for (std::size_t i = 0; i < measurements.size(); ++i) {
-      iteration_array.push_back({{"iteration", i},
-                                 {"wall_seconds", measurements[i].wall_seconds},
-                                 {"rows_returned", measurements[i].rows_returned},
-                                 {"peak_gpu_memory_bytes", measurements[i].peak_gpu_memory_bytes}});
+      const IterationMetrics& m = measurements[i];
+      nlohmann::json entry = {{"iteration", i},
+                              {"wall_seconds", m.wall_seconds},
+                              {"rows_returned", m.rows_returned},
+                              {"peak_gpu_memory_bytes", m.peak_gpu_memory_bytes}};
+      entry["parquet_decoding_seconds"] =
+          m.parquet_decoding_seconds ? nlohmann::json(*m.parquet_decoding_seconds) : nlohmann::json(nullptr);
+      entry["gpu_execution_seconds"] =
+          m.gpu_execution_seconds ? nlohmann::json(*m.gpu_execution_seconds) : nlohmann::json(nullptr);
+      entry["device_to_host_seconds"] =
+          m.device_to_host_seconds ? nlohmann::json(*m.device_to_host_seconds) : nlohmann::json(nullptr);
+      iteration_array.push_back(std::move(entry));
     }
     report["iteration_results"] = iteration_array;
     report["first_iteration_wall_seconds"] = wall_seconds.front();

@@ -90,6 +90,19 @@ picking one.
 
 ## Profiling results (2026-08-08, local RTX 5060 Ti)
 
+Caveat shared by every number below, called out already in
+`rmm_environment.cpp`'s own comment: this GPU is a desktop card also used
+interactively (not a dedicated headless one), and had other real GPU load
+on it (confirmed via `nvidia-smi`: ~47% utilization, ~6 GiB used, no CUDA
+compute context -- consistent with a game's graphics workload) during at
+least some of this session's measurements. Absolute timings above carry
+some contention noise; the *relative* conclusions (decode's ~57% share
+consistent across both scan sizes, D2H negligible except for large result
+sets) are more robust, since contention affects both sides of each ratio
+on the same shared GPU. Worth a clean re-check on an idle GPU before
+treating the absolute numbers as authoritative for any tuning decision
+that depends on them precisely.
+
 Two query shapes, 3 runs each, 20M-row synthetic dataset (8 files) via the
 CLI's `--stats` flag. Values are per-run averages; `compute-only` is
 `gpu_execution_seconds - parquet_decoding_seconds` (`gpu_execution_seconds`
@@ -109,10 +122,45 @@ and compute -- confirming the doc's original hedge that pinned memory (#1)
 The bigger, unaddressed cost in this profile is Parquet decode itself, not
 covered by any item on this list yet.
 
+**Methodology caveat (resolved below):** the table above comes from a
+*fresh CLI process per query* (`kernellake query --stats`) -- each run pays
+its own CUDA context creation + cudf/RMM first-kernel-launch cost, which
+lands inside `parquet_decoding_seconds` (the scan is the first operator to
+touch the GPU), potentially inflating decode's share and flattening its
+apparent scaling with data volume. Checked this by extending
+`kernellake benchmark tpch`'s `IterationMetrics`
+(`src/cli/benchmark_tpch_command.cpp`) to also report
+`parquet_decoding_seconds`/`gpu_execution_seconds`/`device_to_host_seconds`
+per iteration (previously only `wall_seconds`/`rows_returned`/
+`peak_gpu_memory_bytes`), then ran the same aggregate query warm (2
+warmup + 5 measured iterations, so cold-start cost is excluded) at two
+scan sizes against one long-lived process -- 2M rows/1 file vs. 20M
+rows/8 files, same 80-row output both times:
+
+| Scanned rows | decode (avg) | compute-only (avg) | D2H (avg) | wall (avg) | decode % of wall |
+|---|---|---|---|---|---|
+| 2,000,000 | 0.0470s | 0.0304s | 0.0004s | 0.0828s | 56.7% |
+| 20,000,000 (10x) | 0.1918s | 0.1137s | 0.0006s | 0.3366s | 57.0% |
+
+Decode's ~57% share of wall time is essentially identical at both scales
+(not an artifact of process-startup noise), and decode time itself scales
+sub-linearly with scanned data volume (10x rows -> ~4.1x decode time,
+consistent with fixed per-query overhead -- reader/row-group setup,
+planning -- amortizing better at larger scans). This confirms the original
+conclusion on firmer footing rather than overturning it: decode is a real,
+data-volume-driven cost, not a cold-start artifact, and D2H's earlier 9.8%
+figure is specific to *large result sets* (`SELECT *` returning 2M rows),
+not large *scanned* input -- these are different, independent axes (a
+`GROUP BY` scanning 20M rows but returning 80 still shows D2H at ~0.18% of
+wall time). The benchmark tool's new per-iteration fields are a permanent,
+reusable addition -- useful for any future warm-process profiling, not
+just this investigation.
+
 ## Recommendation
 
 #1 (pinned memory) is now de-prioritized based on the measurements above --
-don't start there. If pursuing further optimization, look at what's
+don't start there; it only matters for queries with genuinely large result
+sets, not large scans. If pursuing further optimization, look at what's
 actually driving Parquet decode time first (not yet investigated: whether
 it's I/O-bound reading from disk/object store, or CPU/GPU decode-bound;
 `kvikio`/GPU-direct-storage configuration is one relevant angle, per
