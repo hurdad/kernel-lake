@@ -77,6 +77,7 @@ void init_for_testing(
       metrics_sdk::PeriodicExportingMetricReaderFactory::Create(std::move(metric_exporter), reader_options);
   auto meter_provider = metrics_sdk::MeterProviderFactory::Create();
   meter_provider->AddMetricReader(std::shared_ptr<metrics_sdk::MetricReader>(std::move(reader)));
+  add_query_duration_histogram_view(*meter_provider, service_name);
   metrics_api::Provider::SetMeterProvider(to_provider<metrics_api::MeterProvider>(std::move(meter_provider)));
   auto meter = metrics_api::Provider::GetMeterProvider()->GetMeter(service_name);
   g_query_duration_histogram = meter->CreateDoubleHistogram("kernellake.query.duration_seconds",

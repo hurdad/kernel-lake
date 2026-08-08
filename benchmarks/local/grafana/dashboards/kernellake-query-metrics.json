@@ -33,6 +33,22 @@
       "targets": [
         {"expr": "rate(kernellake_query_duration_seconds_sum{job=\"otel-collector\"}[1m]) / rate(kernellake_query_duration_seconds_count{job=\"otel-collector\"}[1m])", "legendFormat": "avg latency"}
       ]
+    },
+    {
+      "id": 4,
+      "title": "Query latency heatmap (full distribution, from histogram buckets)",
+      "type": "heatmap",
+      "description": "Requires src/observability/internal.hpp's add_query_duration_histogram_view() (explicit seconds-scale bucket boundaries: 0.001..120) -- without it, every real query's sub-few-second latency collapses into the OTel SDK's own default first bucket (<=5s) and this heatmap (like the p50/p95/p99 panel above) is a single flat band, not a real distribution. Confirmed for real against this stack before/after that fix.",
+      "gridPos": {"h": 9, "w": 24, "x": 0, "y": 16},
+      "targets": [
+        {"expr": "sum(rate(kernellake_query_duration_seconds_bucket{job=\"otel-collector\"}[$__rate_interval])) by (le)", "format": "heatmap", "legendFormat": "{{le}}"}
+      ],
+      "options": {
+        "calculate": false,
+        "yAxis": {"unit": "s", "axisLabel": "query latency"},
+        "color": {"mode": "scheme", "scheme": "Spectral", "steps": 64},
+        "cellGap": 1
+      }
     }
   ]
 }

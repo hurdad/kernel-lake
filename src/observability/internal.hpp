@@ -13,6 +13,12 @@
 #include <opentelemetry/metrics/provider.h>
 #include <opentelemetry/nostd/shared_ptr.h>
 #include <opentelemetry/nostd/unique_ptr.h>
+#include <opentelemetry/sdk/metrics/aggregation/aggregation_config.h>
+#include <opentelemetry/sdk/metrics/instruments.h>
+#include <opentelemetry/sdk/metrics/meter_provider.h>
+#include <opentelemetry/sdk/metrics/view/instrument_selector_factory.h>
+#include <opentelemetry/sdk/metrics/view/meter_selector_factory.h>
+#include <opentelemetry/sdk/metrics/view/view_factory.h>
 #include <opentelemetry/sdk/resource/resource.h>
 #include <opentelemetry/trace/provider.h>
 #include <spdlog/sinks/base_sink.h>
@@ -21,6 +27,7 @@
 #include <mutex>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace kernellake::observability::detail {
 
@@ -99,6 +106,37 @@ class OtelSpdlogSink : public spdlog::sinks::base_sink<std::mutex> {
 
 inline resource_sdk::Resource build_resource(const std::string& service_name) {
   return resource_sdk::Resource::Create({{"service.name", service_name}});
+}
+
+// Registers an explicit-bucket-boundary View for kernellake.query.duration_
+// seconds, replacing the OTel SDK's own default histogram boundaries ([0,
+// 5, 10, 25, 50, 75, 100, 250, 500, 750, 1000, 2500, 5000, 7500, 10000]).
+// Those defaults are tuned for an unscaled/millisecond-ish value range --
+// this metric records values in *seconds* (QueryResult::
+// elapsed_wall_seconds), so every real query observed so far (sub-second to
+// a few seconds, even at real TPC-H scale factors) fell into the single
+// "<=5" bucket, making p50/p95/p99 (histogram_quantile() in Grafana) and
+// any heatmap built from this histogram meaningless -- confirmed for real
+// against benchmarks/local/'s own Prometheus (`le="0.0"` count=0,
+// `le="5.0"` count=8, identical through `le="10000.0"`, for query latencies
+// that were actually all under 0.35s). Must be registered on the *SDK*
+// MeterProvider (via its own AddView(), only available on the concrete
+// type, not the type-erased API-layer nostd::shared_ptr<metrics_api::
+// MeterProvider> Provider::SetMeterProvider() takes) before any instrument
+// is created against it -- callers must call this before their own
+// CreateDoubleHistogram("kernellake.query.duration_seconds", ...) call.
+inline void add_query_duration_histogram_view(metrics_sdk::MeterProvider& provider,
+                                              const std::string& service_name) {
+  auto instrument_selector = metrics_sdk::InstrumentSelectorFactory::Create(
+      metrics_sdk::InstrumentType::kHistogram, "kernellake.query.duration_seconds", "s");
+  auto meter_selector = metrics_sdk::MeterSelectorFactory::Create(service_name, "", "");
+  auto aggregation_config = std::make_shared<metrics_sdk::HistogramAggregationConfig>();
+  aggregation_config->boundaries_ = {0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5,
+                                     1,     2.5,   5,    10,    30,   60,  120};
+  auto view =
+      metrics_sdk::ViewFactory::Create("kernellake.query.duration_seconds", "whole-query execution duration",
+                                       metrics_sdk::AggregationType::kHistogram, aggregation_config);
+  provider.AddView(std::move(instrument_selector), std::move(meter_selector), std::move(view));
 }
 
 // Defined once in query_tracing_otel.cpp; read/written by both it and

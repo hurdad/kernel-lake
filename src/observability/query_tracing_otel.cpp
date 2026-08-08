@@ -207,6 +207,7 @@ void init(const ObservabilitySection& config) {
 
     auto provider = metrics_sdk::MeterProviderFactory::Create();
     provider->AddMetricReader(std::shared_ptr<metrics_sdk::MetricReader>(std::move(reader)));
+    add_query_duration_histogram_view(*provider, config.service_name);
     metrics_api::Provider::SetMeterProvider(to_provider<metrics_api::MeterProvider>(std::move(provider)));
 
     auto meter = metrics_api::Provider::GetMeterProvider()->GetMeter(config.service_name);
