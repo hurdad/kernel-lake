@@ -202,19 +202,18 @@ specifically need EC2-scale data or the full benchmark harness. Reach for
 EC2 only once a local check like this one has narrowed down what's worth
 spending real money to verify at scale.
 
-## New finding: Flight SQL server crashes on plain narrowed `SELECT` projections
+## Fixed: narrowed `SELECT` projections crashed when combined with `ORDER BY`/`LIMIT`
 
 Found while driving `kernellake-server` locally for the memory-growth check
-above -- **not yet investigated further, root cause unconfirmed.**
+above. **Fixed 2026-08-08** (same session, once isolated) -- not actually a
+Flight SQL server bug as first suspected; see below.
 
 Any query of the shape `SELECT col1, col2, ... FROM read_parquet(...)`
-(explicit column list, no aggregate, not `SELECT *`) crashes when issued
-through the Flight SQL server, every time, regardless of `WHERE`/`LIMIT`:
+(explicit column list, no aggregate, not `SELECT *`) crashed whenever
+combined with `ORDER BY` and/or `LIMIT`:
 
 ```
-adbc_driver_manager.OperationalError: UNKNOWN: [FlightSQL]
 vector::_M_range_check: __n (which is 3) >= this->size() (which is 3)
-(Unknown; ExecuteQuery)
 ```
 
 - `SELECT order_id, amount, region FROM ... WHERE amount > 990 ORDER BY amount DESC`
@@ -224,16 +223,36 @@ vector::_M_range_check: __n (which is 3) >= this->size() (which is 3)
 - `SELECT order_id, amount, discount FROM ... LIMIT 1000` (no `WHERE` at all)
   -> `__n (which is 3) >= this->size() (which is 3)`
 
-The server catches it and stays up (returns a gRPC `Unknown` error rather
-than crashing the process), but this is a real, easily reproduced
-correctness/availability bug on an extremely common query shape. It's
-specific to the Flight SQL server layer, not the query engine itself: the
-same narrowed-projection pattern is exercised constantly by the existing
-GPU unit test suite (`HashJoinQueryTest.WhereClauseAfterJoinFiltersCorrectly`
-et al., all 82 passing) via direct in-process `QueryEngine::execute()`
-calls that never touch `flight_sql_server.cpp`. `SELECT *` and `GROUP
-BY`-aggregate queries both work fine over Flight SQL -- only a plain
-explicit column list triggers it. Points at result-schema/ticket
-construction in `src/server/flight_sql_server.cpp`, not the physical
-planner. Worth a dedicated investigation; out of scope for the memory-growth
-check that found it.
+**Root cause.** First reproduced through `kernellake-server`, but a plain
+CLI `kernellake query` against the same file crashed identically -- ruling
+out the Flight SQL layer and pointing at `src/io/physical_planner.cpp`
+instead. `LogicalSort`/`LogicalLimit` are pass-through nodes (same schema as
+their child) that can end up sitting directly between a surviving
+`LogicalProjection` and the `Filter`/`Scan`/`Join` chain it needs to remap
+its column indices against: `LogicalSort`, whenever a non-aggregate query
+has an `ORDER BY` (`logical_planner.cpp` places it directly on the
+Filter/Scan chain); `LogicalLimit`, whenever the optimizer's
+`insert_limit()` pushes a `LIMIT` down through a `LogicalProjection` to sit
+just above whatever it can actually benefit from (`optimizer.cpp`). The
+projection's "does my child reference the scan schema, and therefore need
+its `ColumnExpression` indices remapped against the pruned scan" check
+(`items_reference_scan_schema` in `physical_planner.cpp`) only tested
+directly for `LogicalFilter`/`LogicalScan`/`LogicalJoin` -- missing both
+pass-through cases, so a surviving, genuinely-reordering projection kept its
+*original* (pre-pruning) column indices instead of the narrowed ones,
+causing the out-of-bounds access at execution time. `SELECT *` and `GROUP
+BY` aggregates never hit it: `SELECT *` elides the projection entirely
+(nothing to remap), and an aggregate-path reprojection's items reference the
+*aggregate's* output schema, not the scan, so they're correctly never
+remapped regardless of what sits in between.
+
+**Fix:** added `references_scan_schema()` in `physical_planner.cpp`, which
+looks through any interposed `LogicalSort`/`LogicalLimit` to find whether
+the real underlying node is `Filter`/`Scan`/`Join`; replaced both the
+projection's own check and the analogous (same-shaped, though not currently
+reachable the same way) check in the `LogicalSort` conversion with it.
+Regression tests: `PhysicalPlannerTest.SurvivingPlainProjectionRemapsThrough
+AnInterposedSort` / `...InterposedLimit` in `tests/unit/physical_planner_test.cpp`.
+Verified against real data on the local GPU: all four repro queries above
+now return correct (correctly filtered/ordered/limited) results; full test
+suite (326 unit + 82 GPU tests) passes with no regressions.

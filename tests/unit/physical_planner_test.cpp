@@ -270,6 +270,68 @@ TEST_F(PhysicalPlannerTest, SurvivingPlainProjectionRemapsAgainstTheNarrowedScan
   EXPECT_EQ(amount_column->column_index(), 0u);
 }
 
+// Regression test for a real bug found while investigating an unrelated GPU
+// memory question: LogicalSort/LogicalLimit are pass-through nodes that can
+// end up directly between a surviving LogicalProjection and the
+// Filter/Scan/Join chain -- LogicalSort whenever a non-aggregate query has
+// an ORDER BY (logical_planner.cpp places it directly on the Filter/Scan
+// chain), LogicalLimit whenever the optimizer's insert_limit() pushes a
+// LIMIT down through a LogicalProjection (optimizer.cpp). The projection's
+// "does my child reference the scan schema" check used to test only for
+// Filter/Scan/Join directly, missing both cases -- so a surviving,
+// genuinely-reordering projection combined with ORDER BY and/or LIMIT kept
+// its *original* (pre-pruning) column indices instead of being remapped
+// against the narrowed scan, causing an out-of-bounds access at execution
+// time. Confirmed for real against a running kernellake-server and the CLI,
+// on real (non-fixture) data: any `SELECT col1, col2, ...` (not `*`, not an
+// aggregate) crashed with `vector::_M_range_check` whenever combined with
+// ORDER BY and/or LIMIT.
+TEST_F(PhysicalPlannerTest, SurvivingPlainProjectionRemapsThroughAnInterposedSort) {
+  const PhysicalPlanPtr plan = plan_for(
+      "SELECT region, amount FROM read_parquet('" + path_ + "') WHERE amount > 0 ORDER BY amount");
+  const auto* result = dynamic_cast<const ArrowResultNode*>(plan.get());
+  ASSERT_NE(result, nullptr);
+  const auto* projection = dynamic_cast<const ProjectionNode*>(result->child().get());
+  ASSERT_NE(projection, nullptr);
+  ASSERT_EQ(projection->items().size(), 2u);
+  const auto* sort = dynamic_cast<const SortNode*>(projection->child().get());
+  ASSERT_NE(sort, nullptr);
+
+  // Same narrowed-scan indices as SurvivingPlainProjectionRemapsAgainstThe
+  // NarrowedScanSchema above (scan pruned to [amount@0, region@1]) -- must
+  // still be remapped correctly with a Sort interposed between the
+  // Projection and the Filter it used to sit directly on.
+  const auto* region_column = dynamic_cast<const ColumnExpression*>(projection->items()[0].expr.get());
+  ASSERT_NE(region_column, nullptr);
+  EXPECT_EQ(region_column->column_index(), 1u);
+  const auto* amount_column = dynamic_cast<const ColumnExpression*>(projection->items()[1].expr.get());
+  ASSERT_NE(amount_column, nullptr);
+  EXPECT_EQ(amount_column->column_index(), 0u);
+}
+
+TEST_F(PhysicalPlannerTest, SurvivingPlainProjectionRemapsThroughAnInterposedLimit) {
+  // insert_limit() (optimizer.cpp) pushes LIMIT down through the
+  // LogicalProjection to sit directly above the Filter it can actually
+  // benefit from -- same interposition problem as the Sort case above, via
+  // a different logical node type.
+  const PhysicalPlanPtr plan =
+      plan_for("SELECT region, amount FROM read_parquet('" + path_ + "') WHERE amount > 0 LIMIT 3");
+  const auto* result = dynamic_cast<const ArrowResultNode*>(plan.get());
+  ASSERT_NE(result, nullptr);
+  const auto* projection = dynamic_cast<const ProjectionNode*>(result->child().get());
+  ASSERT_NE(projection, nullptr);
+  ASSERT_EQ(projection->items().size(), 2u);
+  const auto* limit = dynamic_cast<const LimitNode*>(projection->child().get());
+  ASSERT_NE(limit, nullptr);
+
+  const auto* region_column = dynamic_cast<const ColumnExpression*>(projection->items()[0].expr.get());
+  ASSERT_NE(region_column, nullptr);
+  EXPECT_EQ(region_column->column_index(), 1u);
+  const auto* amount_column = dynamic_cast<const ColumnExpression*>(projection->items()[1].expr.get());
+  ASSERT_NE(amount_column, nullptr);
+  EXPECT_EQ(amount_column->column_index(), 0u);
+}
+
 TEST_F(PhysicalPlannerTest, AggregateOrderBySurvivesWhenReprojectionIsNotRemoved) {
   // Combines both fixes: a surviving aggregate reprojection AND a Sort
   // directly above it (not above LogicalAggregate), which is the shape

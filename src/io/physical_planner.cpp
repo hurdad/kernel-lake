@@ -190,6 +190,38 @@ const Schema* find_scan_schema(const PhysicalPlanNode& node) {
   return nullptr;
 }
 
+// Whether a node's ColumnExpressions reference the base-table (pre-pruning)
+// scan schema, looking through any LogicalSort/LogicalLimit sitting in
+// between -- both are pass-through nodes (same schema as their child) that
+// can end up directly under a LogicalProjection: LogicalSort, whenever a
+// non-aggregate query has an ORDER BY (binder.cpp places it directly on the
+// Filter/Scan chain); LogicalLimit, whenever the optimizer's insert_limit()
+// pushes a LIMIT down through a LogicalProjection to sit just above the
+// scan/filter/join it can actually benefit from (optimizer.cpp). Missing
+// either case here previously left a Projection's items/Sort's keys
+// unremapped whenever one of these sat in between -- a real bug: the scan
+// beneath had already been narrowed to required_columns(), but the
+// expressions above it still carried original (pre-narrowing) column
+// indices, causing an out-of-bounds vector access at execution time for any
+// narrowed (non-*, non-aggregate) SELECT combined with ORDER BY and/or
+// LIMIT. See PhysicalPlannerTest.SurvivingPlainProjectionRemapsThroughAn
+// InterposedSort/...InterposedLimit.
+bool references_scan_schema(const LogicalPlanNode* node) {
+  while (true) {
+    if (const auto* sort = dynamic_cast<const LogicalSort*>(node)) {
+      node = sort->child().get();
+      continue;
+    }
+    if (const auto* limit = dynamic_cast<const LogicalLimit*>(node)) {
+      node = limit->child().get();
+      continue;
+    }
+    return dynamic_cast<const LogicalFilter*>(node) != nullptr ||
+           dynamic_cast<const LogicalScan*>(node) != nullptr ||
+           dynamic_cast<const LogicalJoin*>(node) != nullptr;
+  }
+}
+
 PhysicalPlanPtr convert_scan(const LogicalScan& scan, ObjectStore& store,
                              TableSourceResolver* extra_resolver) {
   const ResolvedTable resolved =
@@ -330,11 +362,10 @@ PhysicalPlanPtr convert(const LogicalPlanPtr& node, ObjectStore& store, TableSou
     // sit directly on a JOIN with no intervening WHERE clause beyond the ON
     // condition (e.g. `SELECT a.x, b.y FROM ... JOIN ... ON ...`), and its
     // items then reference the join's combined pre-narrowing schema just
-    // like they'd reference a bare scan's.
-    const bool items_reference_scan_schema =
-        dynamic_cast<const LogicalFilter*>(projection->child().get()) != nullptr ||
-        dynamic_cast<const LogicalScan*>(projection->child().get()) != nullptr ||
-        dynamic_cast<const LogicalJoin*>(projection->child().get()) != nullptr;
+    // like they'd reference a bare scan's. references_scan_schema() also
+    // looks through any LogicalSort/LogicalLimit interposed here -- see its
+    // own comment.
+    const bool items_reference_scan_schema = references_scan_schema(projection->child().get());
     std::vector<NamedExpression> items = projection->items();
     if (items_reference_scan_schema) {
       if (const Schema* scan_schema = find_scan_schema(*child)) {
@@ -381,11 +412,12 @@ PhysicalPlanPtr convert(const LogicalPlanPtr& node, ObjectStore& store, TableSou
     // matches the aggregate's natural column order, leaving Sort sitting
     // directly on LogicalAggregate -- a LogicalProjection child is not a
     // reliable "aggregate path" signal, but LogicalFilter/LogicalScan *is*
-    // a reliable "non-aggregate path" signal.
-    const bool keys_reference_scan_schema =
-        dynamic_cast<const LogicalFilter*>(sort->child().get()) != nullptr ||
-        dynamic_cast<const LogicalScan*>(sort->child().get()) != nullptr ||
-        dynamic_cast<const LogicalJoin*>(sort->child().get()) != nullptr;
+    // a reliable "non-aggregate path" signal. references_scan_schema() also
+    // looks through any LogicalLimit interposed here -- see its own comment
+    // (not currently reachable for Sort's own child via insert_limit(), which
+    // only recurses through LogicalProjection, but kept consistent with the
+    // identical check above rather than assuming that never changes).
+    const bool keys_reference_scan_schema = references_scan_schema(sort->child().get());
     if (keys_reference_scan_schema) {
       if (const Schema* scan_schema = find_scan_schema(*child)) {
         for (LogicalSort::Key& key : keys) {
