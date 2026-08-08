@@ -174,15 +174,47 @@ overhead. This is the number to treat as authoritative; the contended
 measurements above are kept for the methodology record, not as the final
 answer.
 
+**Is decode I/O-bound? No -- checked directly.** `benchmark tpch --mode
+cold` already exists for exactly this (`evict_from_page_cache()` in
+`benchmark_tpch_command.cpp`, `posix_fadvise(..., POSIX_FADV_DONTNEED)`
+before every iteration). Ran it back-to-back against `--mode warm` (page
+cache left alone across iterations), same warm process, idle GPU, 20M-row
+dataset, 8 measured iterations each:
+
+| Mode | per-iteration decode (s) | avg decode |
+|---|---|---|
+| warm | 0.0922, 0.0935, 0.0933, 0.0930, 0.0941, 0.0951, 0.0928, 0.0968 | 0.0939s |
+| cold (cache evicted every iteration) | 0.0908, 0.0923, 0.0937, 0.0940, 0.0923, 0.0920, 0.0943, 0.0923 | 0.0927s |
+
+Indistinguishable -- the two distributions overlap completely, well within
+normal per-iteration variance. Evicting the Linux page cache before every
+single read has no measurable effect on decode time on this machine (WSL2,
+NVMe-backed). That rules out OS-page-cache-level I/O latency as what's
+driving decode cost here -- whatever's taking the time is downstream of
+that: the actual read syscalls, the host-to-device copy of raw
+(compressed) bytes, or cudf's own GPU-side decompression/decode kernels.
+Distinguishing between *those* three needs either instrumentation inside
+cudf itself or the full `nsys` kernel-level trace this investigation
+couldn't get working (see "Fixed" item #5 above) -- not pursued further
+here. (Caveat: this result is specific to this machine's storage stack --
+a WSL2 VM's virtualized disk likely already goes through a fast host-side
+cache Linux's own page-cache eviction can't touch, so "not I/O-bound" here
+doesn't necessarily generalize to, say, real S3 access latency on the AWS
+benchmark path.)
+
 ## Recommendation
 
 #1 (pinned memory) is now de-prioritized based on the measurements above --
 don't start there; it only matters for queries with genuinely large result
-sets, not large scans. If pursuing further optimization, look at what's
-actually driving Parquet decode time first (not yet investigated: whether
-it's I/O-bound reading from disk/object store, or CPU/GPU decode-bound;
-`kvikio`/GPU-direct-storage configuration is one relevant angle, per
-`cmake/ThirdPartyRapids.cmake`'s own vendoring of libkvikio). #2 (concurrent
+sets, not large scans. Parquet decode is the confirmed lever (~55% of wall
+time, scales with data volume, not explained by OS-page-cache I/O
+latency on this machine) -- the next narrowing step needs real
+instrumentation this environment couldn't get working (`nsys`'s host-side
+importer, or manual timing inside cudf itself) to split it into read
+syscalls / H2D copy of raw bytes / GPU decompress-decode kernels; `kvikio`/
+GPU-direct-storage configuration (already vendored, per
+`cmake/ThirdPartyRapids.cmake`) is a plausible lever for the H2D-copy
+portion specifically, but unconfirmed without that split. #2 (concurrent
 queries) is the biggest structural change and should wait until there's a
 concrete reason (observed queueing under real load) to take on the
 RMM-sharing redesign it requires.
