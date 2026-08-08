@@ -62,9 +62,21 @@ picking one.
 
 3. **Overlap Parquet decode with compute across multiple streams** for
    multi-file/multi-fragment scans. Everything currently funnels through
-   the one per-query stream sequentially.
-   - Tradeoff: adds real complexity (stream sync points, multiple
-     in-flight allocations to track against the query's memory limit).
+   the one per-query stream sequentially. **Prototyped 2026-08-08 -- see
+   "Overlap prototype" below: real, reproducible ~13% wall-time win.** Not
+   yet implemented in the real engine.
+   - Tradeoff: adds real complexity -- and more than the original framing
+     here suggested. `cudf::io::chunked_parquet_reader::read_chunk()` is a
+     *blocking* host call (it needs the resulting row count on the host
+     side before it can return), so "use two streams" alone doesn't get
+     overlap -- decoding chunk N+1 while computing on chunk N needs a
+     background host thread prefetching the next chunk, not just a second
+     stream from the same thread. That means real cross-thread
+     synchronization (not just CUDA events) and rethinking
+     `ParquetScanOperator`'s single-threaded pull-based `next()` contract,
+     plus tracking allocations across two concurrently-active streams
+     against the query's memory limit (`RmmEnvironment`'s stack assumes one
+     stream today).
 
 4. **Retune `pass_read_limit_bytes`** (currently
    `rmm_environment.query_memory_limit_bytes() / 4`, see
@@ -252,6 +264,50 @@ wall time) vs. 65-77% for Q6 (a single filtered `SUM`, almost nothing but
 scan+decode). Compression cost isn't a fixed tax; it matters more for
 scan-heavy/compute-light queries than compute-heavy ones.
 
+## Overlap prototype (opt #3): does decode/compute overlap actually help?
+
+Before touching the real engine, checked whether overlapping decode with
+compute is worth the real complexity outlined in opt #3 above -- decode
+being confirmed decompression-bound (GPU-compute-bound) raised the
+question of whether it and downstream compute would just contend for the
+same SMs with no net benefit, since the classic case for stream overlap
+(hiding *I/O* latency behind compute) doesn't apply here.
+
+**Method.** A standalone prototype (not part of the real build -- linked
+directly against the vendored `libcudf`/`librmm` using flags pulled from
+`compile_commands.json`), not wired into KernelLake's operator tree.
+Loads two real 6M-row SF2 `lineitem` files (snappy), and for each of 5
+iterations runs:
+- **Sequential baseline:** decode file 1 -> compute over file 1 (Q6's
+  shape: filter `l_quantity < 24`, `SUM(l_extendedprice * l_discount)`) ->
+  decode file 2 -> compute over file 2, all on one stream, one thread.
+- **Overlap:** a background `std::thread` starts decoding file 2 on its
+  own stream while the main thread decodes + computes over file 1 on a
+  separate stream; main thread joins the background thread before
+  computing over file 2.
+
+**Result**, 3 independent runs of 5 iterations each, idle GPU:
+
+| Run | sequential mean | overlap mean | speedup |
+|---|---|---|---|
+| 1 | 0.0973s | 0.0849s | 12.8% |
+| 2 | 0.0927s | 0.0809s | 12.8% |
+| 3 | 0.0932s | 0.0811s | 13.0% |
+
+**Real and reproducible -- worth implementing for real.** ~13% wall-time
+reduction, consistent across independent runs, confirms there's genuine
+idle GPU capacity during at least one phase (likely: decode has real
+host-side bookkeeping/synchronization overhead between its own internal
+stages, not just GPU kernels, leaving SM time free for compute to use
+concurrently) that overlap can exploit -- the "they'll just contend for
+the same SMs" worry didn't hold. The catch found along the way: this only
+works via a background *thread* prefetching the next chunk, not just a
+second stream from the same thread, since `read_chunk()` blocks the host
+until that chunk's row count is known (see opt #3's updated tradeoff note
+above) -- a bigger change to `ParquetScanOperator`'s single-threaded
+pull-based design than the original framing implied, but the prototype
+result says it's worth doing.
+
 ## Recommendation
 
 #1 (pinned memory) is now de-prioritized based on the measurements above --
@@ -267,10 +323,26 @@ explicit, documented tradeoff (query speed vs. storage footprint) for
 anyone generating or choosing Parquet data for KernelLake to read, rather
 than defaulting to Snappy without discussion. Whether it's worth *changing*
 the default depends on a tradeoff this doc can't resolve alone: storage/
-transfer cost (especially over S3, not measured here) vs. decode speed. #2
-(concurrent queries) is the biggest structural change and should wait
-until there's a concrete reason (observed queueing under real load) to
-take on the RMM-sharing redesign it requires.
+transfer cost (especially over S3, not measured here) vs. decode speed.
+
+#3 (decode/compute overlap) is now also confirmed worth doing -- the
+prototype above found a real, reproducible ~13% wall-time win, and it's a
+genuine architecture improvement (not just a config choice like #1), so
+it stacks with the compression finding rather than competing with it: an
+uncompressed-or-lighter-codec dataset gets *both* less decode work and
+that work overlapped with compute. Next step if pursued: port the
+prototype's background-thread-prefetch pattern into
+`ParquetScanOperator`/`operator_builder.cpp` for real, which needs solving
+the two real problems the prototype sidestepped -- (1) making
+`ExecutionContext`/`RmmEnvironment` safe for two concurrently-active
+streams (today's design assumes one), and (2) fitting a background-thread
+prefetch into the operator tree's synchronous single-threaded `next()`
+pull contract without breaking every other operator's assumptions about
+when `next()` may block.
+
+#2 (concurrent queries) remains the biggest structural change and should
+wait until there's a concrete reason (observed queueing under real load)
+to take on the RMM-sharing redesign it requires.
 
 ## Follow-up: GPU memory growing across benchmark runs
 
