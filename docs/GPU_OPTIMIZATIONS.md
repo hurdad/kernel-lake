@@ -202,22 +202,52 @@ cache Linux's own page-cache eviction can't touch, so "not I/O-bound" here
 doesn't necessarily generalize to, say, real S3 access latency on the AWS
 benchmark path.)
 
+**Is it decompression, then? Yes -- confirmed directly, and it's the
+biggest single lever found in this whole investigation.** Generated three
+byte-identical (same rows, same schema, same dictionary encoding) 20M-row
+files via `pyarrow`, varying only Parquet compression codec, then ran each
+through the same warm `benchmark tpch` setup (idle GPU, 8 iterations):
+
+| Codec | file size | decode (avg) | vs. uncompressed |
+|---|---|---|---|
+| none | 745.9 MB | 0.0733s | -- |
+| snappy (KernelLake's current default -- `sample_data_generator.cpp`) | 662.3 MB | 0.0896s | +22.2% |
+| zstd | 560.5 MB | 0.1038s | +41.6% (+15.8% vs. snappy) |
+
+Striking: decode time moves in the *opposite* direction from file size --
+zstd has the smallest file (least to read/transfer) but the slowest
+decode, because it costs more to decompress than it saves in transfer
+time. This directly confirms decode is decompression-bound, not
+I/O-bound, on this machine: switching Snappy -> uncompressed cuts decode
+time by ~18% (equivalently, uncompressed -> Snappy costs +22%), which
+at decode's confirmed ~55% share of wall time works out to roughly a
+12% *total wall-time* difference for Snappy vs. uncompressed, and ~23%
+for zstd vs. uncompressed -- for a compression choice that's otherwise
+invisible to query correctness and easy to change. (Caveat: this trades
+against on-disk/on-S3 storage cost and real network transfer time, which
+matter more over a slow network or against real object storage than on
+this machine's local NVMe -- the AWS benchmark path, reading real S3 data,
+is a different tradeoff than what's measured here.)
+
 ## Recommendation
 
 #1 (pinned memory) is now de-prioritized based on the measurements above --
 don't start there; it only matters for queries with genuinely large result
 sets, not large scans. Parquet decode is the confirmed lever (~55% of wall
-time, scales with data volume, not explained by OS-page-cache I/O
-latency on this machine) -- the next narrowing step needs real
-instrumentation this environment couldn't get working (`nsys`'s host-side
-importer, or manual timing inside cudf itself) to split it into read
-syscalls / H2D copy of raw bytes / GPU decompress-decode kernels; `kvikio`/
-GPU-direct-storage configuration (already vendored, per
-`cmake/ThirdPartyRapids.cmake`) is a plausible lever for the H2D-copy
-portion specifically, but unconfirmed without that split. #2 (concurrent
-queries) is the biggest structural change and should wait until there's a
-concrete reason (observed queueing under real load) to take on the
-RMM-sharing redesign it requires.
+time, scales with data volume), and it's confirmed decompression-bound, not
+I/O-bound, on this machine -- the compression codec KernelLake's own
+`generate-data` writes by default (Snappy, `sample_data_generator.cpp`)
+costs ~22% more decode time than uncompressed, ~15% less than zstd. This is
+the single most concrete, actionable lever this whole investigation found:
+no architecture change needed, just a codec choice -- worth surfacing as an
+explicit, documented tradeoff (query speed vs. storage footprint) for
+anyone generating or choosing Parquet data for KernelLake to read, rather
+than defaulting to Snappy without discussion. Whether it's worth *changing*
+the default depends on a tradeoff this doc can't resolve alone: storage/
+transfer cost (especially over S3, not measured here) vs. decode speed. #2
+(concurrent queries) is the biggest structural change and should wait
+until there's a concrete reason (observed queueing under real load) to
+take on the RMM-sharing redesign it requires.
 
 ## Follow-up: GPU memory growing across benchmark runs
 
