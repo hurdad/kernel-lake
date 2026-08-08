@@ -416,6 +416,41 @@ ClientSpan start_client_span(std::string_view operation_name) {
   return span;
 }
 
+ClientSpan start_client_span(std::string_view operation_name, const ClientSpan& parent) {
+  if (!g_enabled || !parent.impl_) {
+    return ClientSpan();
+  }
+
+  // Explicit parent via StartSpanOptions, not RuntimeContext::Attach --
+  // this deliberately does *not* touch the thread-local "current span"
+  // stack (see ExecutionContext::current_span's own comment for why
+  // InstrumentedOperator needs that: correct nesting for an operator with
+  // more than one child opened sequentially requires each child to name
+  // its exact parent rather than inherit whatever's currently attached,
+  // and background-thread work, e.g. ParquetScanOperator's decode thread,
+  // never automatically picks up thread-local context from the thread that
+  // spawned it anyway).
+  trace_api::StartSpanOptions options;
+  options.parent = parent.impl_->span->GetContext();
+
+  ClientSpan span;
+  span.impl_ = std::make_unique<ClientSpan::Impl>();
+  span.impl_->span = trace_api::Provider::GetTracerProvider()
+                         ->GetTracer(g_tracer_name)
+                         ->StartSpan(to_otel(operation_name), options);
+  return span;
+}
+
+void ClientSpan::set_attribute(std::string_view key, double value) {
+  if (!impl_) return;
+  impl_->span->SetAttribute(to_otel(key), value);
+}
+
+void ClientSpan::set_attribute(std::string_view key, std::int64_t value) {
+  if (!impl_) return;
+  impl_->span->SetAttribute(to_otel(key), value);
+}
+
 namespace {
 
 // Adapts ClientSpan::inject()'s std::function setter to OTel's

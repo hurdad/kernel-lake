@@ -5,6 +5,7 @@
 
 #include "kernellake/common/identifiers.hpp"
 #include "kernellake/execution_gpu/metrics_registry.hpp"
+#include "kernellake/observability/query_tracing.hpp"
 
 namespace kernellake {
 
@@ -30,6 +31,21 @@ struct ExecutionContext {
   CancellationToken* cancellation = nullptr;
   MetricsRegistry* metrics = nullptr;
   QueryMemoryTracker* memory_tracker = nullptr;
+
+  // The span the *currently opening* operator should parent its own child
+  // span to (see InstrumentedOperator, operator_builder.cpp), giving Jaeger
+  // a real span tree shaped like the physical plan rather than one flat
+  // query span. nullptr at the top of the tree (the outermost operator
+  // parents to the whole-query span instead -- see start_query_span()).
+  // Non-owning; only ever points at a ClientSpan that outlives the
+  // recursive open() call it's set for -- see InstrumentedOperator::open()
+  // for why this is threaded explicitly through here rather than via
+  // OTel's own thread-local "current span" mechanism (query_tracing.hpp's
+  // ClientSpan/start_client_span already use that mechanism for their one
+  // existing caller, an outbound gRPC call -- it doesn't generalize to an
+  // operator with more than one child opened sequentially, e.g.
+  // HashJoinOperator's left then right).
+  const observability::ClientSpan* current_span = nullptr;
 };
 
 }  // namespace kernellake

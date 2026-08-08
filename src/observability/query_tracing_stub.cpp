@@ -53,7 +53,14 @@ ClientSpan start_client_span(std::string_view /*operation_name*/) {
   return ClientSpan();
 }
 
+ClientSpan start_client_span(std::string_view /*operation_name*/, const ClientSpan& /*parent*/) {
+  return ClientSpan();
+}
+
 void ClientSpan::inject(const std::function<void(std::string_view, std::string_view)>& /*setter*/) const {}
+
+void ClientSpan::set_attribute(std::string_view /*key*/, double /*value*/) {}
+void ClientSpan::set_attribute(std::string_view /*key*/, std::int64_t /*value*/) {}
 
 void ClientSpan::finish_ok() {}
 

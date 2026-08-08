@@ -1,6 +1,7 @@
 // Provides the real QueryEngine::execute() for GPU-enabled
 // (KERNELLAKE_WITH_CUDA=ON) builds. Mutually exclusive with
 // query_engine_execute_stub.cpp -- see that file's comment.
+#include <fmt/format.h>
 #include <rmm/mr/per_device_resource.hpp>
 
 #include <chrono>
@@ -159,10 +160,16 @@ QueryResult QueryEngine::execute(const PhysicalPlanPtr& physical, RmmEnvironment
     }
     result.row_groups_considered = row_groups_considered;
     result.row_groups_scanned = row_groups_scanned;
-    // ParquetScanOperator's own accumulated time (a leaf operator, so its
-    // MetricsRegistry total is its true self time, not inclusive of
-    // anything else -- see MetricsRegistry's own doc comment).
-    result.parquet_decoding_seconds = metrics.total_seconds(scan->node_name());
+    // Not metrics.total_seconds(scan->node_name()) (ParquetScanOperator's
+    // plain next()-call self time): since decode/compute overlap (see that
+    // operator's class comment), most of its real decode cost happens on a
+    // background thread *between* next() calls, not inside them, so that
+    // plain self-time now under-reports real decode cost for the common
+    // (non-partitioned) scan path. InstrumentedOperator (operator_builder.cpp)
+    // separately records the operator's own resource_seconds() -- real
+    // cumulative time inside every reader_->read_chunk() call, regardless
+    // of which thread/path made it -- under this derived key instead.
+    result.parquet_decoding_seconds = metrics.total_seconds(fmt::format("{}.resource_seconds", scan->node_name()));
     // compressed_bytes_read/rows_scanned and host_to_device_seconds are not
     // tracked yet: the latter has no natural boundary in this architecture
     // today (cudf's chunked Parquet reader decodes host file bytes directly

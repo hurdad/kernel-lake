@@ -26,6 +26,9 @@ add_executable(kernellake_gpu_tests
   # has OTel wired in, same condition tests/unit/CMakeLists.txt uses for
   # query_tracing_test.cpp.
   $<$<BOOL:${KERNELLAKE_ENABLE_OTEL}>:gpu_memory_metrics_otel_test.cpp>
+  # Same OTel-specific condition: asserts InstrumentedOperator's real
+  # per-operator span tree via the same in-memory test seam.
+  $<$<BOOL:${KERNELLAKE_ENABLE_OTEL}>:query_plan_tracing_test.cpp>
 )
 
 target_link_libraries(kernellake_gpu_tests PRIVATE

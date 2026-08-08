@@ -136,6 +136,47 @@ TEST_F(MultiBatchIntegrationTest, ScanEmitsMultipleBatchesAcrossMismatchedFilesW
   EXPECT_GT(batch_count, 2);
 }
 
+TEST_F(MultiBatchIntegrationTest, EarlyCloseAfterOneBatchDoesNotHangOrLeak) {
+  RmmEnvironment env(default_config());
+  LocalObjectStore store;
+  const std::vector<ObjectInfo> files = discover_parquet_files(store, {glob_});
+  ASSERT_EQ(files.size(), 2u);
+
+  std::vector<PhysicalFileFragment> fragments;
+  for (const ObjectInfo& file : files) {
+    const int row_groups = file.uri.value().find("part-a") != std::string::npos ? 3 : 1;
+    const int rows = file.uri.value().find("part-a") != std::string::npos ? 300 : 250;
+    std::vector<int> selected(static_cast<std::size_t>(row_groups));
+    std::iota(selected.begin(), selected.end(), 0);
+    fragments.push_back(PhysicalFileFragment{file.uri, rows, row_groups, selected, {}, {}});
+  }
+  Schema schema({Field{"region", string_type(false)}, Field{"amount", float64_type(false)}});
+
+  // Same tiny pass_read_limit_bytes as the sibling test above -- forces
+  // several chunks, so the background decode thread (see
+  // ParquetScanOperator's decode/compute overlap) is genuinely still
+  // mid-scan, with a chunk already prefetched into its handoff queue, at
+  // the point this test stops pulling -- exactly what a real LIMIT
+  // pushdown does. Regression coverage for close()'s producer-thread
+  // shutdown/drain path, which the sibling "consume everything" test above
+  // can't exercise (it always runs the scan to exhaustion, so the producer
+  // is always already finished by the time close() runs).
+  ParquetScanOperator scan(1, fragments, {"region", "amount"}, std::make_shared<const Schema>(schema), store,
+                           /*pass_read_limit_bytes=*/256);
+  ExecutionContext context = make_context();
+  scan.open(context);
+
+  const std::optional<DeviceBatch> first_batch = scan.next(context);
+  ASSERT_TRUE(first_batch.has_value());
+  EXPECT_GT(first_batch->row_count(), 0u);
+
+  // Deliberately not draining the rest -- close() must stop the background
+  // decode thread and release its already-decoded-but-undelivered chunk (if
+  // any) on its own, not hang waiting for a next() call that will never
+  // come. A hang here fails the whole test binary, not just this test.
+  scan.close(context);
+}
+
 TEST_F(MultiBatchIntegrationTest, FullPipelineCorrectAcrossMultipleBatchesAndMismatchedRowGroups) {
   const auto stmt = sql::parse_sql("SELECT region, SUM(amount) AS total, COUNT(*) AS n FROM read_parquet('" +
                                    glob_ + "') GROUP BY region");

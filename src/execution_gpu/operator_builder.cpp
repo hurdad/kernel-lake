@@ -1,5 +1,6 @@
 #include "kernellake/execution_gpu/operator_builder.hpp"
 
+#include <fmt/format.h>
 #include <nvtx3/nvtx3.hpp>
 
 #include <chrono>
@@ -15,36 +16,100 @@
 #include "kernellake/execution_gpu/projection_operator.hpp"
 #include "kernellake/execution_gpu/scalar_aggregate_operator.hpp"
 #include "kernellake/execution_gpu/sort_operator.hpp"
+#include "kernellake/observability/query_tracing.hpp"
 
 namespace kernellake {
 
 namespace {
 
 // Wraps every operator in the tree generically (see build() below), so no
-// individual operator needs its own timing/NVTX code. Every PhysicalOperator
-// subclass's name() returns a string literal (checked across every
-// concrete operator in this codebase), so the std::string_view it returns
-// is always null-terminated -- `.data()` is safe to pass to NVTX/use as a
-// map key without a copy on the hot path, though MetricsRegistry::record()
-// still takes a copy internally to own the key.
+// individual operator needs its own timing/NVTX/tracing code. Every
+// PhysicalOperator subclass's name() returns a string literal (checked
+// across every concrete operator in this codebase), so the std::string_view
+// it returns is always null-terminated -- `.data()` is safe to pass to
+// NVTX/use as a map key without a copy on the hot path, though
+// MetricsRegistry::record() still takes a copy internally to own the key.
+//
+// Also gives every operator its own child span (see docs/OBSERVABILITY.md),
+// so a real trace tool (Jaeger) shows a span tree shaped like the physical
+// plan itself, not one flat whole-query span with a pile of attributes.
+// Each span's lifetime is open() through close() -- see
+// ExecutionContext::current_span's own comment for why the *parenting* of
+// each child's span is only threaded through context for the duration of
+// this operator's own recursive inner_->open() call, not held for this
+// operator's whole lifetime.
 class InstrumentedOperator final : public PhysicalOperator {
  public:
   InstrumentedOperator(std::unique_ptr<PhysicalOperator> inner, bool nvtx_enabled)
       : inner_(std::move(inner)), nvtx_enabled_(nvtx_enabled) {}
 
-  void open(ExecutionContext& context) override { inner_->open(context); }
+  void open(ExecutionContext& context) override {
+    span_ = context.current_span != nullptr
+                ? observability::start_client_span(inner_->name(), *context.current_span)
+                : observability::start_client_span(inner_->name());
+
+    // Only attached to context for the duration of the recursive
+    // inner_->open() call immediately below (which is what invokes any
+    // child operator's own InstrumentedOperator::open()) -- restored right
+    // after, so a second child opened later by the same inner_->open() call
+    // (e.g. HashJoinOperator opening its right side after its left) parents
+    // its own span here too, as this operator's child, not as the first
+    // child's child. See ExecutionContext::current_span's own comment.
+    const observability::ClientSpan* const previous_span = context.current_span;
+    context.current_span = &*span_;
+    try {
+      inner_->open(context);
+    } catch (const std::exception& e) {
+      context.current_span = previous_span;
+      span_->finish_error(e.what());
+      throw;
+    }
+    context.current_span = previous_span;
+  }
 
   std::optional<DeviceBatch> next(ExecutionContext& context) override {
     std::optional<nvtx3::scoped_range> range;
     if (nvtx_enabled_) range.emplace(inner_->name().data());
     const auto start = std::chrono::steady_clock::now();
-    std::optional<DeviceBatch> result = inner_->next(context);
+    std::optional<DeviceBatch> result;
+    try {
+      result = inner_->next(context);
+    } catch (const std::exception& e) {
+      if (context.metrics != nullptr) {
+        context.metrics->record(
+            inner_->name(), std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count());
+      }
+      span_->finish_error(e.what());
+      throw;
+    }
     const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
     if (context.metrics != nullptr) context.metrics->record(inner_->name(), seconds);
     return result;
   }
 
-  void close(ExecutionContext& context) override { inner_->close(context); }
+  void close(ExecutionContext& context) override {
+    // inner_->close() first, not after: it's what joins ParquetScanOperator's
+    // background decode thread (see that class), so resource_seconds()
+    // below only reflects a *final* total if this happens first.
+    inner_->close(context);
+    if (const std::optional<double> resource_seconds = inner_->resource_seconds()) {
+      span_->set_attribute("kernellake.operator.resource_seconds", *resource_seconds);
+      if (context.metrics != nullptr) {
+        // A second, distinctly-keyed MetricsRegistry total alongside the
+        // plain self-time one next() already records above: for an
+        // operator like ParquetScanOperator whose real cost is
+        // deliberately overlapped with (not included in) its own next()
+        // calls' wall-clock time, next()'s self-time alone would
+        // under-report -- see resource_seconds()'s own doc comment.
+        // query_engine_execute_gpu.cpp reads this back via the same
+        // derived key to populate QueryResult::parquet_decoding_seconds
+        // accurately post-overlap, without needing a direct pointer to
+        // whichever operator instance(s) in the tree provided it.
+        context.metrics->record(fmt::format("{}.resource_seconds", inner_->name()), *resource_seconds);
+      }
+    }
+    span_->finish_ok();
+  }
 
   [[nodiscard]] std::string_view name() const noexcept override { return inner_->name(); }
   [[nodiscard]] OperatorId id() const noexcept override { return inner_->id(); }
@@ -52,6 +117,7 @@ class InstrumentedOperator final : public PhysicalOperator {
  private:
   std::unique_ptr<PhysicalOperator> inner_;
   bool nvtx_enabled_;
+  std::optional<observability::ClientSpan> span_;
 };
 
 std::unique_ptr<PhysicalOperator> build(const PhysicalPlanPtr& node, ObjectStore& store,

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <exception>
 #include <functional>
 #include <memory>
@@ -96,6 +97,14 @@ class ClientSpan {
   //   });
   void inject(const std::function<void(std::string_view, std::string_view)>& setter) const;
 
+  // Attaches a numeric attribute to this span (e.g. a per-operator
+  // decode-thread resource cost -- see PhysicalOperator::resource_seconds()
+  // and InstrumentedOperator). No-op when disabled/not built. Must be
+  // called before finish_ok()/finish_error() -- OTel spans stop accepting
+  // attribute writes once ended.
+  void set_attribute(std::string_view key, double value);
+  void set_attribute(std::string_view key, std::int64_t value);
+
   // Sets status Ok and ends the span.
   void finish_ok();
 
@@ -105,6 +114,7 @@ class ClientSpan {
 
  private:
   friend ClientSpan start_client_span(std::string_view);
+  friend ClientSpan start_client_span(std::string_view, const ClientSpan&);
   ClientSpan() = default;
   struct Impl;
   std::unique_ptr<Impl> impl_;  // null when disabled or not built with otel
@@ -112,10 +122,20 @@ class ClientSpan {
 
 // Starts a child span named `operation_name` (e.g.
 // "delta_txn.ListActiveFiles"), parented to whatever span is currently
-// active (see start_query_span() -- the whole-query span, typically).
-// Always returns a valid ClientSpan, even when tracing is disabled/not
-// built.
+// active (see start_query_span() -- the whole-query span, typically), via
+// OTel's own thread-local "current span" mechanism. Always returns a valid
+// ClientSpan, even when tracing is disabled/not built.
 [[nodiscard]] ClientSpan start_client_span(std::string_view operation_name);
+
+// Same as the above, but parented explicitly to `parent` rather than
+// whatever's thread-local-current -- used by InstrumentedOperator
+// (operator_builder.cpp) to build a real per-operator span tree shaped
+// like the physical plan (see ExecutionContext::current_span's own
+// comment for why an explicit parent, not the thread-local mechanism, is
+// needed there). If `parent` is itself a no-op span (disabled/not built),
+// this returns a no-op span too, without consulting the thread-local
+// mechanism at all.
+[[nodiscard]] ClientSpan start_client_span(std::string_view operation_name, const ClientSpan& parent);
 
 }  // namespace observability
 }  // namespace kernellake
