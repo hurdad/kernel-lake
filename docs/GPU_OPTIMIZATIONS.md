@@ -229,6 +229,29 @@ matter more over a slow network or against real object storage than on
 this machine's local NVMe -- the AWS benchmark path, reading real S3 data,
 is a different tradeoff than what's measured here.)
 
+**Confirmed again on real TPC-H data and real benchmark queries** (not
+just synthetic data/queries) -- generated real SF1 `lineitem` (6M rows) at
+all three codecs via the project's own `tools/generate_tpch.py`
+(`--compression none|snappy|zstd`, already supports this), then ran the
+actual `benchmarks/tpch/queries/q01.sql` and `q06.sql` through
+`benchmark tpch --mode warm` (idle GPU, 6 iterations):
+
+| Query | none | snappy | zstd | snappy vs. none | zstd vs. none |
+|---|---|---|---|---|---|
+| Q1 (`GROUP BY` over lineitem) | 0.0210s (34.4% of wall) | 0.0335s (45.1%) | 0.0352s (45.4%) | +59.5% | +67.6% |
+| Q6 (scalar aggregate) | 0.0170s (65.4% of wall) | 0.0263s (76.7%) | 0.0270s (76.1%) | +54.7% | +58.8% |
+
+Same pattern, and actually a *larger* decode penalty than the synthetic
+test (55-68% here vs. 22-42% synthetic) -- real TPC-H `lineitem` has more
+columns and a different value distribution than the synthetic generator,
+so the exact percentage isn't the point; the direction and the fact that
+it holds on the project's real benchmark queries is. Also notable: decode's
+share of wall time varies a lot by query shape -- 34-45% for Q1 (six
+aggregates + a two-column `GROUP BY`, more GPU compute work competing for
+wall time) vs. 65-77% for Q6 (a single filtered `SUM`, almost nothing but
+scan+decode). Compression cost isn't a fixed tax; it matters more for
+scan-heavy/compute-light queries than compute-heavy ones.
+
 ## Recommendation
 
 #1 (pinned memory) is now de-prioritized based on the measurements above --
