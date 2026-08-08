@@ -25,7 +25,9 @@ class CudaDeviceGuard {
   int previous_device_id_;
 };
 
-// RAII non-blocking CUDA stream.
+// RAII CUDA stream, deliberately *not* created with cudaStreamNonBlocking
+// (see CudaStream::CudaStream() in cuda_utils.cpp for why that matters --
+// it's load-bearing, not just an unset flag).
 class CudaStream {
  public:
   CudaStream();

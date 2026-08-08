@@ -24,6 +24,18 @@ CudaDeviceGuard::~CudaDeviceGuard() {
   cudaSetDevice(previous_device_id_);
 }
 
+// Deliberately plain cudaStreamCreate() (a "blocking" stream, in CUDA's
+// terminology), not cudaStreamCreateWithFlags(..., cudaStreamNonBlocking).
+// Every cudf call in every GPU operator takes this stream explicitly (see
+// ExecutionContext::stream), but arrow_bridge.cpp's to_arrow_host()/
+// from_arrow() calls do not -- they run on CUDA's legacy default/null
+// stream instead. A blocking-flagged stream implicitly synchronizes with
+// the null stream (null-stream work waits for everything previously
+// queued on any blocking stream to finish first), which is the only
+// reason those default-stream calls read correct, fully-computed device
+// data. Switching this to cudaStreamNonBlocking would silently break that
+// ordering guarantee and race the D2H copy in to_arrow_record_batch()
+// against still-in-flight kernels on this stream.
 CudaStream::CudaStream() {
   check_cuda(cudaStreamCreate(&stream_), "cudaStreamCreate");
 }

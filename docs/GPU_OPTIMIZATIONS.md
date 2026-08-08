@@ -25,16 +25,17 @@ picking one.
   Streams give async/overlapping kernel execution *within* a query, not
   concurrent queries.
 - `CudaStream` (`cuda_utils.cpp`) is created via plain `cudaStreamCreate()`,
-  not `cudaStreamCreateWithFlags(..., cudaStreamNonBlocking)` -- despite the
-  header comment above it calling it a "non-blocking" stream, which is
-  wrong. This is load-bearing, not just stale wording: `to_arrow_host()` /
-  `from_arrow()` in `arrow_bridge.cpp` don't take a stream argument, so they
-  run on CUDA's default/null stream. That only reads correct data because a
+  not `cudaStreamCreateWithFlags(..., cudaStreamNonBlocking)`. This is
+  load-bearing, not just an unset flag: `to_arrow_host()` / `from_arrow()`
+  in `arrow_bridge.cpp` don't take a stream argument, so they run on
+  CUDA's default/null stream. That only reads correct data because a
   blocking-flagged stream implicitly synchronizes with the null stream
   (null-stream ops wait for prior work on any blocking stream to finish).
-  If the flag were "fixed" to actually be non-blocking, the D2H copy in
+  If the flag were changed to actually be non-blocking, the D2H copy in
   `to_arrow_record_batch()` would race against still-in-flight kernels on
-  `context.stream`.
+  `context.stream`. **Fixed 2026-08-08:** the header comment used to
+  mislabel this a "non-blocking" stream; `cuda_utils.hpp`/`cuda_utils.cpp`
+  now document why the blocking flag is deliberate instead.
 
 ## Opportunities, roughly by expected payoff vs. effort
 
