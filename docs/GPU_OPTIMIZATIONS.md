@@ -308,6 +308,46 @@ above) -- a bigger change to `ParquetScanOperator`'s single-threaded
 pull-based design than the original framing implied, but the prototype
 result says it's worth doing.
 
+**Implemented for real (2026-08-08, `c1f98f9`).** The prototype's pattern
+is now in `ParquetScanOperator`/`operator_builder.cpp` for the
+non-partitioned scan path (the common case -- see that operator's own
+class comment for why the rarer partitioned path was left synchronous).
+Both concerns the prototype had sidestepped turned out to already be
+handled or were addressed directly: `RmmEnvironment` installs one resource
+stack as the *device's* default resource (not scoped to any one stream),
+so two concurrently-active streams' allocations are tracked/limited
+identically with no redesign needed; cross-stream data-readiness is
+handled with a `cudaStreamWaitEvent` (non-blocking on the host) rather
+than a real host-side synchronization primitive, so the consumer's own
+stream never actually blocks waiting for decode.
+
+Re-measured post-implementation with a real controlled A/B -- the
+pre-change and post-change binaries built from the same source tree
+(`git worktree`), run back-to-back against identical local (not S3 --
+network/object-store variance would otherwise confound the comparison)
+SF10 Parquet data, 5 iterations each, cold mode:
+
+| Query | wall (old) | wall (new) | delta |
+|---|---|---|---|
+| Q1  | 0.508s | 0.466s | -8.1% |
+| Q6  | 0.213s | 0.193s | -9.5% |
+| Q14 | 0.489s | 0.430s | -12.1% |
+| Q19 | 0.724s | 0.638s | -11.8% |
+
+Consistent with the standalone prototype's ~13% finding, holding up
+end-to-end through the real engine (parse/plan/execute/result-materialize,
+not just the isolated decode+compute microbenchmark the prototype
+measured). Note: `QueryResult.parquet_decoding_seconds` moved by more
+than the wall-time delta above (e.g. Q1: 0.228s -> 0.084s) -- this isn't
+decode getting proportionally faster; it now measures time on
+`decode_stream_` specifically, isolated from other stream traffic (D2H
+copies, etc. still on the default/consumer stream), where the old
+next()-self-time measurement's whole window could include incidental
+cross-stream serialization that had nothing to do with decode itself.
+Wall time is still the trustworthy end-to-end number; treat
+`parquet_decoding_seconds` as a genuine measurement of decode-stream time,
+not as directly comparable pre/post this change.
+
 ## Recommendation
 
 #1 (pinned memory) is now de-prioritized based on the measurements above --
@@ -325,20 +365,13 @@ than defaulting to Snappy without discussion. Whether it's worth *changing*
 the default depends on a tradeoff this doc can't resolve alone: storage/
 transfer cost (especially over S3, not measured here) vs. decode speed.
 
-#3 (decode/compute overlap) is now also confirmed worth doing -- the
-prototype above found a real, reproducible ~13% wall-time win, and it's a
-genuine architecture improvement (not just a config choice like #1), so
-it stacks with the compression finding rather than competing with it: an
+#3 (decode/compute overlap) is now implemented for real (`c1f98f9`), not
+just prototyped -- an 8-12% real wall-time reduction confirmed end-to-end
+via a controlled A/B (see above), and it's a genuine architecture
+improvement (not just a config choice like #1), so it stacks with the
+compression finding rather than competing with it: an
 uncompressed-or-lighter-codec dataset gets *both* less decode work and
-that work overlapped with compute. Next step if pursued: port the
-prototype's background-thread-prefetch pattern into
-`ParquetScanOperator`/`operator_builder.cpp` for real, which needs solving
-the two real problems the prototype sidestepped -- (1) making
-`ExecutionContext`/`RmmEnvironment` safe for two concurrently-active
-streams (today's design assumes one), and (2) fitting a background-thread
-prefetch into the operator tree's synchronous single-threaded `next()`
-pull contract without breaking every other operator's assumptions about
-when `next()` may block.
+that work overlapped with compute.
 
 #2 (concurrent queries) remains the biggest structural change and should
 wait until there's a concrete reason (observed queueing under real load)
