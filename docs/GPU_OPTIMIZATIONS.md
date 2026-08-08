@@ -90,18 +90,15 @@ picking one.
 
 ## Profiling results (2026-08-08, local RTX 5060 Ti)
 
-Caveat shared by every number below, called out already in
+Caveat on the first two tables below, called out already in
 `rmm_environment.cpp`'s own comment: this GPU is a desktop card also used
 interactively (not a dedicated headless one), and had other real GPU load
 on it (confirmed via `nvidia-smi`: ~47% utilization, ~6 GiB used, no CUDA
-compute context -- consistent with a game's graphics workload) during at
-least some of this session's measurements. Absolute timings above carry
-some contention noise; the *relative* conclusions (decode's ~57% share
-consistent across both scan sizes, D2H negligible except for large result
-sets) are more robust, since contention affects both sides of each ratio
-on the same shared GPU. Worth a clean re-check on an idle GPU before
-treating the absolute numbers as authoritative for any tuning decision
-that depends on them precisely.
+compute context -- consistent with a game's graphics workload) during those
+measurements. A clean re-check on an idle GPU (below, "Clean re-check on an
+idle GPU") confirmed the relative conclusions held and tightened up the
+absolute numbers -- treat that last table as authoritative, not the earlier
+two.
 
 Two query shapes, 3 runs each, 20M-row synthetic dataset (8 files) via the
 CLI's `--stats` flag. Values are per-run averages; `compute-only` is
@@ -155,6 +152,27 @@ not large *scanned* input -- these are different, independent axes (a
 wall time). The benchmark tool's new per-iteration fields are a permanent,
 reusable addition -- useful for any future warm-process profiling, not
 just this investigation.
+
+**Clean re-check on an idle GPU (2026-08-08, same day, later):** the
+contention noted above was a concurrent game session on this desktop GPU;
+re-ran the identical warm 2M-vs-20M-rows comparison once it ended
+(`nvidia-smi` confirmed ~14% utilization / ~1.1 GiB used beforehand, back
+near the untouched baseline), 3 warmup + 8 measured iterations this time:
+
+| Scanned rows | decode (avg) | compute-only (avg) | D2H (avg) | wall (avg) | decode % of wall |
+|---|---|---|---|---|---|
+| 2,000,000 | 0.0165s | 0.0102s | 0.0003s | 0.0304s | 54.2% |
+| 20,000,000 (10x) | 0.0930s (5.6x) | 0.0513s (5.0x) | 0.0003s (flat) | 0.1704s (5.6x) | 54.6% |
+
+Same qualitative picture, now with tighter numbers and no contention
+caveat needed: decode's share is consistent (54.2% vs 54.6%) across
+scales, D2H stays flat and negligible regardless of scan size, and decode
+now scales *closer to linearly* with data volume (5.6x time for 10x rows,
+vs. the noisier 4.1x under contention) -- the sub-linear amortization
+effect was partly a contention artifact, not purely fixed per-query
+overhead. This is the number to treat as authoritative; the contended
+measurements above are kept for the methodology record, not as the final
+answer.
 
 ## Recommendation
 
