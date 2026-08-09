@@ -93,6 +93,14 @@ python3 aws_benchmark_runner.py \
   --query all --iterations 2 --output ../results-sf100.json
 ```
 
+Add `--duckdb` to also run each query through DuckDB in-process on
+whichever host runs this command (needs the `duckdb` Python package and
+network access to S3 -- reads the same real data via the `httpfs`/`aws`
+extensions and this instance's IAM role, no separate infra to provision).
+It's excluded from every cost table (no dedicated instance to attribute a
+$/hour to) but included in the latency and scan-throughput tables as a
+third, single-node, CPU-only reference point.
+
 Compute real cost (after the run, before teardown -- so instance uptime
 reflects the actual run window):
 

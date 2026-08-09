@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """AWS benchmark orchestrator: KernelLake (remote kernellake-server over
-Flight SQL) vs. PySpark (remote standalone cluster), against real S3 data,
-across scale factors.
+Flight SQL) vs. PySpark (remote standalone cluster) vs. optionally DuckDB
+(in-process on this orchestrator, reading the same real S3 data), across
+scale factors.
 
 Extends tools/benchmark_three_way.py's shape rather than reimplementing it:
 reuses kernellake_sql()/spark_sql()/load_query_text() (query-text
@@ -11,6 +12,14 @@ duckdb_compare.py's normalize()/rows_match() (cross-engine validation
 is reported as a validation failure and excluded from the timing table,
 never silently timed anyway, same rule benchmark_three_way.py already
 follows).
+
+DuckDB is opt-in (--duckdb) and, unlike KernelLake/PySpark, isn't scored
+in any cost table: it runs in-process on whichever host runs this script
+(the Spark master instance in the standard topology), not on infra
+dedicated to it, so there's no real per-instance $/hour to attribute a
+query's cost against -- attributing one would imply a dedicated-infra cost
+that doesn't exist. It's included purely as a third, single-node,
+CPU-only latency/correctness reference point.
 
 **"cold" vs "warm" mean something different here than in
 benchmark_three_way.py**, and that difference is deliberate, not an
@@ -228,6 +237,45 @@ def run_pyspark_query(spark, query_number: int) -> tuple:
     return table, elapsed
 
 
+def new_duckdb_connection(region: str):
+    """A fresh, S3-ready DuckDB connection: httpfs for s3:// reads, plus
+    the aws extension's CREDENTIAL_CHAIN provider so it resolves this
+    instance's real IAM role the same way boto3/the AWS SDK would --
+    consistent with how kernellake-server/Spark authenticate to S3 here
+    (InstanceProfileCredentialsProvider), not a static access key. DuckDB
+    accepts the *same* 's3://' scheme and the *same* substituted SQL
+    KernelLake does (see run_duckdb_query()'s own comment), unlike Spark's
+    's3a://' + separate SQL rewrite.
+    """
+    import duckdb
+
+    con = duckdb.connect()
+    con.install_extension("httpfs")
+    con.load_extension("httpfs")
+    con.install_extension("aws")
+    con.load_extension("aws")
+    con.sql("CREATE OR REPLACE SECRET (TYPE S3, PROVIDER CREDENTIAL_CHAIN)")
+    con.sql(f"SET s3_region = '{region}'")
+    return con
+
+
+def run_duckdb_query(con, query_number: int, globs: dict) -> tuple:
+    # Same substituted SQL as KernelLake's own read_parquet(...) calls --
+    # DuckDB accepts that syntax natively, no rewrite needed (see
+    # tools/duckdb_compare.py's equivalent comment for the local benchmark).
+    sql = kernellake_sql(
+        query_number, globs["data"], globs.get("part_data"), globs.get("orders_data"), globs.get("customer_data")
+    )
+    start = time.perf_counter()
+    # .arrow() returns a RecordBatchReader (lazy), not a materialized
+    # pa.Table -- .read_all() is what actually pulls results and is also
+    # what triggers execution to complete, same as duckdb_compare.py's
+    # run_duckdb() already does for the local benchmark.
+    table = con.sql(sql).arrow().read_all()
+    elapsed = time.perf_counter() - start
+    return table, elapsed
+
+
 def spark_scan_metrics(spark) -> dict | None:
     """Best-effort scan-phase input bytes/duration for the *most recently
     completed* stage, via Spark's own REST API. This is a **supporting**
@@ -337,6 +385,7 @@ def benchmark_query(
     globs: dict,
     kernellake_cursor,
     spark,
+    duckdb_con,
     modes: tuple,
     iterations: int,
     kernellake_ssh_host: str | None,
@@ -348,15 +397,17 @@ def benchmark_query(
     table_format: str = "flat",
     iceberg_catalog_uri: str | None = None,
     iceberg_warehouse: str | None = None,
-) -> tuple[dict, object]:
-    """Returns (result, spark) -- `spark` is returned because cold mode
-    replaces the session with a fresh one (see module docstring's "cold vs
-    warm" definition); the caller must use the returned session for
-    subsequent queries, not the one it passed in."""
+    aws_region: str = "us-east-1",
+) -> tuple[dict, object, object]:
+    """Returns (result, spark, duckdb_con) -- both session objects are
+    returned because cold mode replaces each with a fresh one (see module
+    docstring's "cold vs warm" definition); the caller must use the
+    returned objects for subsequent queries, not the ones it passed in."""
     result: dict = {"query": query_number, "modes": {}}
     for mode in modes:
-        kl_samples, spark_samples = [], []
+        kl_samples, spark_samples, duckdb_samples = [], [], []
         validated = None
+        validated_duckdb = None
         for rep in range(iterations):
             is_first_rep = rep == 0
             if mode == "cold" and is_first_rep and kernellake_ssh_host and ssh_key_path:
@@ -365,9 +416,18 @@ def benchmark_query(
                 spark.stop()
                 spark = new_spark_session(spark_master_host, iceberg_catalog_uri, iceberg_warehouse)
                 register_spark_views(spark, s3_bucket, scale_factor, compression, table_format)
+            if mode == "cold" and is_first_rep and duckdb_con is not None:
+                duckdb_con.close()
+                duckdb_con = new_duckdb_connection(aws_region)
 
             kl_table, kl_elapsed = run_kernellake_query(kernellake_cursor, query_number, globs, table_format)
             kl_samples.append(kl_elapsed)
+
+            if duckdb_con is not None:
+                duckdb_table, duckdb_elapsed = run_duckdb_query(duckdb_con, query_number, globs)
+                duckdb_samples.append(duckdb_elapsed)
+                if validated_duckdb is None:
+                    validated_duckdb = rows_match(normalize(kl_table), normalize(duckdb_table))
 
             if spark is not None:
                 spark_table, spark_elapsed = run_pyspark_query(spark, query_number)
@@ -388,8 +448,18 @@ def benchmark_query(
             elif validated is False:
                 print(f"WARNING: Q{query_number} ({mode}): KernelLake and PySpark results do NOT match -- "
                       "excluding this query/mode's timing from any headline number.", file=sys.stderr)
+        if duckdb_samples:
+            entry["duckdb"] = median_stats(duckdb_samples)
+            entry["results_match_duckdb"] = validated_duckdb
+            if validated_duckdb:
+                entry["latency_speedup_ratio_duckdb"] = (
+                    entry["duckdb"]["median_seconds"] / entry["kernellake"]["median_seconds"]
+                )
+            elif validated_duckdb is False:
+                print(f"WARNING: Q{query_number} ({mode}): KernelLake and DuckDB results do NOT match -- "
+                      "excluding this query/mode's DuckDB timing from any headline number.", file=sys.stderr)
         result["modes"][mode] = entry
-    return result, spark
+    return result, spark, duckdb_con
 
 
 def main() -> int:
@@ -398,7 +468,14 @@ def main() -> int:
     parser.add_argument("--kernellake-port", type=int, default=31337)
     parser.add_argument("--kernellake-ssh-key", default=None, help="Path to the SSH private key, for real cold-mode server restarts. Omit to skip real restarts (cold mode then only means \"first rep of this run\", not \"freshly restarted server\").")
     parser.add_argument("--spark-master-host", default=None, help="Omit to run KernelLake-only (no PySpark comparison, no cross-engine validation)")
+    parser.add_argument("--duckdb", action="store_true",
+                         help="Also run each query through DuckDB, in-process on this orchestrator host, "
+                              "against the same real S3 data (via httpfs + the aws extension's IAM "
+                              "instance-role credential chain). Flat table format only -- see "
+                              "new_duckdb_connection()'s own comment for why it's excluded from cost "
+                              "tables. Opt-in: off by default so existing invocations are unaffected.")
     parser.add_argument("--s3-bucket", required=True)
+    parser.add_argument("--aws-region", default="us-east-1", help="Used for DuckDB's s3_region setting (--duckdb only).")
     parser.add_argument("--scale-factor", type=int, required=True)
     parser.add_argument("--compression", default="snappy", choices=["snappy", "zstd"],
                          help="Which generate_and_upload_data.sh --compression run to read "
@@ -436,6 +513,9 @@ def main() -> int:
     if args.table_format == "iceberg" and args.spark_master_host and not (args.iceberg_catalog_uri and args.iceberg_warehouse):
         print("--table-format iceberg with --spark-master-host requires --iceberg-catalog-uri and --iceberg-warehouse", file=sys.stderr)
         return 1
+    if args.duckdb and args.table_format == "iceberg":
+        print("--duckdb only supports --table-format flat (no Iceberg REST catalog wiring for DuckDB here)", file=sys.stderr)
+        return 1
 
     kernellake_conn = connect_kernellake(args.kernellake_host, args.kernellake_port)
     kernellake_cursor = kernellake_conn.cursor()
@@ -444,6 +524,8 @@ def main() -> int:
     if args.spark_master_host:
         spark = new_spark_session(args.spark_master_host, args.iceberg_catalog_uri, args.iceberg_warehouse)
         register_spark_views(spark, args.s3_bucket, args.scale_factor, args.compression, args.table_format)
+
+    duckdb_con = new_duckdb_connection(args.aws_region) if args.duckdb else None
 
     # Real compressed/uncompressed bytes scanned per table, cached (many
     # queries share lineitem) -- flat format only, see table_bytes_scanned()'s
@@ -482,11 +564,11 @@ def main() -> int:
             query_tables.append("customer")
 
         print(f"=== Q{query_number} ===", file=sys.stderr)
-        query_result, spark = benchmark_query(
-            query_number, globs, kernellake_cursor, spark, modes, args.iterations,
+        query_result, spark, duckdb_con = benchmark_query(
+            query_number, globs, kernellake_cursor, spark, duckdb_con, modes, args.iterations,
             args.kernellake_host, args.kernellake_ssh_key,
             args.spark_master_host, args.s3_bucket, args.scale_factor, args.compression,
-            args.table_format, args.iceberg_catalog_uri, args.iceberg_warehouse,
+            args.table_format, args.iceberg_catalog_uri, args.iceberg_warehouse, args.aws_region,
         )
 
         if args.table_format == "flat":
@@ -518,9 +600,10 @@ def main() -> int:
         "unsupported_queries": UNSUPPORTED_QUERIES,
         "cold_warm_definition": (
             "cold: first query against a freshly-restarted kernellake-server / freshly-created "
-            "SparkSession. warm: repeated query against an already-running server/session. "
-            "NOT the same concept as local-disk OS-page-cache cold/warm (there is no local page "
-            "cache for S3-resident data on the client side) -- see this script's own module docstring."
+            "SparkSession / freshly-created DuckDB connection (--duckdb). warm: repeated query "
+            "against an already-running server/session/connection. NOT the same concept as "
+            "local-disk OS-page-cache cold/warm (there is no local page cache for S3-resident data "
+            "on the client side) -- see this script's own module docstring."
         ),
     }
     Path(args.output).write_text(json.dumps(report, indent=2, default=str))

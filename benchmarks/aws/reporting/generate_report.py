@@ -42,7 +42,12 @@ def engine_hourly_rates(cost_data: dict | None) -> dict[str, float | None]:
     master vs. worker), so it's derived as spark_usd / total spark
     instance-hours -- the real blended $/hour the whole cluster cost
     during this run, appropriate here since a Spark query uses the whole
-    cluster while running, not one node's worth of capacity."""
+    cluster while running, not one node's worth of capacity.
+
+    duckdb: deliberately absent, here and from cost_per_query_table()/
+    cost_efficiency_table() below -- it runs in-process on whichever host
+    ran the orchestrator (not on infra dedicated to it), so there is no
+    real per-instance $/hour to attribute a query's cost against."""
     if cost_data is None:
         return {"kernellake": None, "pyspark": None}
     detail = cost_data.get("detail", {})
@@ -58,19 +63,27 @@ def latency_speedup_table(benchmark_runs: list) -> list[dict]:
         sf = run["scale_factor"]
         for q in run["queries"]:
             for mode, entry in q["modes"].items():
-                if "pyspark" not in entry:
+                if "pyspark" not in entry and "duckdb" not in entry:
                     continue
-                rows.append(
-                    {
-                        "scale_factor": sf,
-                        "query": q["query"],
-                        "mode": mode,
-                        "kernellake_median_seconds": entry["kernellake"]["median_seconds"],
-                        "pyspark_median_seconds": entry["pyspark"]["median_seconds"],
-                        "latency_speedup_ratio": entry.get("latency_speedup_ratio"),
-                        "results_match": entry.get("results_match"),
-                    }
-                )
+                row = {
+                    "scale_factor": sf,
+                    "query": q["query"],
+                    "mode": mode,
+                    "kernellake_median_seconds": entry["kernellake"]["median_seconds"],
+                }
+                if "pyspark" in entry:
+                    row["pyspark_median_seconds"] = entry["pyspark"]["median_seconds"]
+                    row["latency_speedup_ratio"] = entry.get("latency_speedup_ratio")
+                    row["results_match"] = entry.get("results_match")
+                if "duckdb" in entry:
+                    # DuckDB: single-node, CPU-only, in-process on the
+                    # orchestrator host -- a reference point, not scored in
+                    # any cost table (see new_duckdb_connection()'s comment
+                    # in aws_benchmark_runner.py for why).
+                    row["duckdb_median_seconds"] = entry["duckdb"]["median_seconds"]
+                    row["latency_speedup_ratio_duckdb"] = entry.get("latency_speedup_ratio_duckdb")
+                    row["results_match_duckdb"] = entry.get("results_match_duckdb")
+                rows.append(row)
     return rows
 
 
@@ -144,7 +157,7 @@ def scan_throughput_table(benchmark_runs: list) -> list[dict]:
                     "mode": mode,
                     "compressed_bytes_scanned": bytes_scanned,
                 }
-                for engine in ("kernellake", "pyspark"):
+                for engine in ("kernellake", "pyspark", "duckdb"):
                     if engine not in entry or not bytes_scanned:
                         continue
                     seconds = entry[engine]["median_seconds"]
@@ -213,7 +226,17 @@ def write_csv(rows: list[dict], path: Path) -> None:
 def markdown_table(rows: list[dict], title: str) -> str:
     if not rows:
         return f"## {title}\n\n_No data._\n\n"
-    columns = list(rows[0].keys())
+    # Union of keys across every row, in first-seen order -- not just
+    # rows[0]'s keys, since rows can be heterogeneous (e.g. a query/mode
+    # with DuckDB data alongside one without, when --duckdb only covers
+    # part of a run).
+    columns: list[str] = []
+    seen = set()
+    for row in rows:
+        for key in row:
+            if key not in seen:
+                seen.add(key)
+                columns.append(key)
     lines = [f"## {title}", "", "| " + " | ".join(columns) + " |", "| " + " | ".join("---" for _ in columns) + " |"]
     for row in rows:
         lines.append("| " + " | ".join(str(row.get(c, "")) for c in columns) + " |")
@@ -262,7 +285,20 @@ def main() -> int:
     for q, reason in sorted(unsupported.items()):
         md.append(f"- **Q{q}**: {reason}")
     md.append("")
-    md.append(markdown_table(speedup_rows, "Latency speedup ratio (headline #1) -- KernelLake vs. PySpark"))
+    has_duckdb = any("duckdb_median_seconds" in row for row in speedup_rows)
+    speedup_title = (
+        "Latency speedup ratio (headline #1) -- KernelLake vs. PySpark vs. DuckDB"
+        if has_duckdb
+        else "Latency speedup ratio (headline #1) -- KernelLake vs. PySpark"
+    )
+    md.append(markdown_table(speedup_rows, speedup_title))
+    if has_duckdb:
+        md.append(
+            "_DuckDB is a single-node, CPU-only, in-process reference point (runs on the orchestrator "
+            "host itself against the same real S3 data) -- not scored in the cost tables below, since "
+            "it has no dedicated per-instance $/hour to attribute a query's cost against._"
+        )
+        md.append("")
     md.append(markdown_table(cost_rows, "Cost per completed query (headline #2)"))
     md.append(markdown_table(concurrency_rows, "Latency & throughput under concurrency (headline #3)"))
     md.append(
