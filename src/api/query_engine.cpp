@@ -10,6 +10,7 @@
 #include "kernellake/optimizer/optimizer.hpp"
 #include "kernellake/planner/logical_planner.hpp"
 #include "kernellake/sql/parser.hpp"
+#include "kernellake/storage/nvme_cache_otel.hpp"
 
 #include "composite_source_resolver.hpp"
 
@@ -82,6 +83,14 @@ PhysicalPlanPtr QueryEngine::explain(std::string_view sql) const {
   delta::DeltaSourceResolver delta_resolver(config_.delta);
   CompositeSourceResolver resolver(iceberg_resolver, delta_resolver);
   return build_physical_plan(plan_logical(sql), store_, &resolver);
+}
+
+std::optional<NvmeCacheMetricsSnapshot> QueryEngine::cache_metrics() const {
+  return store_.cache_metrics();
+}
+
+void QueryEngine::register_cache_otel_instruments() const {
+  register_nvme_cache_otel_instruments(store_);
 }
 
 }  // namespace kernellake

@@ -2581,6 +2581,115 @@ log` is the authoritative chronology if that ordering ever matters.
   commit `437227d`): kernellake-server + otel-collector + prometheus +
   grafana + jaeger + minio, verified working end to end against a real
   local GPU -- real Grafana dashboards for query metrics and GPU memory.
+- **NVMe cache tier between the remote object stores and the GPU scan
+  path** -- see `docs/ARCHITECTURE.md`'s "NVMe cache tier" section for the
+  full design. A new `NvmeObjectCache` (`src/storage/nvme_object_cache.cpp`)
+  is a whole-object, read-through local-disk cache that
+  `ObjectStoreRegistry::open()` routes any non-`"file"`-scheme read
+  through when `storage.cache.enabled` (new `CacheSection`, off by
+  default); local paths are never cached. Cache key is the URI string's
+  own hash alone (FNV-1a 64-bit, not `std::hash` -- process-stable, needed
+  since the cache is meant to survive restarts), deliberately never
+  re-verified against the backend on a hit -- write-once Parquet-in-
+  object-storage is this project's existing assumption, and even a
+  metadata-only HEAD on every hit would undercut the point of the cache.
+  Population streams the whole object to a `.tmp-*` file and
+  `rename()`s it into place atomically; per-key `std::mutex` locking
+  serializes concurrent population of the *same* URI without blocking
+  unrelated misses (verified with an 8-thread race,
+  backend `open()` call count asserted == 1). Eviction is LRU by file
+  mtime (bumped on every hit as an atime substitute), synchronous at the
+  end of every population, bounded by `storage.cache.max_size_bytes`
+  (default 100 GiB; `0` means unbounded). No changes were needed to
+  `ObjectStoreDatasource`/`ParquetScanOperator` at all -- a cache hit hands
+  cudf a local-file `RandomAccessObject` through the exact same
+  `ObjectStore::open()` call site every other backend already used, so
+  cuFile's own read path (host or device) applies transparently, with the
+  same real GDS-style benefit *this session's own* cuFile/compat-mode
+  investigation above already found for genuinely local reads.
+
+  **A real bug found and fixed by testing against actual MinIO** (`docker`
+  wasn't available earlier in this session; once it was, this tier got a
+  real cloud-backend round trip rather than staying unit-tested only):
+  `read_parquet(...)` resolves its source via `ObjectStore::list()`
+  *before* any `open()` call (`src/storage/file_discovery.cpp`), and
+  `list()` was never routed through the cache -- so a fully-cached repeat
+  query still required the backend reachable just to re-discover a file
+  it already had locally, defeating the point once the backend goes
+  offline. Confirmed for real: stopped the MinIO container between two
+  otherwise-identical queries against real uploaded data, and the second
+  one failed at file discovery despite the object being fully cached.
+  Fixed with `NvmeObjectCache::cached_info()` (a pure local stat, no
+  network) plus a matching check at the top of
+  `ObjectStoreRegistry::list()` -- safe without glob detection, since the
+  cache is only ever populated under an exact single-object URI, never a
+  glob/directory string. `list_recursive()` (true directory-listing
+  discovery) is deliberately left live-only; the pre-existing
+  catch-and-retry-via-`list()` fallback in
+  `discover_parquet_files_recursive()` is what reaches the fixed `list()`
+  path for the common single-explicit-file case anyway. Full writeup
+  (including why a timing comparison against loopback MinIO was an
+  honest null result, not a performance win) in `docs/ARCHITECTURE.md`.
+
+  Verified for real: `dev` (334/334, +9 new tests: the original 7 plus 2
+  covering `cached_info()`) and `gpu-dev` (443/443, zero regressions
+  across every existing GPU/server/observability test) both pass on this
+  session's real GPU hardware. A real `kernellake --config <cache-enabled
+  yaml> query --backend gpu` run through the actual CLI binary against a
+  real locally-generated Parquet file confirmed the local-path bypass:
+  the configured cache directory stayed empty after a correct query
+  result. **The decisive real-MinIO test**: a real 2M-row Parquet file was
+  generated, uploaded to a real MinIO container
+  (`benchmarks/local/docker-compose.yml`'s `minio`/`minio-init` services,
+  brought up standalone), queried once with caching enabled (populating
+  the cache), then MinIO was stopped outright and the identical query
+  re-run -- it returned the correct result (`5000` rows on a smaller
+  fixture used for this specific check) with the backend fully offline
+  the entire time, real end-to-end proof the cache eliminates the network
+  dependency for a repeat query, not just at the unit-test layer.
+- **NVMe cache metrics: hits, misses, evictions, current size** (follow-up
+  to the NVMe cache tier just above). `NvmeObjectCache` gained five plain
+  atomic counters and a `snapshot()` method -- instance-level, not a
+  `GpuMemoryMetricsRegistry`-style process-wide static, since this class
+  (unlike `RmmEnvironment`) is already a single long-lived instance per
+  `QueryEngine`, which also makes it trivially per-test-isolated with no
+  reset-for-testing hook needed. `current_bytes`/`current_entries` are
+  maintained incrementally rather than re-walking the cache directory on
+  every read, seeded once from whatever's already on disk at construction
+  (so a server restart against a pre-populated cache directory reports
+  real numbers immediately) -- and this incremental tracking let
+  `evict_if_over_budget()` skip its directory walk entirely in the common
+  under-budget case, a free efficiency win found while wiring this
+  through. Exposed two ways: `kernellake query --stats` prints
+  `cache_hits`/`cache_misses`/`cache_evictions`/`cache_current_bytes`/
+  `cache_current_entries`; `kernellake-server` registers real OTel
+  instruments under `kernellake.storage.cache.*`
+  (`src/storage/nvme_cache_metrics_otel.cpp`/`_stub.cpp`, split by
+  `KERNELLAKE_ENABLE_OTEL` alone, mirroring `src/observability/`'s own
+  split) once at startup -- deliberately not called from the CLI, whose
+  single-query process lifetime is too short for OTel's periodic exporter
+  to matter. Full design writeup in `docs/ARCHITECTURE.md`'s "NVMe cache
+  tier" section.
+
+  Verified for real against the same MinIO/otel-collector/Prometheus stack
+  the cache tier itself was verified against: a real `kernellake-server`
+  (built with `KERNELLAKE_BUILD_SERVER=ON` and `KERNELLAKE_ENABLE_OTEL=ON`
+  together -- no preset combines both, a scratch build directory was used)
+  served five real Flight SQL queries (a real Python
+  `adbc_driver_flightsql` client) against a real MinIO-hosted object, and
+  Prometheus's own `/metrics` endpoint showed `kernellake_storage_cache_
+  current_bytes` matching the cached file's real on-disk size exactly
+  (`341684`), `_misses_total 1`, `_current_entries 1`, `_evictions_total
+  0`, and `_hits_total 23` (more than "4" because each logical query
+  triggers several distinct cache-checking calls internally -- `list()`,
+  its `list_recursive()` fallback, and the real `open()` -- each a real,
+  separately-counted avoided backend call, not a bug). The CLI `--stats`
+  path was verified separately against the same real bucket, matching the
+  real cached file size exactly there too. `dev` (340/340, +7 new
+  `NvmeObjectCacheTest` cases), a scratch `otel-server-dev`-combination
+  build (347/347, including a real `FlightSqlServerTest` construction path
+  now exercising the new registration call's early-return branch for
+  real), and `gpu-dev` (449/449, zero regressions) all pass.
 
 ## Not yet started
 
@@ -2701,48 +2810,29 @@ log` is the authoritative chronology if that ordering ever matters.
   engines' access to the same files) -- not done this session. Like the
   GDS finding above, this increasingly looks like it may not have a fix
   within kernellake's own code either way, but that isn't confirmed yet.
-- **NVMe cache tier between S3 and the GPU, on the kvikio/cuFile path
-  already linked in** (kvikio is already fetched/pinned, see "Done" above;
-  `ObjectStoreDatasource`'s `device_read`/`device_read_async` -- the real,
-  validated fix in this session's `docs/GPU_OPTIMIZATIONS.md` -- is the
-  natural place to add a cache check in front of the S3 round-trip).
-  Attacks the actual bottleneck this file's own cuFile/GDS investigation
-  above already found real: SF100/SF1000 scans are I/O-bound (decode is
-  cheap by comparison, per the `parquet_decoding_seconds` shares quoted
-  above), and repeated queries against overlapping data (the ordinary BI/
-  analytics access pattern -- the same tables, shifting filters) pay the
-  full S3 fetch every time today, cold or warm, since "warm" here only
-  ever meant *this process's* already-open state, never a persisted local
-  copy. A local NVMe cache turns a repeat query's scan into a local read
-  instead of a network fetch -- and unlike S3 objects (inherently remote,
-  no direct DMA path), a locally-cached copy *would* get a real
-  GPUDirect-Storage-style benefit from cuFile even in compat mode (the
-  compat-mode finding above is specifically about *this dev box's*
-  consumer GPU being outside NVIDIA's official Tesla/Quadro GDS support
-  matrix, not about cuFile-on-local-NVMe being slow in general -- compat
-  mode still means disk -> host page cache -> GPU, meaningfully faster
-  than disk-doesn't-exist-yet -> network -> GPU for anything already
-  cached).
-
-  Architecturally distinctive, not just faster: this is a different shape
-  of answer to "how does KernelLake compete with a distributed engine"
-  than more nodes -- a distributed engine scales by adding machines that
-  each still re-stream cold objects from S3 on every query; a single GPU
-  node with a local NVMe cache holding the actual hot working set instead
-  answers repeat queries without touching the network at all, which fits
-  this project's existing single-node architecture (one `RmmEnvironment`,
-  one `ObjectStoreDatasource` per server process) rather than requiring
-  any distributed cache-coherence protocol. Real design work needed before
-  starting: a cache key (S3 bucket+key+byte-range is enough since TPC-H-
-  style Parquet files are immutable once written -- no invalidation logic
-  needed unless/until an overwrite-in-place workload is ever supported),
-  an eviction policy sized against the NVMe device's real capacity (not
-  the GPU's VRAM -- this is a host-disk cache feeding cuFile, not a device-
-  memory structure), and where the cache lives relative to
-  `kernellake-server`'s process lifetime (survives restarts, i.e. actually
-  on disk, not an in-memory structure that a "cold" server-restart rep in
-  `benchmarks/aws/runner/aws_benchmark_runner.py` would just wipe every
-  time and make indistinguishable from no cache at all).
+- NVMe cache tier (see "Done" above -- a real MinIO round trip, including
+  a real backend-fully-offline test, is now verified): a genuine
+  before/after wall-clock speed comparison against a real cross-network S3
+  bucket (the correctness/network-independence claim is verified for
+  real; the loopback-MinIO timing check run this session was an honest
+  null result, not evidence either way, since loopback network latency
+  was never the bottleneck being measured); GCS/Azure emulator round
+  trips specifically (only S3/MinIO was exercised end-to-end so far, not
+  fake-gcs-server/Azurite); and replacing `evict_if_over_budget()`'s
+  `O(cache file count)` directory scan when eviction actually triggers
+  (now skipped entirely in the common under-budget case, see "Done"
+  above's metrics entry -- but still a full walk once eviction *is*
+  needed, fine at this cache's target scale, a handful to low hundreds of
+  files) with an in-memory size-tracked structure if a much larger working
+  set ever makes that walk itself a bottleneck.
+- NVMe cache metrics (see "Done" above): wiring `storage.cache` into
+  `benchmarks/local/config/kernellake-server.yaml` (the local
+  docker-compose stack's own server config, which already runs MinIO +
+  otel-collector + Prometheus + Grafana but doesn't yet enable caching by
+  default) and a Grafana dashboard panel for `kernellake.storage.cache.*`
+  -- same deferred-dashboard-wiring gap already disclosed for the GPU
+  memory metrics entry above ("Benchmark/OTLP-integration-test/collector-
+  config wiring deferred"), not attempted here either.
 - TPC-H `execution-only` benchmark mode (needs an operator-tree entry point
   that skips `ParquetScanOperator`); TPC-H beyond SF10 (SF0.01/0.1/1/10 all
   verified, see "Done" above)

@@ -1750,6 +1750,287 @@ what `credentials_kind` selects); CI automation of the emulator-based
 smoke tests (manual verification only in this pass, matching how Phase
 1/2's Flight SQL/OTel manual smoke tests were never wired into CI either).
 
+### NVMe cache tier
+
+A local-filesystem, whole-object, read-through cache sitting in front of
+the *remote* (`s3`/`gs`/`gcs`/`abfs`/`abfss`/`az`/`hdfs`) `ObjectStore`
+backends added above -- attacks the bottleneck this project's own cuFile/
+GDS cold-vs-warm investigation (see "GPU Parquet scan's cold-vs-warm gap"
+above) already found real: I/O-bound scans where a repeat query against
+overlapping data paid the full remote fetch every time, since "warm"
+previously only ever meant *this process's* already-open state, never a
+persisted local copy. See `docs/ROADMAP.md`'s matching entry for the
+motivation and the three real design questions (cache key, eviction
+policy, restart persistence) resolved below.
+
+**Design**: `NvmeObjectCache` (`include/kernellake/storage/
+nvme_object_cache.hpp`, `src/storage/nvme_object_cache.cpp`) is not itself
+an `ObjectStore` -- it's a decorator-shaped helper with one real method,
+`get_or_populate(uri, backend)`, that `ObjectStoreRegistry::open()`
+(`include/kernellake/storage/object_store_registry.hpp`) calls instead of
+`backend.open(uri)` whenever `storage.cache.enabled` is true *and* the
+URI's scheme isn't `"file"` -- local paths are already local, so routing
+them through the cache would just duplicate the same bytes onto the same
+disk for no benefit. This keeps the interception to a single call site
+that already covers both execution backends (GPU's `ParquetScanOperator`
+and CPU's `acero_query_executor.cpp` both go through `ObjectStore::open()`
+the same way), rather than touching either scan path directly.
+
+The cache key is the URI string's own hash (FNV-1a 64-bit, chosen over
+`std::hash<std::string>` specifically because its algorithm is
+implementation-defined and not guaranteed stable across process restarts,
+which would matter for a cache meant to survive them) -- **not**
+re-verified against the backend's current object size or ETag on every
+open(). This is deliberate, on the same write-once assumption this
+project's own TPC-H/benchmark tooling already relies on for Parquet files
+in object storage: a cache *hit* therefore makes zero calls to the remote
+backend, not even a metadata HEAD, since even a metadata-only round trip
+would undercut what this cache exists to avoid. An overwrite-in-place
+workload is not supported by this cache (nor, today, by anything else in
+this project's cloud storage support).
+
+On a miss, `NvmeObjectCache::populate()` streams the whole object to a
+`.tmp-<pid>-<counter>`-suffixed file in the cache directory (64 MiB
+chunks via the same `RandomAccessObject::as_arrow_file()->ReadAt()` path
+`ObjectStoreDatasource` already uses, so no new remote-read code path was
+introduced), then `std::filesystem::rename()`s it into place -- atomic on
+POSIX for a same-directory rename, so a concurrent reader can never
+observe a partially-written cache entry. Per-cache-key `std::mutex`
+locking (`key_locks_`, grown but never pruned -- acceptable for the
+working-set sizes this targets) serializes population of the *same*
+object across threads without blocking unrelated cache misses, verified
+by `NvmeObjectCacheTest.ConcurrentPopulateOfSameKeyFetchesBackendExactlyOnce`
+(8 threads racing on one URI, backend `open()` call count asserted == 1).
+
+Reading a cache hit is delegated to a `LocalObjectStore` instance rooted
+at the cache directory, reusing its existing `arrow::io::ReadableFile`
+path rather than a second hand-rolled local-file reader. This is also why
+`ObjectStoreDatasource` (the class `ParquetScanOperator` hands to cudf,
+see "Cloud object storage" above) needed no changes at all: it already
+just calls `RandomAccessObject::as_arrow_file()->ReadAt()` inside its
+`host_read()`/`device_read()` overrides without caring which concrete
+`ObjectStore` produced that object. On a cache hit, the object it receives
+*is* a local-file `RandomAccessObject`, so cuFile's own GPUDirect-Storage-
+style path (even in the compat-mode this dev box runs under -- see the
+cold-vs-warm gap writeup above) applies automatically -- no separate
+cuFile-specific integration was needed for the "locally-cached copy gets a
+real GDS-style benefit" claim in this section's opening paragraph.
+
+**Eviction**: least-recently-used by file mtime, bumped on every cache hit
+(a standard atime-via-mtime substitute, since POSIX atime updates aren't
+guaranteed on read and many real deployments mount with `noatime`
+anyway). Runs synchronously at the end of every `populate()` call: lists
+the cache directory (`.cache`-suffixed entries only, so an in-flight
+`.tmp-*` write from a concurrent population is never counted or deleted),
+sums sizes, and if over `storage.cache.max_size_bytes`, removes the
+oldest-mtime entries until back under budget. `max_size_bytes: 0` means
+unbounded (no eviction), matching this project's existing "0 == no limit"
+convention (`EngineSection::query_memory_limit_bytes`). Unlinking a cache
+entry that a concurrent query still has an open file descriptor against is
+safe on POSIX -- the inode stays valid and readable until the last
+descriptor closes, only the directory entry disappears, so an in-flight
+read is never disrupted by an eviction racing against it. This eviction
+scan is `O(cache file count)` on every population, an intentional MVP
+simplification (see docs/ROADMAP.md's entry for what a size-tracked
+alternative would look like) that's fine at the file counts this cache
+targets (a handful to low hundreds of Parquet files per working set, not
+millions).
+
+**Config** (`CacheSection`, embedded as `storage.cache` in
+`include/kernellake/common/config.hpp`): `enabled` (default `false`,
+existing deployments unaffected), `directory` (required if enabled,
+validated in `validate_config()`), `max_size_bytes` (default 100 GiB).
+Survives `kernellake-server` restarts by construction -- it's a plain
+directory of files, not an in-memory structure that a restart would wipe.
+
+**A real bug found and fixed by the MinIO round trip below**: the design
+above intercepts `ObjectStore::open()`, but `read_parquet(...)` resolves
+its source *before* any `open()` call, through
+`discover_parquet_files[_recursive]()` (`src/storage/file_discovery.cpp`),
+which calls `ObjectStore::list()`/`list_recursive()` to turn a URI into an
+`ObjectInfo` (size, existence). Those were never routed through the
+cache -- so even a fully-cached repeat query still required the backend
+reachable just to *re-discover* a file it already had a complete local
+copy of, silently defeating the point for a backend that's gone offline
+since the cache was populated. Confirmed for real (see below) by stopping
+the MinIO container between two otherwise-identical queries: the second
+one failed at file discovery ("failed to inspect ... HeadObject ...
+Could not connect to server") despite the object being fully cached.
+
+Fixed with `NvmeObjectCache::cached_info(uri)` -- a pure local stat (no
+network) that returns the cached size for a URI *only* if that exact
+string was previously passed to `get_or_populate()` -- and a matching
+check at the top of `ObjectStoreRegistry::list()`: a cache hit returns
+`{ObjectInfo{uri, cached_size}}` directly, skipping `backend_for()`
+entirely. This is safe without any glob/directory detection: the cache is
+only ever populated under an *exact* single-object URI (from a real
+`open()` call), so a glob pattern or directory prefix string can never
+coincidentally match a cache entry -- confirmed by
+`NvmeObjectCacheTest.CachedInfoIsNulloptForADifferentUnrelatedUri`.
+`list_recursive()` (how a directory's file *set* is discovered in the
+first place) is deliberately left live-only, since a same-string cache
+lookup can't answer "what files exist under this prefix now" -- but
+`discover_parquet_files_recursive()`'s own pre-existing
+catch-`StorageError`-and-retry-via-`list()` fallback (for the "this
+wasn't actually a directory" case) is exactly what reaches the now-fixed
+`list()` cache check for the common single-explicit-file source, so the
+real failure mode above is fully closed without changing
+`list_recursive()` at all.
+
+**Verified for real**: `dev` (334/334, +9 new: the original 7 -- 6
+`NvmeObjectCacheTest` cases covering miss-then-populate, hit-skips-
+backend entirely, distinct URIs get distinct entries, concurrent
+same-key population, LRU eviction under a tight budget, and
+`max_size_bytes: 0` staying unbounded, plus 1 `ObjectStoreRegistryTest`
+case for the `"file"`-scheme bypass -- plus 2 more added for the
+`cached_info()` fix above) and `gpu-dev` (443/443 total, zero regressions
+across every existing GPU/server/observability test) both pass on this
+session's real GPU hardware.
+
+Beyond the unit tests, this tier was verified against a **real MinIO
+container** (`benchmarks/local/docker-compose.yml`'s own `minio`/
+`minio-init` services, brought up standalone rather than the full stack)
+once `docker` became available in this session, superseding an earlier
+pass of this same section that had to disclose no-`docker` as a real,
+open gap:
+- A real 5,000-row and a real 2,000,000-row (~72 MiB) Parquet file, each
+  generated by `kernellake generate-data` and uploaded via a throwaway
+  `minio/mc` container, both round-tripped correctly through
+  `kernellake query --backend gpu` against `s3://kernellake-bench/...`
+  with `storage.cache.enabled: true` (real `credentials_kind: explicit`
+  against MinIO's `minioadmin`/`minioadmin`, `endpoint_override:
+  "localhost:9000"`, `scheme: http` -- the same shape
+  `benchmarks/local/config/kernellake-server.yaml` already uses).
+- **The decisive test**: after the first (cache-populating) query
+  succeeded, the MinIO container was stopped outright
+  (`docker stop local-minio-1`, confirmed down via a failed health-check
+  curl) and the *identical* query was re-run. Before the `list()` fix
+  above, this failed with a real connection error at file discovery; after
+  the fix, it returned the correct row count (`5000`) with MinIO fully
+  offline the entire time -- direct, real proof that a cache hit truly
+  makes zero backend calls, end to end, not just at the `open()` layer
+  the unit tests already covered.
+- A timing comparison (cache disabled vs. enabled, 3 repeat runs each, the
+  2M-row file, `--stats`) was also run but is **not** reported as a
+  performance win here: MinIO on this box is a loopback container, so
+  network latency was never the bottleneck being measured, and the
+  cached/uncached `elapsed_wall_seconds` came out statistically
+  indistinguishable (~0.31-0.43s either way) -- an honest null result
+  under these conditions, not evidence the cache doesn't help. The
+  MinIO-stopped test above is the real, decisive evidence for this tier;
+  a genuine before/after *speed* claim would need a real cross-network S3
+  bucket (real latency, not loopback), which this session didn't have
+  access to either -- left as a further open item alongside the
+  size-tracked-eviction one in `docs/ROADMAP.md`.
+- A `kernellake --config <cache-enabled yaml> query --backend gpu` run
+  against a real locally-generated Parquet file over the plain local-file
+  path (not S3) confirmed the *other* direction too: the configured cache
+  directory stayed empty after a correct query result, proving the scheme
+  check actually gates the cache path rather than caching every read
+  unconditionally.
+
+#### Cache metrics (hits/misses/evictions/size)
+
+`NvmeObjectCache` (`include/kernellake/storage/nvme_object_cache.hpp`)
+keeps five plain `std::atomic<std::uint64_t>` counters as instance
+members -- `hits_`, `misses_`, `evictions_`, `current_bytes_`,
+`current_entries_` -- rather than a GPU-memory-metrics-style process-wide
+static registry: unlike `RmmEnvironment` (recreated per query in the CLI
+path, the reason `GpuMemoryMetricsRegistry` needs to be a static/global
+survivor), `NvmeObjectCache` is already a single, long-lived instance for
+its whole owning `QueryEngine`'s lifetime (one per CLI invocation, one for
+kernellake-server's entire process), so plain instance members are
+simpler and, as a bonus, trivially per-test-isolated (no
+reset-for-testing hook needed, unlike `GpuMemoryMetricsRegistry`'s own
+tests). `NvmeObjectCache::snapshot()` returns a point-in-time
+`NvmeCacheMetricsSnapshot` (relaxed loads, safe from any thread
+concurrently with `get_or_populate()`).
+
+A "hit" is counted by both `get_or_populate()` finding an existing cache
+entry *and* a successful `cached_info()` lookup (the `list()`-path check
+added by the MinIO round-trip fix above) -- both represent a real backend
+call genuinely avoided. A "miss" is counted only by `get_or_populate()`
+having to populate a new entry; a `cached_info()` failure is deliberately
+*not* counted as a miss, since nothing consumes that as a completed cache
+decision the way a `get_or_populate()` miss is (the caller just falls
+through to a live `list()` call, untracked by this class either way).
+`current_bytes_`/`current_entries_` are maintained incrementally (`+=` in
+`populate()`, using the *actual* bytes written -- `offset`, not the
+caller-claimed `size_bytes`, since those differ on the short-read path --
+not a re-walk of the directory on every read), seeded once from whatever
+already exists on disk at construction time
+(`seed_metrics_from_existing_directory()`) so a kernellake-server restart
+against an already-populated cache directory reports real numbers
+immediately, not a false-zero "growth since this instance started". This
+incremental maintenance also let `evict_if_over_budget()` skip its
+`O(cache file count)` directory walk entirely in the common
+comfortably-under-budget case -- it now only walks the directory when
+`current_bytes_` itself is already known to be over budget, a free
+efficiency win found while wiring the counters through eviction.
+
+**Two consumption paths, deliberately different in scope**:
+- **CLI `--stats`**: `QueryEngine::cache_metrics()` (forwards to
+  `ObjectStoreRegistry::cache_metrics()`, `nullopt` when caching is
+  disabled) is read once after `execute()` and printed alongside the
+  existing timing fields (`cache_hits`/`cache_misses`/`cache_evictions`/
+  `cache_current_bytes`/`cache_current_entries`). Cumulative-since-
+  QueryEngine-construction, not scoped to just that one call the way
+  `rows_scanned`/`files_scanned` are -- but since `kernellake query` is a
+  one-query-per-process CLI invocation, that distinction is moot in
+  practice.
+- **OTel, server-only**: `register_nvme_cache_otel_instruments()`
+  (`src/storage/nvme_cache_metrics_otel.cpp`/`_stub.cpp`, split by
+  `KERNELLAKE_ENABLE_OTEL` exactly like `src/observability/`'s own
+  `query_tracing_otel.cpp`/`_stub.cpp` -- no CUDA gate needed, unlike
+  `src/memory/gpu_memory_metrics_otel.cpp`'s two-dimensional one, since
+  neither `ObjectStoreRegistry` nor `NvmeObjectCache` have a CUDA
+  dependency) registers five instruments under `kernellake.storage.cache.*`
+  (`hits`/`misses`/`evictions` as `Int64ObservableCounter`,
+  `current_bytes`/`current_entries` as `Int64ObservableGauge`). Unlike
+  `gpu_memory_metrics_otel.cpp`'s registry-wide, instance-agnostic design,
+  these instruments are tied to one specific `ObjectStoreRegistry`
+  instance via the OTel callback's own `void*` user-data parameter (a
+  `const_cast` `ObjectStoreRegistry*`, safe since every callback only ever
+  calls `cache_metrics() const` on it) -- `KernelLakeFlightSqlServer`'s
+  constructor calls `engine_.register_cache_otel_instruments()` once,
+  right after constructing its own long-lived `engine_` member, the one
+  instance this registration is meant for. **Deliberately not called from
+  the CLI**: a single `kernellake query` process's lifetime is too short
+  for OTel's periodic exporter to ever fire meaningfully, unlike the
+  always-final `--stats` snapshot, which needs no exporter at all.
+
+**Verified for real, extending the same MinIO/otel-collector/Prometheus
+stack this section's earlier verification already used**: a real
+`kernellake-server` (built with `-DKERNELLAKE_BUILD_SERVER=ON
+-DKERNELLAKE_ENABLE_OTEL=ON` together, in a scratch build directory --
+neither preset alone builds this combination, same gap the "Project-wide
+`-Wl,--no-as-needed`" entry above already found and fixed for a different
+symbol) was pointed at a real MinIO bucket and a real `otel-collector` +
+Prometheus (from `benchmarks/local/docker-compose.yml`'s own services,
+brought up standalone). Five real Flight SQL queries (a real Python
+`adbc_driver_flightsql` client, not this project's own code) against the
+same `s3://` object -- one real miss, four real hits -- produced, scraped
+directly from Prometheus's own `/metrics` endpoint:
+`kernellake_storage_cache_misses_total 1`,
+`kernellake_storage_cache_current_entries 1`,
+`kernellake_storage_cache_current_bytes 341684` (exactly the cached
+file's real on-disk size, byte for byte), `kernellake_storage_cache_
+evictions_total 0`, and `kernellake_storage_cache_hits_total 23` (higher
+than "4" because each logical query triggers more than one cache-checking
+call internally -- `list()`'s `cached_info()` check, `list_recursive()`'s
+fallback path, and the real data `open()` -- not a bug, just several real
+avoided-backend-calls per query, each counted honestly rather than
+collapsed into one). The CLI `--stats` path was verified separately
+against the same real MinIO bucket: `cache_current_bytes` matched the
+real cached file size exactly there too, and `cache_hits`/`cache_misses`
+behaved correctly across separate cold/warm CLI invocations. `dev`
+(340/340, +7 new `NvmeObjectCacheTest` snapshot/seeding cases),
+`otel-server-dev` (a scratch preset combination, 347/347, including a
+real `FlightSqlServerTest` construction path that now exercises
+`register_cache_otel_instruments()`'s early-return branch for real since
+that suite's own config has caching disabled), and `gpu-dev` (449/449,
+zero regressions) all pass.
+
 ## Future architecture (interfaces only, not yet implemented)
 
 These are named as forward-declared types or documented models so later

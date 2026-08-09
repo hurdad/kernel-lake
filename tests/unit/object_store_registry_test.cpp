@@ -63,6 +63,24 @@ TEST_F(ObjectStoreRegistryTest, DispatchesFileSchemeToLocalBackend) {
 // deterministic to assert here without any network is that an outright
 // unrecognized scheme fails fast and clearly, before any backend
 // construction is even attempted.
+// Enabling storage.cache must never affect "file"-scheme reads -- they're
+// already local, so routing them through NvmeObjectCache would just
+// duplicate the same bytes onto the same disk for no benefit. Confirms the
+// wiring in ObjectStoreRegistry::open() checks scheme, not just
+// config.cache.enabled.
+TEST_F(ObjectStoreRegistryTest, EnabledCacheDoesNotInterceptFileScheme) {
+  StorageSection config;
+  config.cache.enabled = true;
+  config.cache.directory = (dir_ / "nvme_cache").string();
+  ObjectStoreRegistry registry(config);
+
+  const std::unique_ptr<RandomAccessObject> object = registry.open(Uri((dir_ / "a.parquet").string()));
+  EXPECT_EQ(object->size(), 1u);
+
+  // No cache directory should ever have been created for a local read.
+  EXPECT_FALSE(fs::exists(dir_ / "nvme_cache"));
+}
+
 TEST_F(ObjectStoreRegistryTest, UnsupportedSchemeThrowsImmediately) {
   const StorageSection config;
   ObjectStoreRegistry registry(config);

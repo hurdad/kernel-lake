@@ -112,6 +112,21 @@ class QueryEngine {
   // before this call).
   [[nodiscard]] QueryResult execute_cpu(const PhysicalPlanPtr& physical) const;
 
+  // nullopt when storage.cache.enabled is false. See NvmeObjectCache::
+  // snapshot() (kernellake/storage/nvme_object_cache.hpp) for field
+  // semantics -- cumulative hits/misses/evictions since this QueryEngine
+  // was constructed, live current_bytes/current_entries gauges.
+  [[nodiscard]] std::optional<NvmeCacheMetricsSnapshot> cache_metrics() const;
+
+  // Registers this engine's cache metrics as OTel instruments under
+  // "kernellake.storage.cache.*" -- a no-op unless built with
+  // KERNELLAKE_ENABLE_OTEL and storage.cache.enabled. Call at most once,
+  // from a caller whose own lifetime already outlives `this`
+  // (kernellake-server's constructor, right after constructing its
+  // QueryEngine member -- see docs/ARCHITECTURE.md's "NVMe cache tier"
+  // section for why the CLI doesn't call this).
+  void register_cache_otel_instruments() const;
+
  private:
   // `metadata_inspection_seconds_out`, when non-null, accumulates the time
   // spent discovering/inspecting each FROM source's Parquet metadata (the

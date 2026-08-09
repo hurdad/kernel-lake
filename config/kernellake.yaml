@@ -46,6 +46,17 @@ storage:
     connection_config:
       host: ""
       port: 0
+  # Local-NVMe read-through cache in front of the remote (s3/gcs/azure/hdfs)
+  # backends above -- see docs/ARCHITECTURE.md's "NVMe cache tier" section.
+  # Disabled by default; never applies to plain local paths. On a cache
+  # miss, the whole remote object is downloaded once to `directory` and
+  # served from there for every later read of that same object (repeat
+  # queries against overlapping data become a local disk read instead of a
+  # network fetch).
+  cache:
+    enabled: false
+    directory: ""            # e.g. "/mnt/nvme/kernellake-cache" -- required if enabled
+    max_size_bytes: 107374182400  # 100 GiB; 0 means unbounded (no eviction)
 
 logging:
   level: info

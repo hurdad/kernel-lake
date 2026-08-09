@@ -218,6 +218,11 @@ EngineConfig parse_config(const std::string& yaml_text) {
   hdfs_opts.replication = read_or(hdfs, "replication", hdfs_opts.replication);
   hdfs_opts.default_block_size = read_or(hdfs, "default_block_size", hdfs_opts.default_block_size);
 
+  const YAML::Node cache = child(storage, "cache");
+  config.storage.cache.enabled = read_or(cache, "enabled", config.storage.cache.enabled);
+  config.storage.cache.directory = read_or(cache, "directory", config.storage.cache.directory);
+  config.storage.cache.max_size_bytes = read_or(cache, "max_size_bytes", config.storage.cache.max_size_bytes);
+
   // iceberg.catalogs is a map keyed by catalog name (read_iceberg('name.ns.table')'s
   // leading component looks it up), unlike storage.{s3,gcs,azure,hdfs}'s
   // single-section-per-scheme shape above -- each entry gets its own
@@ -435,6 +440,10 @@ void validate_config(const EngineConfig& config) {
     throw ConfigurationError(
         fmt::format("storage.azure.dfs_storage_scheme '{}' is unsupported (expected 'https' or 'http')",
                     config.storage.azure.options.dfs_storage_scheme));
+  }
+
+  if (config.storage.cache.enabled && config.storage.cache.directory.empty()) {
+    throw ConfigurationError("storage.cache.directory must not be empty when storage.cache.enabled is true");
   }
 
   static constexpr std::array<const char*, 3> kIcebergCredentialsKinds = {"none", "bearer_token",

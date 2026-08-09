@@ -37,7 +37,7 @@ void print_optional(const char* label, const std::optional<double>& value) {
   }
 }
 
-void print_stats(const QueryResult& result) {
+void print_stats(const QueryResult& result, const std::optional<NvmeCacheMetricsSnapshot>& cache) {
   std::fprintf(stderr, "query stats:\n");
   print_optional("rows_returned", result.rows_returned);
   print_optional("files_considered", result.files_considered);
@@ -52,6 +52,19 @@ void print_stats(const QueryResult& result) {
   print_optional("host_to_device_seconds", result.host_to_device_seconds);
   print_optional("device_to_host_seconds", result.device_to_host_seconds);
   print_optional("elapsed_wall_seconds", result.elapsed_wall_seconds);
+  // Cumulative since this process/QueryEngine was constructed, not scoped
+  // to just this one query -- see NvmeObjectCache::snapshot()'s own
+  // comment. Since `kernellake query` is a one-query-per-process CLI
+  // invocation, that's the same thing here in practice.
+  if (cache) {
+    std::fprintf(stderr, "  cache_hits: %llu\n", static_cast<unsigned long long>(cache->hits));
+    std::fprintf(stderr, "  cache_misses: %llu\n", static_cast<unsigned long long>(cache->misses));
+    std::fprintf(stderr, "  cache_evictions: %llu\n", static_cast<unsigned long long>(cache->evictions));
+    std::fprintf(stderr, "  cache_current_bytes: %llu\n",
+                 static_cast<unsigned long long>(cache->current_bytes));
+    std::fprintf(stderr, "  cache_current_entries: %llu\n",
+                 static_cast<unsigned long long>(cache->current_entries));
+  }
 }
 
 }  // namespace
@@ -116,7 +129,7 @@ int run_query(const std::vector<std::string_view>& args, const EngineConfig& con
       span.finish(result, query_sql, effective_config.engine.backend);
       write_query_result(result, *format, output_path);
       if (show_stats) {
-        print_stats(result);
+        print_stats(result, engine.cache_metrics());
       }
     } catch (const KernelLakeError& e) {
       span.finish_error(e, query_sql, effective_config.engine.backend);

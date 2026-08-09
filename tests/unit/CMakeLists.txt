@@ -11,6 +11,7 @@ add_executable(kernellake_unit_tests
   storage_test.cpp
   gcs_object_store_test.cpp
   object_store_registry_test.cpp
+  nvme_object_cache_test.cpp
   parquet_metadata_test.cpp
   parquet_pruning_test.cpp
   table_resolution_test.cpp

@@ -130,12 +130,35 @@ struct HdfsSection {
   }()};
 };
 
+// Optional local-NVMe read-through cache sitting in front of the *remote*
+// (non-"file") ObjectStore backends above -- see docs/ARCHITECTURE.md's
+// "NVMe cache tier" section for the full design. Disabled by default:
+// existing deployments behave identically until an operator opts in with a
+// real local directory. Never applies to plain local paths, which are
+// already local -- caching them would just duplicate the same bytes on the
+// same disk.
+struct CacheSection {
+  bool enabled = false;
+  // Local filesystem directory the cache lives in; must be non-empty if
+  // enabled is true (validated in validate_config()). A plain directory of
+  // files, not an in-memory structure, so it survives kernellake-server
+  // restarts by construction.
+  std::string directory;
+  // Total cache size budget in bytes. Once a newly-populated entry would
+  // push the directory over this budget, least-recently-used entries (by
+  // file mtime, bumped on every cache hit) are evicted until it's back
+  // under budget. 0 means unbounded (no eviction) -- matches this project's
+  // existing "0 == no limit" convention (see EngineSection::query_memory_limit_bytes).
+  std::uint64_t max_size_bytes = 100ULL * 1024 * 1024 * 1024;  // 100 GiB
+};
+
 struct StorageSection {
   std::string local_root = "/";
   S3Section s3;
   GcsSection gcs;
   AzureSection azure;
   HdfsSection hdfs;
+  CacheSection cache;
 };
 
 // One named Iceberg REST catalog (see src/iceberg/rest_catalog_client.cpp).

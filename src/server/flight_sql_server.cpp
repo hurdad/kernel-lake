@@ -57,6 +57,16 @@ KernelLakeFlightSqlServer::KernelLakeFlightSqlServer(const EngineConfig& config)
   if (config_.engine.backend == "gpu") {
     gpu_coordinator_ = std::make_unique<GpuExecutionCoordinator>(config_);
   }
+  // Safe to call unconditionally, same reasoning as
+  // RmmEnvironment's own register_gpu_memory_otel_instruments() call: a
+  // no-op against whatever no-op MeterProvider observability::init()
+  // installed when KERNELLAKE_ENABLE_OTEL is off or observability.enabled
+  // is false, and engine_ (constructed just above) outlives this server
+  // for its whole process lifetime -- the one instance this instrument
+  // registration is meant for. Not called from the CLI: a single query's
+  // process lifetime is too short for OTel's periodic exporter to matter
+  // (see docs/ARCHITECTURE.md's "NVMe cache tier" section).
+  engine_.register_cache_otel_instruments();
 }
 
 KernelLakeFlightSqlServer::~KernelLakeFlightSqlServer() = default;
