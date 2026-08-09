@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <future>
 #include <optional>
 #include <utility>
 
@@ -157,10 +158,31 @@ LiteralStorage parse_partition_value(const std::string& value, const DataType& t
 ResolvedTable resolve_table(ObjectStore& store, const std::vector<std::string>& sources) {
   const std::vector<ObjectInfo> files = discover_parquet_files_recursive(store, sources);
 
+  // Concurrent, not a plain loop: each inspect_parquet_file() call is a
+  // full round-trip to the backend (footer read) for one independent
+  // file -- run sequentially, this scales linearly with file count and
+  // dominates query latency once there are enough files. Confirmed for
+  // real against SF100 (120 files) via `kernellake query --stats`:
+  // metadata_inspection_seconds measured ~5.5s -- 120 files x ~45ms/file
+  // round-trip, matching a fully serial pattern almost exactly (see
+  // docs/GPU_OPTIMIZATIONS.md). std::launch::async per file, same pattern
+  // already validated for the equivalent scan-time fix in
+  // ObjectStoreDatasource -- ObjectStore::open()/the underlying Arrow
+  // filesystem's read path are safe for concurrent use from multiple
+  // threads (the same guarantee that fix already relies on), and each
+  // future here targets a different, independent file. Order preserved
+  // (metadata[i] corresponds to files[i]) since callers below (partition
+  // segment extraction) assume that lockstep.
+  std::vector<std::future<FileMetadata>> metadata_futures;
+  metadata_futures.reserve(files.size());
+  for (const ObjectInfo& file : files) {
+    metadata_futures.push_back(
+        std::async(std::launch::async, [&store, uri = file.uri] { return inspect_parquet_file(store, uri); }));
+  }
   std::vector<FileMetadata> metadata;
   metadata.reserve(files.size());
-  for (const ObjectInfo& file : files) {
-    metadata.push_back(inspect_parquet_file(store, file.uri));
+  for (std::future<FileMetadata>& future : metadata_futures) {
+    metadata.push_back(future.get());
   }
   validate_schema_compatibility(metadata);
 
