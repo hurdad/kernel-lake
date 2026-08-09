@@ -4,7 +4,10 @@
 #include <arrow/io/interfaces.h>
 #include <fmt/format.h>
 
+#include <rmm/device_buffer.hpp>
+
 #include "kernellake/common/errors.hpp"
+#include "kernellake/execution_gpu/cuda_utils.hpp"
 
 namespace kernellake {
 
@@ -22,6 +25,23 @@ class ArrowBufferDatasourceBuffer final : public cudf::io::datasource::buffer {
 
  private:
   std::shared_ptr<arrow::Buffer> buffer_;
+};
+
+// Wraps device memory for device_read()'s buffer-returning overload -- the
+// same pattern as ArrowBufferDatasourceBuffer above, just device- instead
+// of host-resident. data() returns a device pointer here; callers of
+// device_read() (as opposed to host_read()) already know that.
+class DeviceBufferDatasourceBuffer final : public cudf::io::datasource::buffer {
+ public:
+  explicit DeviceBufferDatasourceBuffer(rmm::device_buffer buffer) : buffer_(std::move(buffer)) {}
+
+  [[nodiscard]] std::size_t size() const override { return buffer_.size(); }
+  [[nodiscard]] const std::uint8_t* data() const override {
+    return static_cast<const std::uint8_t*>(buffer_.data());
+  }
+
+ private:
+  rmm::device_buffer buffer_;
 };
 
 }  // namespace
@@ -84,6 +104,63 @@ std::future<std::unique_ptr<cudf::io::datasource::buffer>> ObjectStoreDatasource
 std::future<std::size_t> ObjectStoreDatasource::host_read_async(std::size_t offset, std::size_t size,
                                                                  std::uint8_t* dst) {
   return std::async(std::launch::async, [this, offset, size, dst] { return host_read(offset, size, dst); });
+}
+
+std::unique_ptr<cudf::io::datasource::buffer> ObjectStoreDatasource::device_read(std::size_t offset,
+                                                                                 std::size_t size,
+                                                                                 rmm::cuda_stream_view stream) {
+  rmm::device_buffer buffer(size, stream);
+  const std::size_t bytes_read =
+      device_read(offset, size, static_cast<std::uint8_t*>(buffer.data()), stream);
+  if (bytes_read != size) {
+    // A short read (offset+size ran past the real object size -- callers do
+    // ask for this deliberately sometimes, e.g. a generous end-of-file
+    // range guess) -- shrink to what was actually written so size()
+    // reports the truth, same as host_read()'s ArrowBufferDatasourceBuffer
+    // already does implicitly (its wrapped arrow::Buffer is sized to
+    // exactly what ReadAt() returned).
+    buffer.resize(bytes_read, stream);
+  }
+  return std::make_unique<DeviceBufferDatasourceBuffer>(std::move(buffer));
+}
+
+std::size_t ObjectStoreDatasource::device_read(std::size_t offset, std::size_t size, std::uint8_t* dst,
+                                               rmm::cuda_stream_view stream) {
+  return device_read_async(offset, size, dst, stream).get();
+}
+
+// This is the override that actually matters -- see class comment.
+// std::launch::async (not deferred): the whole point is that this starts
+// running -- including the real, blocking network host_read() below --
+// the moment this function is called, not when the returned future is
+// waited on. cudf's own read_column_chunks_async() (confirmed by reading
+// v26.06.00's actual source) calls this once per coalesced column-chunk
+// group in a plain loop, collecting every returned future before waiting
+// on any of them -- so by the time it starts waiting, every one of these
+// host_read() calls is already running concurrently on its own thread.
+std::future<std::size_t> ObjectStoreDatasource::device_read_async(std::size_t offset, std::size_t size,
+                                                                   std::uint8_t* dst,
+                                                                   rmm::cuda_stream_view stream) {
+  return std::async(std::launch::async, [this, offset, size, dst, stream] {
+    const std::unique_ptr<cudf::io::datasource::buffer> host_buffer = host_read(offset, size);
+    const std::size_t bytes_read = host_buffer->size();
+    // cudaMemcpyAsync, not a plain memcpy-then-return: this enqueues the
+    // host-to-device copy on `stream` -- the same stream every other decode
+    // operation for this scan uses (see ParquetScanOperator's
+    // decode_stream_) -- so any kernel cudf launches on that stream *after*
+    // this future's .get() returns is correctly ordered after this copy,
+    // with no separate host-side synchronize needed here. Safe regarding
+    // host_buffer's lifetime specifically because it is *pageable* memory
+    // (ReadAt() returns a plain heap buffer, not a pinned one) -- CUDA's
+    // own documented behavior is that a host-to-device cudaMemcpyAsync from
+    // pageable memory blocks the calling thread until the copy completes
+    // (the driver has to stage it through an internal pinned buffer first),
+    // so host_buffer is never touched-after-free even though this call is
+    // nominally "async".
+    check_cuda(cudaMemcpyAsync(dst, host_buffer->data(), bytes_read, cudaMemcpyHostToDevice, stream.value()),
+              "cudaMemcpyAsync in ObjectStoreDatasource::device_read_async");
+    return bytes_read;
+  });
 }
 
 }  // namespace kernellake

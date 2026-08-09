@@ -594,18 +594,72 @@ path's `next()` now time from before `has_next()`, not just around
 `parquet_decoding_seconds` now reads ~27.7s of a ~31.5s total, an honest
 number instead of a misleading one.
 
-**Not yet fixed: the actual serialization.** 156 sequential synchronous
-reads, one full round-trip at a time, appears to be inherent to
-`chunked_parquet_reader`'s multi-datasource constructor (the one used for
-any non-local scan) -- it never calls the async override at all, so
-nothing at the `ObjectStoreDatasource` adapter layer can influence *when*
-cudf chooses to issue a read. A real fix needs either a speculative
-prefetch/read-ahead layer built into `ObjectStoreDatasource` itself (start
-reading likely-next ranges before cudf asks for them), or a way to get
-cudf to process the N per-file datasources concurrently at its own level
-(unconfirmed whether one exists in this cudf version -- no local source to
-check, only prebuilt-wheel headers). Both are real, riskier engineering
-than what's been done here; not attempted yet. `host_read_async()` stays
-overridden regardless (a real correctness fix for any future/other caller
-that does use it), just documented as not the fix for this specific
-regression.
+**Fixed: the actual serialization, via `device_read`/`device_read_async`.**
+Cloned cudf `v26.06.00` (the exact pinned version -- `cmake/ThirdPartyRapids.cmake`)
+to read the real source rather than guess further. In
+`cpp/src/io/parquet/reader_impl_preprocess_utils.cu`'s
+`read_column_chunks_async()`:
+
+```cpp
+if (source->is_device_read_preferred(io_size)) {
+  auto fut = source->device_read_async(io_offset, io_size, dest, stream);
+  read_tasks.emplace_back(std::move(fut));           // taken as-is -- real concurrency possible
+} else {
+  read_tasks.emplace_back(std::async(std::launch::deferred, [source, ...] {
+    auto const read_buffer = source.get().host_read(io_offset, io_size);  // bypasses host_read_async() entirely
+    ...
+  }));
+}
+// ... later, sequentially:
+for (auto& task : read_tasks) { task.get(); }
+```
+
+For any datasource with `supports_device_read() == false` (the base-class
+default -- what `ObjectStoreDatasource` had), cudf never calls
+`host_read_async()` at all; it calls the plain synchronous `host_read()`
+directly, wraps *that specific call* in its own `std::launch::deferred`,
+then waits on every chunk's future in sequence. But for a
+*device*-preferred source, cudf takes whatever future `device_read_async()`
+returns completely unmodified -- if that future represents work already
+launched (not deferred), every column-chunk read for a pass gets kicked
+off concurrently in the loop above, and the later sequential `.get()`
+calls just wait for work already in flight.
+
+**Fix:** `ObjectStoreDatasource::supports_device_read()` now returns
+`true`, with real `device_read()`/`device_read_async()` overrides --
+`device_read_async()` launches a real `host_read()` on
+`std::launch::async` (same reasoning as the `host_read_async()` overrides
+above) and copies the result into device memory via a stream-ordered
+`cudaMemcpyAsync`. Safe regarding the host buffer's lifetime because
+`ReadAt()` returns *pageable* (not pinned) memory -- CUDA's own documented
+behavior is that a host-to-device `cudaMemcpyAsync` from pageable memory
+blocks the calling thread until the copy completes, so the buffer is never
+touched-after-free despite the call being nominally "async". Metadata/footer
+reads are a separate code path (not `read_column_chunks_async`), so
+they're unaffected either way -- this targets exactly the large
+column-chunk reads that dominated the earlier 533MB/156-call measurement.
+
+**Validated for real, twice:**
+- **Correctness**: real DuckDB-cross-validated runs at SF1 and SF10 against
+  the local docker-compose stack's MinIO (a genuinely non-local
+  `ObjectStoreDatasource` path, just low-latency) -- all 6 queries pass at
+  both scale factors, through the new concurrent-copy code path.
+- **Performance, real EC2 g6.2xlarge against real S3** (not local-machine-
+  to-S3, which an earlier attempt at this measurement used by mistake --
+  ~13 MiB/s from this dev box vs. ~60+ MiB/s from an actual same-region EC2
+  instance, not a representative comparison): pre/post binaries built from
+  the same source tree via `git worktree`, both Docker-built and run on the
+  same real `g6.2xlarge` instance, real bucket:
+
+| Query | wall before | wall after | speedup | decode before | decode after |
+|---|---|---|---|---|---|
+| Q1  | 8.22s | 3.51s | **2.34x** | 6.19s | 0.76s |
+| Q6  | 9.07s | 3.07s | **2.95x** | 7.26s | 0.70s |
+| Q14 | 13.43s | 2.80s | **4.80x** | 11.52s | 0.88s |
+| Q19 | 13.36s | 3.04s | **4.40x** | 11.40s | 0.89s |
+
+Row counts matched exactly between old and new for every query (on top of
+the DuckDB cross-validation above). Confirmed the instance's S3 traffic
+routes through the real VPC Gateway Endpoint (`aws_vpc_endpoint.s3`, prefix
+list `pl-63a5400a`), not the public internet path, so this isn't measuring
+an accidentally-suboptimal network route.

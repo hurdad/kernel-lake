@@ -2,6 +2,8 @@
 
 #include <cudf/io/datasource.hpp>
 
+#include <rmm/cuda_stream_view.hpp>
+
 #include <future>
 #include <memory>
 
@@ -18,20 +20,35 @@ namespace kernellake {
 // bounded, ranged reads against the backend -- this never pre-loads a whole
 // remote object into host memory.
 //
-// host_read_async() overrides matter, not just an optimization: cudf's own
-// base-class default (undeclared here before -- see git history) wraps the
-// synchronous host_read() in `std::async(std::launch::deferred, ...)`,
-// which does not run until the returned future is waited on -- so a caller
-// that kicks off N "async" reads (cudf's own Parquet reader does this once
-// per column chunk it needs) and then waits on each future in turn gets N
-// fully *serialized* reads, no overlap at all, each paying this backend's
-// own full round-trip latency back-to-back. Confirmed for real: invisible
-// against local files or MinIO-on-localhost (near-zero per-request
-// latency either way), but a real ~15-20x scan-throughput regression
-// against real S3 (0.07-0.17 GB/s vs. 1.5-2.7 GB/s locally, same queries,
-// same SF10 data) -- see docs/GPU_OPTIMIZATIONS.md. Overriding these to
-// launch on a real thread (std::launch::async) instead is what actually
-// lets multiple column-chunk reads overlap their network wait time.
+// host_read_async() is overridden below for its own sake (cudf's base-class
+// default wraps host_read() in std::launch::deferred, which is a real bug
+// for any caller that actually invokes it), but it turned out **not** to be
+// what fixes this class's own real-S3 scan-throughput regression (0.07-0.17
+// GB/s vs. 1.5-2.7 GB/s locally, same SF10 queries -- see
+// docs/GPU_OPTIMIZATIONS.md). Confirmed by reading cudf v26.06.00's actual
+// source (cpp/src/io/parquet/reader_impl_preprocess_utils.cu,
+// read_column_chunks_async()): for any datasource with
+// supports_device_read() == false (the base-class default), cudf never
+// calls host_read_async() at all -- it calls the plain synchronous
+// host_read() directly, wraps *that specific call* in its own
+// std::launch::deferred future, then waits on every chunk's future in
+// sequence, one at a time. host_read_async() being real or fake is simply
+// never consulted on that path.
+//
+// The actual fix: for a *device*-preferred source, cudf takes whatever
+// future device_read_async() returns completely unmodified -- if that
+// future represents work already launched (not deferred), every
+// column-chunk read for a pass gets kicked off concurrently in cudf's own
+// coalescing loop, and the later sequential .get() calls just wait for
+// work already in flight (wall time -> max() of the reads instead of
+// sum()). supports_device_read() = true routes calls through that branch;
+// device_read_async() launches a real host_read() concurrently
+// (std::launch::async, same reasoning as host_read_async() above) and
+// copies the result into device memory via a stream-ordered
+// cudaMemcpyAsync -- for the *pageable* host buffer ReadAt() returns, that
+// call blocks the launching thread until the copy is done (CUDA's own
+// documented behavior for non-pinned sources), so the host buffer's
+// lifetime is never at risk even though the copy is issued "async".
 class ObjectStoreDatasource final : public cudf::io::datasource {
  public:
   explicit ObjectStoreDatasource(std::unique_ptr<RandomAccessObject> object);
@@ -42,6 +59,17 @@ class ObjectStoreDatasource final : public cudf::io::datasource {
 
   std::future<std::unique_ptr<datasource::buffer>> host_read_async(std::size_t offset, std::size_t size) override;
   std::future<std::size_t> host_read_async(std::size_t offset, std::size_t size, std::uint8_t* dst) override;
+
+  // See class comment: this is the override that actually routes cudf's
+  // Parquet reader through a concurrency-capable path for this datasource.
+  [[nodiscard]] bool supports_device_read() const override { return true; }
+
+  [[nodiscard]] std::unique_ptr<datasource::buffer> device_read(std::size_t offset, std::size_t size,
+                                                                 rmm::cuda_stream_view stream) override;
+  std::size_t device_read(std::size_t offset, std::size_t size, std::uint8_t* dst,
+                          rmm::cuda_stream_view stream) override;
+  std::future<std::size_t> device_read_async(std::size_t offset, std::size_t size, std::uint8_t* dst,
+                                             rmm::cuda_stream_view stream) override;
 
  private:
   std::unique_ptr<RandomAccessObject> object_;
