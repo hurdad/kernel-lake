@@ -663,3 +663,58 @@ the DuckDB cross-validation above). Confirmed the instance's S3 traffic
 routes through the real VPC Gateway Endpoint (`aws_vpc_endpoint.s3`, prefix
 list `pl-63a5400a`), not the public internet path, so this isn't measuring
 an accidentally-suboptimal network route.
+
+## Fixed: sequential per-file metadata inspection (SF100 latency reversal)
+
+Found investigating a real, full reversal in the SF10-vs-SF100 AWS
+benchmark comparison (see `benchmarks/aws/docs/COST_ESTIMATES.md`):
+KernelLake beat PySpark on 8/12 query/mode combinations at SF10, but
+PySpark won all 10 measured comparisons 2-4x at SF100, even after the
+`device_read`/`device_read_async` fix above was already in place. Ran
+`kernellake query --stats`/`benchmark tpch` standalone against the same
+real SF100 Q1 data (`s3://.../tpch-data/sf100/lineitem-*.parquet`, 120
+files) to get a full cost breakdown rather than guess:
+
+```
+metadata_inspection_seconds: 5.51s   <- previously invisible in benchmark JSON output
+parquet_decoding_seconds:    7.9s
+gpu_execution_seconds:       17.5s
+wall_seconds:                28.0s
+```
+
+`resolve_table()` in `src/io/table_resolution.cpp` was a plain sequential
+loop over every discovered file, calling `inspect_parquet_file()` (a full
+footer-read round-trip to the backend) one at a time:
+
+```cpp
+for (const ObjectInfo& file : files) {
+  metadata.push_back(inspect_parquet_file(store, file.uri));
+}
+```
+
+Same architectural bug class as the cudf `read_column_chunks_async()`
+serialization fixed above, but in KernelLake's own code, not a dependency
+-- 120 files x ~45ms/file round-trip serialized is almost exactly the
+measured 5.5s. SF10 has only 12 files (~0.5s), which is why this never
+showed up as a problem until SF100's 120-file lineitem table.
+
+**Fix:** `std::async(std::launch::async, ...)` per file, same pattern
+already validated for the `device_read_async` fix -- `ObjectStore::open()`/
+the underlying Arrow filesystem's read path are safe for concurrent use
+from multiple threads (the same guarantee that fix already relies on),
+and each future targets a different, independent file. Futures are
+collected in original order (not as they complete) since callers below
+(Hive partition-segment extraction, schema validation) assume
+`metadata[i]` corresponds to `files[i]`.
+
+**Validated for real, on the same EC2 kernellake host against the same
+SF100 data:**
+
+| | before | after | speedup |
+|---|---|---|---|
+| `metadata_inspection_seconds` | 5.51s | 0.38s | **14.5x** |
+| `elapsed_wall_seconds` (Q1) | 28.0s | 22.5s | 1.24x |
+
+Deployed to the live benchmark server and the SF100-vs-PySpark comparison
+rerun with both fixes in place; see `benchmarks/aws/docs/COST_ESTIMATES.md`
+for the updated head-to-head numbers.
