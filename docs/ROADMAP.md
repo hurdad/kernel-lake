@@ -2600,6 +2600,48 @@ and covered by passing tests -- not merely designed or stubbed.
   engines' access to the same files) -- not done this session. Like the
   GDS finding above, this increasingly looks like it may not have a fix
   within kernellake's own code either way, but that isn't confirmed yet.
+- **NVMe cache tier between S3 and the GPU, on the kvikio/cuFile path
+  already linked in** (kvikio is already fetched/pinned, see "Done" above;
+  `ObjectStoreDatasource`'s `device_read`/`device_read_async` -- the real,
+  validated fix in this session's `docs/GPU_OPTIMIZATIONS.md` -- is the
+  natural place to add a cache check in front of the S3 round-trip).
+  Attacks the actual bottleneck this file's own cuFile/GDS investigation
+  above already found real: SF100/SF1000 scans are I/O-bound (decode is
+  cheap by comparison, per the `parquet_decoding_seconds` shares quoted
+  above), and repeated queries against overlapping data (the ordinary BI/
+  analytics access pattern -- the same tables, shifting filters) pay the
+  full S3 fetch every time today, cold or warm, since "warm" here only
+  ever meant *this process's* already-open state, never a persisted local
+  copy. A local NVMe cache turns a repeat query's scan into a local read
+  instead of a network fetch -- and unlike S3 objects (inherently remote,
+  no direct DMA path), a locally-cached copy *would* get a real
+  GPUDirect-Storage-style benefit from cuFile even in compat mode (the
+  compat-mode finding above is specifically about *this dev box's*
+  consumer GPU being outside NVIDIA's official Tesla/Quadro GDS support
+  matrix, not about cuFile-on-local-NVMe being slow in general -- compat
+  mode still means disk -> host page cache -> GPU, meaningfully faster
+  than disk-doesn't-exist-yet -> network -> GPU for anything already
+  cached).
+
+  Architecturally distinctive, not just faster: this is a different shape
+  of answer to "how does KernelLake compete with a distributed engine"
+  than more nodes -- a distributed engine scales by adding machines that
+  each still re-stream cold objects from S3 on every query; a single GPU
+  node with a local NVMe cache holding the actual hot working set instead
+  answers repeat queries without touching the network at all, which fits
+  this project's existing single-node architecture (one `RmmEnvironment`,
+  one `ObjectStoreDatasource` per server process) rather than requiring
+  any distributed cache-coherence protocol. Real design work needed before
+  starting: a cache key (S3 bucket+key+byte-range is enough since TPC-H-
+  style Parquet files are immutable once written -- no invalidation logic
+  needed unless/until an overwrite-in-place workload is ever supported),
+  an eviction policy sized against the NVMe device's real capacity (not
+  the GPU's VRAM -- this is a host-disk cache feeding cuFile, not a device-
+  memory structure), and where the cache lives relative to
+  `kernellake-server`'s process lifetime (survives restarts, i.e. actually
+  on disk, not an in-memory structure that a "cold" server-restart rep in
+  `benchmarks/aws/runner/aws_benchmark_runner.py` would just wipe every
+  time and make indistinguishable from no cache at all).
 - TPC-H `execution-only` benchmark mode (needs an operator-tree entry point
   that skips `ParquetScanOperator`); TPC-H beyond SF10 (SF0.01/0.1/1/10 all
   verified, see "Done" above)
