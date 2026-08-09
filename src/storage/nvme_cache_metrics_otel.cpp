@@ -136,18 +136,18 @@ void register_nvme_cache_otel_instruments(const ObjectStoreRegistry& registry) {
   g_instruments.misses->AddCallback(&observe_misses, registry_ptr);
 
   g_instruments.evictions = meter->CreateInt64ObservableCounter(
-      "kernellake.storage.cache.evictions", "Cumulative NVMe cache entries evicted to stay under max_size_bytes",
-      "{eviction}");
+      "kernellake.storage.cache.evictions",
+      "Cumulative NVMe cache entries evicted to stay under max_size_bytes", "{eviction}");
   g_instruments.evictions->AddCallback(&observe_evictions, registry_ptr);
 
-  g_instruments.current_bytes = meter->CreateInt64ObservableGauge(
-      "kernellake.storage.cache.current_bytes", "Current total bytes cached on the local NVMe cache directory",
-      "By");
+  g_instruments.current_bytes =
+      meter->CreateInt64ObservableGauge("kernellake.storage.cache.current_bytes",
+                                        "Current total bytes cached on the local NVMe cache directory", "By");
   g_instruments.current_bytes->AddCallback(&observe_current_bytes, registry_ptr);
 
   g_instruments.current_entries = meter->CreateInt64ObservableGauge(
-      "kernellake.storage.cache.current_entries", "Current number of objects cached on the local NVMe cache directory",
-      "{entry}");
+      "kernellake.storage.cache.current_entries",
+      "Current number of objects cached on the local NVMe cache directory", "{entry}");
   g_instruments.current_entries->AddCallback(&observe_current_entries, registry_ptr);
 }
 

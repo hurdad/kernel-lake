@@ -442,12 +442,16 @@ ClientSpan start_client_span(std::string_view operation_name, const ClientSpan& 
 }
 
 void ClientSpan::set_attribute(std::string_view key, double value) {
-  if (!impl_) return;
+  if (!impl_) {
+    return;
+  }
   impl_->span->SetAttribute(to_otel(key), value);
 }
 
 void ClientSpan::set_attribute(std::string_view key, std::int64_t value) {
-  if (!impl_) return;
+  if (!impl_) {
+    return;
+  }
   impl_->span->SetAttribute(to_otel(key), value);
 }
 

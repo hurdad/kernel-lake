@@ -169,7 +169,8 @@ QueryResult QueryEngine::execute(const PhysicalPlanPtr& physical, RmmEnvironment
     // separately records the operator's own resource_seconds() -- real
     // cumulative time inside every reader_->read_chunk() call, regardless
     // of which thread/path made it -- under this derived key instead.
-    result.parquet_decoding_seconds = metrics.total_seconds(fmt::format("{}.resource_seconds", scan->node_name()));
+    result.parquet_decoding_seconds =
+        metrics.total_seconds(fmt::format("{}.resource_seconds", scan->node_name()));
     // compressed_bytes_read/rows_scanned and host_to_device_seconds are not
     // tracked yet: the latter has no natural boundary in this architecture
     // today (cudf's chunked Parquet reader decodes host file bytes directly

@@ -287,8 +287,8 @@ TEST_F(PhysicalPlannerTest, SurvivingPlainProjectionRemapsAgainstTheNarrowedScan
 // aggregate) crashed with `vector::_M_range_check` whenever combined with
 // ORDER BY and/or LIMIT.
 TEST_F(PhysicalPlannerTest, SurvivingPlainProjectionRemapsThroughAnInterposedSort) {
-  const PhysicalPlanPtr plan = plan_for(
-      "SELECT region, amount FROM read_parquet('" + path_ + "') WHERE amount > 0 ORDER BY amount");
+  const PhysicalPlanPtr plan =
+      plan_for("SELECT region, amount FROM read_parquet('" + path_ + "') WHERE amount > 0 ORDER BY amount");
   const auto* result = dynamic_cast<const ArrowResultNode*>(plan.get());
   ASSERT_NE(result, nullptr);
   const auto* projection = dynamic_cast<const ProjectionNode*>(result->child().get());

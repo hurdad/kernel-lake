@@ -838,7 +838,7 @@ log` is the authoritative chronology if that ordering ever matters.
   `CompiledExpr`/`CompiledCase`/`CompiledDecimalCast` machinery
   `HashAggregateOperator` already had (duplicated per-operator, matching
   this codebase's existing convention -- see `docs/ARCHITECTURE.md`'s
-  "CASE expression implementation notes"). `CASE` inside `WHERE` on the GPU
+  "LIKE/IN/CASE/CAST implementation notes"). `CASE` inside `WHERE` on the GPU
   backend remains unsupported (`FilterOperator`'s own, separate gap;
   confirmed still failing after this fix) -- out of scope since neither
   Q12 nor Q14's `WHERE` clause needs it.
@@ -1151,8 +1151,8 @@ log` is the authoritative chronology if that ordering ever matters.
   bare `{data}` -> `*.parquet` glob**, which was safe when
   `generate_tpch.py` only wrote `lineitem` files but broke once
   `orders`/`part`/`customer` joined `lineitem` in the same output
-  directory (starting at commit `2556abee`, from a concurrent session on
-  another machine, then compounded by this session's own `customer`
+  directory (`part` added in commit `91cd603` for Q19, `orders` in
+  `c821700` for Q12, then compounded by this session's own `customer`
   addition) -- the glob matched every table at once, so
   `kernellake explain` failed with a schema mismatch
   (`l_orderkey INT64 NOT NULL vs o_orderkey INT64 NOT NULL`) for every
@@ -1683,11 +1683,14 @@ log` is the authoritative chronology if that ordering ever matters.
   not a hidden footgun the user never asked for. Verified for real:
   `dev` 188/188 (up from 184), `server-dev` 40/40 `Binder.*` tests
   passing (full-suite count unaffected by this change), `gpu-dev`
-  191/191 `kernellake_unit_tests` (up from 187) and 78/78
-  `kernellake_gpu_tests` (up from 76, both counts from this bug's own
-  round -- the earlier `ScalarAggregateOperator` fix's container had
-  already been torn down), via the same incremental `ninja`/`docker exec`
-  rebuild against a real RTX 5060 Ti.
+  191/191 `kernellake_unit_tests` (up from 187) and 81/81
+  `kernellake_gpu_tests` (this bug's own two new tests on top of the
+  earlier `ScalarAggregateOperator` fix's real 79 -- a later audit pass
+  caught that this entry originally miscomputed the "up from" baseline as
+  the stale pre-`ScalarAggregateOperator`-fix figure, 76, giving a wrong
+  78/78 that didn't reconcile against the very next entry's own 81/81),
+  via the same incremental `ninja`/`docker exec` rebuild against a real
+  RTX 5060 Ti.
 - **Continued the audit into the SQL parser (`parser.cpp`) -- found two
   more real, high-severity process-crash bugs, both confirmed with
   standalone repros before being fixed.** (1)
@@ -2685,11 +2688,51 @@ log` is the authoritative chronology if that ordering ever matters.
   its `list_recursive()` fallback, and the real `open()` -- each a real,
   separately-counted avoided backend call, not a bug). The CLI `--stats`
   path was verified separately against the same real bucket, matching the
-  real cached file size exactly there too. `dev` (340/340, +7 new
-  `NvmeObjectCacheTest` cases), a scratch `otel-server-dev`-combination
-  build (347/347, including a real `FlightSqlServerTest` construction path
-  now exercising the new registration call's early-return branch for
-  real), and `gpu-dev` (449/449, zero regressions) all pass.
+  real cached file size exactly there too. `dev` (340/340, up from the
+  cache tier entry's own 334/334 -- +6 new `NvmeObjectCacheTest` snapshot/
+  seeding cases), a scratch `otel-server-dev`-combination build (347/347,
+  including a real `FlightSqlServerTest` construction path now exercising
+  the new registration call's early-return branch for real), and `gpu-dev`
+  (449/449, zero regressions) all pass.
+- **NVMe cache wired into the local docker-compose stack, plus a Grafana
+  dashboard** (follow-up to the two entries just above -- this closes the
+  "not attempted here either" gap they both left open in their own first
+  drafts). `benchmarks/local/config/kernellake-server.yaml` now sets
+  `storage.cache.enabled: true` by default, backed by a new named
+  `nvme-cache-data` Docker volume (`docker-compose.yml`) mounted at
+  `/cache` -- a named volume specifically, not container-ephemeral
+  storage, so the cache actually survives `docker compose restart`/
+  container recreation as designed, not just process restarts. A new
+  `grafana/dashboards/kernellake-storage-cache.json` (current bytes,
+  current entries, hit/miss rate, cumulative hits/misses/evictions)
+  joins the existing query-metrics and GPU-memory dashboards, auto-
+  provisioned by Grafana's existing file-based provisioning with no other
+  config change needed. `docs/OBSERVABILITY.md` gained a new §2.2.2
+  documenting the verified OTel-name -> Prometheus-name mapping,
+  mirroring §2.2.1's GPU memory table.
+
+  Verified for real through this *exact* stack (not a scratch build): a
+  real `runtime-gpu` image built and run via `docker compose up -d
+  --build`, real data uploaded to the stack's own MinIO, real Flight SQL
+  queries via `adbc_driver_flightsql`, Grafana's own datasource-proxy API
+  queried directly and confirmed to return real matching data for the new
+  panels' own Prometheus expressions, and a real dashboard-provisioning
+  check (`GET /api/search?query=NVMe` showed the dashboard live in the
+  "KernelLake" folder). **The decisive test**: after the cache was
+  populated, MinIO was stopped (`docker compose stop minio`) and
+  `kernellake-server` was *restarted* (`docker compose restart`, a real
+  container recreation, not just the same process continuing) -- `docker
+  compose exec kernellake-server ls -la /cache` confirmed the cached file
+  (`257962` bytes, matching the source file exactly) survived the
+  container recreation on the named volume, and the identical query,
+  re-run against the restarted server with MinIO still down, eventually
+  returned the correct result (`6000` rows) -- slower than the earlier
+  same-process test in the cache tier's own entry above (AWS SDK
+  connection-retry/backoff to a stopped-but-DNS-resolvable container took
+  longer than a host-level immediate connection refusal), but correct.
+  Stack torn down afterward with `docker compose down` (volumes kept, the
+  documented default); no source code changed for this entry, so no
+  build/test-suite run was needed or done.
 
 ## Not yet started
 
@@ -2825,17 +2868,14 @@ log` is the authoritative chronology if that ordering ever matters.
   needed, fine at this cache's target scale, a handful to low hundreds of
   files) with an in-memory size-tracked structure if a much larger working
   set ever makes that walk itself a bottleneck.
-- NVMe cache metrics (see "Done" above): wiring `storage.cache` into
-  `benchmarks/local/config/kernellake-server.yaml` (the local
-  docker-compose stack's own server config, which already runs MinIO +
-  otel-collector + Prometheus + Grafana but doesn't yet enable caching by
-  default) and a Grafana dashboard panel for `kernellake.storage.cache.*`
-  -- same deferred-dashboard-wiring gap already disclosed for the GPU
-  memory metrics entry above ("Benchmark/OTLP-integration-test/collector-
-  config wiring deferred"), not attempted here either.
 - TPC-H `execution-only` benchmark mode (needs an operator-tree entry point
-  that skips `ParquetScanOperator`); TPC-H beyond SF10 (SF0.01/0.1/1/10 all
-  verified, see "Done" above)
+  that skips `ParquetScanOperator`). (TPC-H at SF100/SF1000 is now done for
+  Q1/Q6, see "Done" above -- this stale "beyond SF10" framing was corrected
+  by a later audit pass; what's still genuinely open at that scale is
+  `kernellake-cpu` at SF1000 -- deliberately skipped, unbounded scan
+  materialization risk, see the SF1000 entry's own `--backends` note -- and
+  Q12/Q19 at SF1000, blocked on the same GPU `HashJoinOperator`/CPU-OOM
+  issues already tracked below, not re-attempted there)
 - Re-running the three-way benchmark's full cold/warm x SF0.01-SF10 sweep
   (see the earlier "Confirmed on real GPU hardware" entry above) with Q19
   and Q12 included, now that both are wired in -- the only way to test

@@ -426,7 +426,8 @@ ExpressionPtr shift_columns(const ExpressionPtr& expr, std::int64_t delta) {
     }
     ExpressionPtr else_branch =
         case_expr->else_branch() ? shift_columns(case_expr->else_branch(), delta) : nullptr;
-    return std::make_shared<CaseExpression>(std::move(when_then), std::move(else_branch), case_expr->result_type());
+    return std::make_shared<CaseExpression>(std::move(when_then), std::move(else_branch),
+                                            case_expr->result_type());
   }
   return expr;  // LiteralExpression: no column indices to shift.
 }
@@ -436,8 +437,8 @@ ExpressionPtr conjunction(std::vector<ExpressionPtr> conjuncts) {
   ExpressionPtr result = std::move(conjuncts.front());
   for (std::size_t i = 1; i < conjuncts.size(); ++i) {
     const bool nullable = result->result_type().nullable || conjuncts[i]->result_type().nullable;
-    result = std::make_shared<BinaryExpression>(BinaryOperator::And, std::move(result), std::move(conjuncts[i]),
-                                                boolean_type(nullable));
+    result = std::make_shared<BinaryExpression>(BinaryOperator::And, std::move(result),
+                                                std::move(conjuncts[i]), boolean_type(nullable));
   }
   return result;
 }
@@ -490,11 +491,13 @@ LogicalPlanPtr push_predicate_through_join(const LogicalJoin& join, const Expres
 
   LogicalPlanPtr new_left = join.left();
   if (!left_conjuncts.empty()) {
-    new_left = rewrite_plan(std::make_shared<LogicalFilter>(new_left, conjunction(std::move(left_conjuncts))));
+    new_left =
+        rewrite_plan(std::make_shared<LogicalFilter>(new_left, conjunction(std::move(left_conjuncts))));
   }
   LogicalPlanPtr new_right = join.right();
   if (!right_conjuncts.empty()) {
-    new_right = rewrite_plan(std::make_shared<LogicalFilter>(new_right, conjunction(std::move(right_conjuncts))));
+    new_right =
+        rewrite_plan(std::make_shared<LogicalFilter>(new_right, conjunction(std::move(right_conjuncts))));
   }
   LogicalPlanPtr new_join = std::make_shared<LogicalJoin>(std::move(new_left), std::move(new_right),
                                                           join.left_key_index(), join.right_key_index());

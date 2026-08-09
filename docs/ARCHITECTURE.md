@@ -2024,8 +2024,9 @@ collapsed into one). The CLI `--stats` path was verified separately
 against the same real MinIO bucket: `cache_current_bytes` matched the
 real cached file size exactly there too, and `cache_hits`/`cache_misses`
 behaved correctly across separate cold/warm CLI invocations. `dev`
-(340/340, +7 new `NvmeObjectCacheTest` snapshot/seeding cases),
-`otel-server-dev` (a scratch preset combination, 347/347, including a
+(340/340, up from the cache tier's own 334/334 -- +6 new
+`NvmeObjectCacheTest` snapshot/seeding cases), `otel-server-dev` (a
+scratch preset combination, 347/347, including a
 real `FlightSqlServerTest` construction path that now exercises
 `register_cache_otel_instruments()`'s early-return branch for real since
 that suite's own config has caching disabled), and `gpu-dev` (449/449,

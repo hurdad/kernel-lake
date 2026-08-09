@@ -2,11 +2,12 @@
 
 **GPU-native analytics for the open lakehouse.**
 
-KernelLake is an open-source GPU-native query engine for Apache Iceberg and
-Parquet data lakes. It executes analytical SQL directly against Parquet
-datasets, using Apache Arrow-compatible columnar data as its in-memory
-representation and NVIDIA GPUs (via RAPIDS libcudf) for accelerated
-execution. KernelLake is a compute and query layer, not a storage database.
+KernelLake is an open-source GPU-native query engine for Apache Iceberg,
+Delta Lake, and plain Parquet data lakes. It executes analytical SQL
+directly against Parquet datasets, using Apache Arrow-compatible columnar
+data as its in-memory representation and NVIDIA GPUs (via RAPIDS libcudf)
+for accelerated execution. KernelLake is a compute and query layer, not a
+storage database.
 
 ## Status
 
@@ -61,15 +62,19 @@ $ kernellake explain --sql "SELECT order_id FROM read_parquet('/tmp/kernellake-d
     WHERE order_id < 50"
 
 ArrowResult
-    └── Projection
-        items: [order_id AS order_id]
-        └── Filter
-            predicate: (order_id < 50)
-            └── ParquetScan
-                files: 1/2
-                row_groups: 1/3
-                columns: [order_id]
+    └── Filter
+        predicate: (order_id < 50)
+        └── ParquetScan
+            files: 1/2
+            row_groups: 1/3
+            columns: [order_id]
 ```
+
+(No `Projection` node: the optimizer's redundant-projection-removal rule
+elides it here, since the scan is already narrowed to exactly the
+`SELECT` list's own column -- see docs/ARCHITECTURE.md's optimizer
+section. A `Projection` node reappears for a query that actually computes
+or reorders columns, e.g. a `CASE` expression or `SELECT b, a`.)
 
 `files: 1/2` and `row_groups: 1/3` mean KernelLake proved the second file
 and two of the first file's three row groups couldn't contain any
@@ -86,14 +91,25 @@ backend instead, in *either* build.
 
 ## Requirements
 
-Tested on Ubuntu 24.04, x86_64.
+Tested on Ubuntu 24.04 and 26.04, x86_64 -- CI builds every preset inside a
+plain `ubuntu:26.04` container (see `.github/workflows/ci.yml`), and this
+project's own non-container dev sandbox has itself moved to 26.04 too (see
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)'s "Ubuntu 26.04 baseline"
+section for why -- Arrow Flight SQL and otel-cpp both need it).
 
 ```bash
-# Core toolchain
+# Core toolchain -- libxml2-dev/uuid-dev are for Arrow's bundled GCS/Azure
+# filesystem support, libavro-dev/libcurl4-openssl-dev for Iceberg manifest
+# reading and REST/OAuth2 calls, libgrpc++-dev/protobuf-compiler-grpc for
+# the Delta Lake gRPC client -- all unconditional even for the base `dev`
+# preset, not specific to any one optional feature (see CMakeLists.txt's
+# own comments on each `find_package`/`pkg_check_modules` call).
 sudo apt-get update
 sudo apt-get install -y build-essential cmake ninja-build git pkg-config \
   python3 python3-pip \
-  libgtest-dev libbenchmark-dev libspdlog-dev nlohmann-json3-dev libyaml-cpp-dev
+  libgtest-dev libbenchmark-dev libspdlog-dev nlohmann-json3-dev libyaml-cpp-dev \
+  libxml2-dev uuid-dev libavro-dev libcurl4-openssl-dev \
+  libgrpc++-dev protobuf-compiler-grpc
 
 # Apache Arrow / Parquet C++ (official Apache Arrow apt repo)
 sudo apt-get install -y -V ca-certificates lsb-release wget
@@ -109,22 +125,58 @@ libcudf/RMM. Only the CUDA Toolkit needs manual installation -- libcudf/RMM
 are vendored automatically via CMake `FetchContent` from pinned RAPIDS PyPI
 wheels the first time you configure the `gpu-dev` preset (no conda/mamba;
 see "GPU dependency vendoring" in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)).
-CMake >= 3.30.4 is required for that preset specifically (newer than Ubuntu
-24.04's apt package).
+CMake >= 3.30.4 is required for that preset specifically -- only a real
+constraint on Ubuntu 24.04, whose own apt `cmake` package is older than
+that (26.04's, 4.2.3 at last check, already isn't).
+
+Two more presets need their own extra packages, on top of the core
+toolchain above: `server-dev` (the Arrow Flight SQL server) additionally
+needs `libarrow-flight-dev`/`libarrow-flight-sql-dev` (same Apache Arrow
+apt repo); `otel-dev` (OpenTelemetry export) needs `opentelemetry-cpp-dev`,
+which -- like `libarrow-flight-sql-dev` -- has no Ubuntu 24.04 apt package
+at all (26.04 only). The two can be combined with each other by passing
+the extra flag directly rather than switching presets --
+`cmake --preset otel-dev -DKERNELLAKE_BUILD_SERVER=ON` -- since there's no
+dedicated combined preset yet (see `otel-dev`'s own `description` in
+`CMakePresets.json`).
 
 ## Build and test
 
+Five CMake presets (`CMakePresets.json`), each independently
+build+test-able; `dev` is the one every other preset builds on
+(`server-dev`/`otel-dev` both `inherits: dev`, `gpu-dev` shares its base
+config):
+
 ```bash
-# CPU-only: SQL parsing through physical planning, pruning, generate-data
+# dev: CPU-only debug build -- SQL parsing through physical planning,
+# pruning, generate-data. No CUDA needed; everything else below needs this
+# one's own Requirements at minimum.
 cmake --preset dev
 cmake --build --preset dev
 ctest --preset dev
 
-# GPU-enabled: adds real query execution (needs CUDA Toolkit 12+, an
-# NVIDIA GPU, and CMake >= 3.30.4 -- see Requirements above)
+# release: same CPU-only scope as dev, RelWithDebInfo instead of Debug.
+cmake --preset release
+cmake --build --preset release
+ctest --preset release
+
+# gpu-dev: adds real GPU query execution (needs CUDA Toolkit 12+, an
+# NVIDIA GPU, and CMake >= 3.30.4 -- see Requirements above).
 cmake --preset gpu-dev
 cmake --build --preset gpu-dev
 ctest --preset gpu-dev
+
+# server-dev: CPU-only + kernellake-server (Arrow Flight SQL). Needs
+# libarrow-flight-dev/libarrow-flight-sql-dev -- see Requirements above.
+cmake --preset server-dev
+cmake --build --preset server-dev
+ctest --preset server-dev
+
+# otel-dev: CPU-only + OpenTelemetry OTLP/gRPC export. Needs
+# opentelemetry-cpp-dev -- see Requirements above.
+cmake --preset otel-dev
+cmake --build --preset otel-dev
+ctest --preset otel-dev
 ```
 
 ## Usage
@@ -220,8 +272,10 @@ intermediate only and are never published. Every stage builds on plain
 `nvidia/cuda` images -- see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)'s
 "Ubuntu 26.04 baseline" section for why (Arrow Flight SQL and otel-cpp both
 need it). This is independent of the Requirements/Build sections above,
-which describe this project's own non-container Ubuntu 24.04 development
-environment -- neither one needs to match the other.
+which describe this project's own non-container development environment
+-- neither one needs to match the other exactly (this project's own
+sandbox happens to be Ubuntu 26.04 too, matching the container, but that's
+not a requirement of the non-container path).
 
 ```bash
 docker build --target runtime-cpu -f docker/Dockerfile -t kernellake/kernellake:runtime-cpu .
@@ -246,10 +300,13 @@ no arm64 hardware or runner was used to verify this). `kernel-lake-gpu` is
 arm64 GPU hardware (e.g. NVIDIA Grace/Jetson) to verify, which hasn't
 happened yet; see `docs/ROADMAP.md`. `docker run --gpus all` against a real
 GPU (RTX 5060 Ti) has been verified for real against this Ubuntu 26.04
-baseline: all 261 tests pass in the `dev-gpu` image, and a real query
-against real generated data through the `runtime-gpu` image alone produces
-correct GPU-executed results -- see `docs/ARCHITECTURE.md`. `runtime-cpu`
-has been verified for real too: a real `docker build --target runtime-cpu`,
+baseline: the full `gpu-dev` test suite passes in the `dev-gpu` image (see
+`docs/ROADMAP.md` for the exact, growing count as of each verified
+milestone -- citing one fixed number here would just go stale), and a real
+query against real generated data through the `runtime-gpu` image alone
+produces correct GPU-executed results -- see `docs/ARCHITECTURE.md`.
+`runtime-cpu` has been verified for real too: a real
+`docker build --target runtime-cpu`,
 `generate-data`, and `query --backend cpu` against real generated data all
 produce correct results through the built image. CI's own `docker-publish`
 job (building against the previous, pre-cpu/gpu-split Dockerfile) had
@@ -266,8 +323,10 @@ from Python with `adbc-driver-flightsql`, or deploy it to Kubernetes via
 `charts/kernellake/` (see that chart's own `README.md`).
 
 Built behind `KERNELLAKE_ENABLE_OTEL` (the `otel-dev` preset), KernelLake
-also exports OpenTelemetry traces (one span per query), one query-duration
-histogram metric, and every existing log line -- see
+also exports OpenTelemetry traces (one span per query), metrics (a
+query-duration histogram; GPU-build-only process/device-level memory
+gauges/counters; NVMe cache hit/miss/eviction/size gauges and counters,
+`kernellake-server`-only), and every existing log line -- see
 [docs/OBSERVABILITY.md](docs/OBSERVABILITY.md) for the full signal list,
 config schema, and how to point it at a real collector.
 
@@ -276,10 +335,16 @@ config schema, and how to point it at a real collector.
 ```
 include/kernellake/<module>/   public headers, one directory per module
 src/<module>/                  implementation, mirrors include/
-tests/unit/                    GoogleTest unit tests (CPU-only, both presets)
+tests/unit/                    GoogleTest unit tests (CPU-only, every preset)
 tests/gpu/                     GoogleTest GPU tests (gpu-dev preset only)
 tools/                         Python tooling (DuckDB cross-validation, TPC-H generation)
-benchmarks/tpch/queries/       Version-controlled TPC-H-derived SQL (q01.sql, q06.sql)
+benchmarks/tpch/queries/       Version-controlled TPC-H-derived SQL (q01/q03/q06/q12/q14/q19.sql)
+benchmarks/local/              Single-machine docker-compose stack (kernellake-server + OTel
+                                Collector + Prometheus + Grafana + Jaeger + MinIO), no cloud needed
+benchmarks/aws/                Real Terraform-provisioned AWS benchmark harness (KernelLake vs.
+                                PySpark/DuckDB over real S3 data) -- see its own README.md
+docker/                        Dockerfile (runtime-cpu/runtime-gpu images) and related tooling
+charts/kernellake/             Helm chart for deploying kernellake-server to Kubernetes
 docs/                          ARCHITECTURE.md, ROADMAP.md, TPCH.md, OBSERVABILITY.md, GPU_OPTIMIZATIONS.md
 config/kernellake.yaml         default engine configuration
 ```

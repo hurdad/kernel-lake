@@ -57,7 +57,8 @@ class ObjectStoreDatasource final : public cudf::io::datasource {
   [[nodiscard]] std::unique_ptr<datasource::buffer> host_read(std::size_t offset, std::size_t size) override;
   std::size_t host_read(std::size_t offset, std::size_t size, std::uint8_t* dst) override;
 
-  std::future<std::unique_ptr<datasource::buffer>> host_read_async(std::size_t offset, std::size_t size) override;
+  std::future<std::unique_ptr<datasource::buffer>> host_read_async(std::size_t offset,
+                                                                   std::size_t size) override;
   std::future<std::size_t> host_read_async(std::size_t offset, std::size_t size, std::uint8_t* dst) override;
 
   // See class comment: this is the override that actually routes cudf's
@@ -65,7 +66,7 @@ class ObjectStoreDatasource final : public cudf::io::datasource {
   [[nodiscard]] bool supports_device_read() const override { return true; }
 
   [[nodiscard]] std::unique_ptr<datasource::buffer> device_read(std::size_t offset, std::size_t size,
-                                                                 rmm::cuda_stream_view stream) override;
+                                                                rmm::cuda_stream_view stream) override;
   std::size_t device_read(std::size_t offset, std::size_t size, std::uint8_t* dst,
                           rmm::cuda_stream_view stream) override;
   std::future<std::size_t> device_read_async(std::size_t offset, std::size_t size, std::uint8_t* dst,

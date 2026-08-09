@@ -102,16 +102,14 @@ std::future<std::unique_ptr<cudf::io::datasource::buffer>> ObjectStoreDatasource
 }
 
 std::future<std::size_t> ObjectStoreDatasource::host_read_async(std::size_t offset, std::size_t size,
-                                                                 std::uint8_t* dst) {
+                                                                std::uint8_t* dst) {
   return std::async(std::launch::async, [this, offset, size, dst] { return host_read(offset, size, dst); });
 }
 
-std::unique_ptr<cudf::io::datasource::buffer> ObjectStoreDatasource::device_read(std::size_t offset,
-                                                                                 std::size_t size,
-                                                                                 rmm::cuda_stream_view stream) {
+std::unique_ptr<cudf::io::datasource::buffer> ObjectStoreDatasource::device_read(
+    std::size_t offset, std::size_t size, rmm::cuda_stream_view stream) {
   rmm::device_buffer buffer(size, stream);
-  const std::size_t bytes_read =
-      device_read(offset, size, static_cast<std::uint8_t*>(buffer.data()), stream);
+  const std::size_t bytes_read = device_read(offset, size, static_cast<std::uint8_t*>(buffer.data()), stream);
   if (bytes_read != size) {
     // A short read (offset+size ran past the real object size -- callers do
     // ask for this deliberately sometimes, e.g. a generous end-of-file
@@ -139,8 +137,8 @@ std::size_t ObjectStoreDatasource::device_read(std::size_t offset, std::size_t s
 // on any of them -- so by the time it starts waiting, every one of these
 // host_read() calls is already running concurrently on its own thread.
 std::future<std::size_t> ObjectStoreDatasource::device_read_async(std::size_t offset, std::size_t size,
-                                                                   std::uint8_t* dst,
-                                                                   rmm::cuda_stream_view stream) {
+                                                                  std::uint8_t* dst,
+                                                                  rmm::cuda_stream_view stream) {
   return std::async(std::launch::async, [this, offset, size, dst, stream] {
     const std::unique_ptr<cudf::io::datasource::buffer> host_buffer = host_read(offset, size);
     const std::size_t bytes_read = host_buffer->size();
@@ -158,7 +156,7 @@ std::future<std::size_t> ObjectStoreDatasource::device_read_async(std::size_t of
     // so host_buffer is never touched-after-free even though this call is
     // nominally "async".
     check_cuda(cudaMemcpyAsync(dst, host_buffer->data(), bytes_read, cudaMemcpyHostToDevice, stream.value()),
-              "cudaMemcpyAsync in ObjectStoreDatasource::device_read_async");
+               "cudaMemcpyAsync in ObjectStoreDatasource::device_read_async");
     return bytes_read;
   });
 }

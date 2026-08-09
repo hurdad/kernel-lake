@@ -356,8 +356,10 @@ TEST_F(NvmeObjectCacheTest, ConstructorSeedsMetricsFromPreExistingCacheDirectory
 
   {
     NvmeObjectCache first_process_cache(cache_config());
-    static_cast<void>(first_process_cache.get_or_populate(Uri((remote_dir_ / "a.parquet").string()), remote_store));
-    static_cast<void>(first_process_cache.get_or_populate(Uri((remote_dir_ / "b.parquet").string()), remote_store));
+    static_cast<void>(
+        first_process_cache.get_or_populate(Uri((remote_dir_ / "a.parquet").string()), remote_store));
+    static_cast<void>(
+        first_process_cache.get_or_populate(Uri((remote_dir_ / "b.parquet").string()), remote_store));
   }
   ASSERT_EQ(count_cache_files(cache_dir_), 2u);
 

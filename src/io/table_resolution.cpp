@@ -176,8 +176,8 @@ ResolvedTable resolve_table(ObjectStore& store, const std::vector<std::string>& 
   std::vector<std::future<FileMetadata>> metadata_futures;
   metadata_futures.reserve(files.size());
   for (const ObjectInfo& file : files) {
-    metadata_futures.push_back(
-        std::async(std::launch::async, [&store, uri = file.uri] { return inspect_parquet_file(store, uri); }));
+    metadata_futures.push_back(std::async(
+        std::launch::async, [&store, uri = file.uri] { return inspect_parquet_file(store, uri); }));
   }
   std::vector<FileMetadata> metadata;
   metadata.reserve(files.size());

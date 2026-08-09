@@ -60,7 +60,8 @@ class QueryPlanTracingTest : public ::testing::Test {
                                          arrow::field("customer_id", arrow::int64(), false)});
       const auto table = arrow::Table::Make(schema, {order_id_array, customer_id_array});
       auto sink = arrow::io::FileOutputStream::Open(orders_path_).ValueOrDie();
-      ASSERT_TRUE(parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), sink, /*chunk_size=*/5).ok());
+      ASSERT_TRUE(
+          parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), sink, /*chunk_size=*/5).ok());
     }
     {
       arrow::Int64Builder customer_id_builder;
@@ -70,7 +71,8 @@ class QueryPlanTracingTest : public ::testing::Test {
       const auto schema = arrow::schema({arrow::field("customer_id", arrow::int64(), false)});
       const auto table = arrow::Table::Make(schema, {customer_id_array});
       auto sink = arrow::io::FileOutputStream::Open(customers_path_).ValueOrDie();
-      ASSERT_TRUE(parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), sink, /*chunk_size=*/3).ok());
+      ASSERT_TRUE(
+          parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), sink, /*chunk_size=*/3).ok());
     }
   }
 
@@ -91,9 +93,9 @@ TEST_F(QueryPlanTracingTest, JoinProducesRealSpanTreeWithSiblingScansAndDecodeTi
   QueryEngine engine{default_config()};
   {
     observability::QuerySpan query_span = observability::start_query_span("kernellake.query");
-    const QueryResult result = engine.execute(
-        "SELECT COUNT(*) AS n FROM read_parquet('" + orders_path_ + "') o JOIN read_parquet('" +
-        customers_path_ + "') c ON o.customer_id = c.customer_id");
+    const QueryResult result = engine.execute("SELECT COUNT(*) AS n FROM read_parquet('" + orders_path_ +
+                                              "') o JOIN read_parquet('" + customers_path_ +
+                                              "') c ON o.customer_id = c.customer_id");
     query_span.finish(result, "join query", "gpu");
   }
   observability::shutdown();  // ForceFlush()es synchronously.

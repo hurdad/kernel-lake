@@ -43,7 +43,8 @@ constexpr std::string_view kCacheFileExtension = ".cache";
 
 }  // namespace
 
-NvmeObjectCache::NvmeObjectCache(CacheSection config) : config_(std::move(config)), cache_store_(config_.directory) {
+NvmeObjectCache::NvmeObjectCache(CacheSection config)
+    : config_(std::move(config)), cache_store_(config_.directory) {
   seed_metrics_from_existing_directory();
 }
 
@@ -143,8 +144,8 @@ void NvmeObjectCache::populate(const std::string& cache_path, RandomAccessObject
   const arrow::Result<std::shared_ptr<arrow::io::FileOutputStream>> out_result =
       arrow::io::FileOutputStream::Open(tmp_path);
   if (!out_result.ok()) {
-    throw StorageError(
-        fmt::format("failed to open NVMe cache temp file '{}': {}", tmp_path, out_result.status().ToString()));
+    throw StorageError(fmt::format("failed to open NVMe cache temp file '{}': {}", tmp_path,
+                                   out_result.status().ToString()));
   }
   const std::shared_ptr<arrow::io::FileOutputStream>& out = *out_result;
   const std::shared_ptr<arrow::io::RandomAccessFile> arrow_remote = remote.as_arrow_file();
@@ -158,8 +159,8 @@ void NvmeObjectCache::populate(const std::string& cache_path, RandomAccessObject
     if (!chunk.ok()) {
       static_cast<void>(out->Close());
       fs::remove(tmp_path);
-      throw StorageError(fmt::format("failed to read {} bytes at offset {} while populating NVMe cache: {}", want,
-                                     offset, chunk.status().ToString()));
+      throw StorageError(fmt::format("failed to read {} bytes at offset {} while populating NVMe cache: {}",
+                                     want, offset, chunk.status().ToString()));
     }
     const std::shared_ptr<arrow::Buffer>& buffer = *chunk;
     if (buffer->size() == 0) {
@@ -246,8 +247,7 @@ void NvmeObjectCache::evict_if_over_budget() {
     return;
   }
 
-  std::sort(entries.begin(), entries.end(),
-           [](const Entry& a, const Entry& b) { return a.mtime < b.mtime; });
+  std::sort(entries.begin(), entries.end(), [](const Entry& a, const Entry& b) { return a.mtime < b.mtime; });
   // Unlinking a file a concurrent reader still has open is safe on POSIX:
   // the inode stays valid (and readable) until every open file descriptor
   // against it is closed, only the directory entry disappears -- an

@@ -89,8 +89,8 @@ void ParquetScanOperator::open(ExecutionContext& context) {
           cudf::io::parquet_reader_options::builder().column_names(columns_).row_groups(row_groups).build();
       reader_ = std::make_unique<cudf::io::chunked_parquet_reader>(
           /*chunk_read_limit=*/0, pass_read_limit_bytes_, std::move(sources),
-          /*parquet_metadatas=*/std::vector<cudf::io::parquet::FileMetaData>{}, options, decode_stream_->get(),
-          context.memory_resource);
+          /*parquet_metadatas=*/std::vector<cudf::io::parquet::FileMetaData>{}, options,
+          decode_stream_->get(), context.memory_resource);
     }
   } catch (const std::exception& e) {
     decode_stream_.reset();
@@ -152,7 +152,8 @@ void ParquetScanOperator::prefetch_loop() {
       const bool has_next = reader_->has_next();
       if (!has_next) {
         const std::lock_guard<std::mutex> lock(queue_mutex_);
-        decode_seconds_ += std::chrono::duration<double>(std::chrono::steady_clock::now() - decode_start).count();
+        decode_seconds_ +=
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - decode_start).count();
         break;
       }
       cudf::io::table_with_metadata result = reader_->read_chunk();
@@ -171,8 +172,9 @@ void ParquetScanOperator::prefetch_loop() {
 
       cudaEvent_t event = nullptr;
       check_cuda(cudaEventCreateWithFlags(&event, cudaEventDisableTiming),
-                "cudaEventCreateWithFlags for prefetched Parquet chunk");
-      check_cuda(cudaEventRecord(event, decode_stream_->get()), "cudaEventRecord for prefetched Parquet chunk");
+                 "cudaEventCreateWithFlags for prefetched Parquet chunk");
+      check_cuda(cudaEventRecord(event, decode_stream_->get()),
+                 "cudaEventRecord for prefetched Parquet chunk");
 
       std::unique_lock<std::mutex> lock(queue_mutex_);
       decode_seconds_ += chunk_decode_seconds;
@@ -232,7 +234,7 @@ std::optional<DeviceBatch> ParquetScanOperator::next(ExecutionContext& context) 
     // itself is enqueued onto context.stream, not a host-side block, so it
     // doesn't cancel out the overlap this exists to get.
     check_cuda(cudaStreamWaitEvent(context.stream, chunk.ready_event, 0),
-              "cudaStreamWaitEvent for prefetched Parquet chunk");
+               "cudaStreamWaitEvent for prefetched Parquet chunk");
     check_cuda(cudaEventDestroy(chunk.ready_event), "cudaEventDestroy for prefetched Parquet chunk");
     return DeviceBatch(std::move(chunk.table), schema_);
   }
@@ -257,7 +259,8 @@ std::optional<DeviceBatch> ParquetScanOperator::next(ExecutionContext& context) 
     if (!reader_->has_next()) {
       {
         const std::lock_guard<std::mutex> lock(queue_mutex_);
-        decode_seconds_ += std::chrono::duration<double>(std::chrono::steady_clock::now() - decode_start).count();
+        decode_seconds_ +=
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - decode_start).count();
       }
       reader_.reset();
       ++current_fragment_index_;
@@ -267,7 +270,8 @@ std::optional<DeviceBatch> ParquetScanOperator::next(ExecutionContext& context) 
     cudf::io::table_with_metadata result = reader_->read_chunk();
     {
       const std::lock_guard<std::mutex> lock(queue_mutex_);
-      decode_seconds_ += std::chrono::duration<double>(std::chrono::steady_clock::now() - decode_start).count();
+      decode_seconds_ +=
+          std::chrono::duration<double>(std::chrono::steady_clock::now() - decode_start).count();
     }
     if (result.tbl->num_rows() == 0) {
       continue;  // empty chunk; keep pulling from the same (still-open) fragment reader.
