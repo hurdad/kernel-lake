@@ -32,12 +32,55 @@ LogicalPlanPtr plan_for(const std::string& sql, const Schema& schema) {
   return build_logical_plan(bound, schema);
 }
 
+LogicalPlanPtr plan_for_join(const std::string& sql, const std::vector<Schema>& schemas) {
+  const auto stmt = sql::parse_sql(sql);
+  const BoundQuery bound = bind_query(stmt, schemas);
+  return build_logical_plan(bound, schemas);
+}
+
 const LogicalScan* find_scan(const LogicalPlanPtr& node) {
   if (const auto* scan = dynamic_cast<const LogicalScan*>(node.get())) return scan;
   for (const LogicalPlanPtr& child : node->children()) {
     if (const LogicalScan* found = find_scan(child)) return found;
   }
   return nullptr;
+}
+
+// Finds the LogicalScan whose schema has a field named `column_name` --
+// for predicate-pushdown tests below, where a query joins several tables
+// and each assertion needs to check a *specific* table's own scan, not
+// just "some scan somewhere" (find_scan() above only ever finds the
+// first, e.g. for a single-table query).
+const LogicalScan* find_scan_with_column(const LogicalPlanPtr& node, const std::string& column_name) {
+  if (const auto* scan = dynamic_cast<const LogicalScan*>(node.get())) {
+    return scan->output_schema().find_field(column_name) ? scan : nullptr;
+  }
+  for (const LogicalPlanPtr& child : node->children()) {
+    if (const LogicalScan* found = find_scan_with_column(child, column_name)) return found;
+  }
+  return nullptr;
+}
+
+Schema customer_schema() {
+  return Schema({
+      Field{"c_custkey", int64_type(false)},
+      Field{"c_mktsegment", string_type(false)},
+  });
+}
+
+Schema orders_schema() {
+  return Schema({
+      Field{"o_orderkey", int64_type(false)},
+      Field{"o_custkey", int64_type(false)},
+      Field{"o_orderdate", date32_type(false)},
+  });
+}
+
+Schema q3_lineitem_schema() {
+  return Schema({
+      Field{"l_orderkey", int64_type(false)},
+      Field{"l_shipdate", date32_type(false)},
+  });
 }
 
 // These three tests select only a strict subset of a two-column schema;
@@ -272,6 +315,104 @@ TEST(Optimizer, IdentifiesPushablePredicatesForPruning) {
   EXPECT_EQ(scan->pushable_predicates()[0].column_name, "event_date");
   EXPECT_EQ(scan->pushable_predicates()[0].op, BinaryOperator::GreaterEqual);
   EXPECT_EQ(scan->pushable_predicates()[1].column_name, "amount");
+}
+
+// Regression test for a real SF100 GPU OOM on TPC-H Q3: predicate pushdown
+// used to stop at a join (see push_predicate_through_join's own comment in
+// optimizer.cpp), so a WHERE clause referencing only one side of a
+// customer/orders JOIN sat above the join instead of filtering the base
+// table first -- meaning the join's build side materialized the entire
+// unfiltered table. Confirmed via a real local A/B (peak GPU memory 1.28
+// GiB -> 0.42 GiB, 3.07x, for the equivalent 3-way query at TPC-H SF1).
+TEST(Optimizer, PushesSingleSidedPredicateThroughTwoWayJoin) {
+  auto plan = plan_for_join(
+      "SELECT o_orderkey FROM read_parquet('/o.parquet') AS o "
+      "JOIN read_parquet('/c.parquet') AS c ON o.o_custkey = c.c_custkey "
+      "WHERE c_mktsegment = 'BUILDING' AND o_orderdate < DATE '1995-03-15'",
+      std::vector<Schema>{orders_schema(), customer_schema()});
+  plan = optimize(std::move(plan));
+
+  // No Filter should remain directly above the join: both WHERE conjuncts
+  // reference exactly one side each, so both should have been pushed all
+  // the way down to their own base scan.
+  const auto* projection = dynamic_cast<const LogicalProjection*>(plan.get());
+  ASSERT_NE(projection, nullptr);
+  EXPECT_NE(dynamic_cast<const LogicalJoin*>(projection->children()[0].get()), nullptr);
+
+  // Reads back via pushable_predicates rather than looking for a Filter
+  // node directly: annotate_scan (already run inside optimize()) collapses
+  // a Filter sitting directly on a scan into the scan's own
+  // pushable_predicates list, same as any other single-table WHERE clause.
+  const LogicalScan* orders_scan = find_scan_with_column(plan, "o_orderdate");
+  ASSERT_NE(orders_scan, nullptr);
+  ASSERT_EQ(orders_scan->pushable_predicates().size(), 1u);
+  EXPECT_EQ(orders_scan->pushable_predicates()[0].column_name, "o_orderdate");
+  EXPECT_EQ(orders_scan->pushable_predicates()[0].op, BinaryOperator::Less);
+
+  const LogicalScan* customer_scan = find_scan_with_column(plan, "c_mktsegment");
+  ASSERT_NE(customer_scan, nullptr);
+  ASSERT_EQ(customer_scan->pushable_predicates().size(), 1u);
+  EXPECT_EQ(customer_scan->pushable_predicates()[0].column_name, "c_mktsegment");
+  EXPECT_EQ(customer_scan->pushable_predicates()[0].op, BinaryOperator::Equal);
+}
+
+// The full TPC-H Q3 shape: a 3-way join chain with one single-table
+// predicate per table. Confirms pushdown recurses through the whole
+// left-deep chain (customer JOIN orders JOIN lineitem), not just one join
+// level -- each of the three base scans should end up with its own
+// predicate, and no Filter should remain above any join.
+TEST(Optimizer, PushesPredicatesThroughThreeWayJoinChain) {
+  auto plan = plan_for_join(
+      "SELECT l_orderkey FROM read_parquet('/c.parquet') AS c "
+      "JOIN read_parquet('/o.parquet') AS o ON c.c_custkey = o.o_custkey "
+      "JOIN read_parquet('/l.parquet') AS l ON o.o_orderkey = l.l_orderkey "
+      "WHERE c_mktsegment = 'BUILDING' AND o_orderdate < DATE '1995-03-15' "
+      "AND l_shipdate > DATE '1995-03-15'",
+      std::vector<Schema>{customer_schema(), orders_schema(), q3_lineitem_schema()});
+  plan = optimize(std::move(plan));
+
+  const auto* projection = dynamic_cast<const LogicalProjection*>(plan.get());
+  ASSERT_NE(projection, nullptr);
+  const auto* outer_join = dynamic_cast<const LogicalJoin*>(projection->children()[0].get());
+  ASSERT_NE(outer_join, nullptr);
+  const auto* inner_join = dynamic_cast<const LogicalJoin*>(outer_join->children()[0].get());
+  ASSERT_NE(inner_join, nullptr);
+  // Neither join has a Filter sitting directly on top of it (checked via
+  // the parent already being a Join/Projection above, not a Filter).
+
+  const LogicalScan* customer_scan = find_scan_with_column(plan, "c_mktsegment");
+  ASSERT_NE(customer_scan, nullptr);
+  ASSERT_EQ(customer_scan->pushable_predicates().size(), 1u);
+  EXPECT_EQ(customer_scan->pushable_predicates()[0].column_name, "c_mktsegment");
+
+  const LogicalScan* orders_scan = find_scan_with_column(plan, "o_orderdate");
+  ASSERT_NE(orders_scan, nullptr);
+  ASSERT_EQ(orders_scan->pushable_predicates().size(), 1u);
+  EXPECT_EQ(orders_scan->pushable_predicates()[0].column_name, "o_orderdate");
+
+  const LogicalScan* lineitem_scan = find_scan_with_column(plan, "l_shipdate");
+  ASSERT_NE(lineitem_scan, nullptr);
+  ASSERT_EQ(lineitem_scan->pushable_predicates().size(), 1u);
+  EXPECT_EQ(lineitem_scan->pushable_predicates()[0].column_name, "l_shipdate");
+}
+
+// A predicate mixing columns from both sides of a join (e.g. a non-equi
+// comparison beyond the ON condition) can't be pushed to either side --
+// must stay exactly where it was, directly above the join, rather than be
+// dropped or incorrectly pushed to one side.
+TEST(Optimizer, DoesNotPushCrossSidePredicateThroughJoin) {
+  auto plan = plan_for_join(
+      "SELECT o_orderkey FROM read_parquet('/o.parquet') AS o "
+      "JOIN read_parquet('/c.parquet') AS c ON o.o_custkey = c.c_custkey "
+      "WHERE o_orderkey > c_custkey",
+      std::vector<Schema>{orders_schema(), customer_schema()});
+  plan = optimize(std::move(plan));
+
+  const auto* projection = dynamic_cast<const LogicalProjection*>(plan.get());
+  ASSERT_NE(projection, nullptr);
+  const auto* filter = dynamic_cast<const LogicalFilter*>(projection->children()[0].get());
+  ASSERT_NE(filter, nullptr);
+  EXPECT_NE(dynamic_cast<const LogicalJoin*>(filter->children()[0].get()), nullptr);
 }
 
 }  // namespace

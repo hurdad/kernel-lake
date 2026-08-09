@@ -86,6 +86,13 @@ picking one.
    - Tradeoff: low risk, but only matters if a workload is actually
      memory-constrained today -- easy to spend time tuning a number that
      isn't the bottleneck.
+   - **A real SF100 Q3 (3-way join) GPU OOM, found in this session's AWS
+     benchmark, turned out to have nothing to do with this knob** -- see
+     "Fixed: predicate pushdown stopped at joins" below. `pass_read_limit_bytes`
+     only sizes Parquet *scan* passes; `HashJoinOperator`'s build side has no
+     size awareness at all, and that's what was actually overflowing. This
+     item (a scan-sizing tweak) is still open on its own merits, but is not
+     what Q3's OOM needed.
 
 5. ~~Profile with `nsys` before acting on any of the above.~~ **Done
    2026-08-08 -- see "Profiling results" below.** Not a full `nsys`
@@ -718,3 +725,76 @@ SF100 data:**
 Deployed to the live benchmark server and the SF100-vs-PySpark comparison
 rerun with both fixes in place; see `benchmarks/aws/docs/COST_ESTIMATES.md`
 for the updated head-to-head numbers.
+
+## Fixed: predicate pushdown stopped at joins (SF100 Q3 GPU OOM)
+
+Real OOM found running the SF100 AWS benchmark: TPC-H-derived Q3 (`customer
+JOIN orders JOIN lineitem WHERE c_mktsegment = 'BUILDING' AND o_orderdate
+< ... AND l_shipdate > ...`) crashed on the g6.2xlarge's single L4 (24GB)
+with `RMM failure: Exceeded memory limit (failed to allocate 1.432 GiB)`.
+The doc's own opportunity #4 (`pass_read_limit_bytes` retuning) was the
+default suspect, but that constant only sizes Parquet *scan* passes --
+`HashJoinOperator::open()` (`src/execution_gpu/hash_join_operator.cpp`)
+materializes its entire build side via one unbounded `cudf::concatenate()`
+call with no size awareness at all, so it was never in the code path that
+could have OOM'd from that knob.
+
+**Root cause: `src/optimizer/optimizer.cpp`'s `annotate_scan()` explicitly
+did not push predicates across a `LogicalJoin`** ("Predicate pushdown does
+not cross a join in this version" -- its own prior comment). For Q3, the
+WHERE clause sat in a single `LogicalFilter` above the *entire* 3-way join
+chain, so `customer JOIN orders` ran fully unfiltered before anything
+checked `c_mktsegment`/`o_orderdate`. Confirmed with real generated data
+before writing any fix (not guessed): at SF1, `c_mktsegment = 'BUILDING'`
+keeps only 20% of customer, and `o_orderdate < 1995-03-15` keeps 46.4% of
+orders -- but because neither filter reached a scan, and orders/customer
+have referential integrity, the unfiltered `customer JOIN orders` matched
+**~100% of orders** (20.0% when computed correctly, i.e. 5x too many rows
+feeding into `HashJoinOperator::open()`'s single unbounded concatenate for
+the *outer* join with `lineitem`).
+
+**Fix:** `push_predicate_through_join()` (new, `optimizer.cpp`) applies
+`sigma_p(A JOIN B) = sigma_p(A) JOIN B` whenever a WHERE conjunct's columns
+belong entirely to one side of a join -- unconditionally valid for the
+INNER-only joins this engine supports (`HashJoinOperator`'s own doc
+comment: no LEFT/RIGHT/FULL, so no null-extension semantics to worry
+about). Splits a WHERE clause's top-level AND conjuncts by which side of
+the join their columns reference (column-index range, mirroring the
+existing required-columns split `annotate_scan()` already did for
+projection pushdown), shifts a right-side conjunct's column indices back
+to that side's own local schema, and wraps each pushable conjunct in a new
+`LogicalFilter` directly above the correct child -- recursing through
+`rewrite_plan()` so it telescopes through an entire N-way left-deep join
+chain one level at a time, not just a single join. A conjunct referencing
+both sides (or neither, e.g. a constant) is left exactly where it was,
+still applied post-join. Once a predicate lands directly on a
+`LogicalFilter(LogicalScan, ...)` shape, it's indistinguishable from any
+ordinary single-table WHERE clause to every downstream pass -- the
+existing `annotate_scan()` scan-pruning path and `find_scan_schema()`-based
+physical-planner remapping both already handled that shape, so no other
+code needed to change.
+
+**Verified real, three ways:**
+- **Plan shape** (`explain --format text` against the real SF1 local
+  dataset, `customer`/`orders`/`lineitem` generated via
+  `tools/generate_tpch.py --scale-factor 1`): before, one `Filter` sat
+  above the outermost `HashJoin` with all three conjuncts ANDed together;
+  after, each of the three `ParquetScan`s has its own single-column
+  `Filter` directly above it, and no `Filter` remains above either
+  `HashJoin`.
+- **Correctness**: `tools/validate_tpch.py --query all` against the same
+  real SF1 data -- all 6 supported queries (Q1/Q3/Q6/Q12/Q14/Q19) match
+  DuckDB row-for-row, including Q3's now-pushed-down 3-way join. New
+  optimizer-level regression tests added
+  (`tests/unit/optimizer_test.cpp`): a 2-way join with one predicate per
+  side, the full 3-way Q3 shape, and a negative case (a cross-side
+  predicate correctly stays unpushed, above the join). 332 unit + 102 GPU
+  tests pass.
+- **Real memory win**, controlled local A/B (pre/post binaries from the
+  same source tree via a throwaway `git worktree`, real GPU, identical
+  SF1 query): `peak_gpu_memory_bytes` for Q3 dropped from **1.28 GiB to
+  0.42 GiB (3.07x)**. Redeployed to the live SF100 benchmark server and
+  reran the full SF100-vs-PySpark comparison with all three fixes in
+  place (`device_read`, metadata-inspection parallelization, and this);
+  see `benchmarks/aws/docs/COST_ESTIMATES.md` for whether Q3 now completes
+  at SF100 and the updated head-to-head numbers.

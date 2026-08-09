@@ -370,6 +370,140 @@ void collect_pushable_predicates(const ExpressionPtr& predicate, std::vector<Pus
 
 LogicalPlanPtr rewrite_plan(const LogicalPlanPtr& node);
 
+// Flattens top-level AND conjuncts of a WHERE predicate into a flat list,
+// for per-conjunct join-side classification below. Mirrors
+// collect_pushable_predicates' AND-splitting but keeps each conjunct as a
+// full Expression subtree (not just simple `col OP literal` comparisons),
+// since predicate pushdown-through-join has no such restriction.
+void collect_conjuncts(const ExpressionPtr& predicate, std::vector<ExpressionPtr>& out) {
+  if (const auto* binary = dynamic_cast<const BinaryExpression*>(predicate.get());
+      binary != nullptr && binary->op() == BinaryOperator::And) {
+    collect_conjuncts(binary->left(), out);
+    collect_conjuncts(binary->right(), out);
+    return;
+  }
+  out.push_back(predicate);
+}
+
+// Rebuilds `expr` with every ColumnExpression's index reduced by `delta` --
+// used to re-localize a conjunct that referenced a join's combined schema
+// down to the join's right child's own local schema (whose columns sit at
+// `delta` == the left child's field count in the combined schema).
+// Everything except ColumnExpression is copied structurally; a WHERE
+// predicate never contains an AggregateExpression (the binder only allows
+// those in SELECT/HAVING), so that type needs no case here.
+ExpressionPtr shift_columns(const ExpressionPtr& expr, std::int64_t delta) {
+  if (const auto* column = dynamic_cast<const ColumnExpression*>(expr.get())) {
+    return std::make_shared<ColumnExpression>(
+        column->name(), static_cast<std::size_t>(static_cast<std::int64_t>(column->column_index()) - delta),
+        column->result_type());
+  }
+  if (const auto* binary = dynamic_cast<const BinaryExpression*>(expr.get())) {
+    return std::make_shared<BinaryExpression>(binary->op(), shift_columns(binary->left(), delta),
+                                              shift_columns(binary->right(), delta), binary->result_type());
+  }
+  if (const auto* unary = dynamic_cast<const UnaryExpression*>(expr.get())) {
+    return std::make_shared<UnaryExpression>(unary->op(), shift_columns(unary->operand(), delta),
+                                             unary->result_type());
+  }
+  if (const auto* cast = dynamic_cast<const CastExpression*>(expr.get())) {
+    return std::make_shared<CastExpression>(shift_columns(cast->operand(), delta), cast->result_type());
+  }
+  if (const auto* between = dynamic_cast<const BetweenExpression*>(expr.get())) {
+    return std::make_shared<BetweenExpression>(shift_columns(between->value(), delta),
+                                               shift_columns(between->lower(), delta),
+                                               shift_columns(between->upper(), delta));
+  }
+  if (const auto* like = dynamic_cast<const LikeExpression*>(expr.get())) {
+    return std::make_shared<LikeExpression>(shift_columns(like->value(), delta), like->pattern(),
+                                            like->negated());
+  }
+  if (const auto* case_expr = dynamic_cast<const CaseExpression*>(expr.get())) {
+    std::vector<CaseExpression::WhenThen> when_then;
+    when_then.reserve(case_expr->when_then().size());
+    for (const CaseExpression::WhenThen& branch : case_expr->when_then()) {
+      when_then.push_back({shift_columns(branch.condition, delta), shift_columns(branch.result, delta)});
+    }
+    ExpressionPtr else_branch =
+        case_expr->else_branch() ? shift_columns(case_expr->else_branch(), delta) : nullptr;
+    return std::make_shared<CaseExpression>(std::move(when_then), std::move(else_branch), case_expr->result_type());
+  }
+  return expr;  // LiteralExpression: no column indices to shift.
+}
+
+// AND-combines a non-empty list of conjuncts back into one predicate.
+ExpressionPtr conjunction(std::vector<ExpressionPtr> conjuncts) {
+  ExpressionPtr result = std::move(conjuncts.front());
+  for (std::size_t i = 1; i < conjuncts.size(); ++i) {
+    const bool nullable = result->result_type().nullable || conjuncts[i]->result_type().nullable;
+    result = std::make_shared<BinaryExpression>(BinaryOperator::And, std::move(result), std::move(conjuncts[i]),
+                                                boolean_type(nullable));
+  }
+  return result;
+}
+
+// Pushes WHERE-clause conjuncts that reference only one side of a join down
+// below it: `sigma_p(A JOIN B) = sigma_p(A) JOIN B` when p only touches A's
+// columns, unconditionally valid for the INNER-only joins this engine
+// supports (see HashJoinOperator's own doc comment -- no LEFT/RIGHT/FULL,
+// so there is no null-extension semantics to worry about). Without this, a
+// chained N-way join (e.g. TPC-H Q3's customer/orders/lineitem) fully
+// materializes every intermediate join's *build* side before any WHERE
+// predicate ever runs -- confirmed as the real cause of a genuine SF100 GPU
+// OOM on Q3 (see docs/GPU_OPTIMIZATIONS.md): with orders/customer's
+// referential integrity, an unfiltered customer JOIN orders materializes
+// ~100% of orders, not the ~20% left after `WHERE c_mktsegment='BUILDING'`,
+// because that filter never reached either scan. Recurses through
+// rewrite_plan so it also pushes through N-way join chains one level at a
+// time, not just a single join. Returns nullptr (caller keeps the plain
+// Filter(join, predicate) shape) when no conjunct could be pushed either
+// side.
+LogicalPlanPtr push_predicate_through_join(const LogicalJoin& join, const ExpressionPtr& predicate) {
+  std::vector<ExpressionPtr> conjuncts;
+  collect_conjuncts(predicate, conjuncts);
+
+  const std::size_t left_count = join.left()->output_schema().field_count();
+  std::vector<ExpressionPtr> left_conjuncts;
+  std::vector<ExpressionPtr> right_conjuncts;
+  std::vector<ExpressionPtr> remaining_conjuncts;
+  for (ExpressionPtr& conjunct : conjuncts) {
+    std::unordered_set<std::size_t> columns;
+    collect_columns(conjunct, columns);
+    const bool all_left =
+        !columns.empty() && std::all_of(columns.begin(), columns.end(),
+                                        [left_count](std::size_t index) { return index < left_count; });
+    const bool all_right =
+        !columns.empty() && std::all_of(columns.begin(), columns.end(),
+                                        [left_count](std::size_t index) { return index >= left_count; });
+    if (all_left) {
+      left_conjuncts.push_back(std::move(conjunct));
+    } else if (all_right) {
+      right_conjuncts.push_back(shift_columns(conjunct, static_cast<std::int64_t>(left_count)));
+    } else {
+      remaining_conjuncts.push_back(std::move(conjunct));
+    }
+  }
+
+  if (left_conjuncts.empty() && right_conjuncts.empty()) {
+    return nullptr;
+  }
+
+  LogicalPlanPtr new_left = join.left();
+  if (!left_conjuncts.empty()) {
+    new_left = rewrite_plan(std::make_shared<LogicalFilter>(new_left, conjunction(std::move(left_conjuncts))));
+  }
+  LogicalPlanPtr new_right = join.right();
+  if (!right_conjuncts.empty()) {
+    new_right = rewrite_plan(std::make_shared<LogicalFilter>(new_right, conjunction(std::move(right_conjuncts))));
+  }
+  LogicalPlanPtr new_join = std::make_shared<LogicalJoin>(std::move(new_left), std::move(new_right),
+                                                          join.left_key_index(), join.right_key_index());
+  if (remaining_conjuncts.empty()) {
+    return new_join;
+  }
+  return std::make_shared<LogicalFilter>(std::move(new_join), conjunction(std::move(remaining_conjuncts)));
+}
+
 // Pushes a LIMIT down through any chain of pass-through LogicalProjection
 // nodes (which never change row count or order) so it ends up sitting
 // directly above the first node that can actually benefit from it
@@ -422,6 +556,12 @@ LogicalPlanPtr rewrite_plan(const LogicalPlanPtr& node) {
       auto always_false = std::make_shared<LogicalFilter>(child, predicate);
       always_false->estimated_rows = 0;
       return always_false;
+    }
+
+    if (const auto* join = dynamic_cast<const LogicalJoin*>(child.get())) {
+      if (LogicalPlanPtr pushed = push_predicate_through_join(*join, predicate)) {
+        return pushed;
+      }
     }
 
     return std::make_shared<LogicalFilter>(std::move(child), std::move(predicate));
