@@ -13,7 +13,7 @@ fabricated number standing in for a real one.
 | Milestone | Scale factor | Estimated cost | Real observed cost | Notes |
 |---|---|---|---|---|
 | dev validation | SF10 | n/a (below any formal milestone) | **$1.25** (kernellake $0.57, spark $0.66) | 2026-08-09. Real run: 6 queries x cold/warm x 2 iterations, KernelLake vs. real PySpark, 1x g6.2xlarge + 1x m7i.xlarge + 3x m7i.4xlarge + monitoring + iceberg catalog. All 12 KernelLake/PySpark result comparisons matched. See `benchmarks/aws/report-sf10/report.md` (gitignored -- regenerate via `reporting/generate_report.py` against `results-sf10.json`/`cost-sf10.json`, also gitignored, or see this file's own summary below). |
-| dev validation | SF100 (pre-fix) | n/a (below M1 -- Q3 excluded, see notes) | **$2.46** (kernellake $0.90, spark $1.52) | 2026-08-09, same infra as the SF10 row above. Q3 (3-way join) excluded: real RMM OOM on the g6.2xlarge's single L4 (24GB) -- "Exceeded memory limit (failed to allocate 1.432GiB)" -- a genuine finding, not a bug from this session's other fixes (see `docs/GPU_OPTIMIZATIONS.md` opportunity #4, `pass_read_limit_bytes` retuning). The other 5 queries: all 10 KernelLake/PySpark comparisons matched, but **PySpark won every single one, 2-4x** -- a full reversal from SF10, where KernelLake won 8/12. See "SF100 latency reversal" below for the real breakdown of why. |
+| dev validation | SF100 (pre-fix) | n/a (below M1 -- Q3 excluded, see notes) | **$2.46** (kernellake $0.90, spark $1.52) | 2026-08-09, same infra as the SF10 row above. Q3 (3-way join) excluded: real RMM OOM on the g6.2xlarge's single L4 (24GB) -- "Exceeded memory limit (failed to allocate 1.432GiB)" -- a genuine finding. **Root cause found and fixed** (not `pass_read_limit_bytes` as first suspected -- see "Q3 OOM: root cause and fix" below): predicate pushdown stopped at joins, plus a separate `max_distinct_keys` cap. The other 5 queries: all 10 KernelLake/PySpark comparisons matched, but **PySpark won every single one, 2-4x** -- a full reversal from SF10, where KernelLake won 8/12. See "SF100 latency reversal" below for the real breakdown of why. |
 | dev validation | SF100 (post-fix) | n/a (same run, after the `resolve_table()` parallelization fix) | **$4.64 cumulative session total** (kernellake $1.47, spark $3.07 -- see notes, not directly comparable to the pre-fix row) | 2026-08-09, same infra, rerun after deploying the `std::async` metadata-inspection fix (`docs/GPU_OPTIMIZATIONS.md`). All 10 comparisons still matched; KernelLake got real-, meaningfully faster per query (Q6 cold 22.7s -> 15.9s) but **PySpark still won every comparison, 2-3x** -- a narrower gap, not a reversal-of-the-reversal. Cost per completed query improved to 2.08x cheaper for KernelLake ($0.147 vs. $0.307, up from 1.7x pre-fix). This row's dollar total is the full session's cumulative instance-hours (`cost_model.py` measures from each instance's real `LaunchTime` to teardown), not an isolated cost for just this rerun -- it includes the SF10 and pre-fix SF100 runs' EC2 time too, since the same instances stayed up throughout. See "SF100 post-fix rerun" below. |
 | M1 | SF100 | run `estimate_cost.py --milestone m1` for current pricing | not yet run (SF100 above is a dev validation subset, not the formal M1 methodology -- Q3 missing, only 5/6 queries, 2 not 3+ iterations) | |
 | M2 | SF100 | run `estimate_cost.py --milestone m2` for current pricing | not yet run | |
@@ -114,6 +114,48 @@ still stands as the bigger remaining factor.
 cheaper ($0.147 vs. $0.307, up from 1.7x pre-fix) -- faster KernelLake
 queries directly lower its own per-query cost share, while PySpark's
 didn't change.
+
+## Q3 OOM: root cause and fix, confirmed at real SF100 (2026-08-09)
+
+Investigated the Q3 OOM directly rather than accepting the original
+suspicion (`pass_read_limit_bytes` under-sizing, opportunity #4 in
+`docs/GPU_OPTIMIZATIONS.md`) -- that constant only sizes Parquet *scan*
+passes, and Q3's failure was in the *join*, a different code path
+entirely. Real root cause: predicate pushdown stopped at joins
+(`src/optimizer/optimizer.cpp`), so Q3's WHERE clause
+(`c_mktsegment`/`o_orderdate`/`l_shipdate`) sat above the entire 3-way
+join instead of filtering `customer`/`orders`/`lineitem` before joining
+-- with real referential integrity between orders/customer, the
+unfiltered `customer JOIN orders` materialized ~100% of orders (not the
+~20% left after `c_mktsegment = 'BUILDING'`) into `HashJoinOperator`'s
+single unbounded `concatenate()` call. Fixed with cross-join predicate
+pushdown (commit `6aac712`); full writeup and a real local-GPU A/B
+(`peak_gpu_memory_bytes` 1.28 GiB -> 0.42 GiB, 3.07x, at SF1) in
+`docs/GPU_OPTIMIZATIONS.md`.
+
+Redeployed to a freshly re-provisioned kernellake host (KernelLake-only,
+no Spark cluster, to minimize cost for this one check) and ran Q3 against
+the real SF100 data that originally OOM'd. The join-OOM was gone, but a
+second, unrelated, pre-existing guard tripped instead:
+`HashAggregateOperator: distinct key count 10799097 exceeds
+max_distinct_keys (10000000)` -- real SF100 Q3 produces ~10.8M distinct
+groups before its `ORDER BY revenue DESC LIMIT 10` trims the result,
+just over the old fixed 10M safety cap (unrelated to the join fix, a
+separate hardcoded default). Doubled to 20M (commit `7ca94ad`) and
+reran:
+
+```
+rows_returned: 10, peak_gpu_memory_bytes: 9.9 GiB (well under the L4's 24 GiB),
+parquet_decoding_seconds: 15.8s, gpu_execution_seconds: 30.1s, elapsed_wall_seconds: 32.2s
+```
+
+**Q3 now completes end to end at real SF100** -- the original crash
+(`RMM failure: Exceeded memory limit`) is confirmed fixed, not just
+theorized. Not re-run through the full SF100-vs-PySpark comparison this
+session (that would need the full 4-instance Spark cluster re-provisioned
+again, a separate cost decision); Q3's own numbers above are standalone
+`kernellake query --stats` output against the live data, same as every
+other real-data confirmation in this document.
 
 ## Data-generation duration (for `estimate_cost.py`'s own
 `data_gen_hours` table, and to correct it once real numbers exist)

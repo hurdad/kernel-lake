@@ -793,8 +793,18 @@ code needed to change.
 - **Real memory win**, controlled local A/B (pre/post binaries from the
   same source tree via a throwaway `git worktree`, real GPU, identical
   SF1 query): `peak_gpu_memory_bytes` for Q3 dropped from **1.28 GiB to
-  0.42 GiB (3.07x)**. Redeployed to the live SF100 benchmark server and
-  reran the full SF100-vs-PySpark comparison with all three fixes in
-  place (`device_read`, metadata-inspection parallelization, and this);
-  see `benchmarks/aws/docs/COST_ESTIMATES.md` for whether Q3 now completes
-  at SF100 and the updated head-to-head numbers.
+  0.42 GiB (3.07x)**.
+- **Confirmed at real SF100 scale, on a real EC2 g6.2xlarge, against the
+  actual data that originally OOM'd.** With only this fix, Q3 no longer
+  OOM'd on the join -- but ran into a second, unrelated, pre-existing
+  guard: `HashAggregateOperator`'s `max_distinct_keys` safety cap (real
+  SF100 Q3 produces ~10.8M distinct `(l_orderkey, o_orderdate,
+  o_shippriority)` groups before its `ORDER BY ... LIMIT 10` trims the
+  result, just over the old 10M default). Fixed by doubling that default
+  to 20M (a fixed safety cap with no cardinality estimation behind it, so
+  headroom matters more than precision -- see the constant's own updated
+  comment in `hash_aggregate_operator.hpp`). With both fixes, **Q3
+  completes end to end at real SF100**: `peak_gpu_memory_bytes` 9.9 GiB
+  (well under the L4's 24GB), 10 correct rows returned,
+  `elapsed_wall_seconds` 32.2s. The original crash
+  (`RMM failure: Exceeded memory limit`) is gone.
