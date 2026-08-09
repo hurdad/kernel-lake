@@ -137,8 +137,24 @@ void ParquetScanOperator::open_current_fragment(ExecutionContext& context) {
 
 void ParquetScanOperator::prefetch_loop() {
   try {
-    while (reader_->has_next()) {
+    while (true) {
+      // Timed from before has_next(), not just around read_chunk(): cudf's
+      // chunked_parquet_reader does its real I/O/decode work for the next
+      // pass *inside* has_next() (it has to fetch and decompress enough
+      // data to know whether another chunk exists), not inside
+      // read_chunk() -- confirmed for real by instrumenting both calls
+      // separately against a real S3 dataset: read_chunk() alone measured
+      // ~0.1s while has_next() measured ~20s for the exact same pass. A
+      // timer around read_chunk() alone (this operator's first cut at
+      // decode_seconds_) looked plausible but was silently measuring the
+      // wrong call.
       const auto decode_start = std::chrono::steady_clock::now();
+      const bool has_next = reader_->has_next();
+      if (!has_next) {
+        const std::lock_guard<std::mutex> lock(queue_mutex_);
+        decode_seconds_ += std::chrono::duration<double>(std::chrono::steady_clock::now() - decode_start).count();
+        break;
+      }
       cudf::io::table_with_metadata result = reader_->read_chunk();
       const double chunk_decode_seconds =
           std::chrono::duration<double>(std::chrono::steady_clock::now() - decode_start).count();
@@ -234,13 +250,20 @@ std::optional<DeviceBatch> ParquetScanOperator::next(ExecutionContext& context) 
       if (current_fragment_index_ >= fragments_.size()) return std::nullopt;
       open_current_fragment(context);
     }
+    // Timed from before has_next(), same reasoning as prefetch_loop()'s own
+    // comment: has_next() is where cudf's chunked reader does its real
+    // per-pass I/O/decode work, not read_chunk().
+    const auto decode_start = std::chrono::steady_clock::now();
     if (!reader_->has_next()) {
+      {
+        const std::lock_guard<std::mutex> lock(queue_mutex_);
+        decode_seconds_ += std::chrono::duration<double>(std::chrono::steady_clock::now() - decode_start).count();
+      }
       reader_.reset();
       ++current_fragment_index_;
       continue;
     }
 
-    const auto decode_start = std::chrono::steady_clock::now();
     cudf::io::table_with_metadata result = reader_->read_chunk();
     {
       const std::lock_guard<std::mutex> lock(queue_mutex_);

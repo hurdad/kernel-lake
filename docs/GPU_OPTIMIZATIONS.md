@@ -544,3 +544,68 @@ AnInterposedSort` / `...InterposedLimit` in `tests/unit/physical_planner_test.cp
 Verified against real data on the local GPU: all four repro queries above
 now return correct (correctly filtered/ordered/limited) results; full test
 suite (326 unit + 82 GPU tests) passes with no regressions.
+
+## Real-S3 scan throughput: root cause found, not yet fixed
+
+Found running a real SF10 benchmark against real AWS infra (`benchmarks/aws/`,
+kernellake host on `g6.2xlarge`, torn down after this session): the same
+queries that hit 1.5-2.7 GB/s scan throughput locally (docker-compose
+stack, MinIO on localhost -- see the local-docker-compose-stack finding
+elsewhere in this repo's history) hit only 0.07-0.17 GB/s over real S3.
+`parquet_decoding_seconds` looked tiny (~0.1s of a ~30s query) at first,
+which was itself misleading -- see below.
+
+**First hypothesis (wrong on the mechanism, real bug anyway).**
+`ObjectStoreDatasource` (`src/execution_gpu/object_store_datasource.cpp`)
+didn't override `cudf::io::datasource::host_read_async()`. That method's
+base-class default wraps the synchronous `host_read()` in
+`std::async(std::launch::deferred, ...)`, which does not run until the
+returned future is waited on -- so a caller that kicks off N "concurrent"
+reads and then waits on each in turn gets N fully serialized reads, no
+overlap, each paying the backend's own round-trip latency back-to-back.
+Fixed by overriding both `host_read_async()` overloads to launch on
+`std::launch::async` instead.
+
+**Confirmed, by instrumenting real calls against the real S3 bucket, that
+this was not the actual bottleneck.** A controlled local A/B (pre/post
+binaries from the same tree via a throwaway `git worktree`, same real S3
+query) showed no measurable difference: ~32s either way. Temporarily
+logging every `host_read`/`host_read_async` call for one query
+(`s3://.../tpch-data/sf10/lineitem-*.parquet`, Q6) showed why:
+`host_read_async()` was called **zero** times. Every one of 156 real reads
+(533MB total -- properly bulk-sized, 4 bytes up to ~7.3MB, not pathologically
+fragmented) went through the plain synchronous `host_read()`, one at a
+time, from a single thread.
+
+**Where the time actually goes -- a second, more important discovery: it's
+inside `has_next()`, not `read_chunk()`.** Instrumenting both calls
+separately: for the same pass, `has_next()` measured ~18-24s while
+`read_chunk()` measured ~0.02-0.1s. `cudf::io::chunked_parquet_reader`
+does its real per-pass I/O and decode work when `has_next()` determines
+whether another chunk exists (it has to fetch and decompress enough data
+to know), not when `read_chunk()` hands that already-prepared data back.
+This means `ParquetScanOperator`'s own `decode_seconds_` timer (added
+alongside the decode/compute overlap work earlier this session, see above)
+was silently measuring the *wrong call* -- it only wrapped `read_chunk()`,
+so `parquet_decoding_seconds` reported ~0.1s of decode cost when the real
+figure was ~28s. **Fixed**: both `prefetch_loop()` and the partitioned
+path's `next()` now time from before `has_next()`, not just around
+`read_chunk()` -- confirmed by rerunning the same real S3 query:
+`parquet_decoding_seconds` now reads ~27.7s of a ~31.5s total, an honest
+number instead of a misleading one.
+
+**Not yet fixed: the actual serialization.** 156 sequential synchronous
+reads, one full round-trip at a time, appears to be inherent to
+`chunked_parquet_reader`'s multi-datasource constructor (the one used for
+any non-local scan) -- it never calls the async override at all, so
+nothing at the `ObjectStoreDatasource` adapter layer can influence *when*
+cudf chooses to issue a read. A real fix needs either a speculative
+prefetch/read-ahead layer built into `ObjectStoreDatasource` itself (start
+reading likely-next ranges before cudf asks for them), or a way to get
+cudf to process the N per-file datasources concurrently at its own level
+(unconfirmed whether one exists in this cudf version -- no local source to
+check, only prebuilt-wheel headers). Both are real, riskier engineering
+than what's been done here; not attempted yet. `host_read_async()` stays
+overridden regardless (a real correctness fix for any future/other caller
+that does use it), just documented as not the fix for this specific
+regression.
