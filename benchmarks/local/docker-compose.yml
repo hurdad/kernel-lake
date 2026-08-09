@@ -116,6 +116,13 @@ services:
     command: ["--config", "/config/kernellake-server.yaml"]
     volumes:
       - ./config/kernellake-server.yaml:/config/kernellake-server.yaml:ro
+      # Backs storage.cache.directory (config/kernellake-server.yaml) -- a
+      # named volume, not container-ephemeral storage, so the NVMe cache
+      # actually survives `docker compose restart`/container recreation as
+      # designed (see docs/ARCHITECTURE.md's "NVMe cache tier" section).
+      # `docker compose down -v` still drops it, same as the other stateful
+      # volumes below.
+      - nvme-cache-data:/cache
     environment:
       - AWS_ACCESS_KEY_ID=minioadmin
       - AWS_SECRET_ACCESS_KEY=minioadmin
@@ -149,3 +156,4 @@ volumes:
   minio-data:
   prometheus-data:
   grafana-data:
+  nvme-cache-data:

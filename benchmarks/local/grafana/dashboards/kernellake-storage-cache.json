@@ -1,0 +1,50 @@
+{
+  "title": "KernelLake NVMe Cache (OTel)",
+  "uid": "kernellake-storage-cache",
+  "schemaVersion": 39,
+  "version": 1,
+  "time": {"from": "now-1h", "to": "now"},
+  "refresh": "5s",
+  "description": "src/storage/nvme_cache_metrics_otel.cpp's kernellake.storage.cache.* instruments (see docs/ARCHITECTURE.md's \"NVMe cache tier\" section, \"Cache metrics\" subsection). No per-series label (one NvmeObjectCache per kernellake-server process, unlike GPU memory's per-gpu.device.id split). Prometheus names verified for real against this exact stack (a real MinIO-backed query round trip, scraped from this stack's own otel-collector/prometheus): kernellake_storage_cache_current_bytes / _current_entries (gauges), kernellake_storage_cache_hits_total / _misses_total / _evictions_total (counters, cumulative since kernellake-server startup). Only populated once storage.cache.enabled is true in config/kernellake-server.yaml and at least one s3://... query has run.",
+  "panels": [
+    {
+      "id": 1,
+      "title": "Current cache size (bytes)",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+      "targets": [
+        {"expr": "kernellake_storage_cache_current_bytes", "legendFormat": "current_bytes"}
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Current cached objects (entry count)",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
+      "targets": [
+        {"expr": "kernellake_storage_cache_current_entries", "legendFormat": "current_entries"}
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Hit/miss rate (ops/sec)",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8},
+      "targets": [
+        {"expr": "rate(kernellake_storage_cache_hits_total[1m])", "legendFormat": "hits/sec"},
+        {"expr": "rate(kernellake_storage_cache_misses_total[1m])", "legendFormat": "misses/sec"}
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Cumulative hits / misses / evictions",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8},
+      "targets": [
+        {"expr": "kernellake_storage_cache_hits_total", "legendFormat": "hits"},
+        {"expr": "kernellake_storage_cache_misses_total", "legendFormat": "misses"},
+        {"expr": "kernellake_storage_cache_evictions_total", "legendFormat": "evictions"}
+      ]
+    }
+  ]
+}

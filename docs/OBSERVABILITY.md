@@ -97,9 +97,10 @@ tagged with a `kernellake.backend` attribute (`"cpu"`/`"gpu"`). Nothing is
 recorded for a failed query (`finish_error()` doesn't touch the histogram,
 matching the "no `elapsed_wall_seconds` to record" reasoning above).
 
-Anything you want beyond query duration and GPU memory (below) currently
-has to come from the span attributes (via a trace-to-metrics pipeline in
-your collector, e.g. Grafana Tempo's span metrics processor) rather than a
+Anything you want beyond query duration, GPU memory, and the NVMe cache
+(below) currently has to come from the span attributes (via a
+trace-to-metrics pipeline in your collector, e.g. Grafana Tempo's span
+metrics processor) rather than a
 native KernelLake metric -- no per-query-type counters, no gauge for
 in-flight queries.
 
@@ -165,6 +166,57 @@ behaves identically either way -- registration
 allocation itself (see that function's own comment), and the
 `KERNELLAKE_ENABLE_OTEL=OFF` stub is a plain no-op, mirroring
 `query_tracing_stub.cpp`'s own pattern.
+
+### 2.2.2 Metrics: NVMe cache (storage layer)
+
+Available in every build (`src/storage/nvme_object_cache.cpp`/
+`nvme_cache_metrics_otel.cpp`/`_stub.cpp`) -- unlike 2.2.1's GPU memory
+metrics, this needs no CUDA at all, since `NvmeObjectCache` has no GPU
+dependency. Only exported by `kernellake-server`
+(`KernelLakeFlightSqlServer`'s constructor calls
+`QueryEngine::register_cache_otel_instruments()` once, right after
+constructing its own long-lived `QueryEngine`); the CLI's `kernellake
+query --stats` exposes the same underlying counters as plain text instead
+(`cache_hits`/`cache_misses`/`cache_evictions`/`cache_current_bytes`/
+`cache_current_entries`) -- a single query's process lifetime is too
+short for OTel's periodic exporter to matter. Nothing is exported at all
+if `storage.cache.enabled` is false.
+
+| Metric (OTel name) | Prometheus name | Instrument | Unit | Meaning |
+|---|---|---|---|---|
+| `kernellake.storage.cache.current_bytes` | `kernellake_storage_cache_current_bytes` | ObservableGauge | `By` | Total bytes currently cached on the local NVMe cache directory |
+| `kernellake.storage.cache.current_entries` | `kernellake_storage_cache_current_entries` | ObservableGauge | `{entry}` | Number of objects currently cached |
+| `kernellake.storage.cache.hits` | `kernellake_storage_cache_hits_total` | ObservableCounter | `{hit}` | Cumulative cache hits since `kernellake-server` startup (a `get_or_populate()` call that found an existing entry, plus every successful `cached_info()` lookup -- see below) |
+| `kernellake.storage.cache.misses` | `kernellake_storage_cache_misses_total` | ObservableCounter | `{miss}` | Cumulative cache misses (a new entry had to be fetched from the backend and populated) |
+| `kernellake.storage.cache.evictions` | `kernellake_storage_cache_evictions_total` | ObservableCounter | `{eviction}` | Cumulative entries evicted (LRU by file mtime) to stay under `storage.cache.max_size_bytes` |
+
+Prometheus names verified for real against `benchmarks/local/`'s own
+stack: a real MinIO-backed query round trip via a real Flight SQL client,
+scraped directly from this stack's own `otel-collector`/`prometheus`
+services -- `current_bytes` matched the cached file's actual on-disk size
+byte for byte. No per-series label: unlike GPU memory (one series per
+`gpu.device.id`), there is exactly one `NvmeObjectCache` per
+`kernellake-server` process, so nothing to dimension by.
+
+`hits` counts both `get_or_populate()` (the actual read path,
+`ParquetScanOperator`/the CPU Acero executor) *and* `cached_info()` (a
+`list()`-path check added specifically so `read_parquet(...)`'s file-
+discovery step, which runs before any `open()` call, doesn't require the
+backend reachable for an already-fully-cached repeat query -- see
+`docs/ARCHITECTURE.md`'s "NVMe cache tier" section for the real bug this
+fixed). A single logical query can therefore register more than one hit
+even against one file (a `list()` hit plus an `open()` hit), which is
+accurate, not a double-count: each represents a real, separate backend
+call actually avoided.
+
+Same ObservableCounter/ObservableGauge reasoning as 2.2.1 applies here:
+`NvmeObjectCache` only ever touches plain `std::atomic` counters on its
+own call paths, never the OTel SDK directly -- the SDK reads a snapshot
+from its own periodic-export callback instead, via the callback's `void*`
+user-data parameter holding a pointer to the one `ObjectStoreRegistry`
+instance `kernellake-server`'s `QueryEngine` owns (not a process-wide
+static registry like `GpuMemoryMetricsRegistry`, since unlike
+`RmmEnvironment` this class is never recreated mid-process).
 
 ### 2.3 Logs: every existing `spdlog` call, for free
 
@@ -324,9 +376,9 @@ deployment today. Only takes effect if the deployed image was built with
 - **Per-operator spans.** Today's tracing is whole-query only -- there's
   no span for "this is the Parquet scan," "this is the hash join," etc.
   Explicitly deferred, not attempted, per `docs/ROADMAP.md`.
-- **No metric beyond query duration and GPU memory (2.2.1).** No
-  per-query-type counters, no gauge for in-flight queries, no
-  queue-depth metric.
+- **No metric beyond query duration, GPU memory (2.2.1), and the NVMe
+  cache (2.2.2).** No per-query-type counters, no gauge for in-flight
+  queries, no queue-depth metric.
 - **No per-query GPU memory metric** (as opposed to the process/device-
   level one in 2.2.1) -- `QueryResult::peak_gpu_memory_bytes` on the span
   is the only per-query GPU memory signal today.

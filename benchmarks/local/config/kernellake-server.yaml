@@ -33,6 +33,19 @@ storage:
     endpoint_override: "minio:9000"
     scheme: http
     tls_verify_certificates: false
+  # NVMe cache tier (see docs/ARCHITECTURE.md's "NVMe cache tier" section)
+  # in front of the s3:// backend above. /cache is a dedicated named Docker
+  # volume (docker-compose.yml's nvme-cache-data), not container-ephemeral
+  # storage -- this cache is designed to survive kernellake-server restarts,
+  # and a plain container-layer path would silently defeat that on every
+  # `docker compose up` after a container recreation. Real hits/misses/size
+  # numbers become visible in this stack's own Grafana dashboard
+  # (grafana/dashboards/kernellake-storage-cache.json) and Prometheus
+  # (kernellake_storage_cache_*) once at least one s3://... query has run.
+  cache:
+    enabled: true
+    directory: /cache
+    max_size_bytes: 10737418240  # 10 GiB -- generous for this stack's own generate_and_upload_data.sh scale, not a real-deployment sizing recommendation
 
 logging:
   level: info

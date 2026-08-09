@@ -82,12 +82,16 @@ isn't), `--no-gpu-metrics` (CPU-only stack).
 
 - Grafana: <http://localhost:3000> (anonymous viewer access, no login) --
   "KernelLake" folder has the query-metrics
-  (`grafana/dashboards/kernellake-query-metrics.json`) and GPU-memory
-  (`grafana/dashboards/kernellake-gpu-memory.json`) dashboards.
-- Prometheus: <http://localhost:9090> -- try `kernellake_query_duration_seconds_count`
-  or `kernellake_gpu_memory_peak_bytes` in the query box directly (see
-  `docs/OBSERVABILITY.md` §2.2.1 for the full OTel-name -> Prometheus-name
-  table).
+  (`grafana/dashboards/kernellake-query-metrics.json`), GPU-memory
+  (`grafana/dashboards/kernellake-gpu-memory.json`), and NVMe-cache
+  (`grafana/dashboards/kernellake-storage-cache.json`) dashboards. The
+  cache dashboard only shows real data once `storage.cache.enabled` (on by
+  default in this stack's own `config/kernellake-server.yaml`) and at
+  least one `s3://...` query has run.
+- Prometheus: <http://localhost:9090> -- try `kernellake_query_duration_seconds_count`,
+  `kernellake_gpu_memory_peak_bytes`, or `kernellake_storage_cache_hits_total`
+  in the query box directly (see `docs/OBSERVABILITY.md` §2.2.1 for the
+  full OTel-name -> Prometheus-name table).
 - Jaeger: <http://localhost:16686> -- pick service `kernellake` to see real
   query spans (`kernellake.query`), with the same attributes described in
   `docs/OBSERVABILITY.md` §2.1 (`kernellake.sql`, `kernellake.backend`,
@@ -112,7 +116,7 @@ KERNELLAKE_TARGET=runtime-cpu docker compose up -d --build
 ## Tear down
 
 ```bash
-docker compose down       # keeps the MinIO/Prometheus/Grafana volumes
+docker compose down       # keeps the MinIO/Prometheus/Grafana/NVMe-cache volumes
 docker compose down -v    # also drops them -- re-run generate_and_upload_data.sh next time
 ```
 
