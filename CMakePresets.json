@@ -12,7 +12,7 @@
       }
     },
     {
-      "name": "dev",
+      "name": "cpu-dev",
       "displayName": "Development (CPU, debug)",
       "inherits": "base",
       "description": "CPU-only debug build: SQL/planner/optimizer/storage/Parquet metadata path without CUDA/libcudf.",
@@ -24,7 +24,7 @@
       }
     },
     {
-      "name": "release",
+      "name": "cpu-release",
       "displayName": "Release (CPU)",
       "inherits": "base",
       "cacheVariables": {
@@ -48,9 +48,22 @@
       }
     },
     {
+      "name": "gpu-release",
+      "displayName": "Release (GPU)",
+      "inherits": "base",
+      "description": "Enables CUDA + libcudf + RMM, optimized (RelWithDebInfo, matching the CPU-only `cpu-release` preset). Requires the CUDA toolkit and a RAPIDS libcudf/RMM install, same as `gpu-dev`.",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "KERNELLAKE_WITH_CUDA": "ON",
+        "KERNELLAKE_BUILD_TESTS": "ON",
+        "KERNELLAKE_BUILD_BENCHMARKS": "ON",
+        "CMAKE_CUDA_COMPILER": "/usr/local/cuda/bin/nvcc"
+      }
+    },
+    {
       "name": "server-dev",
       "displayName": "Development (CPU, Flight SQL server)",
-      "inherits": "dev",
+      "inherits": "cpu-dev",
       "description": "CPU-only debug build with the Arrow Flight SQL server (kernellake-server) enabled. Requires libarrow-flight-dev, libarrow-flight-sql-dev, and gRPC.",
       "cacheVariables": {
         "KERNELLAKE_BUILD_SERVER": "ON"
@@ -59,7 +72,7 @@
     {
       "name": "otel-dev",
       "displayName": "Development (CPU, OpenTelemetry OTLP/gRPC)",
-      "inherits": "dev",
+      "inherits": "cpu-dev",
       "description": "CPU-only debug build with OpenTelemetry OTLP/gRPC tracing+metrics+logs export enabled. Requires opentelemetry-cpp-dev. Combine directly with -DKERNELLAKE_BUILD_SERVER=ON (no dedicated combined preset yet) to also exercise the Flight SQL server's query span.",
       "cacheVariables": {
         "KERNELLAKE_ENABLE_OTEL": "ON"
@@ -67,27 +80,34 @@
     }
   ],
   "buildPresets": [
-    { "name": "dev", "configurePreset": "dev" },
-    { "name": "release", "configurePreset": "release" },
+    { "name": "cpu-dev", "configurePreset": "cpu-dev" },
+    { "name": "cpu-release", "configurePreset": "cpu-release" },
     { "name": "gpu-dev", "configurePreset": "gpu-dev" },
+    { "name": "gpu-release", "configurePreset": "gpu-release" },
     { "name": "server-dev", "configurePreset": "server-dev" },
     { "name": "otel-dev", "configurePreset": "otel-dev" }
   ],
   "testPresets": [
     {
-      "name": "dev",
-      "configurePreset": "dev",
+      "name": "cpu-dev",
+      "configurePreset": "cpu-dev",
       "output": { "outputOnFailure": true },
       "execution": { "noTestsAction": "error", "stopOnFailure": false }
     },
     {
-      "name": "release",
-      "configurePreset": "release",
+      "name": "cpu-release",
+      "configurePreset": "cpu-release",
       "output": { "outputOnFailure": true }
     },
     {
       "name": "gpu-dev",
       "configurePreset": "gpu-dev",
+      "output": { "outputOnFailure": true },
+      "execution": { "noTestsAction": "error", "stopOnFailure": false }
+    },
+    {
+      "name": "gpu-release",
+      "configurePreset": "gpu-release",
       "output": { "outputOnFailure": true },
       "execution": { "noTestsAction": "error", "stopOnFailure": false }
     },

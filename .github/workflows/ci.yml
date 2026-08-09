@@ -46,10 +46,30 @@
 # unconditionally links Arrow's bundled google-cloud-cpp/Azure SDK C++
 # code too, not just the server/otel-enabled presets -- so this same
 # constraint now applies to cpu-build-test/tpch-tooling-smoke as well,
-# not just server-build-test/otel-build-test. The GitHub Actions runs
-# themselves have not been executed (no way to trigger an actual Actions
-# run from within this repository's development environment); review the
-# first run before trusting it blindly.
+# not just server-build-test/otel-build-test.
+#
+# Every libarrow*-dev package installed below is pinned to =25.0.0-1 (the
+# exact apt package version string, Debian revision included) -- matching
+# how every other real third-party dependency in this project is pinned
+# (see docker/Dockerfile's own comment on this). Every other apt package
+# here (gRPC, opentelemetry-cpp-dev, gtest, benchmark, spdlog,
+# nlohmann-json, yaml-cpp, avro-c, libcurl, libxml2, ...) is left unpinned
+# for now. If the 25.0.0-1 build ever disappears from Apache's apt repo,
+# bump this pin to whatever revision `apt-cache policy libarrow-dev`
+# reports as available then, in every job below plus docker/Dockerfile and
+# README.md -- don't drop back to unpinned.
+#
+# This workflow runs for real on GitHub Actions on every push to main (not
+# a hypothetical -- real run history exists and is inspectable via
+# `gh run list`/the Actions tab or the REST API without needing repo
+# write access). It has caught real regressions this way more than once:
+# a real clang-format drift across several files and a real
+# readability-braces-around-statements clang-tidy finding in
+# src/observability/query_tracing_otel.cpp both failed CI for real before
+# being found and fixed, neither introduced by the fixing commit itself --
+# i.e. this workflow had already been silently red on `main` for a
+# stretch before that was noticed and corrected. Treat a red run as a real
+# signal, not noise to route around.
 #
 # GPU-dependent work (the `gpu-dev` preset, `tests/gpu/`, real query
 # execution, DuckDB cross-validation, and TPC-H benchmarks) is
@@ -79,11 +99,11 @@ jobs:
           files=$(find src include tests -name '*.cpp' -o -name '*.hpp')
           clang-format-18 --style=file --dry-run --Werror $files
 
-  # Covers every CPU-buildable src/*.cpp (the `dev` preset's own scope, same
-  # as cpu-build-test below) against .clang-tidy's checks (bugprone-*,
+  # Covers every CPU-buildable src/*.cpp (the `cpu-dev` preset's own scope,
+  # same as cpu-build-test below) against .clang-tidy's checks (bugprone-*,
   # performance-*, plus a handful of readability/cppcoreguidelines rules --
   # see .clang-tidy's own comments for what's deliberately excluded and
-  # why). Needs a real build, not just `cmake --preset dev`: some included
+  # why). Needs a real build, not just `cmake --preset cpu-dev`: some included
   # headers only exist after FetchContent/build (e.g. hsql-src), and
   # HeaderFilterRegex still needs real Arrow/Parquet headers on disk to
   # resolve #includes correctly while parsing each translation unit.
@@ -118,11 +138,11 @@ jobs:
             "https://packages.apache.org/artifactory/arrow/ubuntu/apache-arrow-apt-source-latest-$(lsb_release --codename --short).deb"
           apt-get install -y -V /tmp/arrow-apt-source.deb
           apt-get update
-          apt-get install -y --no-install-recommends libarrow-dev libparquet-dev libarrow-dataset-dev
-      - name: Configure and build (dev preset, CPU-only)
+          apt-get install -y --no-install-recommends libarrow-dev=25.0.0-1 libparquet-dev=25.0.0-1 libarrow-dataset-dev=25.0.0-1
+      - name: Configure and build (cpu-dev preset)
         run: |
-          cmake --preset dev
-          cmake --build --preset dev
+          cmake --preset cpu-dev
+          cmake --build --preset cpu-dev
       - name: Run clang-tidy
         run: |
           files=$(find src -name '*.cpp' \
@@ -132,7 +152,7 @@ jobs:
             ! -path 'src/server/*' \
             ! -name 'query_tracing_otel.cpp' \
             ! -name 'query_tracing_test_support.cpp')
-          run-clang-tidy-18 -p build/dev -quiet -j "$(nproc)" -warnings-as-errors='*' $files
+          run-clang-tidy-18 -p build/cpu-dev -quiet -j "$(nproc)" -warnings-as-errors='*' $files
 
   cpu-build-test:
     # See this file's own top-of-file comment: plain ubuntu:26.04 (via
@@ -161,13 +181,13 @@ jobs:
             "https://packages.apache.org/artifactory/arrow/ubuntu/apache-arrow-apt-source-latest-$(lsb_release --codename --short).deb"
           apt-get install -y -V /tmp/arrow-apt-source.deb
           apt-get update
-          apt-get install -y --no-install-recommends libarrow-dev libparquet-dev libarrow-dataset-dev
-      - name: Configure (dev preset, CPU-only)
-        run: cmake --preset dev
+          apt-get install -y --no-install-recommends libarrow-dev=25.0.0-1 libparquet-dev=25.0.0-1 libarrow-dataset-dev=25.0.0-1
+      - name: Configure (cpu-dev preset)
+        run: cmake --preset cpu-dev
       - name: Build
-        run: cmake --build --preset dev
+        run: cmake --build --preset cpu-dev
       - name: Test
-        run: ctest --preset dev --output-on-failure
+        run: ctest --preset cpu-dev --output-on-failure
 
   tpch-tooling-smoke:
     # See cpu-build-test's own comment on why this needs ubuntu:26.04 too.
@@ -192,16 +212,16 @@ jobs:
             "https://packages.apache.org/artifactory/arrow/ubuntu/apache-arrow-apt-source-latest-$(lsb_release --codename --short).deb"
           apt-get install -y -V /tmp/arrow-apt-source.deb
           apt-get update
-          apt-get install -y --no-install-recommends libarrow-dev libparquet-dev libarrow-dataset-dev
+          apt-get install -y --no-install-recommends libarrow-dev=25.0.0-1 libparquet-dev=25.0.0-1 libarrow-dataset-dev=25.0.0-1
       - name: Install pyarrow (for generate_tpch.py)
         run: pip install --user --break-system-packages pyarrow
-      - name: Build (dev preset)
+      - name: Build (cpu-dev preset)
         run: |
-          cmake --preset dev
-          cmake --build --preset dev
+          cmake --preset cpu-dev
+          cmake --build --preset cpu-dev
       - name: generate-data smoke test
         run: |
-          ./build/dev/src/cli/kernellake generate-data --output /tmp/kernellake-sales --rows 10000 --files 2
+          ./build/cpu-dev/src/cli/kernellake generate-data --output /tmp/kernellake-sales --rows 10000 --files 2
 
       # SF1 is the spec's own CI recommendation, but that is a ~6,000,000-row
       # generation run (see tools/generate_tpch.py); a much smaller scale
@@ -236,7 +256,7 @@ jobs:
                    s|{orders_data}|/tmp/kernellake-tpch-smoke/orders-*.parquet|; \
                    s|{customer_data}|/tmp/kernellake-tpch-smoke/customer-*.parquet|")
             echo "=== $q ==="
-            ./build/dev/src/cli/kernellake explain --sql "$sql"
+            ./build/cpu-dev/src/cli/kernellake explain --sql "$sql"
           done
 
   server-build-test:
@@ -269,8 +289,8 @@ jobs:
           apt-get install -y -V /tmp/arrow-apt-source.deb
           apt-get update
           apt-get install -y --no-install-recommends \
-            libarrow-dev libparquet-dev libarrow-dataset-dev \
-            libarrow-flight-dev libarrow-flight-sql-dev
+            libarrow-dev=25.0.0-1 libparquet-dev=25.0.0-1 libarrow-dataset-dev=25.0.0-1 \
+            libarrow-flight-dev=25.0.0-1 libarrow-flight-sql-dev=25.0.0-1
       - name: Install gRPC
         run: apt-get install -y --no-install-recommends libgrpc++-dev protobuf-compiler-grpc
       - name: Configure (server-dev preset)
@@ -279,7 +299,7 @@ jobs:
         run: cmake --build --preset server-dev
       - name: Test
         run: ctest --preset server-dev --output-on-failure
-      # The clang-tidy job above covers every file the `dev` preset builds;
+      # The clang-tidy job above covers every file the `cpu-dev` preset builds;
       # src/server/*.cpp only exists in this preset (KERNELLAKE_BUILD_SERVER),
       # so it's checked here instead, against this job's own already-built
       # server-dev compile_commands.json.
@@ -325,7 +345,7 @@ jobs:
             "https://packages.apache.org/artifactory/arrow/ubuntu/apache-arrow-apt-source-latest-$(lsb_release --codename --short).deb"
           apt-get install -y -V /tmp/arrow-apt-source.deb
           apt-get update
-          apt-get install -y --no-install-recommends libarrow-dev libparquet-dev libarrow-dataset-dev
+          apt-get install -y --no-install-recommends libarrow-dev=25.0.0-1 libparquet-dev=25.0.0-1 libarrow-dataset-dev=25.0.0-1
       - name: Install opentelemetry-cpp
         run: apt-get install -y --no-install-recommends opentelemetry-cpp-dev
       - name: Install gRPC

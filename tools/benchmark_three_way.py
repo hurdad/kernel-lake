@@ -48,7 +48,7 @@ Usage:
 Requires: pyspark (+ a JVM on PATH), pyarrow, duckdb, adbc-driver-flightsql.
 Not part of this project's own CPU-only dev environment's dependency set --
 see docker/Dockerfile's `benchmark-gpu` stage, which adds all of them to a
-`dev-gpu`-based image specifically to run this script in a reproducible
+`gpu-release`-based image specifically to run this script in a reproducible
 container alongside a real GPU (`docker run --gpus all`).
 """
 

@@ -29,7 +29,7 @@ cmake --preset otel-dev   # -DKERNELLAKE_ENABLE_OTEL=ON, CPU-only
 cmake --preset gpu-dev -DKERNELLAKE_ENABLE_OTEL=ON
 ```
 
-`docker/Dockerfile`'s `dev-cpu`/`dev-gpu` stages (and therefore
+`docker/Dockerfile`'s `cpu-release`/`gpu-release` stages (and therefore
 `runtime-cpu`/`runtime-gpu`) already build with `KERNELLAKE_ENABLE_OTEL=ON`,
 so the published images support this out of the box -- you only need the
 config below to actually turn it on.

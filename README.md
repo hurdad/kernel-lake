@@ -1,5 +1,7 @@
 # KernelLake
 
+[![CI](https://github.com/hurdad/kernel-lake/actions/workflows/ci.yml/badge.svg)](https://github.com/hurdad/kernel-lake/actions/workflows/ci.yml)
+
 **GPU-native analytics for the open lakehouse.**
 
 KernelLake is an open-source GPU-native query engine for Apache Iceberg,
@@ -101,9 +103,10 @@ section for why -- Arrow Flight SQL and otel-cpp both need it).
 # Core toolchain -- libxml2-dev/uuid-dev are for Arrow's bundled GCS/Azure
 # filesystem support, libavro-dev/libcurl4-openssl-dev for Iceberg manifest
 # reading and REST/OAuth2 calls, libgrpc++-dev/protobuf-compiler-grpc for
-# the Delta Lake gRPC client -- all unconditional even for the base `dev`
-# preset, not specific to any one optional feature (see CMakeLists.txt's
-# own comments on each `find_package`/`pkg_check_modules` call).
+# the Delta Lake gRPC client -- all unconditional even for the base
+# `cpu-dev` preset, not specific to any one optional feature (see
+# CMakeLists.txt's own comments on each `find_package`/`pkg_check_modules`
+# call).
 sudo apt-get update
 sudo apt-get install -y build-essential cmake ninja-build git pkg-config \
   python3 python3-pip \
@@ -111,13 +114,17 @@ sudo apt-get install -y build-essential cmake ninja-build git pkg-config \
   libxml2-dev uuid-dev libavro-dev libcurl4-openssl-dev \
   libgrpc++-dev protobuf-compiler-grpc
 
-# Apache Arrow / Parquet C++ (official Apache Arrow apt repo)
+# Apache Arrow / Parquet C++ (official Apache Arrow apt repo). Pinned to
+# 25.0.0-1 -- unlike most other dependencies here, apt would otherwise
+# silently float to whatever the repo currently serves; see
+# docker/Dockerfile's own comment for the full rationale and what to do if
+# this exact revision ever disappears from the repo.
 sudo apt-get install -y -V ca-certificates lsb-release wget
 wget -O /tmp/arrow-apt-source.deb \
   "https://packages.apache.org/artifactory/arrow/ubuntu/apache-arrow-apt-source-latest-$(lsb_release --codename --short).deb"
 sudo apt-get install -y -V /tmp/arrow-apt-source.deb
 sudo apt-get update
-sudo apt-get install -y libarrow-dev libparquet-dev libarrow-dataset-dev
+sudo apt-get install -y libarrow-dev=25.0.0-1 libparquet-dev=25.0.0-1 libarrow-dataset-dev=25.0.0-1
 ```
 
 GPU execution additionally needs the CUDA Toolkit (12+) and RAPIDS
@@ -132,9 +139,10 @@ that (26.04's, 4.2.3 at last check, already isn't).
 Two more presets need their own extra packages, on top of the core
 toolchain above: `server-dev` (the Arrow Flight SQL server) additionally
 needs `libarrow-flight-dev`/`libarrow-flight-sql-dev` (same Apache Arrow
-apt repo); `otel-dev` (OpenTelemetry export) needs `opentelemetry-cpp-dev`,
-which -- like `libarrow-flight-sql-dev` -- has no Ubuntu 24.04 apt package
-at all (26.04 only). The two can be combined with each other by passing
+apt repo, same `=25.0.0-1` pin as above); `otel-dev` (OpenTelemetry export)
+needs `opentelemetry-cpp-dev`, which -- like
+`libarrow-flight-sql-dev` -- has no Ubuntu 24.04 apt package at all (26.04
+only). The two can be combined with each other by passing
 the extra flag directly rather than switching presets --
 `cmake --preset otel-dev -DKERNELLAKE_BUILD_SERVER=ON` -- since there's no
 dedicated combined preset yet (see `otel-dev`'s own `description` in
@@ -142,29 +150,37 @@ dedicated combined preset yet (see `otel-dev`'s own `description` in
 
 ## Build and test
 
-Five CMake presets (`CMakePresets.json`), each independently
-build+test-able; `dev` is the one every other preset builds on
-(`server-dev`/`otel-dev` both `inherits: dev`, `gpu-dev` shares its base
-config):
+Six CMake presets (`CMakePresets.json`), each independently build+test-able;
+`cpu-dev` is the one `server-dev`/`otel-dev` both build on
+(`inherits: cpu-dev`), `gpu-dev`/`gpu-release` share `cpu-dev`/`cpu-release`'s
+base config plus CUDA:
 
 ```bash
-# dev: CPU-only debug build -- SQL parsing through physical planning,
+# cpu-dev: CPU-only debug build -- SQL parsing through physical planning,
 # pruning, generate-data. No CUDA needed; everything else below needs this
 # one's own Requirements at minimum.
-cmake --preset dev
-cmake --build --preset dev
-ctest --preset dev
+cmake --preset cpu-dev
+cmake --build --preset cpu-dev
+ctest --preset cpu-dev
 
-# release: same CPU-only scope as dev, RelWithDebInfo instead of Debug.
-cmake --preset release
-cmake --build --preset release
-ctest --preset release
+# cpu-release: same CPU-only scope as cpu-dev, RelWithDebInfo instead of
+# Debug -- what docker/Dockerfile's published runtime-cpu image is built
+# from.
+cmake --preset cpu-release
+cmake --build --preset cpu-release
+ctest --preset cpu-release
 
-# gpu-dev: adds real GPU query execution (needs CUDA Toolkit 12+, an
+# gpu-dev: adds real GPU query execution, Debug (needs CUDA Toolkit 12+, an
 # NVIDIA GPU, and CMake >= 3.30.4 -- see Requirements above).
 cmake --preset gpu-dev
 cmake --build --preset gpu-dev
 ctest --preset gpu-dev
+
+# gpu-release: same GPU scope as gpu-dev, RelWithDebInfo instead of Debug --
+# what docker/Dockerfile's published runtime-gpu image is built from.
+cmake --preset gpu-release
+cmake --build --preset gpu-release
+ctest --preset gpu-release
 
 # server-dev: CPU-only + kernellake-server (Arrow Flight SQL). Needs
 # libarrow-flight-dev/libarrow-flight-sql-dev -- see Requirements above.
@@ -182,22 +198,23 @@ ctest --preset otel-dev
 ## Usage
 
 ```bash
-# Generate a deterministic synthetic dataset (works with either preset)
-./build/dev/src/cli/kernellake generate-data --output /tmp/kernellake-sales \
+# Generate a deterministic synthetic dataset (works with any preset)
+./build/cpu-dev/src/cli/kernellake generate-data --output /tmp/kernellake-sales \
   --rows 10000000 --files 16 --row-group-rows 250000 --seed 42
 
 # Inspect a Parquet file's schema, row groups, and column statistics
-./build/dev/src/cli/kernellake inspect-parquet --path /data/sales.parquet
-./build/dev/src/cli/kernellake inspect-parquet --path /data/sales.parquet --format json
+./build/cpu-dev/src/cli/kernellake inspect-parquet --path /data/sales.parquet
+./build/cpu-dev/src/cli/kernellake inspect-parquet --path /data/sales.parquet --format json
 
 # See the plan KernelLake would run for a query
-./build/dev/src/cli/kernellake explain \
+./build/cpu-dev/src/cli/kernellake explain \
   --sql "SELECT region, SUM(amount) FROM read_parquet('/data/sales/*.parquet') GROUP BY region"
-./build/dev/src/cli/kernellake explain --logical --sql "..."   # pre-physical-planning view
-./build/dev/src/cli/kernellake explain --format json --sql "..."
+./build/cpu-dev/src/cli/kernellake explain --logical --sql "..."   # pre-physical-planning view
+./build/cpu-dev/src/cli/kernellake explain --format json --sql "..."
 
-# Run a query on the GPU (requires a gpu-dev build; the dev build's binary
-# throws a clear ExecutionError for the (default) gpu backend instead)
+# Run a query on the GPU (requires a gpu-dev/gpu-release build; a CPU-only
+# build's binary throws a clear ExecutionError for the (default) gpu
+# backend instead)
 ./build/gpu-dev/src/cli/kernellake query \
   --sql "SELECT region, SUM(amount) FROM read_parquet('/tmp/kernellake-sales/*.parquet') \
          WHERE event_date >= DATE '2026-01-01' GROUP BY region"
@@ -207,10 +224,10 @@ ctest --preset otel-dev
 ./build/gpu-dev/src/cli/kernellake query --sql "..." --stats   # prints measured metrics to stderr
 
 # Run the same query on the CPU (Apache Arrow Acero) instead -- works with
-# either build, including the CPU-only dev build. Supports LIKE/CASE/JOIN
-# (including N-way chains) too; see docs/ARCHITECTURE.md for this
-# backend's current query-shape scope.
-./build/dev/src/cli/kernellake query --backend cpu \
+# any build, including a CPU-only one. Supports LIKE/CASE/JOIN (including
+# N-way chains) too; see docs/ARCHITECTURE.md for this backend's current
+# query-shape scope.
+./build/cpu-dev/src/cli/kernellake query --backend cpu \
   --sql "SELECT region, SUM(amount) FROM read_parquet('/tmp/kernellake-sales/*.parquet') GROUP BY region"
 ```
 
@@ -261,13 +278,15 @@ engines -- see `docs/ROADMAP.md` for real numbers from this.
 ## Docker
 
 `docker/Dockerfile` is a single multi-stage file publishing two runtime
-images: `runtime-cpu` (no CUDA/RAPIDS at all -- 456 MB) and `runtime-gpu`
-(full CUDA/RAPIDS closure -- 2.17 GB). Both ship the same two binaries
-(`kernellake`, `kernellake-server`); they differ only in whether the GPU
-execution backend is compiled in. The `dev-cpu`/`dev-gpu` build stages
-(full toolchain, repo built inside them -- the GPU one is 14.1 GB) are
-intermediate only and are never published. Every stage builds on plain
-`ubuntu:26.04`, with `runtime-gpu`/`dev-gpu` installing CUDA via apt's own
+images: `runtime-cpu` (no CUDA/RAPIDS at all) and `runtime-gpu` (full
+CUDA/RAPIDS closure). Both ship the same two binaries (`kernellake`,
+`kernellake-server`), built optimized (`cpu-release`/`gpu-release`
+presets, RelWithDebInfo -- not the Debug builds `cpu-dev`/`gpu-dev` produce
+for local iteration); they differ only in whether the GPU execution
+backend is compiled in. The `cpu-release`/`gpu-release` build stages (full
+toolchain, repo built inside them) are intermediate only and are never
+published. Every stage builds on plain `ubuntu:26.04`, with
+`runtime-gpu`/`gpu-release` installing CUDA via apt's own
 `nvidia-cuda-toolkit` (12.4.1), not Ubuntu 24.04 or NVIDIA's official
 `nvidia/cuda` images -- see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)'s
 "Ubuntu 26.04 baseline" section for why (Arrow Flight SQL and otel-cpp both
@@ -300,18 +319,24 @@ no arm64 hardware or runner was used to verify this). `kernel-lake-gpu` is
 arm64 GPU hardware (e.g. NVIDIA Grace/Jetson) to verify, which hasn't
 happened yet; see `docs/ROADMAP.md`. `docker run --gpus all` against a real
 GPU (RTX 5060 Ti) has been verified for real against this Ubuntu 26.04
-baseline: the full `gpu-dev` test suite passes in the `dev-gpu` image (see
-`docs/ROADMAP.md` for the exact, growing count as of each verified
-milestone -- citing one fixed number here would just go stale), and a real
-query against real generated data through the `runtime-gpu` image alone
-produces correct GPU-executed results -- see `docs/ARCHITECTURE.md`.
-`runtime-cpu` has been verified for real too: a real
-`docker build --target runtime-cpu`,
-`generate-data`, and `query --backend cpu` against real generated data all
-produce correct results through the built image. CI's own `docker-publish`
-job (building against the previous, pre-cpu/gpu-split Dockerfile) had
-separately succeeded end to end on real GitHub Actions; re-confirming CI
-still passes with this restructuring is still pending.
+baseline, on both the original Debug-built GPU image and, after the later
+`cpu-dev`/`gpu-dev` -> `cpu-release`/`gpu-release` optimization switch for
+the published images, re-verified again against the now-`RelWithDebInfo`
+`runtime-gpu`: a real `docker build --target runtime-gpu` (2.48 GB disk,
+904 MB content, at last measurement) followed by a real `docker run
+--gpus all ... query --backend gpu` against real generated data produced
+correct GPU-executed results. `runtime-cpu` has been verified for real
+too, both before and after the same switch: a real
+`docker build --target runtime-cpu` (541 MB disk, 136 MB content at last
+measurement), `generate-data`, and `query --backend cpu` against real
+generated data all produce correct results through the built image. See
+`docs/ARCHITECTURE.md` for the full `gpu-dev`-era test-suite verification
+this predates. CI's own `docker-publish` job (building against the
+previous, pre-cpu/gpu-split Dockerfile) had separately succeeded end to
+end on real GitHub Actions; re-confirming CI still passes with the
+cpu-release/gpu-release restructuring is still pending (the restructuring
+itself has only been verified locally so far, not yet through an actual
+GitHub Actions run).
 
 ## Arrow Flight SQL server and observability
 

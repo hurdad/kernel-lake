@@ -226,7 +226,7 @@ translation units selected by a CMake generator expression on
 a `PhysicalOperator` tree, pulled to exhaustion inside
 `RmmEnvironment::track_query()` for per-query memory accounting, with each
 resulting `DeviceBatch` converted to an Arrow `RecordBatch` via
-`kernellake/execution/arrow_bridge.hpp`); the CPU-only `dev` preset's stub
+`kernellake/execution/arrow_bridge.hpp`); the CPU-only `cpu-dev` preset's stub
 throws a clear `ExecutionError` instead -- **unless** `engine.backend` (or
 `kernellake query --backend`) is set to `"cpu"`, in which case both builds
 instead dispatch to `execute_cpu()`. The `kernellake query` CLI command
@@ -939,7 +939,16 @@ that existed at the time). A later session split that GPU build path into
 docs/ROADMAP.md for the current shape and what's published) -- the
 `dev-gpu`/`runtime-gpu` stages are exactly this section's `dev`/`runtime`,
 renamed, with no change to their own build steps, so every fact below still
-applies to them unchanged.
+applies to them unchanged. A still-later session renamed the intermediate
+stages again, to `cpu-release`/`gpu-release` (see the matching CMake
+presets), and switched them from `CMAKE_BUILD_TYPE: Debug` to
+`RelWithDebInfo` at the same time -- this second rename is not purely
+cosmetic like the first one, but the Ubuntu-26.04-specific facts in this
+section (Arrow Flight SQL/Abseil linking, otel-cpp apt availability) are
+about the base OS and installed apt packages, not the optimization level,
+so they still apply unchanged; only size/timing numbers tied to the old
+Debug build should be treated as stale until re-measured, not the
+linking/dependency facts themselves.
 
 `docker/Dockerfile`'s GPU build path build on plain
 `ubuntu:26.04`, not Ubuntu 24.04 or NVIDIA's official `nvidia/cuda` devel/
@@ -1368,7 +1377,11 @@ their own build steps, so the facts and verification results below still
 apply to them unchanged; the specific `docker build --target dev`/
 `--target runtime` commands quoted below need `-gpu` appended to still
 work against the current Dockerfile (or `-cpu` for the equivalent CPU-only
-path, not covered by this session's own verification).
+path, not covered by this session's own verification). A still-later
+session renamed `dev-cpu`/`dev-gpu` again, to `cpu-release`/`gpu-release`,
+switching `CMAKE_BUILD_TYPE` from `Debug` to `RelWithDebInfo` at the same
+time -- see the "Ubuntu 26.04 baseline" section above's own note on that
+rename for what still applies unchanged vs. what needs re-measuring.
 
 Phase 3 of the Flight SQL/otel-cpp/Helm-chart epic (Phase 0, Phase 1
 `kernellake-server`, and Phase 2 OpenTelemetry, all above). Closes the
