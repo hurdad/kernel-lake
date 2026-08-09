@@ -35,10 +35,15 @@ CMake preset rather than `tests/unit/`).
 | `sql` | Parser-independent AST (`kernellake::sql::AstSelectStatement`) and the parser adapter around the vendored `hyrise/sql-parser` |
 | `planner` | Binder, logical plan + logical planner, physical plan node definitions |
 | `optimizer` | Rule-based logical plan rewriting |
-| `storage` | `ObjectStore`/`LocalObjectStore`, file discovery |
+| `storage` | `ObjectStore`/`LocalObjectStore`/cloud backends (S3/GCS/Azure/HDFS), file discovery |
+| `iceberg` | Iceberg REST catalog client, manifest reading, partition pruning, position-delete reads, schema translation (`kernellake_iceberg`) |
+| `delta` | Delta Lake read support (`kernellake_delta`) |
 | `io` | Parquet metadata inspection, row-group pruning, the physical planner (ties `planner` + `storage` + `io` together) |
 | `memory` | RAII CUDA device/stream wrappers, RMM memory-pool/statistics/limit configuration (`gpu-dev` preset only) |
-| `execution` | `PhysicalOperator`/`DeviceBatch`/`ExecutionContext`, the Arrow<->cudf bridge, the AST expression compiler, and every concrete GPU operator (`gpu-dev` preset only) |
+| `execution_gpu` | `PhysicalOperator`/`DeviceBatch`/`ExecutionContext`, the Arrow<->cudf bridge, the AST expression compiler, and every concrete GPU operator (`gpu-dev` preset only) -- renamed from `execution` |
+| `execution_cpu` | The CPU (Arrow Acero) execution backend (`kernellake_execution_cpu`) -- every preset, not `gpu-dev`-only |
+| `observability` | OpenTelemetry tracing/metrics/logging wiring (`kernellake_observability`, see `docs/OBSERVABILITY.md`) |
+| `server` | `kernellake-server`, Flight SQL, `GpuExecutionCoordinator` (`kernellake_flight_sql_server`, `KERNELLAKE_BUILD_SERVER` only) |
 | `generator` | `kernellake generate-data`'s deterministic synthetic dataset generator (CPU-only, no CUDA dependency) |
 | `api` | `QueryEngine`, the top-level entry point |
 | `cli` | The `kernellake` executable and its subcommands |
@@ -102,7 +107,7 @@ SELECT <items> FROM read_parquet(...) AS a JOIN read_parquet(...) AS b ON <a.col
   the `SELECT` list, `GROUP BY` keys, and both grouped and scalar aggregate
   arguments (e.g. `SUM(CASE WHEN ... THEN ... ELSE ... END)`, TPC-H Q12/
   Q14's shape) -- but **not yet in `WHERE`** (a separate, still-open
-  `FilterOperator` gap; see "CASE expression implementation notes" below)
+  `FilterOperator` gap; see "LIKE/IN/CASE/CAST implementation notes" below)
 - A `SELECT` item that *combines multiple aggregates arithmetically* (e.g.
   TPC-H Q14's `100.00 * SUM(...) / SUM(...)`, a ratio of two aggregates,
   neither one a bare aggregate call by itself) -- both backends, since this
@@ -303,7 +308,7 @@ external NVTX profiling.
 | `FilterOperator` | `cudf::compute_column` + `cudf::apply_boolean_mask` over a compiled AST predicate |
 | `ProjectionOperator` | Compiled AST per computed item; a bare column reference is copied directly instead (see below) |
 | `ScalarAggregateOperator` | No `GROUP BY`: `cudf::reduce` with its `init` parameter folds each batch into a running scalar (SUM/MIN/MAX/AVG numerator); COUNT/AVG's denominator is a host-side counter. Empty input produces NULL, not zero, except `COUNT(*)`/`COUNT(x)` which produce 0. |
-| `HashAggregateOperator` | `GROUP BY`: `cudf::groupby::streaming_groupby` accumulates partial groups across batches within `max_distinct_keys` (default 10M), `finalize()`d on last `next()` |
+| `HashAggregateOperator` | `GROUP BY`: each incoming batch is aggregated on its own with a plain, one-shot `cudf::groupby::groupby`, then folded into a running partial result (concatenate + re-aggregate) -- not `cudf::groupby::streaming_groupby` (replaced: that design coupled `max_distinct_keys` to an unrelated per-call row-count limit, causing severe slowdowns on low-cardinality GROUP BYs over large scans). `accumulated_` exceeding `max_distinct_keys` (default 20M) throws. |
 | `LimitOperator` | `cudf::slice` + the `cudf::table` copy constructor to truncate the final batch |
 | `SortOperator` | `ORDER BY`: **blocking**, unlike every operator above -- consumes `child` to exhaustion, concatenates every batch (`cudf::concatenate`) into one table, then `cudf::stable_sorted_order` + `cudf::gather`. Memory footprint is the whole result set, not bounded like the streaming operators. |
 | `HashJoinOperator` | Two-table `INNER JOIN`: its *build* (right) side is **blocking** like `SortOperator` (consumed to exhaustion, concatenated into one table, then wraps a single `cudf::hash_join`); its *probe* (left) side streams normally, one `inner_join()` + double-`cudf::gather` per batch. See "Hash joins" above. |
@@ -435,7 +440,7 @@ compile a non-plain-column aggregate argument via the plain `cudf::ast`
 ("unrecognized expression type in GPU expression compiler") -- unlike
 `HashAggregateOperator` (the `GROUP BY` path), which already had the
 `CASE`-aware `compile_expr()`/`materialize()`/`materialize_case()` fast
-paths (see "CASE expression implementation notes" below). This is exactly
+paths (see "LIKE/IN/CASE/CAST implementation notes" below). This is exactly
 TPC-H Q14's shape: a *scalar* `SUM(CASE WHEN ... THEN ... ELSE ... END)`,
 no `GROUP BY`. Fixed by giving `ScalarAggregateOperator` the identical
 `CompiledExpr`/`CompiledCase`/`CompiledDecimalCast` structs and
@@ -766,11 +771,17 @@ would fail on an implementation detail unrelated to correctness.
   smaller table) instead of `lineitem`, confirmed via `kernellake explain
   --format json`; Q3's 3-way chain shows the swap propagating sensibly
   through both join steps (smallest table innermost/build, largest
-  outermost/probe). This narrows, but doesn't eliminate, the real SF100
-  OOM risk documented in `docs/ROADMAP.md` -- neither execution operator
-  has a bounded/streaming join design (see below), so an arbitrarily large
-  build side, even the smaller of the two, can still exceed available
-  memory at large enough scale.
+  outermost/probe). This build-side sizing heuristic narrows, but on its
+  own doesn't eliminate, OOM risk from a large build side -- neither
+  execution operator has a bounded/streaming join design (see below), so
+  an arbitrarily large build side, even the smaller of the two, can still
+  exceed available memory at large enough scale. A real SF100 GPU OOM on
+  TPC-H Q3 (a 3-way join) turned out to have a different, more direct
+  cause -- see "Predicate pushdown across a join" below and
+  `docs/GPU_OPTIMIZATIONS.md` -- and is now confirmed fixed at real SF100
+  scale; this heuristic's own remaining exposure (a build side that's
+  genuinely large even after correct join-side selection and predicate
+  pushdown) is real but separate, and still applies.
 - **N-way joins, generalized from an original two-table-only design.** A
   real investigation found the underlying `hsql` SQL parser already parses
   `A JOIN B JOIN C ON ...` correctly into a left-deep nested `TableRef` tree
@@ -849,17 +860,28 @@ would fail on an implementation detail unrelated to correctness.
   binder.cpp rejects this with a clear `BindingError` rather than trying to
   compile a cast into the join key extraction. Make both sides the same
   type instead.
-- **No predicate pushdown across a join**: `LogicalScan::pushable_predicates()`
-  stays empty for both sides of a JOIN query (the optimizer's
-  `annotate_scan()` splits *required columns* by side using each
-  `ColumnExpression`'s combined index, but always discards
-  `pushable_predicates` collected above a `LogicalJoin` rather than routing
-  them to one side -- `PushablePredicate`'s bare column name has no way to
-  say which side it came from once two schemas are in play). Row-group
-  pruning still runs per-side in the physical planner; a JOIN query's WHERE
-  clause (beyond the ON condition) just never narrows it. Column pruning
-  (only reading columns actually referenced, on each side, including the
-  join key) still works normally.
+- **Predicate pushdown across a join**: `rewrite_plan()`'s
+  `push_predicate_through_join()` (`src/optimizer/optimizer.cpp`) splits a
+  WHERE clause's top-level AND conjuncts by which side of a `LogicalJoin`
+  their columns belong to (a single-sided conjunct's columns all fall
+  below, or all at/above, the join's `left()` child's field count) and
+  pushes each one down as a new `LogicalFilter` directly above that
+  child -- `sigma_p(A JOIN B) = sigma_p(A) JOIN B`, unconditionally valid
+  since this engine only supports INNER joins (no null-extension
+  semantics to worry about). Recurses through `rewrite_plan()`, so it
+  telescopes through an entire N-way left-deep join chain one level at a
+  time. A conjunct referencing columns from both sides (or a constant)
+  is left exactly where it was, still applied post-join via a
+  `LogicalFilter` directly above the join. Once a predicate lands
+  directly on a `LogicalFilter(LogicalScan, ...)` shape, it flows into
+  the ordinary single-table `pushable_predicates()`/row-group-pruning
+  path below (`annotate_scan()` needs no join-specific handling for
+  this -- it already knew how to collect predicates from a `LogicalFilter`
+  sitting directly on a scan). Fixed after a real SF100 GPU OOM on
+  TPC-H Q3 found the unfiltered build side of a chained join
+  materializing far more rows than the query's WHERE clause should have
+  left -- see `docs/GPU_OPTIMIZATIONS.md`'s "predicate pushdown stopped
+  at joins" section for the full investigation and real EC2 validation.
 - **Known limitation**: remapping a column reference that sits *directly
   above* the join (in a `Filter`/`Projection`/`Aggregate`/`Sort` whose
   child is the join itself) matches by column *name* against the join's
@@ -1040,7 +1062,7 @@ with no other column reference anywhere in the query (no `WHERE`, no
 `LogicalScan::required_columns()` from `src/optimizer/optimizer.cpp`'s
 column-pruning pass -- correct in principle, since `COUNT(*)` needs no
 column data, only a row count. `ParquetScanOperator::next()`
-(`src/execution/parquet_scan_operator.cpp`) then gates on
+(`src/execution_gpu/parquet_scan_operator.cpp`) then gates on
 `result.tbl->num_rows() > 0`, but a `cudf::table` with zero columns
 selected has no column to derive a row count from, so `num_rows()` reads
 `0` regardless of how many rows the underlying row groups actually
@@ -1507,12 +1529,12 @@ fields in config at all -- it reads `AWS_ACCESS_KEY_ID`/
 so secrets never need to live in a config file. `HdfsSection` is
 config-schema-only in this phase (see Non-goals below).
 
-**GPU scan path** (`ParquetScanOperator`, `src/execution/
+**GPU scan path** (`ParquetScanOperator`, `src/execution_gpu/
 parquet_scan_operator.cpp`): local-scheme fragments keep cudf's own
 `source_info(file_paths)` local-path constructor completely unchanged (no
 added indirection for the common case). Any fragment with a non-local
 scheme routes through a new `ObjectStoreDatasource`
-(`src/execution/object_store_datasource.cpp`), a `cudf::io::datasource`
+(`src/execution_gpu/object_store_datasource.cpp`), a `cudf::io::datasource`
 subclass wrapping whatever `ObjectStore::open()` returned (local, S3, GCS,
 or Azure -- this class doesn't know or care which), implementing the 3
 required pure virtuals (`size()`, both `host_read()` overloads) via
@@ -1732,7 +1754,10 @@ smoke tests (manual verification only in this pass, matching how Phase
 
 These are named as forward-declared types or documented models so later
 work has a clean seam to build against; none of them have implementations
-yet, and none are exposed as supported CLI features.
+yet, and none are exposed as supported CLI features. (The catalog model
+and cloud storage backend that used to be listed here are done -- see
+"Cloud object storage" and the Iceberg/Delta Lake sections above; this
+section now covers only true distributed-execution non-goals.)
 
 **Future physical operators**: `Exchange`, `Spill`, `Repartition`,
 `MergeAggregate`, `Broadcast`.
@@ -1748,13 +1773,6 @@ Workers     -> execute local GPU pipelines
             -> final result returned to client
 ```
 Large worker-to-worker data is never planned to route through the
-coordinator.
-
-**Future catalog model**: `Catalog`, `Table`, `TableSnapshot`, `DataFile`,
-`PartitionSpec`, with eventual support for Apache Iceberg REST catalogs,
-Apache Polaris, Nessie, and Hadoop-compatible catalogs. KernelLake will not
-implement a proprietary table format.
-
-**Future storage backend**: an `S3ObjectStore` implementing the same
-`ObjectStore` interface `LocalObjectStore` does today, plus documentation
-for MinIO/Ceph compatibility.
+coordinator. Multi-node distributed query execution is an explicit
+non-goal for the MVP (see `docs/ROADMAP.md`) -- `kernellake-server`
+replicas today are fully independent, no coordinator, no shuffle.

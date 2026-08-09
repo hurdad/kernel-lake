@@ -23,7 +23,7 @@ CPU-side fix); `CASE` inside an aggregate argument (grouped *or* scalar),
 `LIKE` inside a `CASE` branch, and a `SELECT` item that combines multiple
 aggregates arithmetically (Q14's `100.00 * SUM(...) / SUM(...)`, rather
 than a single bare aggregate call) all now work on both backends too (see
-`docs/ARCHITECTURE.md`'s "CASE expression implementation notes" and the
+`docs/ARCHITECTURE.md`'s "LIKE/IN/CASE/CAST implementation notes" and the
 entries just above it).
 
 `CASE` inside `WHERE` on the GPU backend remains unsupported (a separate

@@ -1,7 +1,16 @@
 # KernelLake roadmap
 
 Status as of the last update to this file. "Done" means built, compiled,
-and covered by passing tests -- not merely designed or stubbed.
+and covered by passing tests -- not merely designed or stubbed. Entries
+are appended over time but not strictly reordered to match commit
+chronology -- a few entries in the Iceberg/Delta Lake stretch (whole-file
+row-level deletes, partition-spec-aware pruning, the Delta client, Delta
+read support) appear in a different order than they actually landed
+(real order: Delta client -> Delta read support -> partition pruning ->
+whole-file deletes, `dev` test count climbing 267 -> 290 -> 310 -> 320
+monotonically), so a reader relying on this file's own top-to-bottom
+order for that stretch's test counts will see them run backward -- `git
+log` is the authoritative chronology if that ordering ever matters.
 
 ## Done
 
@@ -2480,6 +2489,98 @@ and covered by passing tests -- not merely designed or stubbed.
     match the table's *current* schema exactly, same limitation and
     rationale as the Iceberg path's own "reading files written under a
     different (evolved) schema version isn't supported yet").
+- **Real AWS TPC-H benchmark harness** (`benchmarks/aws/`, commit
+  `51484cc` and many follow-ups): Terraform-provisioned infra (KernelLake
+  GPU host, self-managed Spark standalone cluster, Iceberg REST catalog,
+  monitoring instance -- self-referencing security group, no public
+  ingress beyond SSH), `runner/aws_benchmark_runner.py` (KernelLake vs.
+  real PySpark over Flight SQL/Spark SQL against real S3 data, cold/warm
+  defined as fresh-vs-reused server/session rather than local page-cache
+  state since there's no local page cache for S3-resident data),
+  `runner/cost_model.py` (real cost from AWS Pricing API + actual
+  instance-hours, not estimated), `reporting/generate_report.py`
+  (Markdown/CSV/JSON reports: latency speedup ratio, cost per completed
+  query, cost efficiency per query, scan throughput). `scripts/teardown.sh`
+  destroys every billed resource but refuses to delete the S3 data bucket
+  by default (`--purge-data` required to also empty it) -- a real,
+  intentional safety rail, not an oversight. Real runs at SF10 and SF100
+  against real infra: see `benchmarks/aws/docs/COST_ESTIMATES.md` for the
+  actual numbers (KernelLake wins on cost throughout; PySpark wins on
+  latency at SF100 with a 4-instance cluster against KernelLake's one
+  instance).
+- **DuckDB added as an opt-in third engine** (`--duckdb`,
+  `runner/aws_benchmark_runner.py`, commit `8c9b57c`): runs in-process on
+  the orchestrator host against the same real S3 data (`httpfs` + the
+  `aws` extension's IAM credential-chain provider, same `read_parquet(...)`
+  SQL KernelLake itself uses). Included in latency/scan-throughput
+  reporting, deliberately excluded from cost tables since it runs on
+  shared, non-dedicated infra with no per-instance $/hour to attribute a
+  query's cost against.
+- **Fixed: real-S3 Parquet scan throughput** (`ObjectStoreDatasource`,
+  commit `a68b5c8`): `supports_device_read()` now returns `true`, with
+  real `device_read`/`device_read_async` overrides, fixing a real cudf
+  `read_column_chunks_async()` serialization bug (the base-class default
+  for a non-device-preferred datasource wraps every column-chunk read in
+  `std::launch::deferred`, so "concurrent" reads ran fully one at a time).
+  Validated on real EC2 against real S3: 2.34x-4.80x wall-time speedup.
+  Full root-cause writeup (including a real false start, `host_read_async`,
+  that turned out not to be the actual bottleneck) in
+  `docs/GPU_OPTIMIZATIONS.md`.
+- **Fixed: sequential per-file metadata inspection** (`src/io/table_resolution.cpp`,
+  commit `3634a9a`): `resolve_table()`'s per-file `inspect_parquet_file()`
+  loop parallelized via `std::async`, same pattern as the scan-throughput
+  fix above. Found investigating a real SF100 latency regression
+  (KernelLake losing to PySpark 2-4x, a reversal from SF10): real EC2
+  measurement showed `metadata_inspection_seconds` at 5.51s for 120 files
+  (SF100's `lineitem`), dropped to 0.38s (14.5x) after the fix. A real,
+  measured partial win -- narrowed the SF100 latency gap but didn't close
+  it (GPU compute time and other overhead dominate more at that scale);
+  see `docs/GPU_OPTIMIZATIONS.md` and `benchmarks/aws/docs/COST_ESTIMATES.md`.
+- **Fixed: predicate pushdown stopped at joins, a real SF100 Q3 GPU OOM**
+  (`src/optimizer/optimizer.cpp`'s `push_predicate_through_join()`, commit
+  `6aac712`; `HashAggregateOperator`'s `max_distinct_keys` doubled 10M ->
+  20M, commit `7ca94ad`): TPC-H Q3 (3-way join) crashed with a real RMM
+  OOM on a real SF100 run -- root cause was predicate pushdown never
+  crossing a `LogicalJoin`, so an unfiltered `customer JOIN orders`
+  materialized ~100% of orders (referential integrity) into
+  `HashJoinOperator`'s single unbounded `concatenate()` call instead of
+  the ~20% `WHERE c_mktsegment = 'BUILDING'` should have left. Fixed with
+  `sigma_p(A JOIN B) = sigma_p(A) JOIN B` pushdown per WHERE conjunct,
+  recursing through N-way join chains -- unconditionally valid since this
+  engine only supports INNER joins. Verified real, three ways: DuckDB
+  row-for-row match on all 6 queries, 3 new optimizer regression tests
+  (332 unit + 102 GPU tests pass), and a real local-GPU A/B
+  (`peak_gpu_memory_bytes` 1.28 GiB -> 0.42 GiB, 3.07x, at SF1). **Then
+  confirmed at real SF100 scale** on the actual EC2 hardware/data that
+  originally OOM'd -- the join-OOM was gone, but a second, unrelated,
+  pre-existing `max_distinct_keys` cap tripped instead (real SF100 Q3
+  produces ~10.8M distinct groups, just over the old 10M default); doubled
+  to 20M and reran -- Q3 now completes end to end at real SF100
+  (`peak_gpu_memory_bytes` 9.9 GiB, well under the L4's 24 GiB). Full
+  writeup in `docs/GPU_OPTIMIZATIONS.md` and
+  `benchmarks/aws/docs/COST_ESTIMATES.md`.
+- **Decode/compute overlap implemented for real** (`ParquetScanOperator`,
+  commit `c1f98f9`, following up the prototype documented in
+  `docs/GPU_OPTIMIZATIONS.md`): background-thread decode on a dedicated
+  `decode_stream_`, one chunk ahead of the consumer, synchronized via
+  `cudaStreamWaitEvent`. Also added per-operator OpenTelemetry tracing
+  spans (`operator_builder.cpp`'s `InstrumentedOperator`, explicit-parent
+  propagation since OTel's thread-local context doesn't survive a
+  spawned thread) -- confirmed live in Jaeger, a 3-way join now produces
+  a correctly-nested span tree instead of one flat span. Re-measured via
+  a real controlled A/B (pre/post binaries from the same tree via a
+  throwaway `git worktree`): 8-12% real wall-time reduction across four
+  TPC-H queries at SF10.
+- **GPU memory metrics via OpenTelemetry** (`src/memory/gpu_memory_metrics*.cpp`,
+  commit `d33254d`): `kernellake.gpu.memory.*` instruments (allocated
+  bytes, peak bytes, allocation-failure count) instrumented at the RMM
+  layer, real observable gauges/counters backed by
+  `GpuMemoryMetricsRegistry`. Benchmark/OTLP-integration-test/collector-
+  config wiring deferred.
+- **Local docker-compose observability stack** (`benchmarks/local/`,
+  commit `437227d`): kernellake-server + otel-collector + prometheus +
+  grafana + jaeger + minio, verified working end to end against a real
+  local GPU -- real Grafana dashboards for query metrics and GPU memory.
 
 ## Not yet started
 
@@ -2744,12 +2845,17 @@ and covered by passing tests -- not merely designed or stubbed.
 
 Distributed execution, multi-node/multi-GPU scheduling, a Kubernetes
 *operator* (custom controller/CRDs -- the plain Helm chart above,
-`charts/kernellake/`, is a Deployment+Service, not an operator), full
-Iceberg catalog
-integration, joins beyond a two-table `INNER JOIN` with a single equality
-key (see "Hash joins" in `docs/ARCHITECTURE.md`), all 22 TPC-H queries,
-cost-based optimization,
-fault-tolerant fragment
+`charts/kernellake/`, is a Deployment+Service, not an operator), catalog
+backends beyond a single Iceberg REST catalog (Apache Polaris, Nessie,
+Hadoop-compatible catalogs -- the REST catalog path itself *is*
+implemented and functionally complete for the MVP's scope, see "Add
+Iceberg REST catalog support end to end" in "Done" above; this item is
+about the *other* catalog implementations, not Iceberg support in
+general), joins with more than one equality key per step (each join step
+still needs exactly one equi-join condition -- N-way join *chains* of up
+to 12 sources ARE supported, see "N-way (3+-table) joins" in "Done"
+above; this is a per-step key-count limit, not a table-count limit), all
+22 TPC-H queries, cost-based optimization, fault-tolerant fragment
 retries, query spilling, materialized views, transactions, data ingestion
 (`INSERT`/`UPDATE`/`DELETE`), a proprietary storage format, and a web UI.
 Interfaces may exist for some of these (see "Future architecture" in

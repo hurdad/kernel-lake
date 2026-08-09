@@ -3,9 +3,11 @@
 Notes from a review of the current CUDA/cudf execution path
 (`src/execution_gpu/`, `src/memory/rmm_environment.cpp`,
 `src/api/query_engine_execute_gpu.cpp`, `src/server/gpu_execution_coordinator_gpu.cpp`).
-Nothing here is implemented yet -- this is a prioritized list of
-opportunities plus the tradeoff each one carries, to work from before
-picking one.
+Originally a prioritized list of opportunities plus the tradeoff each one
+carries, none yet implemented -- several have since been investigated,
+profiled, and (where it paid off) implemented for real; each opportunity
+below is marked with its current status, and later sections in this file
+document what was actually done and measured.
 
 ## Current state (baseline, for context)
 
@@ -20,6 +22,11 @@ picking one.
   (`query_engine_execute_gpu.cpp`), threaded through every operator via
   `ExecutionContext::stream`. Every cudf call in every operator passes it
   explicitly -- no operator falls back to the legacy default stream.
+  **Since updated:** `ParquetScanOperator` now also owns its own
+  `decode_stream_` (see "Overlap prototype (opt #3)" below) for
+  background-thread decode/compute overlap -- the *query* still has one
+  primary stream, but that one operator is no longer single-stream
+  internally.
 - `GpuExecutionCoordinator` (`gpu_execution_coordinator_gpu.cpp`) holds a
   mutex around `execute()`: only one query runs at a time, server-wide.
   Streams give async/overlapping kernel execution *within* a query, not
@@ -63,8 +70,10 @@ picking one.
 3. **Overlap Parquet decode with compute across multiple streams** for
    multi-file/multi-fragment scans. Everything currently funnels through
    the one per-query stream sequentially. **Prototyped 2026-08-08 -- see
-   "Overlap prototype" below: real, reproducible ~13% wall-time win.** Not
-   yet implemented in the real engine.
+   "Overlap prototype" below: real, reproducible ~13% wall-time win.**
+   **Implemented for real the same session (`c1f98f9`), not just
+   prototyped** -- see the "Recommendation" section below for the
+   controlled-A/B real-engine result (8-12% wall-time reduction).
    - Tradeoff: adds real complexity -- and more than the original framing
      here suggested. `cudf::io::chunked_parquet_reader::read_chunk()` is a
      *blocking* host call (it needs the resulting row count on the host
@@ -387,8 +396,9 @@ to take on the RMM-sharing redesign it requires.
 ## Follow-up: GPU memory growing across benchmark runs
 
 Observed during AWS GPU-instance benchmark testing (`benchmarks/aws/`):
-device memory usage climbed with each successive benchmark run. Root cause
-investigation below; not yet fixed.
+device memory usage climbed with each successive benchmark run. **Root
+cause found and confirmed benign, not a leak** -- see the verified
+conclusion below; no fix was needed.
 
 **Mechanism.** `benchmarks/aws/runner/aws_benchmark_runner.py` talks to a
 long-lived `kernellake-server` process over Flight SQL
@@ -552,7 +562,7 @@ Verified against real data on the local GPU: all four repro queries above
 now return correct (correctly filtered/ordered/limited) results; full test
 suite (326 unit + 82 GPU tests) passes with no regressions.
 
-## Real-S3 scan throughput: root cause found, not yet fixed
+## Fixed: real-S3 scan throughput (device_read/device_read_async)
 
 Found running a real SF10 benchmark against real AWS infra (`benchmarks/aws/`,
 kernellake host on `g6.2xlarge`, torn down after this session): the same

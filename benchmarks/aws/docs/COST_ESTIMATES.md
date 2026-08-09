@@ -52,7 +52,7 @@ scale, even on the queries it won on latency. Whether this flips at larger
 scale factors (more data amortizing the GPU's fixed per-query overhead) is
 exactly what the SF100 run below tests.
 
-## SF100 dev validation run (2026-08-09) -- real results, and a real reversal
+## SF100 dev validation run, pre-fix (2026-08-09) -- real results, and a real reversal
 
 Same infra as the SF10 run above (g6.2xlarge + 1x m7i.xlarge + 3x
 m7i.4xlarge). Q3 (3-way join) excluded -- see the table row above for the

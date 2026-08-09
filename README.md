@@ -45,8 +45,8 @@ region-6  19411.167328676154
 That ran the full pipeline against real GPU hardware: SQL parsing,
 binding/type-checking, the rule-based optimizer, file discovery, Parquet
 metadata inspection and row-group pruning, GPU filtering, GPU grouped
-aggregation (`cudf::groupby::streaming_groupby`), and Arrow result
-conversion. `peak_gpu_memory_bytes` and `elapsed_wall_seconds` are measured,
+aggregation (per-batch `cudf::groupby::groupby` folded into a running
+partial result), and Arrow result conversion. `peak_gpu_memory_bytes` and `elapsed_wall_seconds` are measured,
 not estimated -- KernelLake never fabricates a metric it can't measure (see
 `QueryResult` in `include/kernellake/api/query_engine.hpp` for which fields
 still report as unmeasured `std::nullopt`, and why).
@@ -162,8 +162,12 @@ ctest --preset gpu-dev
   --sql "SELECT region, SUM(amount) FROM read_parquet('/tmp/kernellake-sales/*.parquet') GROUP BY region"
 ```
 
-Supported SQL grammar, the `read_parquet(...)` syntax, and everything
-that's intentionally not yet supported are documented in
+`read_parquet(...)` reads plain Parquet files/globs; `read_iceberg('catalog.namespace.table')`
+reads a real Apache Iceberg table via a REST catalog (manifest reading,
+partition-spec-aware pruning, row-level deletes); `read_delta('table_uri')`
+reads a real Delta Lake table. All three compose with joins, filters, and
+aggregates the same way. Supported SQL grammar and everything
+intentionally not yet supported are documented in
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Correctness validation against DuckDB
@@ -276,7 +280,7 @@ tests/unit/                    GoogleTest unit tests (CPU-only, both presets)
 tests/gpu/                     GoogleTest GPU tests (gpu-dev preset only)
 tools/                         Python tooling (DuckDB cross-validation, TPC-H generation)
 benchmarks/tpch/queries/       Version-controlled TPC-H-derived SQL (q01.sql, q06.sql)
-docs/                          ARCHITECTURE.md, ROADMAP.md, TPCH.md, OBSERVABILITY.md
+docs/                          ARCHITECTURE.md, ROADMAP.md, TPCH.md, OBSERVABILITY.md, GPU_OPTIMIZATIONS.md
 config/kernellake.yaml         default engine configuration
 ```
 

@@ -30,6 +30,10 @@ does not extend to them.
 | libuuid (util-linux) | BSD-3-Clause | kernel.org/pub/linux/utils/util-linux | System package (`uuid-dev`), needed by `libarrow-dev`'s bundled Azure SDK C++ code (request-ID generation) |
 | google-cloud-cpp | Apache-2.0 | github.com/googleapis/google-cloud-cpp | Bundled *inside* `libarrow-dev`'s `libarrow_bundled_dependencies.a` (Arrow's own vendored copy, used by `arrow::fs::GcsFileSystem`) -- license taken from the upstream project directly; unlike every other entry in this file, not independently verified against a local installed `/usr/share/doc/<pkg>/copyright` file, since it isn't its own apt package |
 | Azure SDK for C++ | MIT ("Expat") | github.com/Azure/azure-sdk-for-cpp | Bundled *inside* `libarrow-dev`'s `libarrow_bundled_dependencies.a` (used by `arrow::fs::AzureFileSystem`) -- same caveat as google-cloud-cpp above |
+| libcurl | curl license (MIT-style, permissive) | curl.se | System package (`libcurl4-openssl-dev`), used by the Iceberg REST catalog client for its REST/OAuth2 HTTP calls (`src/iceberg/`) -- unconditional, not gated behind a build option |
+| Apache Avro C (avro-c) | Apache-2.0 | avro.apache.org | System package (`libavro-dev`), used to read Iceberg manifest-list/manifest files (Avro Object Container Files, `src/iceberg/manifest_reader.cpp`) -- unconditional, found via `find_library`/`find_path` since it ships no pkg-config/CMake config package |
+| gRPC | Apache-2.0 | github.com/grpc/grpc | System package (`libgrpc++-dev`, `protobuf-compiler-grpc`) -- unconditional (needed by the Delta Lake gRPC client, `src/delta/`, talking to the separate `delta-txn-service`), not gated behind `KERNELLAKE_BUILD_SERVER` |
+| Protocol Buffers | BSD-3-Clause | github.com/protocolbuffers/protobuf | System package (`libprotobuf-dev`) -- unconditional, same reason as gRPC above |
 
 ## Linked into the `kernellake` binary (`gpu-dev` / `KERNELLAKE_WITH_CUDA=ON` only)
 
@@ -63,16 +67,17 @@ relying on this summary.
 
 Both default `OFF` in the local `dev`/`gpu-dev` presets, but the published
 `docker/Dockerfile` `runtime-cpu`/`runtime-gpu` images turn both on (see
-`docs/ARCHITECTURE.md`'s "Docker image: kernellake-server + OpenTelemetry"
-section) -- these are genuinely shipped in the default distributed
-artifact, verified against each package's own installed
-`/usr/share/doc/<pkg>/copyright`, not assumed from general knowledge.
+`docs/ARCHITECTURE.md`'s "Docker image and Helm chart" section) -- these
+are genuinely shipped in the default distributed artifact, verified
+against each package's own installed `/usr/share/doc/<pkg>/copyright`,
+not assumed from general knowledge. gRPC and Protocol Buffers themselves
+are **not** in this table -- they moved to the unconditional table above
+once the Delta Lake gRPC client (`src/delta/`) started needing them
+regardless of `KERNELLAKE_BUILD_SERVER`.
 
 | Dependency | License | Source | How it's consumed |
 | --- | --- | --- | --- |
 | Apache Arrow Flight / Flight SQL C++ | Apache-2.0 | Same Apache Arrow release as the base Arrow entry above | System package (`libarrow-flight-dev`, `libarrow-flight-sql-dev`, official Apache Arrow apt repo) |
-| gRPC | Apache-2.0 | github.com/grpc/grpc | System package (`libgrpc++-dev`, `protobuf-compiler-grpc`) |
-| Protocol Buffers | BSD-3-Clause | github.com/protocolbuffers/protobuf | System package (`libprotobuf-dev`), transitive dependency of gRPC and Arrow Flight |
 | opentelemetry-cpp | Apache-2.0 | github.com/open-telemetry/opentelemetry-cpp | System package (`opentelemetry-cpp-dev`, apt-native on Ubuntu 26.04 only -- see `docs/ARCHITECTURE.md`) |
 
 ## Declared but not yet actually used
@@ -94,8 +99,8 @@ artifact, verified against each package's own installed
 ## Compatibility
 
 All open-source licenses above (Apache-2.0, MIT/Expat, MIT-style/X11,
-BSD-3-Clause) are mutually compatible with KernelLake's own Apache
-License 2.0 and with each other; none impose copyleft or
+BSD-3-Clause, the curl license) are mutually compatible with KernelLake's
+own Apache License 2.0 and with each other; none impose copyleft or
 source-disclosure obligations on KernelLake's own code. No source code
 has been copied from any of these dependencies into KernelLake's own
 source tree -- they are consumed exclusively as system packages, CMake
