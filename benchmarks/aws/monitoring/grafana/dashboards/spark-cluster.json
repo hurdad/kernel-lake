@@ -1,0 +1,47 @@
+{
+  "title": "Spark Cluster",
+  "uid": "spark-cluster",
+  "schemaVersion": 39,
+  "version": 1,
+  "time": {"from": "now-1h", "to": "now"},
+  "refresh": "15s",
+  "panels": [
+    {
+      "id": 1,
+      "title": "CPU Utilization by Node (%)",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+      "targets": [
+        {"expr": "100 - (avg by (instance) (rate(node_cpu_seconds_total{job=~\"spark-master-node|spark-worker-node-.*\",mode=\"idle\"}[1m])) * 100)", "legendFormat": "{{instance}}"}
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Memory Used by Node (%)",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
+      "targets": [
+        {"expr": "100 * (1 - node_memory_MemAvailable_bytes{job=~\"spark-master-node|spark-worker-node-.*\"} / node_memory_MemTotal_bytes{job=~\"spark-master-node|spark-worker-node-.*\"})", "legendFormat": "{{instance}}"}
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Network RX/TX by Node (bytes/sec)",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 8},
+      "targets": [
+        {"expr": "rate(node_network_receive_bytes_total{job=~\"spark-master-node|spark-worker-node-.*\",device!=\"lo\"}[1m])", "legendFormat": "{{instance}} RX"},
+        {"expr": "rate(node_network_transmit_bytes_total{job=~\"spark-master-node|spark-worker-node-.*\",device!=\"lo\"}[1m])", "legendFormat": "{{instance}} TX"}
+      ]
+    },
+    {
+      "id": 4,
+      "title": "JVM Heap Used (Spark internal, via JMX exporter -- verify exact metric name during M1, javaagent default naming can vary by Spark/JMX-exporter version)",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 16},
+      "targets": [
+        {"expr": "jvm_memory_bytes_used{area=\"heap\",job=~\"spark-master-jmx|spark-worker-jmx-.*\"}", "legendFormat": "{{instance}}"}
+      ]
+    }
+  ]
+}

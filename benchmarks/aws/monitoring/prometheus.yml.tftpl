@@ -1,0 +1,62 @@
+# This is a Terraform template (rendered by monitoring_instance.tf's inner
+# templatefile() call before being embedded in monitoring-init.sh) -- the
+# "for" loop directives and dollar-brace interpolations below are Terraform
+# template syntax, not literal Prometheus config syntax; the *rendered*
+# output (real IPs substituted in) is what actually lands on the
+# monitoring instance as prometheus.yml.
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  # Each KernelLake host: node_exporter (host CPU/mem/net/disk),
+  # dcgm-exporter (GPU utilization/memory/power/temperature), and the
+  # OTel Collector's own Prometheus exporter (kernellake-server's real
+  # query-level metrics -- see ../terraform/user-data/kernellake-host-init.sh
+  # and this project's "OTel -> Prometheus" design).
+%{ for ip in kernellake_ips ~}
+  - job_name: "kernellake-host-node-${ip}"
+    static_configs:
+      - targets: ["${ip}:9100"]
+        labels:
+          instance_role: kernellake-host
+  - job_name: "kernellake-host-gpu-${ip}"
+    static_configs:
+      - targets: ["${ip}:9400"]
+        labels:
+          instance_role: kernellake-host
+  - job_name: "kernellake-host-otel-${ip}"
+    static_configs:
+      - targets: ["${ip}:8889"]
+        labels:
+          instance_role: kernellake-host
+%{ endfor ~}
+
+  # Spark master + workers: node_exporter plus the Prometheus JMX exporter
+  # javaagent (Spark-internal executor/task metrics) -- see
+  # ../terraform/user-data/spark-node-init.sh.
+  - job_name: "spark-master-node"
+    static_configs:
+      - targets: ["${spark_master_ip}:9100"]
+        labels:
+          instance_role: spark-master
+  - job_name: "spark-master-jmx"
+    static_configs:
+      - targets: ["${spark_master_ip}:7777"]
+        labels:
+          instance_role: spark-master
+%{ for ip in spark_worker_ips ~}
+  - job_name: "spark-worker-node-${ip}"
+    static_configs:
+      - targets: ["${ip}:9100"]
+        labels:
+          instance_role: spark-worker
+  - job_name: "spark-worker-jmx-${ip}"
+    static_configs:
+      - targets: ["${ip}:7777"]
+        labels:
+          instance_role: spark-worker
+%{ endfor ~}

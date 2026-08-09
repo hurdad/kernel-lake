@@ -82,6 +82,20 @@ __pycache__/
 # tooling that produces them is what's committed (see docs/ROADMAP.md).
 benchmark-results/
 
+# benchmarks/aws/runner/aws_benchmark_runner.py + reporting/* output: same
+# reasoning as benchmark-results/ above -- real, point-in-time numbers for
+# one specific run (real AWS costs and rates drift over time), not source.
+# The tooling that produces them is committed; docs/COST_ESTIMATES.md is
+# where the real headline numbers from an actual run get recorded in
+# prose/table form once one has happened, so they're not lost even though
+# the raw JSON/CSV isn't tracked.
+benchmarks/aws/results-*.json
+benchmarks/aws/cost-*.json
+benchmarks/aws/aggregated-*.json
+benchmarks/aws/report-*/
+benchmarks/aws/dashboard-*.html
+benchmarks/aws/scaling-*.json
+
 # Terraform (benchmarks/aws/terraform/): state can contain resource
 # attributes that shouldn't be public (and is single-environment/
 # point-in-time, not source), .terraform/ is a large local provider-plugin

@@ -1,0 +1,38 @@
+{
+  "title": "KernelLake Query Metrics (OTel)",
+  "uid": "kernellake-query-metrics",
+  "schemaVersion": 39,
+  "version": 1,
+  "time": {"from": "now-1h", "to": "now"},
+  "refresh": "15s",
+  "description": "src/observability/query_tracing_otel.cpp emits exactly one metric today: kernellake.query.duration_seconds (a histogram of QueryResult::elapsed_wall_seconds, one sample per completed query -- see that file's own CreateDoubleHistogram() call). The OTel Collector's Prometheus exporter renders an OTel histogram as <name>_bucket/_sum/_count (dots become underscores) -- this dashboard queries those derived series, not a separately-emitted throughput/error-rate metric (neither exists yet).",
+  "panels": [
+    {
+      "id": 1,
+      "title": "Query throughput (queries/sec, derived from histogram _count)",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+      "targets": [{"expr": "rate(kernellake_query_duration_seconds_count{job=~\"kernellake-host-otel-.*\"}[1m])", "legendFormat": "{{instance}}"}]
+    },
+    {
+      "id": 2,
+      "title": "Query latency p50/p95/p99 (seconds)",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
+      "targets": [
+        {"expr": "histogram_quantile(0.50, rate(kernellake_query_duration_seconds_bucket{job=~\"kernellake-host-otel-.*\"}[5m]))", "legendFormat": "p50"},
+        {"expr": "histogram_quantile(0.95, rate(kernellake_query_duration_seconds_bucket{job=~\"kernellake-host-otel-.*\"}[5m]))", "legendFormat": "p95"},
+        {"expr": "histogram_quantile(0.99, rate(kernellake_query_duration_seconds_bucket{job=~\"kernellake-host-otel-.*\"}[5m]))", "legendFormat": "p99"}
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Average query latency (sum/count, seconds)",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 8},
+      "targets": [
+        {"expr": "rate(kernellake_query_duration_seconds_sum{job=~\"kernellake-host-otel-.*\"}[1m]) / rate(kernellake_query_duration_seconds_count{job=~\"kernellake-host-otel-.*\"}[1m])", "legendFormat": "{{instance}}"}
+      ]
+    }
+  ]
+}

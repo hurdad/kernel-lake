@@ -1,0 +1,62 @@
+{
+  "title": "KernelLake GPU Host(s)",
+  "uid": "kernellake-gpu-host",
+  "schemaVersion": 39,
+  "version": 1,
+  "time": {"from": "now-1h", "to": "now"},
+  "refresh": "15s",
+  "panels": [
+    {
+      "id": 1,
+      "title": "GPU Utilization (%)",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+      "targets": [{"expr": "DCGM_FI_DEV_GPU_UTIL{job=~\"kernellake-host-gpu-.*\"}", "legendFormat": "{{instance}}"}]
+    },
+    {
+      "id": 2,
+      "title": "GPU Memory Used (bytes)",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
+      "targets": [{"expr": "DCGM_FI_DEV_FB_USED{job=~\"kernellake-host-gpu-.*\"} * 1048576", "legendFormat": "{{instance}}"}]
+    },
+    {
+      "id": 3,
+      "title": "GPU Power Draw (W)",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8},
+      "targets": [{"expr": "DCGM_FI_DEV_POWER_USAGE{job=~\"kernellake-host-gpu-.*\"}", "legendFormat": "{{instance}}"}]
+    },
+    {
+      "id": 4,
+      "title": "GPU Temperature (C)",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8},
+      "targets": [{"expr": "DCGM_FI_DEV_GPU_TEMP{job=~\"kernellake-host-gpu-.*\"}", "legendFormat": "{{instance}}"}]
+    },
+    {
+      "id": 5,
+      "title": "Host CPU Utilization (%)",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 16},
+      "targets": [{"expr": "100 - (avg by (instance) (rate(node_cpu_seconds_total{job=~\"kernellake-host-node-.*\",mode=\"idle\"}[1m])) * 100)", "legendFormat": "{{instance}}"}]
+    },
+    {
+      "id": 6,
+      "title": "Host Memory Used (%)",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 16},
+      "targets": [{"expr": "100 * (1 - node_memory_MemAvailable_bytes{job=~\"kernellake-host-node-.*\"} / node_memory_MemTotal_bytes{job=~\"kernellake-host-node-.*\"})", "legendFormat": "{{instance}}"}]
+    },
+    {
+      "id": 7,
+      "title": "Network RX/TX (bytes/sec)",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 24},
+      "targets": [
+        {"expr": "rate(node_network_receive_bytes_total{job=~\"kernellake-host-node-.*\",device!=\"lo\"}[1m])", "legendFormat": "{{instance}} RX"},
+        {"expr": "rate(node_network_transmit_bytes_total{job=~\"kernellake-host-node-.*\",device!=\"lo\"}[1m])", "legendFormat": "{{instance}} TX"}
+      ]
+    }
+  ]
+}

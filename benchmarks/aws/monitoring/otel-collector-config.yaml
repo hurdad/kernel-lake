@@ -1,0 +1,38 @@
+# Reference copy of the OTel Collector config each KernelLake host actually
+# runs -- the live copy is embedded directly in
+# ../terraform/user-data/kernellake-host-init.sh (a boot-time dependency,
+# so it can't wait on an S3 fetch the way monitoring/grafana/dashboards/
+# does), kept in sync with this file by hand. Same "vendored, not
+# build-time linked" convention this repo's own proto/delta_txn.proto
+# already uses for a cross-repo copy.
+#
+# Receives kernellake-server's real OTel metrics on :4317 (OTLP gRPC,
+# matching ObservabilitySection::otlp_endpoint's default) and exposes them
+# for the central Prometheus instance to scrape on :8889/metrics.
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+
+exporters:
+  prometheus:
+    endpoint: 0.0.0.0:8889
+
+processors:
+  batch: {}
+
+service:
+  pipelines:
+    metrics:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [prometheus]
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      # No trace backend wired up this phase (the ask was metrics ->
+      # Prometheus specifically) -- traces are received and processed but
+      # have nowhere to export to yet. Add a backend (Jaeger/Tempo/etc.)
+      # and an exporter here if trace visualization is wanted later.
+      exporters: []

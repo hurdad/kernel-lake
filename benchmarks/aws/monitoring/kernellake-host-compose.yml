@@ -1,0 +1,57 @@
+# Reference copy of the docker-compose stack each KernelLake host actually
+# runs -- the live copy is embedded directly in
+# ../terraform/user-data/kernellake-host-init.sh (Terraform's templatefile()
+# substitutes ${kernellake_docker_image}/${aws_region} into it there), kept
+# in sync with this file by hand. Shown here with example values so the
+# shape is reviewable without reading through a bash heredoc.
+services:
+  kernellake-server:
+    image: "<ECR-or-registry-URI>/kernellake:runtime-gpu"  # var.kernellake_docker_image
+    entrypoint: ["/opt/kernellake/bin/kernellake-server"]
+    command: ["--config", "/config/kernellake-server.yaml"]
+    network_mode: host
+    volumes:
+      - ./kernellake-server.yaml:/config/kernellake-server.yaml:ro
+    environment:
+      - AWS_REGION=us-east-1  # var.aws_region
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped
+    depends_on:
+      - otel-collector
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:latest
+    command: ["--config=/etc/otel-collector-config.yaml"]
+    network_mode: host
+    volumes:
+      - ./otel-collector-config.yaml:/etc/otel-collector-config.yaml:ro  # see ./otel-collector-config.yaml
+    restart: unless-stopped
+
+  node-exporter:
+    image: prom/node-exporter:latest
+    network_mode: host
+    pid: host
+    volumes:
+      - /:/host:ro,rslave
+    command:
+      - "--path.rootfs=/host"
+      - "--web.listen-address=:9100"
+    restart: unless-stopped
+
+  dcgm-exporter:
+    image: nvcr.io/nvidia/k8s/dcgm-exporter:latest
+    network_mode: host
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped

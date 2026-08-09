@@ -1,0 +1,29 @@
+# Reference copy of the docker-compose stack the monitoring instance
+# actually runs (Prometheus + Grafana) -- the live copy is embedded
+# directly in ../terraform/user-data/monitoring-init.sh, kept in sync with
+# this file by hand.
+services:
+  prometheus:
+    image: prom/prometheus:latest
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro  # rendered from prometheus.yml.tftpl
+    ports:
+      - "9090:9090"
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:latest
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro  # synced from S3 by monitoring-init.sh
+    ports:
+      - "3000:3000"
+    environment:
+      # Anonymous viewer access -- this instance sits behind the benchmark
+      # security group (SSH-scoped, internal-only otherwise, see
+      # ../terraform/networking.tf), not the public internet, so a login
+      # wall adds friction without adding real protection here. Revisit if
+      # this instance's security group is ever loosened.
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Viewer
+    restart: unless-stopped

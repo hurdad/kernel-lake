@@ -1,0 +1,14 @@
+# Copy to terraform.tfvars and fill in real values -- that file is
+# gitignored (see ../../../.gitignore) since it holds deployer-specific
+# values (an SSH key name that must already exist in your AWS account, and
+# your own IP for allowed_ssh_cidr), not shared defaults.
+
+ssh_key_name              = "your-ec2-key-pair-name"
+allowed_ssh_cidr          = "203.0.113.4/32" # your own public IP, /32
+kernellake_instance_count = 1
+spark_worker_count        = 3
+# g6.8xlarge is the benchmark spec default (see variables.tf) -- override
+# only if your account's G/VT-family vCPU quota doesn't cover it yet.
+# g6.2xlarge (8 vCPUs) fits under a partial-approval quota and has the same
+# GPU (1x NVIDIA L4), just less host CPU/RAM (32GB vs 128GB).
+# kernellake_instance_type  = "g6.2xlarge"
