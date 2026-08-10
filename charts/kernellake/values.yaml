@@ -26,6 +26,29 @@ service:
   # Matches ServerSection's own default (include/kernellake/common/config.hpp).
   port: 31337
 
+# Inbound TLS for the Flight SQL listener itself (server.use_tls in
+# include/kernellake/common/config.hpp) -- distinct from observability.useTls
+# below, which is outbound TLS to the OTLP collector. Cert/key material is
+# never put in values.yaml or the rendered ConfigMap; instead this points at
+# a Secret you create yourself (cert-manager, `kubectl create secret tls`,
+# External Secrets, etc.) that this chart mounts read-only.
+server:
+  tls:
+    enabled: false
+    # Name of a Secret in this Release's namespace holding the server
+    # cert+key. Defaults to the two keys a `kubernetes.io/tls` Secret has
+    # (tls.crt/tls.key) -- override secretCertKey/secretKeyKey if yours
+    # differs. Required when enabled: true.
+    secretName: ""
+    secretCertKey: tls.crt
+    secretKeyKey: tls.key
+    # mTLS: require clients to present a certificate signed by the CA in
+    # clientCaSecretName's clientCaSecretKey. Requires enabled: true;
+    # clientCaSecretName is required when requireClientCert: true.
+    requireClientCert: false
+    clientCaSecretName: ""
+    clientCaSecretKey: ca.crt
+
 # Only consulted when backend: gpu.
 gpu:
   resourceName: nvidia.com/gpu

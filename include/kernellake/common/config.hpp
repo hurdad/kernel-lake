@@ -245,6 +245,32 @@ struct ServerSection {
   // rejects new statements past this cap with ExecutionError rather than
   // buffering unboundedly.
   std::uint32_t max_pending_results = 1024;
+
+  // Inbound TLS for the Flight SQL listener itself, as opposed to
+  // delta.use_tls/observability.use_tls above, which are outbound TLS for
+  // this process's own gRPC clients. tls_cert_path/tls_key_path are PEM
+  // files read at startup and passed to
+  // arrow::flight::FlightServerOptions::tls_certificates; both must be set
+  // when use_tls is true (validate_config() below checks this).
+  bool use_tls = false;
+  std::string tls_cert_path;
+  std::string tls_key_path;
+  // mTLS: when set, clients must present a certificate signed by the CA in
+  // tls_client_ca_cert_path (-> FlightServerOptions::verify_client /
+  // root_certificates). Only meaningful when use_tls is also true.
+  bool require_client_cert = false;
+  std::string tls_client_ca_cert_path;
+
+  // Static bearer-token auth, checked by a ServerMiddleware
+  // (src/server/auth_middleware.cpp) against every call's "authorization:
+  // Bearer <token>" header. Same shape as delta.api_key above (a single
+  // shared secret, not per-client credentials) -- a first pass, not a
+  // long-term identity system. Independent of use_tls: sending a bearer
+  // token over a plaintext connection defeats its purpose, but that's a
+  // deployment-configuration mistake for the operator to avoid, not
+  // something validate_config() cross-checks here.
+  bool auth_enabled = false;
+  std::string auth_token;
 };
 
 // Batch export tuning shared by the trace and log OTLP/gRPC processors

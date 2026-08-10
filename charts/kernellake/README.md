@@ -18,6 +18,10 @@ section.
   HTTP). If nothing is listening, `kernellake-server` logs clean export
   errors rather than crashing -- see the parent repo's
   `docs/ARCHITECTURE.md`, "OpenTelemetry observability" section.
+- For `server.tls.enabled: true` -- a Secret in the release namespace
+  holding the server certificate+key (e.g. `kubectl create secret tls
+  kernellake-tls --cert=server.pem --key=server.key`, or one managed by
+  cert-manager). This chart never generates or stores cert material itself.
 
 ## Install
 
@@ -27,6 +31,13 @@ helm install kernellake charts/kernellake --set backend=gpu    # GPU backend
 helm install kernellake charts/kernellake \
   --set observability.enabled=true \
   --set observability.otlpEndpoint=otel-collector.observability.svc.cluster.local:4317
+
+# TLS: point at a pre-existing Secret (see Prerequisites) -- never put cert/key
+# material directly in --set or a values file.
+kubectl create secret tls kernellake-tls --cert=server.pem --key=server.key
+helm install kernellake charts/kernellake \
+  --set server.tls.enabled=true \
+  --set server.tls.secretName=kernellake-tls
 ```
 
 ## Values
@@ -38,6 +49,12 @@ helm install kernellake charts/kernellake \
 | `backend` | `cpu` | `cpu` or `gpu` -- mirrors `engine.backend` |
 | `service.type` | `ClusterIP` | Kubernetes Service type |
 | `service.port` | `31337` | Flight SQL port (matches `ServerSection`'s own default) |
+| `server.tls.enabled` | `false` | Inbound TLS for the Flight SQL listener (`server.use_tls`) |
+| `server.tls.secretName` | `""` | Secret holding the server cert+key; required when `enabled: true` (see Prerequisites) |
+| `server.tls.secretCertKey` / `secretKeyKey` | `tls.crt` / `tls.key` | Keys within that Secret (defaults match a `kubernetes.io/tls` Secret) |
+| `server.tls.requireClientCert` | `false` | mTLS -- require clients to present a cert signed by `clientCaSecretName`'s CA (`server.require_client_cert`); requires `enabled: true` |
+| `server.tls.clientCaSecretName` | `""` | Secret holding the client-verification CA bundle; required when `requireClientCert: true` |
+| `server.tls.clientCaSecretKey` | `ca.crt` | Key within that Secret holding the CA cert |
 | `gpu.resourceName` | `nvidia.com/gpu` | Extended resource name requested when `backend: gpu` |
 | `gpu.count` | `1` | How many GPU resources to request |
 | `resources` | `{}` | Standard Kubernetes CPU/memory requests/limits, merged with the automatic GPU request above |
@@ -55,9 +72,11 @@ helm install kernellake charts/kernellake \
 This is a **thin** surface over `EngineConfig`
 (`include/kernellake/common/config.hpp` in the parent repo) -- any field
 not listed above keeps `kernellake-server`'s own compiled-in default. Full
-per-signal OTel processor/batch/sampler tuning, mTLS, etc. are not yet
-exposed through Helm values; edit `templates/configmap.yaml` directly if
-you need them, or use `--set-file` to replace the rendered `kernellake.yaml`.
+per-signal OTel processor/batch/sampler tuning and outbound mTLS to the
+OTLP collector (`observability.tls_client_cert_path`/`tls_client_key_path`)
+are not yet exposed through Helm values; edit `templates/configmap.yaml`
+directly if you need them, or use `--set-file` to replace the rendered
+`kernellake.yaml`.
 
 ## Connecting
 

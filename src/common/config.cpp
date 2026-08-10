@@ -280,6 +280,15 @@ EngineConfig parse_config(const std::string& yaml_text) {
   config.server.port = read_or(server, "port", config.server.port);
   config.server.max_pending_results =
       read_or(server, "max_pending_results", config.server.max_pending_results);
+  config.server.use_tls = read_or(server, "use_tls", config.server.use_tls);
+  config.server.tls_cert_path = read_or(server, "tls_cert_path", config.server.tls_cert_path);
+  config.server.tls_key_path = read_or(server, "tls_key_path", config.server.tls_key_path);
+  config.server.require_client_cert =
+      read_or(server, "require_client_cert", config.server.require_client_cert);
+  config.server.tls_client_ca_cert_path =
+      read_or(server, "tls_client_ca_cert_path", config.server.tls_client_ca_cert_path);
+  config.server.auth_enabled = read_or(server, "auth_enabled", config.server.auth_enabled);
+  config.server.auth_token = read_or(server, "auth_token", config.server.auth_token);
 
   const YAML::Node observability = root["observability"];
   config.observability.enabled = read_or(observability, "enabled", config.observability.enabled);
@@ -510,6 +519,21 @@ void validate_config(const EngineConfig& config) {
   }
   if (config.server.max_pending_results == 0) {
     throw ConfigurationError("server.max_pending_results must be > 0");
+  }
+  if (config.server.use_tls &&
+      (config.server.tls_cert_path.empty() || config.server.tls_key_path.empty())) {
+    throw ConfigurationError(
+        "server.tls_cert_path and server.tls_key_path must both be set when server.use_tls is true");
+  }
+  if (config.server.require_client_cert && !config.server.use_tls) {
+    throw ConfigurationError("server.require_client_cert requires server.use_tls to also be true");
+  }
+  if (config.server.require_client_cert && config.server.tls_client_ca_cert_path.empty()) {
+    throw ConfigurationError(
+        "server.tls_client_ca_cert_path must be set when server.require_client_cert is true");
+  }
+  if (config.server.auth_enabled && config.server.auth_token.empty()) {
+    throw ConfigurationError("server.auth_token must not be empty when server.auth_enabled is true");
   }
 
   if (config.observability.otlp_protocol != "grpc" && config.observability.otlp_protocol != "http") {

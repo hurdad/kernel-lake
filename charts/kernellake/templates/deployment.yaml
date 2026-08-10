@@ -65,12 +65,32 @@ spec:
             - name: config
               mountPath: /etc/kernellake
               readOnly: true
+            {{- if .Values.server.tls.enabled }}
+            - name: server-tls
+              mountPath: /etc/kernellake/tls
+              readOnly: true
+            {{- if .Values.server.tls.requireClientCert }}
+            - name: server-tls-client-ca
+              mountPath: /etc/kernellake/tls-client-ca
+              readOnly: true
+            {{- end }}
+            {{- end }}
           resources:
             {{- toYaml $resources | nindent 12 }}
       volumes:
         - name: config
           configMap:
             name: {{ include "kernellake.fullname" . }}
+        {{- if .Values.server.tls.enabled }}
+        - name: server-tls
+          secret:
+            secretName: {{ required "server.tls.secretName must be set when server.tls.enabled is true" .Values.server.tls.secretName }}
+        {{- if .Values.server.tls.requireClientCert }}
+        - name: server-tls-client-ca
+          secret:
+            secretName: {{ required "server.tls.clientCaSecretName must be set when server.tls.requireClientCert is true" .Values.server.tls.clientCaSecretName }}
+        {{- end }}
+        {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

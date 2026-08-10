@@ -4,6 +4,7 @@
 # Flight SQL specifically needs 26.04, not 24.04.
 add_library(kernellake_flight_sql_server STATIC
   flight_sql_server.cpp
+  auth_middleware.cpp
   $<IF:$<BOOL:${KERNELLAKE_WITH_CUDA}>,gpu_execution_coordinator_gpu.cpp,gpu_execution_coordinator_stub.cpp>
 )
 

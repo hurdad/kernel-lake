@@ -1,7 +1,8 @@
+{{- $scheme := ternary "grpc+tls" "grpc" .Values.server.tls.enabled }}
 KernelLake Flight SQL server ({{ .Values.backend }} backend) deployed as {{ include "kernellake.fullname" . }}.
 
 In-cluster clients connect to:
-  grpc://{{ include "kernellake.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.service.port }}
+  {{ $scheme }}://{{ include "kernellake.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.service.port }}
 
 From outside the cluster, port-forward first:
   kubectl port-forward --namespace {{ .Release.Namespace }} svc/{{ include "kernellake.fullname" . }} {{ .Values.service.port }}:{{ .Values.service.port }}
@@ -11,10 +12,21 @@ Then connect with any Arrow Flight SQL client, e.g. the ADBC Python driver
 docs/ARCHITECTURE.md's "Arrow Flight SQL server" section):
 
   import adbc_driver_flightsql.dbapi as flight_sql
-  conn = flight_sql.connect("grpc://localhost:{{ .Values.service.port }}")
+  conn = flight_sql.connect("{{ $scheme }}://localhost:{{ .Values.service.port }}")
   cur = conn.cursor()
   cur.execute("SELECT region, SUM(amount) AS total FROM read_parquet('/data/*.parquet') GROUP BY region")
   print(cur.fetchall())
+{{- if .Values.server.tls.enabled }}
+
+TLS is enabled (server.tls.enabled: true). If the server certificate isn't
+signed by a CA already in your client's trust store, pass it explicitly,
+e.g. adbc_driver_manager.dbapi.connect(..., db_kwargs={"tls_root_certs": ...}).
+{{- if .Values.server.tls.requireClientCert }}
+mTLS is also enabled (server.tls.requireClientCert: true) -- clients must
+present a certificate signed by the CA in the server.tls.clientCaSecretName
+Secret, or the handshake will be rejected.
+{{- end }}
+{{- end }}
 
 {{- if eq .Values.backend "gpu" }}
 

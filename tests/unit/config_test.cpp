@@ -162,6 +162,91 @@ TEST(Config, DeltaSectionDefaultsToUnconfigured) {
   EXPECT_TRUE(config.delta.api_key.empty());
 }
 
+TEST(Config, ParsesServerTlsSection) {
+  const std::string yaml = R"(
+server:
+  host: 127.0.0.1
+  port: 31338
+  use_tls: true
+  tls_cert_path: /etc/ssl/server.pem
+  tls_key_path: /etc/ssl/server.key
+  require_client_cert: true
+  tls_client_ca_cert_path: /etc/ssl/client_ca.pem
+)";
+  const EngineConfig config = parse_config(yaml);
+  EXPECT_TRUE(config.server.use_tls);
+  EXPECT_EQ(config.server.tls_cert_path, "/etc/ssl/server.pem");
+  EXPECT_EQ(config.server.tls_key_path, "/etc/ssl/server.key");
+  EXPECT_TRUE(config.server.require_client_cert);
+  EXPECT_EQ(config.server.tls_client_ca_cert_path, "/etc/ssl/client_ca.pem");
+  EXPECT_NO_THROW((void)(validate_config(config)));
+}
+
+TEST(Config, ServerTlsDefaultsToDisabled) {
+  const EngineConfig config = default_config();
+  EXPECT_FALSE(config.server.use_tls);
+  EXPECT_TRUE(config.server.tls_cert_path.empty());
+  EXPECT_TRUE(config.server.tls_key_path.empty());
+  EXPECT_FALSE(config.server.require_client_cert);
+}
+
+TEST(Config, RejectsServerTlsMissingCertOrKey) {
+  EngineConfig config = default_config();
+  config.server.use_tls = true;
+  config.server.tls_cert_path = "/etc/ssl/server.pem";
+  // tls_key_path left empty.
+  EXPECT_THROW((void)(validate_config(config)), ConfigurationError);
+
+  config = default_config();
+  config.server.use_tls = true;
+  config.server.tls_key_path = "/etc/ssl/server.key";
+  // tls_cert_path left empty.
+  EXPECT_THROW((void)(validate_config(config)), ConfigurationError);
+}
+
+TEST(Config, RejectsServerRequireClientCertWithoutTls) {
+  EngineConfig config = default_config();
+  config.server.require_client_cert = true;
+  config.server.tls_client_ca_cert_path = "/etc/ssl/client_ca.pem";
+  // use_tls left false.
+  EXPECT_THROW((void)(validate_config(config)), ConfigurationError);
+}
+
+TEST(Config, RejectsServerRequireClientCertMissingCaPath) {
+  EngineConfig config = default_config();
+  config.server.use_tls = true;
+  config.server.tls_cert_path = "/etc/ssl/server.pem";
+  config.server.tls_key_path = "/etc/ssl/server.key";
+  config.server.require_client_cert = true;
+  // tls_client_ca_cert_path left empty.
+  EXPECT_THROW((void)(validate_config(config)), ConfigurationError);
+}
+
+TEST(Config, ParsesServerAuthSection) {
+  const std::string yaml = R"(
+server:
+  auth_enabled: true
+  auth_token: super-secret-token
+)";
+  const EngineConfig config = parse_config(yaml);
+  EXPECT_TRUE(config.server.auth_enabled);
+  EXPECT_EQ(config.server.auth_token, "super-secret-token");
+  EXPECT_NO_THROW((void)(validate_config(config)));
+}
+
+TEST(Config, ServerAuthDefaultsToDisabled) {
+  const EngineConfig config = default_config();
+  EXPECT_FALSE(config.server.auth_enabled);
+  EXPECT_TRUE(config.server.auth_token.empty());
+}
+
+TEST(Config, RejectsServerAuthEnabledWithoutToken) {
+  EngineConfig config = default_config();
+  config.server.auth_enabled = true;
+  // auth_token left empty.
+  EXPECT_THROW((void)(validate_config(config)), ConfigurationError);
+}
+
 TEST(Config, LoadConfigFileRejectsMissingPath) {
   EXPECT_THROW((void)(load_config_file("/nonexistent/kernellake.yaml")), ConfigurationError);
 }

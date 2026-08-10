@@ -34,6 +34,18 @@ data:
     server:
       host: 0.0.0.0
       port: {{ .Values.service.port | int64 }}
+{{- if .Values.server.tls.enabled }}
+      use_tls: true
+      # Paths match the Secret volume mounts in templates/deployment.yaml --
+      # a Secret's keys are each mounted as a file named after the key
+      # directly under the mount path.
+      tls_cert_path: /etc/kernellake/tls/{{ .Values.server.tls.secretCertKey }}
+      tls_key_path: /etc/kernellake/tls/{{ .Values.server.tls.secretKeyKey }}
+{{- if .Values.server.tls.requireClientCert }}
+      require_client_cert: true
+      tls_client_ca_cert_path: /etc/kernellake/tls-client-ca/{{ .Values.server.tls.clientCaSecretKey }}
+{{- end }}
+{{- end }}
 
     observability:
       enabled: {{ .Values.observability.enabled }}

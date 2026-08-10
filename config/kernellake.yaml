@@ -77,6 +77,22 @@ benchmark:
 server:
   host: 0.0.0.0
   port: 31337
+  # Inbound TLS for the Flight SQL listener. Both tls_cert_path and
+  # tls_key_path (PEM) are required when use_tls is true.
+  use_tls: false
+  tls_cert_path: ""
+  tls_key_path: ""
+  # mTLS: require clients to present a certificate signed by the CA in
+  # tls_client_ca_cert_path. Requires use_tls: true.
+  require_client_cert: false
+  tls_client_ca_cert_path: ""
+  # Static bearer-token auth: every RPC must carry an
+  # "authorization: Bearer <auth_token>" header, or it's rejected before
+  # reaching the query engine. auth_token must be set when auth_enabled is
+  # true. Combine with use_tls above -- a bearer token sent over plaintext
+  # gives an eavesdropper the token itself.
+  auth_enabled: false
+  auth_token: ""
 
 # Only takes effect when built with KERNELLAKE_ENABLE_OTEL=ON. See
 # include/kernellake/common/config.hpp for full field docs -- notably:

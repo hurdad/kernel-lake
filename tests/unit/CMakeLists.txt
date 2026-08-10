@@ -33,6 +33,7 @@ add_executable(kernellake_unit_tests
   query_engine_execute_cpu_test.cpp
   sample_data_generator_test.cpp
   $<$<BOOL:${KERNELLAKE_BUILD_SERVER}>:flight_sql_server_test.cpp>
+  $<$<BOOL:${KERNELLAKE_BUILD_SERVER}>:auth_middleware_test.cpp>
   $<$<BOOL:${KERNELLAKE_ENABLE_OTEL}>:query_tracing_test.cpp>
 )
 
