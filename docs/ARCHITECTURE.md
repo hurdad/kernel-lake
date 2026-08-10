@@ -16,7 +16,7 @@ SQL text
   -> file discovery          (kernellake::ObjectStore, discover_parquet_files)
   -> Parquet metadata + pruning (kernellake::inspect_parquet_file, evaluate_pruning)
   -> physical plan           (kernellake::PhysicalPlanNode, build_physical_plan)
-  -> GPU execution           (kernellake::PhysicalOperator / DeviceBatch, kernellake_execution)
+  -> GPU execution           (kernellake::PhysicalOperator / DeviceBatch, kernellake_execution_gpu)
   -> Arrow result
 ```
 
@@ -60,20 +60,25 @@ KernelLake vendors `hyrise/sql-parser` (MIT license, pinned commit) via
 CMake `FetchContent` rather than hand-writing a parser. That grammar's
 `FROM` clause accepts table names, joins, and subqueries -- but has no
 table-valued-function syntax. `kernellake::sql::parse_sql()` therefore
-finds every occurrence of `read_parquet('path' [, 'path2', ...])` in the
-query text with a regex, extracts each one's path arguments, and
+finds every occurrence of `read_parquet('path' [, 'path2', ...])`,
+`read_iceberg('catalog.namespace.table')`, or `read_delta('table_uri')` in
+the query text, extracts each one's path/identifier arguments, and
 substitutes a distinct placeholder identifier for each occurrence, leaving
 the surrounding syntax (`JOIN`/`ON`/aliases/commas) completely untouched --
 hsql's own grammar still parses the real table-reference/join structure
-around those placeholders. `parse_sql()` then walks the resulting
-`fromTable` and only accepts two shapes: a single placeholder (the
-single-table MVP case) or exactly one `INNER JOIN ... ON` between two
-placeholders, both aliased (see "Hash joins" below); anything else (a real
-table name, a subquery, `LEFT`/`RIGHT`/`FULL`/`CROSS` JOIN, a comma-style
-join, 3+ `read_parquet(...)` sources) fails with a clear `SqlError` rather
-than being silently reinterpreted. This is a narrow, deliberately limited
-syntax adapter, not general SQL-string rewriting -- optimizer rules always
-operate on the structured plan/expression trees, never on SQL text.
+around those placeholders. This scan is hand-rolled rather than
+`std::regex`-based: an earlier `std::regex` implementation recursed once
+per repetition of a `(...)*` group and could stack-overflow on pathological
+input (see `src/sql/parser.cpp`'s own comments for the detail). `parse_sql()`
+then walks the resulting `fromTable` and accepts either a single placeholder
+(the single-table MVP case) or a chain of `INNER JOIN ... ON` steps between
+placeholders, up to `kMaxJoinSources = 12` sources, each aliased (see "Hash
+joins" below for the N-way generalization); anything else (a real table
+name, a subquery, `LEFT`/`RIGHT`/`FULL`/`CROSS` JOIN, a comma-style join,
+or more than 12 sources) fails with a clear `SqlError` rather than being
+silently reinterpreted. This is a narrow, deliberately limited syntax
+adapter, not general SQL-string rewriting -- optimizer rules always operate
+on the structured plan/expression trees, never on SQL text.
 
 ## Supported SQL grammar (current)
 
@@ -84,6 +89,10 @@ SELECT <items> FROM read_parquet('path' [, 'path2', ...])
 SELECT <items> FROM read_parquet(...) AS a JOIN read_parquet(...) AS b ON <a.col = b.col>
   [WHERE <expr>] [GROUP BY <cols>] [ORDER BY <cols>] [LIMIT <n>]
 ```
+
+`read_parquet(...)` may be replaced by `read_iceberg('catalog.namespace.table')`
+or `read_delta('table_uri')` in either shape above, and mixed freely across
+sources within one join chain.
 
 - Column references, aliases, `*`
 - Numeric, string, boolean, date (`DATE 'YYYY-MM-DD'`), and `NULL` literals
@@ -210,7 +219,7 @@ a `GROUP BY`, or `ScalarAggregate` when it does not; `LogicalSort` becomes
 `KERNELLAKE_WITH_CUDA` (off by default) gates everything that needs CUDA,
 libcudf, and RMM: `DeviceBatch` (the GPU-resident batch wrapping
 `cudf::table`), `ExecutionContext`, the `PhysicalOperator` streaming
-interface, and the concrete GPU operators (`kernellake_execution`,
+interface, and the concrete GPU operators (`kernellake_execution_gpu`,
 `kernellake_memory`; see `tests/gpu/`). This gate is about the GPU path
 specifically, not about whether queries can execute at all on a CPU-only
 build -- see "CPU execution backend" below for the real, always-available
@@ -222,11 +231,11 @@ translation units selected by a CMake generator expression on
 `_stub.cpp`), plus a third, **always-built** translation unit
 (`query_engine_execute_cpu.cpp`) providing `execute_cpu()`. The GPU build's
 `execute(sql)` runs the real GPU operator pipeline by default
-(`kernellake/execution/operator_builder.hpp` turns a `PhysicalPlanPtr` into
+(`kernellake/execution_gpu/operator_builder.hpp` turns a `PhysicalPlanPtr` into
 a `PhysicalOperator` tree, pulled to exhaustion inside
 `RmmEnvironment::track_query()` for per-query memory accounting, with each
 resulting `DeviceBatch` converted to an Arrow `RecordBatch` via
-`kernellake/execution/arrow_bridge.hpp`); the CPU-only `cpu-dev` preset's stub
+`kernellake/execution_gpu/arrow_bridge.hpp`); the CPU-only `cpu-dev` preset's stub
 throws a clear `ExecutionError` instead -- **unless** `engine.backend` (or
 `kernellake query --backend`) is set to `"cpu"`, in which case both builds
 instead dispatch to `execute_cpu()`. The `kernellake query` CLI command
@@ -236,7 +245,7 @@ depends on both which preset built it and the `backend` setting.
 
 Everything else in this document (parsing through physical planning and
 pruning), plus `kernellake generate-data`, is CPU-only and builds/tests
-with the `dev` CMake preset alone.
+with the `cpu-dev` CMake preset alone.
 
 ### Concurrency: `RmmEnvironment`'s lifetime and the split execution API
 
@@ -1024,7 +1033,7 @@ that this project's own sandbox is on Ubuntu 26.04 too (see "Ubuntu 26.04
 baseline" above) with apt's `nvidia-cuda-toolkit`, invoking the `gpu-dev`
 preset here also needs an explicit `-DCMAKE_CUDA_COMPILER=/usr/bin/nvcc`
 override, same as `docker/Dockerfile` already does in its own `cmake
---preset gpu-dev` invocation. Updating the preset's own default to match is
+--preset gpu-release` invocation. Updating the preset's own default to match is
 a reasonable follow-up, not done here since both current environments work
 fine with the explicit override and neither depends on the preset default
 being correct.
@@ -1103,18 +1112,19 @@ untested query shape; a real `kernellake query --backend gpu` for a bare
 `dev`/`gpu-dev`/`server-dev`/`otel-dev` all reconfirmed with zero
 regressions (see "Cloud object storage" below for the exact counts).
 
-**`runtime` stage's shared-library closure.** `runtime-libs`'s `ldd`-based
-closure (used to avoid hard-coding vendored library names/paths that would
-go stale on a version bump) excludes only a short, fixed list of
+**`runtime-gpu` stage's shared-library closure.** `runtime-libs-gpu`'s
+`ldd`-based closure (used to avoid hard-coding vendored library names/paths
+that would go stale on a version bump) excludes only a short, fixed list of
 glibc/libgcc/libstdc++ basenames -- those are guaranteed present, at an
-identical version, on the `runtime` stage's `ubuntu:26.04` base, since
-`dev` builds `FROM` that exact same base. This differs from the
-NVIDIA-image-based design it replaced, which additionally excluded
-everything under `/usr/lib/*` on the assumption that the CUDA *runtime*
-Docker image (`nvidia/cuda:*-runtime-*`) pre-supplied those paths --  an
-assumption that no longer applies now that `runtime` is plain Ubuntu with
-no CUDA preinstalled, so CUDA's own shared libraries (`libcudart.so.12`,
-etc.) are now correctly included in the copied closure instead of silently
+identical version, on the `runtime-gpu` stage's `ubuntu:26.04` base, since
+`gpu-release` (the stage `runtime-libs-gpu` runs `ldd` against) builds
+`FROM` that exact same base. This differs from the NVIDIA-image-based
+design it replaced, which additionally excluded everything under
+`/usr/lib/*` on the assumption that the CUDA *runtime* Docker image
+(`nvidia/cuda:*-runtime-*`) pre-supplied those paths -- an assumption that
+no longer applies now that `runtime-gpu` is plain Ubuntu with no CUDA
+preinstalled, so CUDA's own shared libraries (`libcudart.so.12`, etc.) are
+now correctly included in the copied closure instead of silently
 assumed-present.
 
 ### Arrow Flight SQL server (`kernellake-server`)
@@ -1526,8 +1536,12 @@ never drift out of sync with Arrow's own struct, since it *is* Arrow's own
 struct. The one thing that can't be embedded this way is credential
 material: Arrow deliberately keeps it behind private fields, settable only
 through each Options type's own factory/`Configure*()` methods
-(`S3Options::Anonymous()`/`Defaults()`/`FromAccessKey()`/
-`FromAssumeRole()`/`FromAssumeRoleWithWebIdentity()`;
+(`S3Options::ConfigureAnonymousCredentials()`/`ConfigureDefaultCredentials()`/
+`ConfigureAccessKey()`/`ConfigureAssumeRoleCredentials()`/
+`ConfigureAssumeRoleWithWebIdentityCredentials()` -- called on an existing
+`options` instance in place, rather than via a static factory that would
+return a fresh struct and discard whatever region/endpoint/etc. fields were
+already set on it;
 `GcsOptions::Anonymous()`/`FromAccessToken()`/
 `FromServiceAccountCredentials()`; `AzureOptions::
 ConfigureAnonymousCredential()`/`ConfigureAccountKeyCredential()`/
@@ -1539,8 +1553,10 @@ matching `*ObjectStore` constructor calls the right factory/`Configure*()`
 method. S3's `credentials_kind: explicit` deliberately has no raw key
 fields in config at all -- it reads `AWS_ACCESS_KEY_ID`/
 `AWS_SECRET_ACCESS_KEY`/`AWS_SESSION_TOKEN` from the environment instead,
-so secrets never need to live in a config file. `HdfsSection` is
-config-schema-only in this phase (see Non-goals below).
+so secrets never need to live in a config file. `HdfsSection` backs a real
+`HdfsObjectStore` (see "A real `HdfsObjectStore` was added after all" below)
+-- only real-cluster read-correctness/connectivity testing remains
+unverified (see "Explicit non-goals" below).
 
 **GPU scan path** (`ParquetScanOperator`, `src/execution_gpu/
 parquet_scan_operator.cpp`): local-scheme fragments keep cudf's own
