@@ -88,6 +88,19 @@ provisioning the others so they aren't idle and billing while you do --
 entirely, `-var="kernellake_instance_count=0"` skips the GPU host. The
 full three-way comparison below needs all of them.
 
+**Single-node Spark**: `spark_worker_count=0` (with `enable_spark=true`)
+gives a self-sufficient single-node standalone cluster -- the master also
+runs its own worker (see spark_cluster.tf). This still runs a real
+standalone cluster (Master + Worker daemons), which has real footguns
+confirmed live on this project: co-located daemons need distinct JMX
+ports, and `SPARK_LOCAL_DIRS` (a Worker-process env var) silently
+overrides `spark.local.dir` (the driver-side config), which bit a real
+run when `/tmp` turned out to be a small RAM-backed tmpfs. For a
+single-node run, `--spark-master-host local` (`aws_benchmark_runner.py`)
+sidesteps all of that by running Spark in-process (`local[*]`) instead --
+prefer it over standing up the standalone daemons when
+`spark_worker_count=0` is what you're doing anyway.
+
 ```bash
 python3 estimate_cost.py --milestone m1
 # Review the estimate, then:

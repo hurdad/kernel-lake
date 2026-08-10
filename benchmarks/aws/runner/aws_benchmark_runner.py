@@ -320,13 +320,36 @@ ICEBERG_SPARK_PACKAGES = "org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.6.
 HADOOP_AWS_PACKAGE = "org.apache.hadoop:hadoop-aws:3.3.4"
 
 
-def new_spark_session(master_host: str, iceberg_catalog_uri: str | None = None, iceberg_warehouse: str | None = None):
+def new_spark_session(
+    master_host: str,
+    iceberg_catalog_uri: str | None = None,
+    iceberg_warehouse: str | None = None,
+    executor_memory: str = "48g",
+    driver_memory: str = "6g",
+):
     from pyspark.sql import SparkSession
+
+    # master_host="local" runs Spark entirely in-process (local[*]: one
+    # JVM, using all local cores as "executors") instead of connecting to
+    # a real standalone cluster -- for single-node testing (the
+    # spark_worker_count=0 topology terraform/spark_cluster.tf supports),
+    # this sidesteps an entire class of standalone-mode-specific problems
+    # confirmed for real on a live run: Master/Worker daemon JMX-port
+    # collisions when co-located, and SPARK_LOCAL_DIRS (a Worker-process
+    # environment variable) silently overriding this function's own
+    # spark.local.dir config below, entirely undetected until a
+    # shuffle-heavy query filled a RAM-backed /tmp. Same driver-side
+    # config (executor_memory/spark.local.dir/etc.) still applies in
+    # local[*] mode, just without any separate daemon to get out of sync
+    # with it. Only appropriate for single-node runs -- the cost-matched
+    # multi-instance topology (spark_worker_count > 0) still needs a real
+    # standalone cluster across multiple real EC2 instances.
+    master_url = "local[*]" if master_host == "local" else f"spark://{master_host}:7077"
 
     packages = [HADOOP_AWS_PACKAGE]
     builder = (
         SparkSession.builder.appName("kernellake-aws-benchmark")
-        .master(f"spark://{master_host}:7077")
+        .master(master_url)
         .config("spark.hadoop.fs.s3a.aws.credentials.provider", "com.amazonaws.auth.InstanceProfileCredentialsProvider")
         # Never set before -- Spark defaults spark.executor.memory to 1g,
         # nowhere near enough for a SF100-scale join (600M lineitem rows).
@@ -335,13 +358,26 @@ def new_spark_session(master_host: str, iceberg_catalog_uri: str | None = None, 
         # immediately OOMing again on a fresh executor with the same
         # inadequate default, until Spark gave up after its max-retries
         # limit -- a real death spiral, not something that self-heals.
-        # 48g on each m7i.4xlarge worker (64GB RAM) leaves ~16GB for OS/
-        # off-heap/page cache; 6g on the driver (which runs in this same
-        # orchestrator process, on the m7i.xlarge Spark master with only
-        # 16GB RAM) leaves similar headroom -- toPandas() collects each
-        # query's (aggregated, small) result set here, not raw table data.
-        .config("spark.executor.memory", "48g")
-        .config("spark.driver.memory", "6g")
+        # Defaults (48g/6g) assume the original m7i.4xlarge workers (64GB
+        # RAM); --spark-executor-memory/--spark-driver-memory below MUST
+        # be sized down for a smaller/single-node topology -- confirmed
+        # for real that leaving these at the default against a 16GB
+        # m7i.xlarge self-sufficient master hangs forever ("Initial job
+        # has not accepted any resources"), not OOMs, since the executor
+        # can never even start: Spark just keeps waiting for resources the
+        # worker can never offer, with no error and no timeout.
+        .config("spark.executor.memory", executor_memory)
+        .config("spark.driver.memory", driver_memory)
+        # Spark's default shuffle-spill dir is java.io.tmpdir (/tmp) --
+        # fine on the original m7i.4xlarge/m7i.xlarge topology if /tmp
+        # happens to be disk-backed there, but confirmed for real on this
+        # topology that /tmp is RAM-backed tmpfs with only ~8GB total
+        # (df -h showed 90GB free on the real root EBS volume vs. a hard
+        # "No space left on device" shuffle failure on /tmp well before
+        # that): a SF100 3-way join's shuffle spill blew straight through
+        # it. Point shuffle spill at the real disk explicitly rather than
+        # relying on whatever /tmp happens to be on a given AMI/instance.
+        .config("spark.local.dir", "/var/spark-tmp")
     )
     if iceberg_catalog_uri:
         # "bench" here must match kernellake-server.yaml's iceberg.catalogs
@@ -398,6 +434,8 @@ def benchmark_query(
     iceberg_catalog_uri: str | None = None,
     iceberg_warehouse: str | None = None,
     aws_region: str = "us-east-1",
+    spark_executor_memory: str = "48g",
+    spark_driver_memory: str = "6g",
 ) -> tuple[dict, object, object]:
     """Returns (result, spark, duckdb_con) -- both session objects are
     returned because cold mode replaces each with a fresh one (see module
@@ -414,7 +452,10 @@ def benchmark_query(
                 restart_kernellake_server(kernellake_ssh_host, ssh_key_path)
             if mode == "cold" and is_first_rep and spark is not None:
                 spark.stop()
-                spark = new_spark_session(spark_master_host, iceberg_catalog_uri, iceberg_warehouse)
+                spark = new_spark_session(
+                    spark_master_host, iceberg_catalog_uri, iceberg_warehouse,
+                    spark_executor_memory, spark_driver_memory,
+                )
                 register_spark_views(spark, s3_bucket, scale_factor, compression, table_format)
             if mode == "cold" and is_first_rep and duckdb_con is not None:
                 duckdb_con.close()
@@ -467,7 +508,11 @@ def main() -> int:
     parser.add_argument("--kernellake-host", required=True)
     parser.add_argument("--kernellake-port", type=int, default=31337)
     parser.add_argument("--kernellake-ssh-key", default=None, help="Path to the SSH private key, for real cold-mode server restarts. Omit to skip real restarts (cold mode then only means \"first rep of this run\", not \"freshly restarted server\").")
-    parser.add_argument("--spark-master-host", default=None, help="Omit to run KernelLake-only (no PySpark comparison, no cross-engine validation)")
+    parser.add_argument("--spark-master-host", default=None,
+                         help="Omit to run KernelLake-only (no PySpark comparison, no cross-engine validation). "
+                              "'local' runs Spark in-process (local[*]) instead of connecting to a real "
+                              "standalone cluster -- see new_spark_session()'s own comment; appropriate for a "
+                              "single-node run (spark_worker_count=0), not the cost-matched multi-instance one.")
     parser.add_argument("--duckdb", action="store_true",
                          help="Also run each query through DuckDB, in-process on this orchestrator host, "
                               "against the same real S3 data (via httpfs + the aws extension's IAM "
@@ -505,6 +550,13 @@ def main() -> int:
     # gives a median across 2 samples per mode, just a cheaper/faster run.
     parser.add_argument("--iterations", type=int, default=2)
     parser.add_argument("--modes", default="cold,warm")
+    parser.add_argument("--spark-executor-memory", default="48g",
+                         help="Must fit within a single Spark worker's real memory (spark_master_public_ip:8080's "
+                              "own JSON reports each worker's 'memory' field) -- defaults assume the original "
+                              "m7i.4xlarge workers (64GB). Too high hangs forever ('Initial job has not accepted "
+                              "any resources'), not an OOM -- confirmed for real against a smaller/self-sufficient "
+                              "single-node topology (spark_worker_count=0), see new_spark_session()'s own comment.")
+    parser.add_argument("--spark-driver-memory", default="6g")
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
 
@@ -522,7 +574,10 @@ def main() -> int:
 
     spark = None
     if args.spark_master_host:
-        spark = new_spark_session(args.spark_master_host, args.iceberg_catalog_uri, args.iceberg_warehouse)
+        spark = new_spark_session(
+            args.spark_master_host, args.iceberg_catalog_uri, args.iceberg_warehouse,
+            args.spark_executor_memory, args.spark_driver_memory,
+        )
         register_spark_views(spark, args.s3_bucket, args.scale_factor, args.compression, args.table_format)
 
     duckdb_con = new_duckdb_connection(args.aws_region) if args.duckdb else None
@@ -569,6 +624,7 @@ def main() -> int:
             args.kernellake_host, args.kernellake_ssh_key,
             args.spark_master_host, args.s3_bucket, args.scale_factor, args.compression,
             args.table_format, args.iceberg_catalog_uri, args.iceberg_warehouse, args.aws_region,
+            args.spark_executor_memory, args.spark_driver_memory,
         )
 
         if args.table_format == "flat":

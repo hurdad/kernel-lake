@@ -28,10 +28,29 @@ apt-get install -y --no-install-recommends openjdk-17-jre-headless python3 pytho
 # start-worker.sh wrapper scripts themselves (confirmed for real, not
 # assumed -- see this file's own start-up section below for the fix:
 # spark-daemon.sh directly, which is what those wrappers call anyway).
-pip3 install --break-system-packages pyspark==3.5.3 boto3
+# pandas: aws_benchmark_runner.py's run_pyspark_query() calls
+# spark.sql(...).toPandas() -- a real, confirmed-live gap
+# (ImportError: Pandas >= 1.0.5 must be installed) on a fresh instance,
+# not an assumed pyspark dependency (pyspark's own pip package doesn't
+# pull it in).
+pip3 install --break-system-packages pyspark==3.5.3 boto3 pandas
 
 SPARK_HOME=$(python3 -c "import pyspark, os; print(os.path.dirname(pyspark.__file__))")
 echo "SPARK_HOME=$${SPARK_HOME}"
+
+# Real disk-backed shuffle-spill dir for the Worker (and, transitively,
+# the executors it launches). SPARK_LOCAL_DIRS (a Worker-process
+# environment variable) overrides spark.local.dir (a driver-side
+# SparkConf entry, e.g. runner/aws_benchmark_runner.py's
+# new_spark_session()) entirely in Spark standalone mode -- confirmed for
+# real that setting only the driver-side config had zero effect,
+# because /tmp (java.io.tmpdir's default, and what the Worker used
+# instead) turned out to be RAM-backed tmpfs on this AMI with only ~8GB
+# total, not real disk -- a SF100 3-way join's shuffle spill blew through
+# it ("No space left on device") well before the real ~90GB-free root EBS
+# volume was anywhere close to full.
+mkdir -p /var/spark-tmp
+chmod 1777 /var/spark-tmp
 
 # node_exporter, same as the KernelLake host, for host-level CPU/memory/
 # network/disk metrics in the same central Prometheus.
@@ -109,11 +128,21 @@ if [ "${role}" = "master" ]; then
   # forever waiting for resources on the first job submitted. Harmless
   # when spark_worker_count > 0 too -- just one more worker alongside the
   # dedicated ones, so the cost-matched multi-node mode is unaffected.
+  #
+  # The worker needs its own SPARK_DAEMON_JAVA_OPTS with a different JMX
+  # port than the master's (both daemons otherwise inherit the same
+  # exported env var, so the second one to start fatally crashes on a
+  # port collision -- confirmed for real on a live instance:
+  # "java.net.BindException: Address already in use" -> a JVM
+  # "ASSERTION FAILED"/native fatal error, not just a graceful skip).
   echo "=== Also starting a Spark worker on the master node itself ==="
-  "$${SPARK_HOME}/sbin/spark-daemon.sh" start org.apache.spark.deploy.worker.Worker 1 "spark://$${OWN_IP}:7077"
+  SPARK_DAEMON_JAVA_OPTS="-javaagent:/opt/jmx_prometheus_javaagent.jar=7778:/opt/jmx-exporter-config.yaml" \
+    SPARK_LOCAL_DIRS="/var/spark-tmp" \
+    "$${SPARK_HOME}/sbin/spark-daemon.sh" start org.apache.spark.deploy.worker.Worker 1 "spark://$${OWN_IP}:7077"
 else
   echo "=== Starting Spark standalone worker, joining master at ${master_ip} ==="
-  "$${SPARK_HOME}/sbin/spark-daemon.sh" start org.apache.spark.deploy.worker.Worker 1 "spark://${master_ip}:7077"
+  SPARK_LOCAL_DIRS="/var/spark-tmp" \
+    "$${SPARK_HOME}/sbin/spark-daemon.sh" start org.apache.spark.deploy.worker.Worker 1 "spark://${master_ip}:7077"
 fi
 
 echo "=== Spark node init (role=${role}) complete $(date -u) ==="

@@ -126,31 +126,63 @@ mapfile -t INSTANCE_STORE_DEVICES < <(
   done | sort -u
 )
 
+# Prints a mountpoint if $1 (or anything built directly on top of it, e.g.
+# an LVM logical volume) is already mounted somewhere -- empty output
+# means genuinely free/raw. Needed because AWS's Deep Learning Base AMI
+# pre-formats+mounts local NVMe as LVM at /opt/dlami/nvme: the raw device
+# itself never shows up in `mount` output (the LVM logical volume does),
+# but the kernel still holds it busy -- confirmed for real ("mkfs.xfs:
+# cannot open /dev/nvme1n1: Device or resource busy" on a live instance,
+# `ls /sys/block/nvme1n1/holders/` showing the LVM dm-0 device holding it)
+# -- so checking `mount | grep "^$dev "` alone (an earlier version of this
+# script did only that) misses this real, common case entirely.
+find_existing_mount() {
+  local dev="$1" mnt holder
+  mnt=$(lsblk -no MOUNTPOINT "$dev" 2>/dev/null | grep -v '^$' | head -1)
+  if [ -n "$mnt" ]; then
+    printf '%s' "$mnt"
+    return
+  fi
+  for holder in "/sys/block/$(basename "$dev")/holders/"*; do
+    [ -e "$holder" ] || continue
+    mnt=$(lsblk -no MOUNTPOINT "/dev/$(basename "$holder")" 2>/dev/null | grep -v '^$' | head -1)
+    if [ -n "$mnt" ]; then
+      printf '%s' "$mnt"
+      return
+    fi
+  done
+}
+
 if [ "$${#INSTANCE_STORE_DEVICES[@]}" -gt 0 ]; then
   echo "=== Found $${#INSTANCE_STORE_DEVICES[@]} local NVMe instance-store device(s): $${INSTANCE_STORE_DEVICES[*]} ==="
-  NVME_CACHE_HOST_DIR="/mnt/kernellake-nvme-cache"
-  mkdir -p "$NVME_CACHE_HOST_DIR"
 
-  if [ "$${#INSTANCE_STORE_DEVICES[@]}" -eq 1 ]; then
-    CACHE_BLOCK_DEVICE="$${INSTANCE_STORE_DEVICES[0]}"
+  EXISTING_MOUNT=""
+  for dev in "$${INSTANCE_STORE_DEVICES[@]}"; do
+    EXISTING_MOUNT="$(find_existing_mount "$dev")"
+    [ -n "$EXISTING_MOUNT" ] && break
+  done
+
+  if [ -n "$EXISTING_MOUNT" ]; then
+    echo "=== Local NVMe already formatted+mounted at $EXISTING_MOUNT (AMI-provided) -- reusing it directly rather than reformatting ==="
+    NVME_CACHE_HOST_DIR="$EXISTING_MOUNT"
   else
-    apt-get install -y --no-install-recommends mdadm
-    CACHE_BLOCK_DEVICE="/dev/md/kernellake-cache"
-    yes | mdadm --create "$CACHE_BLOCK_DEVICE" --level=0 \
-      --raid-devices="$${#INSTANCE_STORE_DEVICES[@]}" "$${INSTANCE_STORE_DEVICES[@]}"
-    udevadm settle
+    NVME_CACHE_HOST_DIR="/mnt/kernellake-nvme-cache"
+    mkdir -p "$NVME_CACHE_HOST_DIR"
+
+    if [ "$${#INSTANCE_STORE_DEVICES[@]}" -eq 1 ]; then
+      CACHE_BLOCK_DEVICE="$${INSTANCE_STORE_DEVICES[0]}"
+    else
+      apt-get install -y --no-install-recommends mdadm
+      CACHE_BLOCK_DEVICE="/dev/md/kernellake-cache"
+      yes | mdadm --create "$CACHE_BLOCK_DEVICE" --level=0 \
+        --raid-devices="$${#INSTANCE_STORE_DEVICES[@]}" "$${INSTANCE_STORE_DEVICES[@]}"
+      udevadm settle
+    fi
+
+    mkfs.xfs -f "$CACHE_BLOCK_DEVICE"
+    mount "$CACHE_BLOCK_DEVICE" "$NVME_CACHE_HOST_DIR"
   fi
 
-  # Some AMIs (e.g. AWS's Deep Learning AMIs) auto-mount instance store on
-  # boot via their own fstab/udev rule -- unmount first if so, otherwise
-  # this mkfs would format a device the kernel considers busy and fail.
-  if mount | grep -q "^$CACHE_BLOCK_DEVICE "; then
-    echo "=== $CACHE_BLOCK_DEVICE was already mounted by the AMI -- unmounting before reformatting ==="
-    umount "$CACHE_BLOCK_DEVICE"
-  fi
-
-  mkfs.xfs -f "$CACHE_BLOCK_DEVICE"
-  mount "$CACHE_BLOCK_DEVICE" "$NVME_CACHE_HOST_DIR"
   chmod 1777 "$NVME_CACHE_HOST_DIR"  # container runs as non-root; world-writable+sticky, same convention as /tmp
 
   # 90% of the real formatted filesystem size, not a guessed constant --
@@ -160,7 +192,7 @@ if [ "$${#INSTANCE_STORE_DEVICES[@]}" -gt 0 ]; then
   FS_BYTES=$(df --output=size -B1 "$NVME_CACHE_HOST_DIR" | tail -1 | tr -d ' ')
   NVME_CACHE_MAX_BYTES=$(( FS_BYTES * 90 / 100 ))
   NVME_CACHE_ENABLED=true
-  echo "=== NVMe cache mounted at $NVME_CACHE_HOST_DIR ($FS_BYTES formatted bytes, $NVME_CACHE_MAX_BYTES byte cache budget) ==="
+  echo "=== NVMe cache ready at $NVME_CACHE_HOST_DIR ($FS_BYTES formatted bytes, $NVME_CACHE_MAX_BYTES byte cache budget) ==="
 else
   echo "=== No local NVMe instance-store device found on this instance -- storage.cache stays disabled ==="
   NVME_CACHE_HOST_DIR="/opt/kernellake-bench/cache-disabled-placeholder"
@@ -211,6 +243,15 @@ receivers:
 exporters:
   prometheus:
     endpoint: 0.0.0.0:8889
+  # No dedicated trace/log backend is provisioned on AWS (unlike
+  # benchmarks/local/'s docker-compose stack, which has Jaeger) -- `debug`
+  # just logs to the collector's own stdout, which is enough to keep
+  # kernellake-server's OTLP exporter calls succeeding (a pipeline with
+  # zero exporters is rejected outright by the collector -- confirmed for
+  # real: "service::pipelines::traces: must have at least one exporter" --
+  # not silently accepted the way it may have been in an older collector
+  # version this config was last verified against).
+  debug: {}
 processors:
   batch: {}
 service:
@@ -222,7 +263,11 @@ service:
     traces:
       receivers: [otlp]
       processors: [batch]
-      exporters: []
+      exporters: [debug]
+    logs:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [debug]
 OTELEOF
 
 # --- docker-compose: kernellake-server + otel-collector + node_exporter +
@@ -272,6 +317,13 @@ services:
   dcgm-exporter:
     image: nvcr.io/nvidia/k8s/dcgm-exporter:latest
     network_mode: host
+    # DCGM's host engine refuses to watch GPU fields as a non-root/
+    # non-privileged process ("error watching fields: Host engine is
+    # running as non-root") -- confirmed for real on a live instance, not
+    # assumed; privileged is the documented fix for running dcgm-exporter
+    # outside Kubernetes (where it'd otherwise get this via a hostPID/
+    # privileged pod security context instead).
+    privileged: true
     deploy:
       resources:
         reservations:

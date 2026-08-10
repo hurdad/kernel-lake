@@ -89,7 +89,11 @@ def s3_data_glob(bucket: str, scale_factor: int, table: str, compression: str = 
         "orders": "orders-*.parquet",
         "customer": "customer-00000.parquet",
     }
-    return f"s3://{bucket}/tpch-data/sf{scale_factor}-{compression}/{prefix_map[table]}"
+    # snappy keeps the original, un-suffixed path (tpch-data/sf100/) --
+    # matches generate_and_upload_data.sh's own SF_DIR convention exactly;
+    # only a non-default codec gets its own suffixed path.
+    sf_dir = f"sf{scale_factor}" if compression == "snappy" else f"sf{scale_factor}-{compression}"
+    return f"s3://{bucket}/tpch-data/{sf_dir}/{prefix_map[table]}"
 
 
 def median_stats(samples: list) -> dict:

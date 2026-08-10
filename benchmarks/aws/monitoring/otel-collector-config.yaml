@@ -18,6 +18,15 @@ receivers:
 exporters:
   prometheus:
     endpoint: 0.0.0.0:8889
+  # No trace/log backend wired up this phase (the ask was metrics ->
+  # Prometheus specifically) -- `debug` just logs to the collector's own
+  # stdout, which is required (not optional): a pipeline with zero
+  # exporters is rejected outright by the collector at startup ("must have
+  # at least one exporter" -- confirmed for real against a live AWS run,
+  # where an empty exporters: [] here crash-looped the container). Add a
+  # real backend (Jaeger/Tempo/etc.) and swap this exporter out if trace/
+  # log visualization is wanted later.
+  debug: {}
 
 processors:
   batch: {}
@@ -31,8 +40,8 @@ service:
     traces:
       receivers: [otlp]
       processors: [batch]
-      # No trace backend wired up this phase (the ask was metrics ->
-      # Prometheus specifically) -- traces are received and processed but
-      # have nowhere to export to yet. Add a backend (Jaeger/Tempo/etc.)
-      # and an exporter here if trace visualization is wanted later.
-      exporters: []
+      exporters: [debug]
+    logs:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [debug]

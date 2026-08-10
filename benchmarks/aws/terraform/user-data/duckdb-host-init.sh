@@ -18,7 +18,10 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get update
 apt-get install -y --no-install-recommends python3 python3-pip curl
 
-pip3 install --break-system-packages duckdb boto3
+# pyarrow: duckdb_query_loop.py's con.sql(...).arrow() needs it -- a real,
+# confirmed-live gap (ModuleNotFoundError on a fresh instance), not an
+# assumed dependency of duckdb's own pip package.
+pip3 install --break-system-packages duckdb boto3 pyarrow
 
 # node_exporter, same as the KernelLake/Spark hosts, for host-level
 # CPU/memory/network/disk metrics in the same central Prometheus -- see

@@ -52,7 +52,15 @@ if [ -z "$BUCKET" ] || [ -z "$SCALE_FACTOR" ] || [ -z "$OUTPUT" ]; then
   exit 1
 fi
 
-PREFIX="tpch-data/sf${SCALE_FACTOR}-${COMPRESSION}/"
+# snappy keeps the original, un-suffixed path (tpch-data/sf100/) -- matches
+# generate_and_upload_data.sh's own SF_DIR convention exactly; only a
+# non-default codec gets its own suffixed path.
+if [ "$COMPRESSION" = "snappy" ]; then
+  SF_DIR="sf${SCALE_FACTOR}"
+else
+  SF_DIR="sf${SCALE_FACTOR}-${COMPRESSION}"
+fi
+PREFIX="tpch-data/${SF_DIR}/"
 echo "=== Listing real objects under s3://${BUCKET}/${PREFIX} (table=${TABLE}) ===" >&2
 
 # Real object keys + sizes via list-objects-v2 (ground truth, same as
