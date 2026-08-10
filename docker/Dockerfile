@@ -99,7 +99,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 #      automatically via lsb_release), then a second `apt-get update` to
 #      pick it up.
 #   3. Everything else in one apt-get install: core toolchain; Arrow/
-#      Parquet/Flight/Flight-SQL (pinned to =25.0.0-1, the exact apt
+#      Parquet/Flight/Flight-SQL (pinned to =25.0.1-1, the exact apt
 #      package version string incl. Debian revision -- every other real
 #      third-party dependency here is pinned already, RAPIDS by
 #      URL+SHA-256 in cmake/ThirdPartyRapids.cmake, so Arrow floating to
@@ -126,8 +126,8 @@ RUN apt-get update && apt-get upgrade -y \
          libgtest-dev libbenchmark-dev libspdlog-dev nlohmann-json3-dev libyaml-cpp-dev \
          libxml2-dev uuid-dev libavro-dev libcurl4-openssl-dev \
          libgrpc++-dev protobuf-compiler-grpc opentelemetry-cpp-dev \
-         libarrow-dev=25.0.0-1 libparquet-dev=25.0.0-1 libarrow-dataset-dev=25.0.0-1 \
-         libarrow-flight-dev=25.0.0-1 libarrow-flight-sql-dev=25.0.0-1 \
+         libarrow-dev=25.0.1-1 libparquet-dev=25.0.1-1 libarrow-dataset-dev=25.0.1-1 \
+         libarrow-flight-dev=25.0.1-1 libarrow-flight-sql-dev=25.0.1-1 \
     && rm -rf /var/lib/apt/lists/* /tmp/arrow-apt-source.deb
 
 # ---------------------------------------------------------------------------
@@ -333,11 +333,22 @@ RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-reco
       ca-certificates libstdc++6 \
     && rm -rf /var/lib/apt/lists/*
 
-RUN mkdir -p /opt/kernellake/bin /opt/kernellake/lib
-COPY --from=gpu-release /workspace/build/gpu-release/src/cli/kernellake /opt/kernellake/bin/kernellake
-COPY --from=gpu-release /workspace/build/gpu-release/src/server/kernellake-server /opt/kernellake/bin/kernellake-server
-COPY --from=runtime-libs-gpu /opt/kernellake-libs/ /opt/kernellake/lib/
+# Runs as a fixed-UID non-root user, not the root this stage's own base
+# layer defaults to -- neither binary needs root (no privileged ports, no
+# host-level access), and a container escape from a root process is a
+# strictly worse outcome than from this one. UID/GID 10001 chosen so it's
+# stable across rebuilds and so charts/kernellake/'s Deployment can pin a
+# matching `securityContext.runAsUser` if it ever needs to; --no-create-home
+# because this user never needs a home directory or shell.
+RUN groupadd --gid 10001 kernellake \
+    && useradd --uid 10001 --gid kernellake --no-create-home --shell /usr/sbin/nologin kernellake
 
+RUN mkdir -p /opt/kernellake/bin /opt/kernellake/lib
+COPY --from=gpu-release --chown=kernellake:kernellake /workspace/build/gpu-release/src/cli/kernellake /opt/kernellake/bin/kernellake
+COPY --from=gpu-release --chown=kernellake:kernellake /workspace/build/gpu-release/src/server/kernellake-server /opt/kernellake/bin/kernellake-server
+COPY --from=runtime-libs-gpu --chown=kernellake:kernellake /opt/kernellake-libs/ /opt/kernellake/lib/
+
+USER kernellake
 ENV LD_LIBRARY_PATH=/opt/kernellake/lib
 ENTRYPOINT ["/opt/kernellake/bin/kernellake"]
 CMD ["--help"]
@@ -359,11 +370,17 @@ RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-reco
       ca-certificates libstdc++6 \
     && rm -rf /var/lib/apt/lists/*
 
-RUN mkdir -p /opt/kernellake/bin /opt/kernellake/lib
-COPY --from=cpu-release /workspace/build/cpu-release/src/cli/kernellake /opt/kernellake/bin/kernellake
-COPY --from=cpu-release /workspace/build/cpu-release/src/server/kernellake-server /opt/kernellake/bin/kernellake-server
-COPY --from=runtime-libs-cpu /opt/kernellake-libs/ /opt/kernellake/lib/
+# See runtime-gpu's identical block above for why this exists and why UID/
+# GID 10001 specifically.
+RUN groupadd --gid 10001 kernellake \
+    && useradd --uid 10001 --gid kernellake --no-create-home --shell /usr/sbin/nologin kernellake
 
+RUN mkdir -p /opt/kernellake/bin /opt/kernellake/lib
+COPY --from=cpu-release --chown=kernellake:kernellake /workspace/build/cpu-release/src/cli/kernellake /opt/kernellake/bin/kernellake
+COPY --from=cpu-release --chown=kernellake:kernellake /workspace/build/cpu-release/src/server/kernellake-server /opt/kernellake/bin/kernellake-server
+COPY --from=runtime-libs-cpu --chown=kernellake:kernellake /opt/kernellake-libs/ /opt/kernellake/lib/
+
+USER kernellake
 ENV LD_LIBRARY_PATH=/opt/kernellake/lib
 ENTRYPOINT ["/opt/kernellake/bin/kernellake"]
 CMD ["--help"]

@@ -48,13 +48,13 @@
 # constraint now applies to cpu-build-test/tpch-tooling-smoke as well,
 # not just server-build-test/otel-build-test.
 #
-# Every libarrow*-dev package installed below is pinned to =25.0.0-1 (the
+# Every libarrow*-dev package installed below is pinned to =25.0.1-1 (the
 # exact apt package version string, Debian revision included) -- matching
 # how every other real third-party dependency in this project is pinned
 # (see docker/Dockerfile's own comment on this). Every other apt package
 # here (gRPC, opentelemetry-cpp-dev, gtest, benchmark, spdlog,
 # nlohmann-json, yaml-cpp, avro-c, libcurl, libxml2, ...) is left unpinned
-# for now. If the 25.0.0-1 build ever disappears from Apache's apt repo,
+# for now. If the 25.0.1-1 build ever disappears from Apache's apt repo,
 # bump this pin to whatever revision `apt-cache policy libarrow-dev`
 # reports as available then, in every job below plus docker/Dockerfile and
 # README.md -- don't drop back to unpinned.
@@ -138,7 +138,7 @@ jobs:
             "https://packages.apache.org/artifactory/arrow/ubuntu/apache-arrow-apt-source-latest-$(lsb_release --codename --short).deb"
           apt-get install -y -V /tmp/arrow-apt-source.deb
           apt-get update
-          apt-get install -y --no-install-recommends libarrow-dev=25.0.0-1 libparquet-dev=25.0.0-1 libarrow-dataset-dev=25.0.0-1
+          apt-get install -y --no-install-recommends libarrow-dev=25.0.1-1 libparquet-dev=25.0.1-1 libarrow-dataset-dev=25.0.1-1
       - name: Configure and build (cpu-dev preset)
         run: |
           cmake --preset cpu-dev
@@ -181,7 +181,7 @@ jobs:
             "https://packages.apache.org/artifactory/arrow/ubuntu/apache-arrow-apt-source-latest-$(lsb_release --codename --short).deb"
           apt-get install -y -V /tmp/arrow-apt-source.deb
           apt-get update
-          apt-get install -y --no-install-recommends libarrow-dev=25.0.0-1 libparquet-dev=25.0.0-1 libarrow-dataset-dev=25.0.0-1
+          apt-get install -y --no-install-recommends libarrow-dev=25.0.1-1 libparquet-dev=25.0.1-1 libarrow-dataset-dev=25.0.1-1
       - name: Configure (cpu-dev preset)
         run: cmake --preset cpu-dev
       - name: Build
@@ -212,7 +212,7 @@ jobs:
             "https://packages.apache.org/artifactory/arrow/ubuntu/apache-arrow-apt-source-latest-$(lsb_release --codename --short).deb"
           apt-get install -y -V /tmp/arrow-apt-source.deb
           apt-get update
-          apt-get install -y --no-install-recommends libarrow-dev=25.0.0-1 libparquet-dev=25.0.0-1 libarrow-dataset-dev=25.0.0-1
+          apt-get install -y --no-install-recommends libarrow-dev=25.0.1-1 libparquet-dev=25.0.1-1 libarrow-dataset-dev=25.0.1-1
       - name: Install pyarrow (for generate_tpch.py)
         run: pip install --user --break-system-packages pyarrow
       - name: Build (cpu-dev preset)
@@ -289,8 +289,8 @@ jobs:
           apt-get install -y -V /tmp/arrow-apt-source.deb
           apt-get update
           apt-get install -y --no-install-recommends \
-            libarrow-dev=25.0.0-1 libparquet-dev=25.0.0-1 libarrow-dataset-dev=25.0.0-1 \
-            libarrow-flight-dev=25.0.0-1 libarrow-flight-sql-dev=25.0.0-1
+            libarrow-dev=25.0.1-1 libparquet-dev=25.0.1-1 libarrow-dataset-dev=25.0.1-1 \
+            libarrow-flight-dev=25.0.1-1 libarrow-flight-sql-dev=25.0.1-1
       - name: Install gRPC
         run: apt-get install -y --no-install-recommends libgrpc++-dev protobuf-compiler-grpc
       - name: Configure (server-dev preset)
@@ -345,7 +345,7 @@ jobs:
             "https://packages.apache.org/artifactory/arrow/ubuntu/apache-arrow-apt-source-latest-$(lsb_release --codename --short).deb"
           apt-get install -y -V /tmp/arrow-apt-source.deb
           apt-get update
-          apt-get install -y --no-install-recommends libarrow-dev=25.0.0-1 libparquet-dev=25.0.0-1 libarrow-dataset-dev=25.0.0-1
+          apt-get install -y --no-install-recommends libarrow-dev=25.0.1-1 libparquet-dev=25.0.1-1 libarrow-dataset-dev=25.0.1-1
       - name: Install opentelemetry-cpp
         run: apt-get install -y --no-install-recommends opentelemetry-cpp-dev
       - name: Install gRPC

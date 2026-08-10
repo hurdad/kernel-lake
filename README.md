@@ -115,7 +115,7 @@ sudo apt-get install -y build-essential cmake ninja-build git pkg-config \
   libgrpc++-dev protobuf-compiler-grpc
 
 # Apache Arrow / Parquet C++ (official Apache Arrow apt repo). Pinned to
-# 25.0.0-1 -- unlike most other dependencies here, apt would otherwise
+# 25.0.1-1 -- unlike most other dependencies here, apt would otherwise
 # silently float to whatever the repo currently serves; see
 # docker/Dockerfile's own comment for the full rationale and what to do if
 # this exact revision ever disappears from the repo.
@@ -124,7 +124,7 @@ wget -O /tmp/arrow-apt-source.deb \
   "https://packages.apache.org/artifactory/arrow/ubuntu/apache-arrow-apt-source-latest-$(lsb_release --codename --short).deb"
 sudo apt-get install -y -V /tmp/arrow-apt-source.deb
 sudo apt-get update
-sudo apt-get install -y libarrow-dev=25.0.0-1 libparquet-dev=25.0.0-1 libarrow-dataset-dev=25.0.0-1
+sudo apt-get install -y libarrow-dev=25.0.1-1 libparquet-dev=25.0.1-1 libarrow-dataset-dev=25.0.1-1
 ```
 
 GPU execution additionally needs the CUDA Toolkit (12+) and RAPIDS
@@ -139,7 +139,7 @@ that (26.04's, 4.2.3 at last check, already isn't).
 Two more presets need their own extra packages, on top of the core
 toolchain above: `server-dev` (the Arrow Flight SQL server) additionally
 needs `libarrow-flight-dev`/`libarrow-flight-sql-dev` (same Apache Arrow
-apt repo, same `=25.0.0-1` pin as above); `otel-dev` (OpenTelemetry export)
+apt repo, same `=25.0.1-1` pin as above); `otel-dev` (OpenTelemetry export)
 needs `opentelemetry-cpp-dev`, which -- like
 `libarrow-flight-sql-dev` -- has no Ubuntu 24.04 apt package at all (26.04
 only). The two can be combined with each other by passing
