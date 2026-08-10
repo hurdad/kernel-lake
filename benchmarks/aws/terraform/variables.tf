@@ -40,19 +40,19 @@ variable "vpc_id" {
 # --- KernelLake host(s) -----------------------------------------------
 
 variable "kernellake_instance_type" {
-  description = "EC2 instance type for the KernelLake GPU benchmark host(s). g6.8xlarge per the benchmark spec: 1x NVIDIA L4 (24GB), 32 vCPUs, 128GB RAM."
+  description = "EC2 instance type for the KernelLake GPU benchmark host(s). g6.xlarge (1x NVIDIA L4 24GB, 4 vCPUs, 16GB RAM, local NVMe instance storage -- confirmed via a real `aws ec2 describe-instance-types` lookup) is the current default because it's the only size that fits this account's real G/VT vCPU quota (8, as of 2026-08-09 -- see docs/COST_ESTIMATES.md and the pending appeal on the quota increase case). g6.4xlarge (16 vCPU, same L4) and g6e.16xlarge (64 vCPU, L40S) are the next two steps of a planned instance-size sweep once quota allows -- override this variable to run them, don't change the default until then."
   type        = string
-  default     = "g6.8xlarge"
+  default     = "g6.xlarge"
 }
 
 variable "kernellake_instance_count" {
-  description = "Number of independent kernellake-server instances to run. 1 for the base latency/cost-per-query benchmark; 1/2/4/8 across separate applies for the M4 concurrency test (see docs/RUNBOOK.md) -- each instance is fully independent (no distributed execution), so this is horizontal replica count, not a cluster size."
+  description = "Number of independent kernellake-server instances to run. 1 for the base latency/cost-per-query benchmark; 1/2/4/8 across separate applies for the M4 concurrency test (see docs/RUNBOOK.md) -- each instance is fully independent (no distributed execution), so this is horizontal replica count, not a cluster size. 0 stands the rest of the stack up (Spark/DuckDB/monitoring/Iceberg catalog) without the GPU host at all -- e.g. for testing/tuning the Spark or DuckDB leg alone, so the (comparatively expensive) GPU instance isn't sitting there idle and billing while it is."
   type        = number
   default     = 1
 
   validation {
-    condition     = var.kernellake_instance_count >= 1 && var.kernellake_instance_count <= 8
-    error_message = "kernellake_instance_count must be between 1 and 8 (the concurrency test's own documented range)."
+    condition     = var.kernellake_instance_count >= 0 && var.kernellake_instance_count <= 8
+    error_message = "kernellake_instance_count must be between 0 and 8 (the concurrency test's own documented range; 0 means no GPU host at all)."
   }
 }
 
@@ -70,6 +70,12 @@ variable "kernellake_ami_id" {
 
 # --- Spark cluster -------------------------------------------------------
 
+variable "enable_spark" {
+  description = "Whether to provision the Spark cluster (master + spark_worker_count workers) at all. false skips it entirely -- e.g. for testing/tuning the KernelLake or DuckDB leg alone, so Spark instances aren't sitting there idle and billing while it is. See kernellake_instance_count's own comment for the equivalent GPU-host toggle."
+  type        = bool
+  default     = true
+}
+
 variable "spark_master_instance_type" {
   description = "EC2 instance type for the Spark standalone master."
   type        = string
@@ -86,6 +92,20 @@ variable "spark_worker_count" {
   description = "Number of Spark worker instances. Sized (instance type x count) against live AWS Pricing API lookups in scripts/estimate_cost.py to approximate the KernelLake host's own hourly cost -- see docs/COST_ESTIMATES.md for the actual comparison once computed, this default is a starting point, not a verified match."
   type        = number
   default     = 3
+}
+
+# --- DuckDB host --------------------------------------------------------
+
+variable "enable_duckdb" {
+  description = "Whether to provision the dedicated DuckDB host at all. false skips it entirely -- e.g. for testing/tuning the KernelLake or Spark leg alone, so the DuckDB instance isn't sitting there idle and billing while it is. See kernellake_instance_count's own comment for the equivalent GPU-host toggle."
+  type        = bool
+  default     = true
+}
+
+variable "duckdb_instance_type" {
+  description = "EC2 instance type for the dedicated DuckDB benchmark host (single-node, CPU-only). Defaults to the same type as the Spark master, not an attempt to cost-match the KernelLake GPU host -- see duckdb_instance.tf's own comment."
+  type        = string
+  default     = "m7i.xlarge"
 }
 
 # --- Iceberg REST catalog ---------------------------------------------

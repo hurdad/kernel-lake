@@ -44,17 +44,66 @@ def engine_hourly_rates(cost_data: dict | None) -> dict[str, float | None]:
     during this run, appropriate here since a Spark query uses the whole
     cluster while running, not one node's worth of capacity.
 
-    duckdb: deliberately absent, here and from cost_per_query_table()/
-    cost_efficiency_table() below -- it runs in-process on whichever host
-    ran the orchestrator (not on infra dedicated to it), so there is no
-    real per-instance $/hour to attribute a query's cost against."""
+    duckdb: present only when cost_model.py was given --duckdb-instance-id
+    (terraform/duckdb_instance.tf's dedicated host was actually used for
+    this run) -- detail.duckdb_hourly_rate_usd is set exactly then. Absent
+    (None) for a run that only used aws_benchmark_runner.py's old
+    in-process --duckdb flag, since that has no dedicated instance to
+    attribute a $/hour to."""
     if cost_data is None:
-        return {"kernellake": None, "pyspark": None}
+        return {"kernellake": None, "pyspark": None, "duckdb": None}
     detail = cost_data.get("detail", {})
     kernellake_rate = detail.get("kernellake_hourly_rate_usd")
     spark_hours = sum(detail.get("spark_instance_hours", {}).values())
     spark_rate = (cost_data["spark_usd"] / spark_hours) if spark_hours > 0 else None
-    return {"kernellake": kernellake_rate, "pyspark": spark_rate}
+    duckdb_rate = detail.get("duckdb_hourly_rate_usd")
+    return {"kernellake": kernellake_rate, "pyspark": spark_rate, "duckdb": duckdb_rate}
+
+
+def merge_duckdb_results(benchmark_runs: list, duckdb_results: list) -> None:
+    """Merges runner/duckdb_query_loop.py's independent per-run output
+    into benchmark_runs in place, matched by scale_factor + query number +
+    mode -- same shape aws_benchmark_runner.py's old in-process --duckdb
+    path used to produce inline, so every downstream table function below
+    (written against entry.get("duckdb")) needs no engine-specific
+    handling for where the data actually came from. A duckdb_results run
+    with no matching benchmark_runs scale_factor/query/mode is skipped
+    with a warning rather than silently dropped or erroring -- the two
+    runs are independent invocations and can legitimately drift (e.g. one
+    query added to one but not the other yet)."""
+    by_scale_factor: dict[int, dict] = {}
+    for run in benchmark_runs:
+        by_query: dict[int, dict] = {q["query"]: q for q in run["queries"]}
+        by_scale_factor[run["scale_factor"]] = by_query
+
+    for dd_run in duckdb_results:
+        by_query = by_scale_factor.get(dd_run["scale_factor"])
+        if by_query is None:
+            print(f"WARNING: --duckdb-results scale_factor={dd_run['scale_factor']} has no matching "
+                  "--input run at that scale factor -- skipped", file=sys.stderr)
+            continue
+        for dd_query in dd_run["queries"]:
+            q = by_query.get(dd_query["query"])
+            if q is None:
+                print(f"WARNING: --duckdb-results Q{dd_query['query']} has no matching query in the "
+                      f"scale_factor={dd_run['scale_factor']} run -- skipped", file=sys.stderr)
+                continue
+            for mode, dd_stats in dd_query["modes"].items():
+                entry = q["modes"].get(mode)
+                if entry is None:
+                    print(f"WARNING: --duckdb-results Q{dd_query['query']} mode={mode} has no matching "
+                          "mode in the benchmark run -- skipped", file=sys.stderr)
+                    continue
+                entry["duckdb"] = {k: v for k, v in dd_stats.items() if k != "row_count"}
+                entry["duckdb_row_count"] = dd_stats.get("row_count")
+                if "kernellake" in entry and entry["kernellake"]["median_seconds"] > 0:
+                    entry["latency_speedup_ratio_duckdb"] = (
+                        entry["duckdb"]["median_seconds"] / entry["kernellake"]["median_seconds"]
+                    )
+                # No results_match_duckdb here -- see duckdb_query_loop.py's
+                # own docstring for why real row-level cross-validation
+                # against KernelLake isn't available once DuckDB runs on
+                # separate, dedicated infra.
 
 
 def latency_speedup_table(benchmark_runs: list) -> list[dict]:
@@ -93,6 +142,7 @@ def cost_per_query_table(benchmark_runs: list, cost_data: dict | None) -> list[d
         sf = run["scale_factor"]
         queries_completed_kl = sum(len(q["modes"]) for q in run["queries"])  # one completed run per query x mode
         queries_completed_spark = sum(1 for q in run["queries"] for m in q["modes"].values() if "pyspark" in m)
+        queries_completed_duckdb = sum(1 for q in run["queries"] for m in q["modes"].values() if "duckdb" in m)
         if cost_data is None:
             rows.append(
                 {
@@ -105,12 +155,23 @@ def cost_per_query_table(benchmark_runs: list, cost_data: dict | None) -> list[d
             continue
         kl_cost = cost_data["kernellake_usd"] / queries_completed_kl if queries_completed_kl else None
         spark_cost = cost_data["spark_usd"] / queries_completed_spark if queries_completed_spark else None
+        # duckdb_usd is only nonzero when cost_model.py was given
+        # --duckdb-instance-id (a real dedicated host was used) -- a run
+        # using the old in-process --duckdb flag has duckdb_usd == 0, so
+        # duckdb_cost stays None here rather than reporting a misleading $0.
+        duckdb_cost = (
+            cost_data.get("duckdb_usd", 0) / queries_completed_duckdb
+            if queries_completed_duckdb and cost_data.get("duckdb_usd", 0) > 0
+            else None
+        )
         rows.append(
             {
                 "scale_factor": sf,
                 "kernellake_cost_per_query_usd": kl_cost,
                 "pyspark_cost_per_query_usd": spark_cost,
+                "duckdb_cost_per_query_usd": duckdb_cost,
                 "cost_ratio_pyspark_over_kernellake": (spark_cost / kl_cost) if (kl_cost and spark_cost) else None,
+                "cost_ratio_duckdb_over_kernellake": (duckdb_cost / kl_cost) if (kl_cost and duckdb_cost) else None,
             }
         )
     return rows
@@ -189,7 +250,7 @@ def cost_efficiency_table(benchmark_runs: list, cost_data: dict | None) -> list[
             if not bytes_scanned:
                 continue
             for mode, entry in q["modes"].items():
-                for engine in ("kernellake", "pyspark"):
+                for engine in ("kernellake", "pyspark", "duckdb"):
                     rate = rates.get(engine)
                     if engine not in entry or rate is None:
                         continue
@@ -248,11 +309,21 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--input", required=True, help="aggregate_results.py's output")
     parser.add_argument("--cost-json", default=None, help="runner/cost_model.py's --output, for real cost-per-query numbers")
+    parser.add_argument(
+        "--duckdb-results",
+        nargs="*",
+        default=[],
+        help="runner/duckdb_query_loop.py's --output file(s), run separately on the dedicated DuckDB host -- "
+        "merged in by scale_factor/query/mode (see merge_duckdb_results()). Omit if this run only used "
+        "aws_benchmark_runner.py's old in-process --duckdb flag (already embedded in --input).",
+    )
     parser.add_argument("--output-dir", required=True)
     args = parser.parse_args()
 
     data = json.loads(Path(args.input).read_text())
     cost_data = json.loads(Path(args.cost_json).read_text()) if args.cost_json else None
+    duckdb_results = [json.loads(Path(p).read_text()) for p in args.duckdb_results]
+    merge_duckdb_results(data["benchmark_runs"], duckdb_results)
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -292,11 +363,20 @@ def main() -> int:
         else "Latency speedup ratio (headline #1) -- KernelLake vs. PySpark"
     )
     md.append(markdown_table(speedup_rows, speedup_title))
+    duckdb_has_cost = cost_data is not None and cost_data.get("duckdb_usd", 0) > 0
     if has_duckdb:
         md.append(
-            "_DuckDB is a single-node, CPU-only, in-process reference point (runs on the orchestrator "
-            "host itself against the same real S3 data) -- not scored in the cost tables below, since "
-            "it has no dedicated per-instance $/hour to attribute a query's cost against._"
+            (
+                "_DuckDB ran on its own dedicated, cost-tracked single-node host "
+                "(terraform/duckdb_instance.tf) -- included in the cost tables below like KernelLake/PySpark._"
+            )
+            if duckdb_has_cost
+            else (
+                "_DuckDB is a single-node, CPU-only reference point -- not scored in the cost tables below "
+                "since this run has no dedicated per-instance $/hour to attribute a query's cost against "
+                "(either the old in-process --duckdb path was used, or --duckdb-results/--cost-json's "
+                "--duckdb-instance-id were omitted for this run)._"
+            )
         )
         md.append("")
     md.append(markdown_table(cost_rows, "Cost per completed query (headline #2)"))

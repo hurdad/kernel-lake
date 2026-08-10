@@ -45,12 +45,16 @@ themselves.
   `runner/aws_benchmark_runner.py`, mirroring `tools/benchmark_three_way.py`),
   so adding one later doesn't require rearchitecting — but none of these
   are wired up this phase.
-- **DuckDB is wired up (`--duckdb`), but deliberately not a headline
-  comparison.** It runs single-node, CPU-only, in-process on whichever
-  host runs the orchestrator (not on infra dedicated to it) against the
-  same real S3 data — a real correctness/latency reference point, but
-  excluded from the cost-per-query and cost-efficiency tables since there
-  is no dedicated per-instance $/hour to attribute a query's cost against.
+- **DuckDB has two modes.** `runner/duckdb_query_loop.py` runs it on its
+  own dedicated, single-node, cost-tracked EC2 host
+  (`terraform/duckdb_instance.tf`, node-count-matched against the
+  KernelLake/Spark hosts) — a real latency *and* cost comparison, included
+  in every table like KernelLake/PySpark. `aws_benchmark_runner.py`'s
+  older `--duckdb` flag still runs it in-process on whichever host runs
+  the orchestrator instead, for a quick sanity check with no infra to
+  provision — excluded from cost tables in that mode only, since there's
+  no dedicated $/hour to attribute a query's cost against. See
+  docs/RUNBOOK.md for both.
 
 ## Real AWS costs — read this before running anything
 

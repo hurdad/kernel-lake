@@ -5,6 +5,8 @@
 # API lookups rather than a hardcoded guess.
 
 resource "aws_instance" "spark_master" {
+  count = var.enable_spark ? 1 : 0
+
   ami                         = data.aws_ami.ubuntu_26_04.id
   instance_type               = var.spark_master_instance_type
   subnet_id                   = local.subnet_id
@@ -32,7 +34,7 @@ resource "aws_instance" "spark_master" {
 }
 
 resource "aws_instance" "spark_worker" {
-  count = var.spark_worker_count
+  count = var.enable_spark ? var.spark_worker_count : 0
 
   ami                         = data.aws_ami.ubuntu_26_04.id
   instance_type               = var.spark_worker_instance_type
@@ -53,7 +55,7 @@ resource "aws_instance" "spark_worker" {
   # not-yet-provisioned one.
   user_data = templatefile("${path.module}/user-data/spark-node-init.sh", {
     role       = "worker"
-    master_ip  = aws_instance.spark_master.private_ip
+    master_ip  = aws_instance.spark_master[0].private_ip
     s3_bucket   = local.s3_bucket_name
     aws_region   = var.aws_region
   })
@@ -67,7 +69,7 @@ resource "aws_instance" "spark_worker" {
 }
 
 output "spark_master_public_ip" {
-  value = aws_instance.spark_master.public_ip
+  value = length(aws_instance.spark_master) > 0 ? aws_instance.spark_master[0].public_ip : null
 }
 
 output "spark_worker_public_ips" {

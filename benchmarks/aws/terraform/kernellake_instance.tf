@@ -15,11 +15,11 @@ resource "aws_instance" "kernellake" {
   key_name                    = var.ssh_key_name
   associate_public_ip_address = true
 
-  # Local NVMe (g6.8xlarge ships with instance store) is left as-is here --
-  # kernellake-server reads directly from S3 (config.hpp's S3Section,
-  # credentials_kind="default" resolves this instance's own IAM role
-  # automatically, no credential wiring needed), so no local data
-  # partitioning/mounting is required for the benchmark itself.
+  # Local NVMe (g6.8xlarge ships with instance store) is detected, formatted,
+  # and mounted by kernellake-host-init.sh itself at boot (device names/
+  # presence can't be assumed from the instance type alone, see that
+  # script's own comment) and wired to kernellake-server's storage.cache --
+  # not left unused, unlike an earlier version of this comment claimed.
   root_block_device {
     volume_size = 100
     volume_type = "gp3"

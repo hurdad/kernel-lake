@@ -87,8 +87,85 @@ if ! docker info 2>/dev/null | grep -qi nvidia; then
   systemctl restart docker
 fi
 
+# awscli: for scripts/measure_s3_throughput.sh (raw S3 GET throughput,
+# run directly on this host over SSH -- see docs/RUNBOOK.md), independent
+# of anything kernellake-server itself does. Native apt package rather
+# than a `docker run` container, since the default IMDSv2 hop limit (1)
+# blocks a container's own network namespace from reaching the instance
+# metadata service for credentials unless the hop limit is explicitly
+# raised -- this instance's own IAM role works out of the box for a
+# process running directly on the host, no such caveat.
+apt-get update
+apt-get install -y --no-install-recommends awscli
+
 mkdir -p /opt/kernellake-bench
 cd /opt/kernellake-bench
+
+# --- NVMe cache tier: format + mount the instance's local NVMe instance
+# store (if present) and point kernellake-server's storage.cache at it --
+# ephemeral, high-throughput local SSD for repeat-scan reads, separate
+# from the root EBS volume (see include/kernellake/common/config.hpp's
+# CacheSection and docs/ARCHITECTURE.md's "NVMe cache tier" section for
+# the feature itself). Detected via /dev/disk/by-id/*Instance_Storage*,
+# not a hardcoded device name or assumed instance-type spec -- Nitro
+# instances present the root EBS volume as an nvme* device too, so name
+# alone can't tell them apart, and not every instance type/size actually
+# ships local instance storage, so this must be checked for real at boot,
+# not assumed from the instance type string. Multiple instance-store
+# devices (some instance types ship more than one) are striped with mdadm
+# RAID0 for combined capacity/throughput -- this cache has no redundancy
+# requirement of its own, S3 is still the durable source of truth.
+NVME_CACHE_HOST_DIR=""
+NVME_CACHE_MAX_BYTES=0
+NVME_CACHE_ENABLED=false
+
+mapfile -t INSTANCE_STORE_DEVICES < <(
+  for link in /dev/disk/by-id/*Instance_Storage*; do
+    [ -e "$link" ] || continue
+    readlink -f "$link"
+  done | sort -u
+)
+
+if [ "$${#INSTANCE_STORE_DEVICES[@]}" -gt 0 ]; then
+  echo "=== Found $${#INSTANCE_STORE_DEVICES[@]} local NVMe instance-store device(s): $${INSTANCE_STORE_DEVICES[*]} ==="
+  NVME_CACHE_HOST_DIR="/mnt/kernellake-nvme-cache"
+  mkdir -p "$NVME_CACHE_HOST_DIR"
+
+  if [ "$${#INSTANCE_STORE_DEVICES[@]}" -eq 1 ]; then
+    CACHE_BLOCK_DEVICE="$${INSTANCE_STORE_DEVICES[0]}"
+  else
+    apt-get install -y --no-install-recommends mdadm
+    CACHE_BLOCK_DEVICE="/dev/md/kernellake-cache"
+    yes | mdadm --create "$CACHE_BLOCK_DEVICE" --level=0 \
+      --raid-devices="$${#INSTANCE_STORE_DEVICES[@]}" "$${INSTANCE_STORE_DEVICES[@]}"
+    udevadm settle
+  fi
+
+  # Some AMIs (e.g. AWS's Deep Learning AMIs) auto-mount instance store on
+  # boot via their own fstab/udev rule -- unmount first if so, otherwise
+  # this mkfs would format a device the kernel considers busy and fail.
+  if mount | grep -q "^$CACHE_BLOCK_DEVICE "; then
+    echo "=== $CACHE_BLOCK_DEVICE was already mounted by the AMI -- unmounting before reformatting ==="
+    umount "$CACHE_BLOCK_DEVICE"
+  fi
+
+  mkfs.xfs -f "$CACHE_BLOCK_DEVICE"
+  mount "$CACHE_BLOCK_DEVICE" "$NVME_CACHE_HOST_DIR"
+  chmod 1777 "$NVME_CACHE_HOST_DIR"  # container runs as non-root; world-writable+sticky, same convention as /tmp
+
+  # 90% of the real formatted filesystem size, not a guessed constant --
+  # leaves headroom for filesystem overhead/metadata so the cache's own
+  # eviction logic (LRU-by-mtime, src/storage/nvme_object_cache.cpp) never
+  # races a hard ENOSPC from the OS itself.
+  FS_BYTES=$(df --output=size -B1 "$NVME_CACHE_HOST_DIR" | tail -1 | tr -d ' ')
+  NVME_CACHE_MAX_BYTES=$(( FS_BYTES * 90 / 100 ))
+  NVME_CACHE_ENABLED=true
+  echo "=== NVMe cache mounted at $NVME_CACHE_HOST_DIR ($FS_BYTES formatted bytes, $NVME_CACHE_MAX_BYTES byte cache budget) ==="
+else
+  echo "=== No local NVMe instance-store device found on this instance -- storage.cache stays disabled ==="
+  NVME_CACHE_HOST_DIR="/opt/kernellake-bench/cache-disabled-placeholder"
+  mkdir -p "$NVME_CACHE_HOST_DIR"
+fi
 
 # --- kernellake-server config -------------------------------------------
 # credentials_kind: "default" (S3Section's own default, config.hpp:75-83)
@@ -100,6 +177,10 @@ engine:
 storage:
   s3:
     credentials_kind: default
+  cache:
+    enabled: $${NVME_CACHE_ENABLED}
+    directory: /cache
+    max_size_bytes: $${NVME_CACHE_MAX_BYTES}
 server:
   port: 31337
 observability:
@@ -155,6 +236,7 @@ services:
     network_mode: host
     volumes:
       - ./kernellake-server.yaml:/config/kernellake-server.yaml:ro
+      - $${NVME_CACHE_HOST_DIR}:/cache
     environment:
       - AWS_REGION=${aws_region}
     deploy:

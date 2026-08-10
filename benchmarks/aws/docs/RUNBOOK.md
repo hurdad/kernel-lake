@@ -9,18 +9,33 @@ milestone has actually run.
 - AWS credentials configured (`aws sts get-caller-identity` should succeed).
 - Terraform >= 1.5, Python 3.11+ with `boto3`, an existing EC2 key pair
   name, and your own IP/CIDR for SSH access.
-- **G/VT-family EC2 vCPU service quota >= 32** (covers `g6.8xlarge`, which
-  needs 32 vCPUs). New/unused AWS accounts often default to a quota of 0
-  for this instance family (confirmed for real during this project's own
-  M1 attempt: `RunInstances` failed with `VcpuLimitExceeded` after the
-  Spark cluster had already been created and started billing). Check and
-  request ahead of time, since approval isn't instant:
+- **G/VT-family EC2 vCPU service quota.** This single quota (code
+  `L-DB2E81BA`) covers every `g6.*`/`g6e.*` GPU instance type, not just
+  the one you're launching -- check the real current value before
+  assuming any given instance type will launch:
   ```bash
   aws service-quotas get-service-quota --service-code ec2 --quota-code L-DB2E81BA \
     --query 'Quota.Value' --output text
-  # If less than 32:
+  aws service-quotas list-requested-service-quota-change-history \
+    --service-code ec2 --query "RequestedQuotas[?QuotaCode=='L-DB2E81BA']"
+  ```
+  `kernellake_instance_type` defaults to `g6.xlarge` (4 vCPUs) specifically
+  because it's the only size that reliably fits a low/default quota.
+  Larger sizes need more: `g6.4xlarge` needs 16, `g6.8xlarge` needs 32,
+  `g6e.16xlarge` needs 64. New/unused AWS accounts often default to a
+  quota of 0-8 for this family (confirmed for real: a `g6.8xlarge` attempt
+  once failed with `VcpuLimitExceeded` *after* the Spark cluster had
+  already started billing, since Terraform provisions in parallel -- and a
+  32-vCPU increase request was later "partially approved" with the new
+  limit equal to the old one, i.e. a real denial, requiring a manual
+  appeal with a detailed use case reopening the Support Center case
+  rather than a second API request -- `request-service-quota-increase`
+  rejects a second request outright while one is still open). Request
+  ahead of time and expect it to take a manual round-trip, not an instant
+  approval:
+  ```bash
   aws service-quotas request-service-quota-increase --service-code ec2 \
-    --quota-code L-DB2E81BA --desired-value 32
+    --quota-code L-DB2E81BA --desired-value <needed-for-your-instance-type>
   ```
 - **No manual Docker build/push needed**: `kernellake_docker_image` defaults
   to `ghcr.io/hurdad/kernel-lake-gpu:latest`, which this repo's own CI
@@ -53,11 +68,27 @@ terraform plan \
 ## M1 -- small validated run
 
 Proves the whole pipeline works end to end (provisioning, data generation,
-both engines, metrics collection, reporting) at manageable cost before
+all engines, metrics collection, reporting) at manageable cost before
 scaling up.
 
+**Every run's output lives in its own dated directory** --
+`runs/<timestamp>-sf<N>/` (gitignored, see `.gitignore` -- real per-run
+numbers aren't source, `docs/COST_ESTIMATES.md` is where the durable
+summary goes once a run is done). Set this up first:
+
 ```bash
-cd ../scripts
+cd ../scripts  # benchmarks/aws/scripts
+RUN_DIR="../runs/$(date +%Y%m%d-%H%M%S)-sf100"
+mkdir -p "$RUN_DIR"
+```
+
+**Selective bring-up**: if you're only testing/tuning one engine, skip
+provisioning the others so they aren't idle and billing while you do --
+`-var="enable_spark=false"` and/or `-var="enable_duckdb=false"` skip those
+entirely, `-var="kernellake_instance_count=0"` skips the GPU host. The
+full three-way comparison below needs all of them.
+
+```bash
 python3 estimate_cost.py --milestone m1
 # Review the estimate, then:
 
@@ -66,6 +97,8 @@ ssh_key_name             = "<your-key-pair-name>"
 allowed_ssh_cidr          = "<your-ip>/32"
 kernellake_docker_image   = "<ECR-URI>/kernellake:runtime-gpu"
 kernellake_instance_count = 1
+# kernellake_instance_type defaults to g6.xlarge -- see Prerequisites'
+# G/VT quota note before overriding to a larger size.
 spark_worker_count        = 3
 EOF
 
@@ -76,6 +109,18 @@ EOF
 
 ./generate_and_upload_data.sh --scale-factor 100 --wait
 ```
+
+**NVMe cache**: `kernellake-host-init.sh` detects, formats, and mounts the
+GPU instance's local NVMe instance storage automatically at boot and
+enables `storage.cache` against it (falls back to disabled with a clear
+log line if the instance type has none -- check
+`/var/log/kernellake-host-init.log` on the host to confirm which path it
+took). No action needed here, but it's real infra state worth confirming
+once per instance type, not assuming: SSH in and check
+`df -h /mnt/kernellake-nvme-cache` and `docker compose logs kernellake-server`
+for cache hit/miss counters, or watch `kernellake.storage.cache.*` in
+Grafana. Expect this to show up as improved *warm*-mode numbers
+specifically (repeat scans of the same data), not cold-mode ones.
 
 Run the benchmark (from a machine with network access to the provisioned
 instances -- SSH to the Spark master or monitoring instance, or set up SSH
@@ -90,49 +135,88 @@ BUCKET=$(cd ../terraform && terraform output -raw s3_bucket_name)
 python3 aws_benchmark_runner.py \
   --kernellake-host "$KL_HOST" --spark-master-host "$SPARK_HOST" \
   --s3-bucket "$BUCKET" --scale-factor 100 \
-  --query all --iterations 2 --output ../results-sf100.json
+  --query all --iterations 2 --output "$RUN_DIR/results.json"
 ```
 
-Add `--duckdb` to also run each query through DuckDB in-process on
-whichever host runs this command (needs the `duckdb` Python package and
-network access to S3 -- reads the same real data via the `httpfs`/`aws`
-extensions and this instance's IAM role, no separate infra to provision).
-It's excluded from every cost table (no dedicated instance to attribute a
-$/hour to) but included in the latency and scan-throughput tables as a
-third, single-node, CPU-only reference point.
+**DuckDB** now runs on its own dedicated, cost-tracked host
+(`terraform/duckdb_instance.tf`) rather than in-process -- scp the query
+loop + query files over, run it via SSH, and copy the results back into
+this run's directory:
+
+```bash
+DUCKDB_HOST=$(cd ../terraform && terraform output -raw duckdb_host_public_ip)
+scp duckdb_query_loop.py ../../tpch/queries "ubuntu@${DUCKDB_HOST}:~/" -r
+ssh "ubuntu@${DUCKDB_HOST}" \
+  "python3 duckdb_query_loop.py --s3-bucket $BUCKET --scale-factor 100 \
+   --query all --iterations 2 --output duckdb-results.json"
+scp "ubuntu@${DUCKDB_HOST}:~/duckdb-results.json" "$RUN_DIR/duckdb-results.json"
+```
+
+(The older `--duckdb` flag on `aws_benchmark_runner.py` still works as a
+quick in-process check with no dedicated infra, but its numbers won't be
+cost-tracked -- see README.md.)
+
+**Raw S3 throughput** (optional, but useful context for interpreting scan
+throughput numbers below): run directly on the KernelLake host itself, so
+it measures the same instance/network path the real queries used.
+
+```bash
+scp ../scripts/measure_s3_throughput.sh "ubuntu@${KL_HOST}:~/"
+ssh "ubuntu@${KL_HOST}" \
+  "./measure_s3_throughput.sh --bucket $BUCKET --scale-factor 100 --output s3-throughput.json"
+scp "ubuntu@${KL_HOST}:~/s3-throughput.json" "$RUN_DIR/s3-throughput.json"
+```
 
 Compute real cost (after the run, before teardown -- so instance uptime
 reflects the actual run window):
 
 ```bash
 KL_ID=$(cd ../terraform && terraform output -json kernellake_instance_ids | jq -r '.[0]')
+DUCKDB_ID=$(cd ../terraform && terraform output -raw duckdb_host_id)
 # ... gather spark/monitoring instance IDs similarly from terraform output ...
 python3 cost_model.py \
   --kernellake-instance-ids "$KL_ID" \
   --spark-instance-ids "<master-id>,<worker-id-1>,<worker-id-2>,<worker-id-3>" \
   --spark-instance-types "m7i.xlarge,m7i.4xlarge,m7i.4xlarge,m7i.4xlarge" \
+  --duckdb-instance-id "$DUCKDB_ID" \
   --monitoring-instance-id "<monitoring-id>" \
-  --output ../cost-sf100.json
+  --output "$RUN_DIR/cost.json"
 ```
 
-Generate the report:
+Generate the report (Markdown/CSV, plus a PDF with the same tables and the
+written analysis/caveats, for sharing outside a repo checkout):
 
 ```bash
 cd ../reporting
-python3 aggregate_results.py --benchmark-results ../results-sf100.json --output ../aggregated.json
-python3 generate_report.py --input ../aggregated.json --cost-json ../cost-sf100.json --output-dir ../report/
-python3 generate_dashboard.py --input ../aggregated.json --cost-json ../cost-sf100.json --output ../dashboard.html
+python3 aggregate_results.py --benchmark-results "$RUN_DIR/results.json" --output "$RUN_DIR/aggregated.json"
+python3 generate_report.py --input "$RUN_DIR/aggregated.json" --cost-json "$RUN_DIR/cost.json" \
+  --duckdb-results "$RUN_DIR/duckdb-results.json" --output-dir "$RUN_DIR/report/"
+python3 generate_pdf_report.py --input "$RUN_DIR/aggregated.json" --cost-json "$RUN_DIR/cost.json" \
+  --duckdb-results "$RUN_DIR/duckdb-results.json" --output "$RUN_DIR/report.pdf"
+python3 generate_dashboard.py --input "$RUN_DIR/aggregated.json" --cost-json "$RUN_DIR/cost.json" \
+  --output "$RUN_DIR/dashboard.html"
 ```
 
-Review `../report/report.md` and `../dashboard.html`. Confirm the headline
-numbers (latency speedup ratio, cost per completed query) look sane before
-proceeding -- this is the actual validation gate for M1, not just "did the
-commands exit zero."
+Review `$RUN_DIR/report/report.md`, `$RUN_DIR/report.pdf`, and
+`$RUN_DIR/dashboard.html`. Confirm the headline numbers (latency speedup
+ratio, cost per completed query) look sane before proceeding -- this is
+the actual validation gate for M1, not just "did the commands exit zero."
+Once a run is worth keeping, record its real headline numbers in
+`docs/COST_ESTIMATES.md`'s prose/table (the `$RUN_DIR` contents themselves
+are gitignored, ephemeral).
 
 ```bash
 cd ../scripts
 ./teardown.sh  # keeps the S3 data; pass --purge-data to also remove it
 ```
+
+**Instance-size sweep**: once G/VT quota allows (see Prerequisites),
+`g6.xlarge` -> `g6.4xlarge` -> `g6e.16xlarge` is the planned next step --
+repeat this M1 sequence with `-var="kernellake_instance_type=g6.4xlarge"`
+(etc.) in place of the default, each into its own `$RUN_DIR`. `g6e.16xlarge`
+carries an L40S GPU rather than the L4 the other two have, so treat that
+leg as a different-GPU-generation data point, not a same-GPU size
+comparison.
 
 ## M2 -- full SF100 report
 
@@ -160,8 +244,9 @@ Then repeat the M1 benchmark-run/cost/report sequence with
 
 ## M4 -- concurrency headline test
 
-The most expensive single step (up to 8x simultaneous `g6.8xlarge`
-instance-hours) -- time-boxed, torn down immediately after.
+The most expensive single step (up to 8x simultaneous GPU-instance-hours,
+at whichever `kernellake_instance_type` is configured) -- time-boxed, torn
+down immediately after.
 
 ```bash
 python3 ../scripts/estimate_cost.py --milestone m4
@@ -170,15 +255,17 @@ cd ../terraform
 terraform apply -var="kernellake_instance_count=8" -var-file=terraform.tfvars
 
 cd ../runner
+RUN_DIR="../runs/$(date +%Y%m%d-%H%M%S)-m4-concurrency"
+mkdir -p "$RUN_DIR"
 KL_HOSTS=$(cd ../terraform && terraform output -json kernellake_instance_public_ips | jq -r 'join(",")')
 python3 scaling_test.py --kernellake-hosts "$KL_HOSTS" --s3-bucket "$BUCKET" \
   --scale-factor 1000 --concurrent-clients 16 --duration-seconds 120 \
-  --output ../scaling-8replicas.json
+  --output "$RUN_DIR/scaling-8replicas.json"
 ```
 
 Repeat for 1/2/4 replicas (re-`apply` with a lower
-`kernellake_instance_count` each time), then aggregate all four
-`scaling-*replicas.json` files via `reporting/aggregate_results.py`'s
+`kernellake_instance_count` each time, same `$RUN_DIR`), then aggregate
+all four `scaling-*replicas.json` files via `reporting/aggregate_results.py`'s
 `--scaling-results` flag before the final report/dashboard generation.
 
 **Teardown immediately after this test** -- 8 GPU instances running is the

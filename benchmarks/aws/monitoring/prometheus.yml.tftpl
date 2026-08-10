@@ -37,7 +37,9 @@ scrape_configs:
 
   # Spark master + workers: node_exporter plus the Prometheus JMX exporter
   # javaagent (Spark-internal executor/task metrics) -- see
-  # ../terraform/user-data/spark-node-init.sh.
+  # ../terraform/user-data/spark-node-init.sh. Skipped entirely when
+  # enable_spark=false (spark_master_ip renders "" -- see monitoring_instance.tf).
+%{ if spark_master_ip != "" ~}
   - job_name: "spark-master-node"
     static_configs:
       - targets: ["${spark_master_ip}:9100"]
@@ -48,6 +50,7 @@ scrape_configs:
       - targets: ["${spark_master_ip}:7777"]
         labels:
           instance_role: spark-master
+%{ endif ~}
 %{ for ip in spark_worker_ips ~}
   - job_name: "spark-worker-node-${ip}"
     static_configs:
@@ -60,3 +63,16 @@ scrape_configs:
         labels:
           instance_role: spark-worker
 %{ endfor ~}
+
+  # DuckDB host: node_exporter only -- no long-lived query engine process
+  # to instrument beyond host-level CPU/mem/net/disk, since queries run as
+  # short-lived SSH-invoked Python processes (see
+  # ../terraform/user-data/duckdb-host-init.sh). Skipped entirely when
+  # enable_duckdb=false (duckdb_host_ip renders "" -- see monitoring_instance.tf).
+%{ if duckdb_host_ip != "" ~}
+  - job_name: "duckdb-host-node"
+    static_configs:
+      - targets: ["${duckdb_host_ip}:9100"]
+        labels:
+          instance_role: duckdb-host
+%{ endif ~}

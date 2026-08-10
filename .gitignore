@@ -88,13 +88,10 @@ benchmark-results/
 # The tooling that produces them is committed; docs/COST_ESTIMATES.md is
 # where the real headline numbers from an actual run get recorded in
 # prose/table form once one has happened, so they're not lost even though
-# the raw JSON/CSV isn't tracked.
-benchmarks/aws/results-*.json
-benchmarks/aws/cost-*.json
-benchmarks/aws/aggregated-*.json
-benchmarks/aws/report-*/
-benchmarks/aws/dashboard-*.html
-benchmarks/aws/scaling-*.json
+# the raw JSON/CSV isn't tracked. Each run's full output (results.json,
+# cost.json, aggregated.json, report/, dashboard.html, report.pdf) lives
+# under its own runs/<timestamp>-sf<N>/ directory -- see docs/RUNBOOK.md.
+benchmarks/aws/runs/
 
 # Terraform (benchmarks/aws/terraform/): state can contain resource
 # attributes that shouldn't be public (and is single-environment/

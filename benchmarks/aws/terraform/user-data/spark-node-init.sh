@@ -98,8 +98,19 @@ export SPARK_DAEMON_JAVA_OPTS
 # instance (master + all 3 workers registered ALIVE) before fixing this
 # file, not assumed.
 if [ "${role}" = "master" ]; then
+  OWN_IP="$(hostname -I | awk '{print $1}')"
   echo "=== Starting Spark standalone master ==="
-  "$${SPARK_HOME}/sbin/spark-daemon.sh" start org.apache.spark.deploy.master.Master 1 --host "$(hostname -I | awk '{print $1}')"
+  "$${SPARK_HOME}/sbin/spark-daemon.sh" start org.apache.spark.deploy.master.Master 1 --host "$${OWN_IP}"
+
+  # Also start a worker on the master itself, registered against its own
+  # master URI. This makes spark_worker_count=0 a genuine, self-sufficient
+  # single-node standalone cluster (real executors to run queries on)
+  # instead of a master with nothing registered to it, which would hang
+  # forever waiting for resources on the first job submitted. Harmless
+  # when spark_worker_count > 0 too -- just one more worker alongside the
+  # dedicated ones, so the cost-matched multi-node mode is unaffected.
+  echo "=== Also starting a Spark worker on the master node itself ==="
+  "$${SPARK_HOME}/sbin/spark-daemon.sh" start org.apache.spark.deploy.worker.Worker 1 "spark://$${OWN_IP}:7077"
 else
   echo "=== Starting Spark standalone worker, joining master at ${master_ip} ==="
   "$${SPARK_HOME}/sbin/spark-daemon.sh" start org.apache.spark.deploy.worker.Worker 1 "spark://${master_ip}:7077"
