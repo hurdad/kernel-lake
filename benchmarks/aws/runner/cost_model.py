@@ -94,7 +94,7 @@ def compute_run_cost(
     kernellake_instance_ids: list[str],
     kernellake_instance_type: str,
     spark_instance_ids: list[str],
-    spark_instance_types: dict[str, str],  # instance_id -> type (master differs from workers)
+    spark_instance_types: dict[str, str],  # instance_id -> type (a single instance today, see spark_cluster.tf; kept as a dict/list pair rather than a scalar in case a multi-node topology comes back)
     monitoring_instance_id: str,
     monitoring_instance_type: str,
     region: str,

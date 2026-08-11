@@ -40,6 +40,7 @@ from generate_report import (  # noqa: E402
     cost_per_query_table,
     latency_speedup_table,
     merge_duckdb_results,
+    merge_pyspark_results,
     scan_throughput_table,
 )
 
@@ -180,6 +181,7 @@ def main() -> int:
     parser.add_argument("--input", required=True, help="aggregate_results.py's output")
     parser.add_argument("--cost-json", default=None, help="runner/cost_model.py's --output")
     parser.add_argument("--duckdb-results", nargs="*", default=[], help="runner/duckdb_query_loop.py's --output file(s)")
+    parser.add_argument("--pyspark-results", nargs="*", default=[], help="runner/pyspark_query_loop.py's --output file(s)")
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
 
@@ -187,6 +189,8 @@ def main() -> int:
     cost_data = json.loads(Path(args.cost_json).read_text()) if args.cost_json else None
     duckdb_results = [json.loads(Path(p).read_text()) for p in args.duckdb_results]
     merge_duckdb_results(data["benchmark_runs"], duckdb_results)
+    pyspark_results = [json.loads(Path(p).read_text()) for p in args.pyspark_results]
+    merge_pyspark_results(data["benchmark_runs"], pyspark_results)
 
     speedup_rows = latency_speedup_table(data["benchmark_runs"])
     cost_rows = cost_per_query_table(data["benchmark_runs"], cost_data)

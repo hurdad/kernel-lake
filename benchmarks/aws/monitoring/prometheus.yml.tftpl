@@ -35,34 +35,20 @@ scrape_configs:
           instance_role: kernellake-host
 %{ endfor ~}
 
-  # Spark master + workers: node_exporter plus the Prometheus JMX exporter
-  # javaagent (Spark-internal executor/task metrics) -- see
-  # ../terraform/user-data/spark-node-init.sh. Skipped entirely when
-  # enable_spark=false (spark_master_ip renders "" -- see monitoring_instance.tf).
-%{ if spark_master_ip != "" ~}
-  - job_name: "spark-master-node"
+  # Spark host: node_exporter only -- no long-lived master/worker daemon
+  # to instrument via JMX anymore (see
+  # ../terraform/user-data/spark-local-init.sh): queries run in local[*]
+  # mode as short-lived SSH-invoked Python processes
+  # (runner/pyspark_query_loop.py), same shape as the DuckDB host below.
+  # Skipped entirely when enable_spark=false (spark_host_ip renders "" --
+  # see monitoring_instance.tf).
+%{ if spark_host_ip != "" ~}
+  - job_name: "spark-host-node"
     static_configs:
-      - targets: ["${spark_master_ip}:9100"]
+      - targets: ["${spark_host_ip}:9100"]
         labels:
-          instance_role: spark-master
-  - job_name: "spark-master-jmx"
-    static_configs:
-      - targets: ["${spark_master_ip}:7777"]
-        labels:
-          instance_role: spark-master
+          instance_role: spark-host
 %{ endif ~}
-%{ for ip in spark_worker_ips ~}
-  - job_name: "spark-worker-node-${ip}"
-    static_configs:
-      - targets: ["${ip}:9100"]
-        labels:
-          instance_role: spark-worker
-  - job_name: "spark-worker-jmx-${ip}"
-    static_configs:
-      - targets: ["${ip}:7777"]
-        labels:
-          instance_role: spark-worker
-%{ endfor ~}
 
   # DuckDB host: node_exporter only -- no long-lived query engine process
   # to instrument beyond host-level CPU/mem/net/disk, since queries run as

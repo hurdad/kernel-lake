@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """AWS benchmark orchestrator: KernelLake (remote kernellake-server over
-Flight SQL) vs. PySpark (remote standalone cluster) vs. optionally DuckDB
-(in-process on this orchestrator, reading the same real S3 data), across
-scale factors.
+Flight SQL) vs. optionally PySpark vs. optionally DuckDB (both in-process
+on this orchestrator, reading the same real S3 data), across scale
+factors.
 
 Extends tools/benchmark_three_way.py's shape rather than reimplementing it:
 reuses kernellake_sql()/spark_sql()/load_query_text() (query-text
@@ -13,13 +13,17 @@ is reported as a validation failure and excluded from the timing table,
 never silently timed anyway, same rule benchmark_three_way.py already
 follows).
 
-DuckDB is opt-in (--duckdb) and, unlike KernelLake/PySpark, isn't scored
-in any cost table: it runs in-process on whichever host runs this script
-(the Spark master instance in the standard topology), not on infra
-dedicated to it, so there's no real per-instance $/hour to attribute a
-query's cost against -- attributing one would imply a dedicated-infra cost
-that doesn't exist. It's included purely as a third, single-node,
-CPU-only latency/correctness reference point.
+PySpark (--spark-master-host) and DuckDB (--duckdb) are both opt-in here
+and, unlike KernelLake, aren't scored in any cost table: they run
+in-process on whichever host runs this script, not on infra dedicated to
+them, so there's no real per-instance $/hour to attribute a query's cost
+against. The PRIMARY, cost-tracked path for both is now their own
+dedicated single-node host (runner/pyspark_query_loop.py on
+terraform/spark_cluster.tf's host; runner/duckdb_query_loop.py on
+terraform/duckdb_instance.tf's host -- see docs/RUNBOOK.md, both scp'd
+over and run via SSH). The in-process flags here remain useful as a
+quick, no-dedicated-infra correctness/latency check, same convention
+--duckdb already established before PySpark followed it to its own host.
 
 **"cold" vs "warm" mean something different here than in
 benchmark_three_way.py**, and that difference is deliberate, not an
@@ -77,7 +81,33 @@ UNSUPPORTED_QUERIES = {
 }
 
 
-def s3_data_glob(bucket: str, scale_factor: int, table: str, compression: str = "snappy", scheme: str = "s3a") -> str:
+def compression_tag(compression: str, compression_level: int | None = None) -> str:
+    """S3 prefix suffix for a given compression choice -- every choice
+    (including snappy) gets its own fully self-describing
+    tpch-data/sf<N>-<tag>/ prefix, no unsuffixed "default" path (an
+    earlier version left snappy unsuffixed for backward compatibility with
+    data generated before this dimension existed, but that was confusing
+    once multiple compressions started being compared side by side -- a
+    real "I don't see sf100-snappy" question). zstd with no explicit level
+    gets the plain "zstd" tag (PyArrow's own codec default -- confirmed
+    via `pa.Codec('zstd').compression_level == 1` that this IS level 1,
+    just not spelled out); an explicit --compression-level always gets
+    spelled out as "zstd-l<N>", even when it's level 1, so both spellings
+    can coexist without colliding. Mirrors generate_and_upload_data.sh's
+    own COMPRESSION_TAG logic exactly."""
+    if compression_level is not None and compression != "zstd":
+        raise ValueError("compression_level only applies to compression='zstd'")
+    if compression == "zstd" and compression_level is None:
+        return "zstd"
+    if compression == "zstd":
+        return f"zstd-l{compression_level}"
+    return compression
+
+
+def s3_data_glob(
+    bucket: str, scale_factor: int, table: str, compression: str = "snappy",
+    scheme: str = "s3a", compression_level: int | None = None,
+) -> str:
     # scheme differs by engine, not just style: Spark's DataFrameReader
     # needs the Hadoop S3A connector's own "s3a://" scheme (registered by
     # the hadoop-aws jar), while KernelLake's read_parquet() rejects that
@@ -99,11 +129,8 @@ def s3_data_glob(bucket: str, scale_factor: int, table: str, compression: str = 
         "orders": "orders-*.parquet",
         "customer": "customer-00000.parquet",
     }
-    # snappy keeps the original, un-suffixed path (tpch-data/sf100/) for
-    # backward compatibility with data already generated before this
-    # dimension existed; zstd (and any other codec) gets its own path so
-    # both can coexist under the same scale factor for a direct comparison.
-    sf_dir = f"sf{scale_factor}" if compression == "snappy" else f"sf{scale_factor}-{compression}"
+    tag = compression_tag(compression, compression_level)
+    sf_dir = f"sf{scale_factor}-{tag}"
     return f"{scheme}://{bucket}/tpch-data/{sf_dir}/{prefix_map[table]}"
 
 
@@ -134,13 +161,19 @@ def s3_bytes_for_glob(s3_client, bucket: str, key_prefix: str) -> int:
     return total
 
 
-def s3_table_key_prefix(scale_factor: int, table: str, compression: str = "snappy") -> str:
+def s3_table_key_prefix(
+    scale_factor: int, table: str, compression: str = "snappy", compression_level: int | None = None,
+) -> str:
     file_prefix_map = {"lineitem": "lineitem-", "part": "part-", "orders": "orders-", "customer": "customer-"}
-    sf_dir = f"sf{scale_factor}" if compression == "snappy" else f"sf{scale_factor}-{compression}"
+    tag = compression_tag(compression, compression_level)
+    sf_dir = f"sf{scale_factor}-{tag}"
     return f"tpch-data/{sf_dir}/{file_prefix_map[table]}"
 
 
-def table_bytes_scanned(s3_client, s3fs, bucket: str, scale_factor: int, table: str, compression: str) -> dict:
+def table_bytes_scanned(
+    s3_client, s3fs, bucket: str, scale_factor: int, table: str, compression: str,
+    compression_level: int | None = None,
+) -> dict:
     """Real compressed (S3 object size) and uncompressed bytes for a
     table's files at this scale factor -- both real, never estimated.
     Uncompressed comes from each Parquet file's own footer metadata
@@ -153,7 +186,7 @@ def table_bytes_scanned(s3_client, s3fs, bucket: str, scale_factor: int, table: 
     here yet."""
     import pyarrow.parquet as pq
 
-    key_prefix = s3_table_key_prefix(scale_factor, table, compression)
+    key_prefix = s3_table_key_prefix(scale_factor, table, compression, compression_level)
     compressed_bytes = 0
     uncompressed_bytes = 0
     paginator = s3_client.get_paginator("list_objects_v2")
@@ -331,20 +364,31 @@ def new_spark_session(
 
     # master_host="local" runs Spark entirely in-process (local[*]: one
     # JVM, using all local cores as "executors") instead of connecting to
-    # a real standalone cluster -- for single-node testing (the
-    # spark_worker_count=0 topology terraform/spark_cluster.tf supports),
-    # this sidesteps an entire class of standalone-mode-specific problems
-    # confirmed for real on a live run: Master/Worker daemon JMX-port
-    # collisions when co-located, and SPARK_LOCAL_DIRS (a Worker-process
-    # environment variable) silently overriding this function's own
-    # spark.local.dir config below, entirely undetected until a
-    # shuffle-heavy query filled a RAM-backed /tmp. Same driver-side
-    # config (executor_memory/spark.local.dir/etc.) still applies in
-    # local[*] mode, just without any separate daemon to get out of sync
-    # with it. Only appropriate for single-node runs -- the cost-matched
-    # multi-instance topology (spark_worker_count > 0) still needs a real
-    # standalone cluster across multiple real EC2 instances.
-    master_url = "local[*]" if master_host == "local" else f"spark://{master_host}:7077"
+    # a real standalone cluster -- this is what runner/pyspark_query_loop.py
+    # (the primary, cost-tracked path, run on terraform/spark_cluster.tf's
+    # dedicated host) always does; this function offers it here too as a
+    # quick in-process check with no dedicated infra needed (see this
+    # module's own docstring). Sidesteps an entire class of standalone-
+    # mode-specific problems confirmed for real on this project's earlier
+    # multi-node topology: Master/Worker daemon JMX-port collisions when
+    # co-located, and SPARK_LOCAL_DIRS (a Worker-process environment
+    # variable) silently overriding this function's own spark.local.dir
+    # config below, entirely undetected until a shuffle-heavy query filled
+    # a RAM-backed /tmp. A non-"local" value connects to a real
+    # spark://<host>:7077 standalone master, which this project no longer
+    # provisions by default.
+    #
+    # IMPORTANT: local[*] mode is ONE JVM -- there is no separate executor
+    # process for spark.executor.memory to size, unlike real cluster mode
+    # below where executor_memory/driver_memory genuinely are two separate
+    # JVMs' heaps. Confirmed for real (see pyspark_query_loop.py's
+    # identical fix/comment): with spark.executor.memory=48g and
+    # spark.driver.memory=6g both set under local[*], the JVM's actual
+    # -Xmx was 6g, not 48g -- executor_memory is silently a no-op there. A
+    # SparkOutOfMemoryError on Q3's join at real SF100 data is what
+    # surfaced this.
+    is_local = master_host == "local"
+    master_url = "local[*]" if is_local else f"spark://{master_host}:7077"
 
     packages = [HADOOP_AWS_PACKAGE]
     builder = (
@@ -366,8 +410,14 @@ def new_spark_session(
         # has not accepted any resources"), not OOMs, since the executor
         # can never even start: Spark just keeps waiting for resources the
         # worker can never offer, with no error and no timeout.
-        .config("spark.executor.memory", executor_memory)
-        .config("spark.driver.memory", driver_memory)
+        #
+        # local[*] mode (is_local): only spark.driver.memory does anything
+        # (see this function's own comment above) -- set it to
+        # executor_memory's value (the one actually sized for the host)
+        # and leave spark.executor.memory unset rather than configuring
+        # something with no effect. Real cluster mode: both settings are
+        # genuinely meaningful, unchanged from before.
+        .config("spark.driver.memory", executor_memory if is_local else driver_memory)
         # Spark's default shuffle-spill dir is java.io.tmpdir (/tmp) --
         # fine on the original m7i.4xlarge/m7i.xlarge topology if /tmp
         # happens to be disk-backed there, but confirmed for real on this
@@ -379,6 +429,10 @@ def new_spark_session(
         # relying on whatever /tmp happens to be on a given AMI/instance.
         .config("spark.local.dir", "/var/spark-tmp")
     )
+    if not is_local:
+        # Real cluster mode only -- executors are genuinely separate JVMs
+        # here, unlike local[*] (see this function's own comment above).
+        builder = builder.config("spark.executor.memory", executor_memory)
     if iceberg_catalog_uri:
         # "bench" here must match kernellake-server.yaml's iceberg.catalogs
         # key (terraform/kernellake_instance.tf) -- same REST catalog
@@ -404,6 +458,7 @@ def new_spark_session(
 def register_spark_views(
     spark, bucket: str, scale_factor: int, compression: str = "snappy",
     table_format: str = "flat", iceberg_catalog: str = "bench",
+    compression_level: int | None = None,
 ) -> None:
     for table in ("lineitem", "part", "orders", "customer"):
         if table_format == "iceberg":
@@ -413,7 +468,9 @@ def register_spark_views(
             # for every table (including lineitem's multi-file
             # "lineitem-*.parquet") -- Spark's own reader natively supports
             # glob patterns in a path, no rewriting needed.
-            spark.read.parquet(s3_data_glob(bucket, scale_factor, table, compression)).createOrReplaceTempView(table)
+            spark.read.parquet(
+                s3_data_glob(bucket, scale_factor, table, compression, compression_level=compression_level)
+            ).createOrReplaceTempView(table)
 
 
 def benchmark_query(
@@ -430,6 +487,7 @@ def benchmark_query(
     s3_bucket: str,
     scale_factor: int,
     compression: str = "snappy",
+    compression_level: int | None = None,
     table_format: str = "flat",
     iceberg_catalog_uri: str | None = None,
     iceberg_warehouse: str | None = None,
@@ -456,7 +514,10 @@ def benchmark_query(
                     spark_master_host, iceberg_catalog_uri, iceberg_warehouse,
                     spark_executor_memory, spark_driver_memory,
                 )
-                register_spark_views(spark, s3_bucket, scale_factor, compression, table_format)
+                register_spark_views(
+                    spark, s3_bucket, scale_factor, compression, table_format,
+                    compression_level=compression_level,
+                )
             if mode == "cold" and is_first_rep and duckdb_con is not None:
                 duckdb_con.close()
                 duckdb_con = new_duckdb_connection(aws_region)
@@ -510,9 +571,11 @@ def main() -> int:
     parser.add_argument("--kernellake-ssh-key", default=None, help="Path to the SSH private key, for real cold-mode server restarts. Omit to skip real restarts (cold mode then only means \"first rep of this run\", not \"freshly restarted server\").")
     parser.add_argument("--spark-master-host", default=None,
                          help="Omit to run KernelLake-only (no PySpark comparison, no cross-engine validation). "
-                              "'local' runs Spark in-process (local[*]) instead of connecting to a real "
-                              "standalone cluster -- see new_spark_session()'s own comment; appropriate for a "
-                              "single-node run (spark_worker_count=0), not the cost-matched multi-instance one.")
+                              "'local' runs Spark in-process (local[*]) right here, for a quick no-dedicated-"
+                              "infra check -- the primary, cost-tracked path is runner/pyspark_query_loop.py "
+                              "run via SSH on terraform/spark_cluster.tf's own dedicated host instead (see "
+                              "docs/RUNBOOK.md). Any other value connects to a real spark://<host>:7077 "
+                              "standalone master, which this project no longer provisions by default.")
     parser.add_argument("--duckdb", action="store_true",
                          help="Also run each query through DuckDB, in-process on this orchestrator host, "
                               "against the same real S3 data (via httpfs + the aws extension's IAM "
@@ -522,10 +585,14 @@ def main() -> int:
     parser.add_argument("--s3-bucket", required=True)
     parser.add_argument("--aws-region", default="us-east-1", help="Used for DuckDB's s3_region setting (--duckdb only).")
     parser.add_argument("--scale-factor", type=int, required=True)
-    parser.add_argument("--compression", default="snappy", choices=["snappy", "zstd"],
-                         help="Which generate_and_upload_data.sh --compression run to read "
-                              "(snappy reads tpch-data/sf<N>/, zstd reads tpch-data/sf<N>-zstd/). "
-                              "Ignored when --table-format iceberg (Iceberg tables always write zstd).")
+    parser.add_argument("--compression", default="snappy", choices=["none", "snappy", "zstd"],
+                         help="Which generate_and_upload_data.sh --compression run to read (reads "
+                              "tpch-data/sf<N>-<tag>/, see compression_tag()). Ignored when "
+                              "--table-format iceberg (Iceberg tables always write zstd).")
+    parser.add_argument("--compression-level", type=int, default=None,
+                         help="zstd only -- matches generate_and_upload_data.sh's --compression-level "
+                              "(and the tpch-data/sf<N>-zstd-l<N>/ prefix it writes to). Omit to read "
+                              "the un-suffixed tpch-data/sf<N>-zstd/ prefix (PyArrow's own default level).")
     parser.add_argument("--table-format", default="flat", choices=["flat", "iceberg"],
                          help="flat: plain Parquet files via read_parquet()/spark.read.parquet() glob "
                               "(the --compression dimension applies). iceberg: real Iceberg tables "
@@ -551,11 +618,10 @@ def main() -> int:
     parser.add_argument("--iterations", type=int, default=2)
     parser.add_argument("--modes", default="cold,warm")
     parser.add_argument("--spark-executor-memory", default="48g",
-                         help="Must fit within a single Spark worker's real memory (spark_master_public_ip:8080's "
-                              "own JSON reports each worker's 'memory' field) -- defaults assume the original "
-                              "m7i.4xlarge workers (64GB). Too high hangs forever ('Initial job has not accepted "
-                              "any resources'), not an OOM -- confirmed for real against a smaller/self-sufficient "
-                              "single-node topology (spark_worker_count=0), see new_spark_session()'s own comment.")
+                         help="Must fit within this local[*] host's own real RAM -- defaults assume the "
+                              "standard spark_instance_type (m7i.4xlarge, 64GB). Too high hangs forever "
+                              "('Initial job has not accepted any resources'), not an OOM -- confirmed for real "
+                              "against a smaller instance, see new_spark_session()'s own comment.")
     parser.add_argument("--spark-driver-memory", default="6g")
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
@@ -578,7 +644,10 @@ def main() -> int:
             args.spark_master_host, args.iceberg_catalog_uri, args.iceberg_warehouse,
             args.spark_executor_memory, args.spark_driver_memory,
         )
-        register_spark_views(spark, args.s3_bucket, args.scale_factor, args.compression, args.table_format)
+        register_spark_views(
+            spark, args.s3_bucket, args.scale_factor, args.compression, args.table_format,
+            compression_level=args.compression_level,
+        )
 
     duckdb_con = new_duckdb_connection(args.aws_region) if args.duckdb else None
 
@@ -604,7 +673,10 @@ def main() -> int:
             # register_spark_views() above builds Spark's own separately
             # (scheme="s3a", the default) since the two engines need
             # different URI schemes for the same underlying S3 objects.
-            return s3_data_glob(args.s3_bucket, args.scale_factor, table, args.compression, scheme="s3")
+            return s3_data_glob(
+                args.s3_bucket, args.scale_factor, table, args.compression,
+                scheme="s3", compression_level=args.compression_level,
+            )
 
         query_tables = ["lineitem"]
         globs = {"data": table_ref("lineitem")}
@@ -623,8 +695,8 @@ def main() -> int:
             query_number, globs, kernellake_cursor, spark, duckdb_con, modes, args.iterations,
             args.kernellake_host, args.kernellake_ssh_key,
             args.spark_master_host, args.s3_bucket, args.scale_factor, args.compression,
-            args.table_format, args.iceberg_catalog_uri, args.iceberg_warehouse, args.aws_region,
-            args.spark_executor_memory, args.spark_driver_memory,
+            args.compression_level, args.table_format, args.iceberg_catalog_uri, args.iceberg_warehouse,
+            args.aws_region, args.spark_executor_memory, args.spark_driver_memory,
         )
 
         if args.table_format == "flat":
@@ -635,7 +707,7 @@ def main() -> int:
                     print(f"  (computing real bytes-scanned for {table}...)", file=sys.stderr)
                     table_bytes_cache[table] = table_bytes_scanned(
                         s3_client_for_bytes, s3fs_for_bytes, args.s3_bucket,
-                        args.scale_factor, table, args.compression,
+                        args.scale_factor, table, args.compression, args.compression_level,
                     )
                 compressed_total += table_bytes_cache[table]["compressed_bytes"]
                 uncompressed_total += table_bytes_cache[table]["uncompressed_bytes"]
@@ -650,6 +722,7 @@ def main() -> int:
     report = {
         "scale_factor": args.scale_factor,
         "compression": args.compression,
+        "compression_level": args.compression_level,
         "table_format": args.table_format,
         "s3_bucket": args.s3_bucket,
         "queries": results,

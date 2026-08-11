@@ -1,7 +1,7 @@
 #!/bin/bash
 # EC2 user-data for the dedicated DuckDB benchmark host. Rendered by
 # Terraform's templatefile() (duckdb_instance.tf) -- plain dollar-brace
-# interpolation is Terraform-injected; see spark-node-init.sh's own
+# interpolation is Terraform-injected; see spark-local-init.sh's own
 # comment for the escaping rule this follows.
 #
 # This instance runs no long-lived service of its own -- it just needs
@@ -16,7 +16,21 @@ echo "=== DuckDB host init starting $(date -u) ==="
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
-apt-get install -y --no-install-recommends python3 python3-pip curl
+apt-get install -y --no-install-recommends python3 python3-pip curl unzip
+
+# Official AWS CLI v2 installer, NOT the Ubuntu 26.04 apt package -- a
+# real, confirmed-live bug: the apt package (aws-cli/2.31.35, "source"
+# build) throws "badly formed help string" on every `aws s3api` call
+# (list-objects-v2 included), while `aws s3` itself works fine, making it
+# fail silently-ish specifically for
+# ../../scripts/measure_s3_throughput.sh's real-object-listing step (see
+# docs/RUNBOOK.md) -- not anything duckdb_query_loop.py itself needs (it
+# talks to S3 via DuckDB's own httpfs/aws extensions instead). The
+# official installer's build (aws-cli/2.36.x, "exe") doesn't have this
+# bug -- confirmed by installing it side by side on the same host.
+curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
+unzip -q /tmp/awscliv2.zip -d /tmp
+/tmp/aws/install
 
 # pyarrow: duckdb_query_loop.py's con.sql(...).arrow() needs it -- a real,
 # confirmed-live gap (ModuleNotFoundError on a fresh instance), not an
@@ -25,7 +39,7 @@ pip3 install --break-system-packages duckdb boto3 pyarrow
 
 # node_exporter, same as the KernelLake/Spark hosts, for host-level
 # CPU/memory/network/disk metrics in the same central Prometheus -- see
-# spark-node-init.sh's own comment for why the release is pinned rather
+# spark-local-init.sh's own comment for why the release is pinned rather
 # than fetched via a "latest" redirect URL.
 curl -fsSL -o /tmp/node_exporter.tar.gz \
   https://github.com/prometheus/node_exporter/releases/download/v1.12.1/node_exporter-1.12.1.linux-amd64.tar.gz \

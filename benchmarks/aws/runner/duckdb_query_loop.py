@@ -80,7 +80,24 @@ def kernellake_sql(
     return text.strip()
 
 
-def s3_data_glob(bucket: str, scale_factor: int, table: str, compression: str = "snappy") -> str:
+def compression_tag(compression: str, compression_level: int | None = None) -> str:
+    # Mirrors aws_benchmark_runner.py's compression_tag() exactly -- see
+    # its own docstring for why every choice (snappy included) gets a
+    # fully-tagged prefix, and why zstd's un-leveled "zstd" tag differs
+    # from an explicit-level "zstd-l<N>" one even at level 1.
+    if compression_level is not None and compression != "zstd":
+        raise ValueError("compression_level only applies to compression='zstd'")
+    if compression == "zstd" and compression_level is None:
+        return "zstd"
+    if compression == "zstd":
+        return f"zstd-l{compression_level}"
+    return compression
+
+
+def s3_data_glob(
+    bucket: str, scale_factor: int, table: str, compression: str = "snappy",
+    compression_level: int | None = None,
+) -> str:
     # Mirrors aws_benchmark_runner.py's s3_data_glob() (s3:// scheme only
     # -- no Spark s3a:// concern here, DuckDB isn't Spark).
     prefix_map = {
@@ -89,10 +106,8 @@ def s3_data_glob(bucket: str, scale_factor: int, table: str, compression: str = 
         "orders": "orders-*.parquet",
         "customer": "customer-00000.parquet",
     }
-    # snappy keeps the original, un-suffixed path (tpch-data/sf100/) --
-    # matches generate_and_upload_data.sh's own SF_DIR convention exactly;
-    # only a non-default codec gets its own suffixed path.
-    sf_dir = f"sf{scale_factor}" if compression == "snappy" else f"sf{scale_factor}-{compression}"
+    tag = compression_tag(compression, compression_level)
+    sf_dir = f"sf{scale_factor}-{tag}"
     return f"s3://{bucket}/tpch-data/{sf_dir}/{prefix_map[table]}"
 
 
@@ -132,15 +147,18 @@ def run_duckdb_query(con, query_number: int, globs: dict) -> tuple:
     return table, elapsed
 
 
-def build_globs(bucket: str, scale_factor: int, query_number: int, compression: str) -> dict:
-    globs = {"data": s3_data_glob(bucket, scale_factor, "lineitem", compression)}
+def build_globs(
+    bucket: str, scale_factor: int, query_number: int, compression: str,
+    compression_level: int | None = None,
+) -> dict:
+    globs = {"data": s3_data_glob(bucket, scale_factor, "lineitem", compression, compression_level)}
     table_for_key = {"part_data": "part", "orders_data": "orders", "customer_data": "customer"}
     if query_number in QUERIES_WITH_SECOND_TABLE:
         key = QUERIES_WITH_SECOND_TABLE[query_number]
-        globs[key] = s3_data_glob(bucket, scale_factor, table_for_key[key], compression)
+        globs[key] = s3_data_glob(bucket, scale_factor, table_for_key[key], compression, compression_level)
     if query_number in QUERIES_WITH_THIRD_TABLE:
         key = QUERIES_WITH_THIRD_TABLE[query_number]
-        globs[key] = s3_data_glob(bucket, scale_factor, table_for_key[key], compression)
+        globs[key] = s3_data_glob(bucket, scale_factor, table_for_key[key], compression, compression_level)
     return globs
 
 
@@ -148,7 +166,10 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--s3-bucket", required=True)
     parser.add_argument("--scale-factor", type=int, required=True)
-    parser.add_argument("--compression", default="snappy")
+    parser.add_argument("--compression", default="snappy", choices=["none", "snappy", "zstd"])
+    parser.add_argument("--compression-level", type=int, default=None,
+                         help="zstd only -- reads tpch-data/sf<N>-zstd-l<N>/ instead of the "
+                              "un-suffixed tpch-data/sf<N>-zstd/ (PyArrow's own default level).")
     parser.add_argument("--query", default="all", help="Query number, or 'all' for every supported query")
     parser.add_argument("--iterations", type=int, default=2)
     parser.add_argument("--modes", default="cold,warm", help="Comma-separated: cold,warm (see module docstring)")
@@ -162,7 +183,7 @@ def main() -> int:
     con = new_duckdb_connection(args.region)
     results = []
     for query_number in queries:
-        globs = build_globs(args.s3_bucket, args.scale_factor, query_number, args.compression)
+        globs = build_globs(args.s3_bucket, args.scale_factor, query_number, args.compression, args.compression_level)
         entry: dict = {"query": query_number, "modes": {}}
         for mode in modes:
             samples = []
@@ -184,6 +205,7 @@ def main() -> int:
         "s3_bucket": args.s3_bucket,
         "scale_factor": args.scale_factor,
         "compression": args.compression,
+        "compression_level": args.compression_level,
         "queries": results,
     }
     Path(args.output).write_text(json.dumps(output, indent=2))

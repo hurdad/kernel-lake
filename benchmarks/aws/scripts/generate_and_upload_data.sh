@@ -17,22 +17,36 @@ TERRAFORM_DIR="${SCRIPT_DIR}/../terraform"
 
 SCALE_FACTOR=""
 WAIT=false
-INSTANCE_TYPE="c6i.8xlarge"
+# generate_tpch.py's row generation is single-threaded pure Python (one
+# rng call per field per row, no multiprocessing) -- confirmed for real via
+# `ps aux` on a running c6i.8xlarge instance (99.9% on exactly one of 32
+# vCPUs, ~125K rows/sec). A big instance buys nothing here except letting
+# fewer of these fit under the account's 64-vCPU on-demand quota at once;
+# c6i.2xlarge (8 vCPU, 16GB RAM -- comfortably above the ~4.6GB RSS
+# actually observed) is plenty and lets 8 of these run concurrently
+# instead of 2, which matters when generating multiple compression
+# variants of the same scale factor side by side.
+INSTANCE_TYPE="c6i.2xlarge"
 USE_SPOT=false
-# snappy by default -- matches generate_tpch.py's write path already in use
-# and keeps the original tpch-data/sf<N>/ layout unchanged for it. zstd
-# writes to a separate tpch-data/sf<N>-zstd/ prefix so both can be
-# benchmarked side by side (aws_benchmark_runner.py's own --compression
-# flag reads whichever one you point it at) -- confirmed readable by the
-# same Arrow/Parquet build KernelLake links against (libparquet.so links
-# libzstd.so.1) via a real local write/read round-trip before adding this.
+# Every compression choice (including snappy) writes to its own, fully
+# self-describing tpch-data/sf<N>-<tag>/ prefix -- no unsuffixed "default"
+# path. An earlier version left snappy unsuffixed for backward
+# compatibility with data generated before this dimension existed, but
+# that was confusing in practice (a real "I don't see sf100-snappy"
+# question) once multiple compressions started being compared side by
+# side, so every variant is explicit now, snappy included.
 COMPRESSION="snappy"
+# zstd only -- see generate_tpch.py's own --compression-level comment for
+# why this needs to be settable at all (PyArrow's codec default, level 1,
+# differs from libzstd's own upstream default, level 3).
+COMPRESSION_LEVEL=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --scale-factor) SCALE_FACTOR="$2"; shift 2 ;;
     --wait) WAIT=true; shift ;;
     --instance-type) INSTANCE_TYPE="$2"; shift 2 ;;
     --compression) COMPRESSION="$2"; shift 2 ;;
+    --compression-level) COMPRESSION_LEVEL="$2"; shift 2 ;;
     # On-demand by default: generate_tpch.py uploads only once, at the very
     # end (no incremental checkpointing) -- a spot interruption partway
     # through a multi-hour SF3000/SF10000 generation would lose all of it,
@@ -43,28 +57,55 @@ while [ $# -gt 0 ]; do
   esac
 done
 if [ -z "$SCALE_FACTOR" ]; then
-  echo "Usage: $0 --scale-factor <N> [--wait] [--instance-type <type>] [--compression snappy|zstd]" >&2
+  echo "Usage: $0 --scale-factor <N> [--wait] [--instance-type <type>] [--compression none|snappy|zstd] [--compression-level <N>]" >&2
   exit 1
 fi
 case "$COMPRESSION" in
-  snappy|zstd) ;;
-  *) echo "--compression must be 'snappy' or 'zstd', got: $COMPRESSION" >&2; exit 1 ;;
+  none|snappy|zstd) ;;
+  *) echo "--compression must be 'none', 'snappy', or 'zstd', got: $COMPRESSION" >&2; exit 1 ;;
 esac
-# Matches aws_benchmark_runner.py's s3_data_glob(): snappy keeps the
-# original un-suffixed path, zstd gets its own so both can coexist.
-if [ "$COMPRESSION" = "snappy" ]; then
-  SF_DIR="sf${SCALE_FACTOR}"
+if [ -n "$COMPRESSION_LEVEL" ] && [ "$COMPRESSION" != "zstd" ]; then
+  echo "--compression-level only applies to --compression zstd" >&2
+  exit 1
+fi
+# Matches aws_benchmark_runner.py's compression_tag(): zstd with no
+# explicit --compression-level defaults to "zstd" (PyArrow's own codec
+# default, confirmed == level 1) rather than "zstd-l1" -- an explicit
+# --compression-level 1 run still gets the fully-spelled-out "zstd-l1" tag
+# (see below), so both spellings exist on purpose: "zstd" for "whatever
+# PyArrow does by default," "zstd-l<N>" for "specifically this level."
+if [ "$COMPRESSION" = "zstd" ] && [ -z "$COMPRESSION_LEVEL" ]; then
+  COMPRESSION_TAG="zstd"
+elif [ "$COMPRESSION" = "zstd" ]; then
+  COMPRESSION_TAG="zstd-l${COMPRESSION_LEVEL}"
 else
-  SF_DIR="sf${SCALE_FACTOR}-${COMPRESSION}"
+  COMPRESSION_TAG="$COMPRESSION"
+fi
+SF_DIR="sf${SCALE_FACTOR}-${COMPRESSION_TAG}"
+# Plain string, not an array -- interpolated directly into the USER_DATA
+# heredoc below (a remote shell script, not this script's own argv), which
+# can't expand a local bash array.
+COMPRESSION_LEVEL_FLAG=""
+if [ -n "$COMPRESSION_LEVEL" ]; then
+  COMPRESSION_LEVEL_FLAG="--compression-level ${COMPRESSION_LEVEL}"
 fi
 
 cd "$TERRAFORM_DIR"
 BUCKET="$(terraform output -raw s3_bucket_name)"
-REGION="$(terraform output -raw aws_region)"
+# REGION/SSH_KEY: honor a pre-set env var before falling back to terraform
+# output -- both are plain `var.*` passthroughs with no resource
+# dependency of their own (see outputs.tf), so a `terraform apply -target`
+# that only re-creates networking/IAM (e.g. after a partial teardown, to
+# run just this data-gen step without standing up the full GPU/Spark/
+# DuckDB/monitoring stack) never pulls them into state -- confirmed for
+# real: `-target=output.aws_region` plans "No changes" since the output
+# has no targetable resource to hang off of, not a mistake in the target
+# list.
+REGION="${REGION:-$(terraform output -raw aws_region)}"
 SUBNET_ID="$(terraform output -raw subnet_id)"
 SG_ID="$(terraform output -raw security_group_id)"
 PROFILE="$(terraform output -raw iam_instance_profile_name)"
-SSH_KEY="$(terraform output -raw ssh_key_name)"
+SSH_KEY="${SSH_KEY:-$(terraform output -raw ssh_key_name)}"
 cd - >/dev/null
 
 echo "=== Uploading tools/generate_tpch.py to s3://${BUCKET}/scripts/ ==="
@@ -105,9 +146,9 @@ pip3 install --break-system-packages pyarrow
 mkdir -p /data
 aws s3 cp "s3://${BUCKET}/scripts/generate_tpch.py" /tmp/generate_tpch.py
 
-echo "=== Generating TPC-H-derived data at SF${SCALE_FACTOR} (${COMPRESSION}, ${LINEITEM_FILES} lineitem files) ==="
+echo "=== Generating TPC-H-derived data at SF${SCALE_FACTOR} (${COMPRESSION}${COMPRESSION_LEVEL:+ level ${COMPRESSION_LEVEL}}, ${LINEITEM_FILES} lineitem files) ==="
 python3 /tmp/generate_tpch.py --scale-factor ${SCALE_FACTOR} --output /data \\
-  --format parquet --compression ${COMPRESSION} --row-group-rows 1000000 --files ${LINEITEM_FILES}
+  --format parquet --compression ${COMPRESSION} ${COMPRESSION_LEVEL_FLAG} --row-group-rows 1000000 --files ${LINEITEM_FILES}
 
 echo "=== Uploading to s3://${BUCKET}/tpch-data/${SF_DIR}/ ==="
 aws s3 sync /data "s3://${BUCKET}/tpch-data/${SF_DIR}/"
@@ -116,7 +157,7 @@ aws s3 sync /data "s3://${BUCKET}/tpch-data/${SF_DIR}/"
 # for this rather than inferring completion from instance state (an
 # instance terminating early due to an error would otherwise look
 # indistinguishable from a successful, self-terminating run).
-echo '{"scale_factor": ${SCALE_FACTOR}, "compression": "${COMPRESSION}", "status": "complete"}' | \\
+echo '{"scale_factor": ${SCALE_FACTOR}, "compression": "${COMPRESSION}", "compression_level": ${COMPRESSION_LEVEL:-null}, "status": "complete"}' | \\
   aws s3 cp - "s3://${BUCKET}/tpch-data/${SF_DIR}/.generation-complete"
 
 # IMDSv2 (token-based) -- this account's instances default to HttpTokens:

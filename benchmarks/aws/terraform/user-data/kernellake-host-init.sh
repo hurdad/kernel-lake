@@ -115,6 +115,12 @@ cd /opt/kernellake-bench
 # devices (some instance types ship more than one) are striped with mdadm
 # RAID0 for combined capacity/throughput -- this cache has no redundancy
 # requirement of its own, S3 is still the durable source of truth.
+#
+# `${nvme_cache_enabled}` (kernellake_nvme_cache_enabled in variables.tf)
+# gates this whole detection/mount step: "false" skips it outright and
+# falls straight to the same disabled-placeholder path used when no
+# device is present at all, so a benchmark run can force every read to
+# genuinely hit S3 instead of a warm repeat-scan cache.
 NVME_CACHE_HOST_DIR=""
 NVME_CACHE_MAX_BYTES=0
 NVME_CACHE_ENABLED=false
@@ -153,7 +159,7 @@ find_existing_mount() {
   done
 }
 
-if [ "$${#INSTANCE_STORE_DEVICES[@]}" -gt 0 ]; then
+if [ "${nvme_cache_enabled}" = "true" ] && [ "$${#INSTANCE_STORE_DEVICES[@]}" -gt 0 ]; then
   echo "=== Found $${#INSTANCE_STORE_DEVICES[@]} local NVMe instance-store device(s): $${INSTANCE_STORE_DEVICES[*]} ==="
 
   EXISTING_MOUNT=""
@@ -194,7 +200,11 @@ if [ "$${#INSTANCE_STORE_DEVICES[@]}" -gt 0 ]; then
   NVME_CACHE_ENABLED=true
   echo "=== NVMe cache ready at $NVME_CACHE_HOST_DIR ($FS_BYTES formatted bytes, $NVME_CACHE_MAX_BYTES byte cache budget) ==="
 else
-  echo "=== No local NVMe instance-store device found on this instance -- storage.cache stays disabled ==="
+  if [ "${nvme_cache_enabled}" != "true" ]; then
+    echo "=== NVMe cache explicitly disabled (kernellake_nvme_cache_enabled=false) -- storage.cache stays disabled ==="
+  else
+    echo "=== No local NVMe instance-store device found on this instance -- storage.cache stays disabled ==="
+  fi
   NVME_CACHE_HOST_DIR="/opt/kernellake-bench/cache-disabled-placeholder"
   mkdir -p "$NVME_CACHE_HOST_DIR"
 fi

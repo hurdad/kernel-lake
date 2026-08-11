@@ -9,17 +9,20 @@
 # itself is the bottleneck or whether the engine is leaving throughput on
 # the table below that ceiling.
 #
-# Intended to run directly on the KernelLake EC2 host over SSH (same
-# instance type/network path the real query benchmark uses), not from the
-# orchestrator's own machine -- see docs/RUNBOOK.md. Uses the `aws` CLI
-# directly (kernellake-host-init.sh installs it) rather than a `docker run`
-# container, since the default IMDSv2 hop limit blocks a container's own
-# network namespace from reaching instance-profile credentials unless the
-# hop limit is explicitly raised.
+# Intended to run directly on each benchmark EC2 host over SSH (the same
+# instance type/network path the real query benchmark used on that host),
+# not from the orchestrator's own machine -- run once per instance
+# (KernelLake, Spark, DuckDB) via run_s3_throughput_all_instances.sh, see
+# docs/RUNBOOK.md. --label identifies which host a given output came from
+# once there's more than one. Uses the `aws` CLI directly (every host's
+# own *-init.sh installs it) rather than a `docker run` container, since
+# the default IMDSv2 hop limit blocks a container's own network namespace
+# from reaching instance-profile credentials unless the hop limit is
+# explicitly raised.
 #
 # Usage:
 #   ./measure_s3_throughput.sh --bucket <bucket> --scale-factor 100 \
-#     [--compression snappy] [--table lineitem] \
+#     --label kernellake [--compression snappy] [--table lineitem] \
 #     [--concurrency-levels "1,4,8,16,32,64"] [--objects-per-level 20] \
 #     --output s3_throughput.json
 set -euo pipefail
@@ -27,39 +30,60 @@ set -euo pipefail
 BUCKET=""
 SCALE_FACTOR=""
 COMPRESSION="snappy"
+# zstd only -- see generate_tpch.py's own --compression-level comment for
+# why this needs to be settable at all.
+COMPRESSION_LEVEL=""
 TABLE="lineitem"
 CONCURRENCY_LEVELS="1,4,8,16,32,64"
 OBJECTS_PER_LEVEL=20
 OUTPUT=""
 REGION="us-east-1"
+# Identifies which instance/role this run's output came from -- needed
+# once this script runs against more than one host in the same benchmark
+# run (see run_s3_throughput_all_instances.sh), so their JSON outputs
+# (and reporting/plot_s3_throughput.py's combined chart) can tell them
+# apart. Defaults to the local hostname rather than requiring it, so a
+# standalone one-off run (the original use case) still works with no
+# extra flag.
+LABEL="$(hostname)"
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --bucket) BUCKET="$2"; shift 2 ;;
     --scale-factor) SCALE_FACTOR="$2"; shift 2 ;;
     --compression) COMPRESSION="$2"; shift 2 ;;
+    --compression-level) COMPRESSION_LEVEL="$2"; shift 2 ;;
     --table) TABLE="$2"; shift 2 ;;
     --concurrency-levels) CONCURRENCY_LEVELS="$2"; shift 2 ;;
     --objects-per-level) OBJECTS_PER_LEVEL="$2"; shift 2 ;;
     --region) REGION="$2"; shift 2 ;;
+    --label) LABEL="$2"; shift 2 ;;
     --output) OUTPUT="$2"; shift 2 ;;
     *) echo "Unknown argument: $1" >&2; exit 1 ;;
   esac
 done
 
 if [ -z "$BUCKET" ] || [ -z "$SCALE_FACTOR" ] || [ -z "$OUTPUT" ]; then
-  echo "Usage: $0 --bucket <bucket> --scale-factor <n> --output <path.json> [--compression snappy] [--table lineitem] [--concurrency-levels \"1,4,8,16,32\"] [--objects-per-level 20]" >&2
+  echo "Usage: $0 --bucket <bucket> --scale-factor <n> --output <path.json> [--label kernellake] [--compression snappy] [--compression-level <N>] [--table lineitem] [--concurrency-levels \"1,4,8,16,32\"] [--objects-per-level 20]" >&2
+  exit 1
+fi
+if [ -n "$COMPRESSION_LEVEL" ] && [ "$COMPRESSION" != "zstd" ]; then
+  echo "--compression-level only applies to --compression zstd" >&2
   exit 1
 fi
 
-# snappy keeps the original, un-suffixed path (tpch-data/sf100/) -- matches
-# generate_and_upload_data.sh's own SF_DIR convention exactly; only a
-# non-default codec gets its own suffixed path.
-if [ "$COMPRESSION" = "snappy" ]; then
-  SF_DIR="sf${SCALE_FACTOR}"
+# Matches generate_and_upload_data.sh's own COMPRESSION_TAG convention
+# exactly -- every compression choice (snappy included) gets its own
+# fully-tagged prefix; zstd with no explicit level reads the un-suffixed
+# tpch-data/sf<N>-zstd/ path (PyArrow's own default level).
+if [ "$COMPRESSION" = "zstd" ] && [ -z "$COMPRESSION_LEVEL" ]; then
+  COMPRESSION_TAG="zstd"
+elif [ "$COMPRESSION" = "zstd" ]; then
+  COMPRESSION_TAG="zstd-l${COMPRESSION_LEVEL}"
 else
-  SF_DIR="sf${SCALE_FACTOR}-${COMPRESSION}"
+  COMPRESSION_TAG="$COMPRESSION"
 fi
+SF_DIR="sf${SCALE_FACTOR}-${COMPRESSION_TAG}"
 PREFIX="tpch-data/${SF_DIR}/"
 echo "=== Listing real objects under s3://${BUCKET}/${PREFIX} (table=${TABLE}) ===" >&2
 
@@ -154,10 +178,12 @@ for r in results:
     best_so_far = max(best_so_far, r['throughput_mbps'])
 
 output = {
+    'label': '$LABEL',
     'bucket': '$BUCKET',
     'scale_factor': $SCALE_FACTOR,
     'table': '$TABLE',
     'compression': '$COMPRESSION',
+    'compression_level': ${COMPRESSION_LEVEL:-None},
     'levels': results,
     'max_throughput_mbps': max(r['throughput_mbps'] for r in results),
     'max_throughput_gbps': max(r['throughput_gbps'] for r in results),

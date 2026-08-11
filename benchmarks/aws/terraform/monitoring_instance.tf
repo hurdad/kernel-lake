@@ -20,18 +20,17 @@ resource "aws_instance" "monitoring" {
   user_data = templatefile("${path.module}/user-data/monitoring-init.sh", {
     s3_bucket = local.s3_bucket_name
     prometheus_config = templatefile("${path.module}/../monitoring/prometheus.yml.tftpl", {
-      kernellake_ips  = aws_instance.kernellake[*].private_ip
-      # spark_master/duckdb_host are now optional (enable_spark/enable_duckdb,
+      kernellake_ips = aws_instance.kernellake[*].private_ip
+      # spark_host/duckdb_host are both optional (enable_spark/enable_duckdb,
       # see variables.tf) -- "" when disabled rather than indexing a 0-count
       # resource, and prometheus.yml.tftpl skips the matching scrape job
       # entirely when it sees an empty string.
-      spark_master_ip = length(aws_instance.spark_master) > 0 ? aws_instance.spark_master[0].private_ip : ""
-      spark_worker_ips = aws_instance.spark_worker[*].private_ip
-      duckdb_host_ip  = length(aws_instance.duckdb_host) > 0 ? aws_instance.duckdb_host[0].private_ip : ""
+      spark_host_ip  = length(aws_instance.spark_host) > 0 ? aws_instance.spark_host[0].private_ip : ""
+      duckdb_host_ip = length(aws_instance.duckdb_host) > 0 ? aws_instance.duckdb_host[0].private_ip : ""
     })
   })
 
-  depends_on = [aws_instance.kernellake, aws_instance.spark_master, aws_instance.spark_worker, aws_instance.duckdb_host]
+  depends_on = [aws_instance.kernellake, aws_instance.spark_host, aws_instance.duckdb_host]
 
   tags = {
     Name = "${var.name_prefix}-monitoring"
@@ -41,6 +40,10 @@ resource "aws_instance" "monitoring" {
 
 output "monitoring_public_ip" {
   value = aws_instance.monitoring.public_ip
+}
+
+output "monitoring_instance_id" {
+  value = aws_instance.monitoring.id
 }
 
 output "grafana_url" {

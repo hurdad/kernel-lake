@@ -106,6 +106,51 @@ def merge_duckdb_results(benchmark_runs: list, duckdb_results: list) -> None:
                 # separate, dedicated infra.
 
 
+def merge_pyspark_results(benchmark_runs: list, pyspark_results: list) -> None:
+    """Merges runner/pyspark_query_loop.py's independent per-run output
+    into benchmark_runs in place -- identical shape/rationale to
+    merge_duckdb_results() above, needed for the same reason: this
+    project's Spark topology moved from in-process
+    (aws_benchmark_runner.py --spark-master-host, producing an inline
+    "pyspark" entry directly) to its own dedicated host
+    (pyspark_query_loop.py, same as DuckDB), but this merge step didn't
+    exist yet -- a real gap, only found by actually running the new
+    topology end to end rather than assumed fixed alongside the rest of
+    that rewrite."""
+    by_scale_factor: dict[int, dict] = {}
+    for run in benchmark_runs:
+        by_query: dict[int, dict] = {q["query"]: q for q in run["queries"]}
+        by_scale_factor[run["scale_factor"]] = by_query
+
+    for ps_run in pyspark_results:
+        by_query = by_scale_factor.get(ps_run["scale_factor"])
+        if by_query is None:
+            print(f"WARNING: --pyspark-results scale_factor={ps_run['scale_factor']} has no matching "
+                  "--input run at that scale factor -- skipped", file=sys.stderr)
+            continue
+        for ps_query in ps_run["queries"]:
+            q = by_query.get(ps_query["query"])
+            if q is None:
+                print(f"WARNING: --pyspark-results Q{ps_query['query']} has no matching query in the "
+                      f"scale_factor={ps_run['scale_factor']} run -- skipped", file=sys.stderr)
+                continue
+            for mode, ps_stats in ps_query["modes"].items():
+                entry = q["modes"].get(mode)
+                if entry is None:
+                    print(f"WARNING: --pyspark-results Q{ps_query['query']} mode={mode} has no matching "
+                          "mode in the benchmark run -- skipped", file=sys.stderr)
+                    continue
+                entry["pyspark"] = {k: v for k, v in ps_stats.items() if k != "row_count"}
+                entry["pyspark_row_count"] = ps_stats.get("row_count")
+                if "kernellake" in entry and entry["kernellake"]["median_seconds"] > 0:
+                    entry["latency_speedup_ratio"] = (
+                        entry["pyspark"]["median_seconds"] / entry["kernellake"]["median_seconds"]
+                    )
+                # No results_match here -- same reason as merge_duckdb_results():
+                # no real row-level cross-validation against KernelLake once
+                # Spark runs on separate, dedicated infra.
+
+
 def latency_speedup_table(benchmark_runs: list) -> list[dict]:
     rows = []
     for run in benchmark_runs:
@@ -317,6 +362,14 @@ def main() -> int:
         "merged in by scale_factor/query/mode (see merge_duckdb_results()). Omit if this run only used "
         "aws_benchmark_runner.py's old in-process --duckdb flag (already embedded in --input).",
     )
+    parser.add_argument(
+        "--pyspark-results",
+        nargs="*",
+        default=[],
+        help="runner/pyspark_query_loop.py's --output file(s), run separately on the dedicated Spark host -- "
+        "merged in by scale_factor/query/mode (see merge_pyspark_results()). Omit if this run only used "
+        "aws_benchmark_runner.py's old in-process --spark-master-host flag (already embedded in --input).",
+    )
     parser.add_argument("--output-dir", required=True)
     args = parser.parse_args()
 
@@ -324,6 +377,8 @@ def main() -> int:
     cost_data = json.loads(Path(args.cost_json).read_text()) if args.cost_json else None
     duckdb_results = [json.loads(Path(p).read_text()) for p in args.duckdb_results]
     merge_duckdb_results(data["benchmark_runs"], duckdb_results)
+    pyspark_results = [json.loads(Path(p).read_text()) for p in args.pyspark_results]
+    merge_pyspark_results(data["benchmark_runs"], pyspark_results)
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)

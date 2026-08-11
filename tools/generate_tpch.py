@@ -369,6 +369,13 @@ def main() -> int:
     parser.add_argument("--output", required=True, help="Output directory")
     parser.add_argument("--format", choices=["parquet"], default="parquet")
     parser.add_argument("--compression", choices=["none", "snappy", "zstd"], default="zstd")
+    # zstd only -- PyArrow's own codec default (level 1, favors write speed)
+    # differs from libzstd's upstream default (level 3, its standard
+    # balanced setting -- what most "zstd default" benchmarks/docs mean).
+    # Left unset, PyArrow's level-1 default applies, same as before this
+    # flag existed. Confirmed via `pa.Codec('zstd').compression_level == 1`
+    # against the pyarrow build this repo pins, not assumed from docs.
+    parser.add_argument("--compression-level", type=int, default=None)
     parser.add_argument("--row-group-rows", type=int, default=1_000_000)
     parser.add_argument("--files", type=int, default=1, help="Number of lineitem Parquet files to write")
     parser.add_argument("--seed", type=int, default=42)
@@ -378,6 +385,8 @@ def main() -> int:
         parser.error("--scale-factor must be positive")
     if args.files <= 0:
         parser.error("--files must be positive")
+    if args.compression_level is not None and args.compression != "zstd":
+        parser.error("--compression-level only applies to --compression zstd")
 
     output_dir = Path(args.output)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -386,15 +395,22 @@ def main() -> int:
     total_part_rows = max(1, int(PART_ROWS_PER_SF * args.scale_factor))
     rng = random.Random(args.seed)
     compression = None if args.compression == "none" else args.compression
+    compression_level = args.compression_level
 
     part_table = generate_part_table(rng, total_part_rows)
     part_path = output_dir / "part-00000.parquet"
-    pq.write_table(part_table, part_path, compression=compression, row_group_size=args.row_group_rows)
+    pq.write_table(
+        part_table, part_path, compression=compression,
+        compression_level=compression_level, row_group_size=args.row_group_rows,
+    )
     print(f"wrote {total_part_rows} rows to {part_path}")
 
     customer_table = generate_customer_table(rng, CUSTOMER_ROWS)
     customer_path = output_dir / "customer-00000.parquet"
-    pq.write_table(customer_table, customer_path, compression=compression, row_group_size=args.row_group_rows)
+    pq.write_table(
+        customer_table, customer_path, compression=compression,
+        compression_level=compression_level, row_group_size=args.row_group_rows,
+    )
     print(f"wrote {CUSTOMER_ROWS} rows to {customer_path}")
 
     rows_per_file = total_rows // args.files

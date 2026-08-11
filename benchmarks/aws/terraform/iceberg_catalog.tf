@@ -9,9 +9,9 @@
 #
 # Deliberately its own standalone instance, not folded into the monitoring
 # instance: monitoring_instance.tf's user_data directly references
-# aws_instance.kernellake[*]/spark_master/spark_worker's private IPs (for
-# Prometheus scrape targets), which makes it un-appliable until those
-# GPU/Spark instances exist. The Iceberg catalog has no such dependency --
+# aws_instance.kernellake[*]/spark_host's private IPs (for Prometheus
+# scrape targets), which makes it un-appliable until those GPU/Spark
+# instances exist. The Iceberg catalog has no such dependency --
 # both the data-generation instance (writing tables via pyiceberg) and,
 # later, kernellake-server/Spark (reading them) only need this instance's
 # IP and port 8181, so it can stand up and start hosting real Iceberg

@@ -9,7 +9,7 @@ resource "aws_instance" "kernellake" {
 
   ami                         = local.kernellake_ami_id
   instance_type               = var.kernellake_instance_type
-  subnet_id                   = local.subnet_id
+  subnet_id                   = var.kernellake_subnet_id != null ? var.kernellake_subnet_id : local.subnet_id
   vpc_security_group_ids      = [aws_security_group.benchmark.id]
   iam_instance_profile        = aws_iam_instance_profile.benchmark_host.name
   key_name                    = var.ssh_key_name
@@ -27,8 +27,12 @@ resource "aws_instance" "kernellake" {
 
   user_data = templatefile("${path.module}/user-data/kernellake-host-init.sh", {
     kernellake_docker_image = var.kernellake_docker_image
-    s3_bucket                = local.s3_bucket_name
-    aws_region                = var.aws_region
+    s3_bucket               = local.s3_bucket_name
+    aws_region              = var.aws_region
+    # Gates the NVMe cache tier detection/mount block in that script's own
+    # "NVMe cache tier" section -- see kernellake_nvme_cache_enabled's own
+    # comment in variables.tf.
+    nvme_cache_enabled = var.kernellake_nvme_cache_enabled ? "true" : "false"
     # Points kernellake-server's own ObservabilitySection.otlp_endpoint at
     # the OTel Collector sidecar this same user-data script also starts --
     # see monitoring/otel-collector-config.yaml and the plan's own
@@ -41,7 +45,7 @@ resource "aws_instance" "kernellake" {
     # read_iceberg('bench.tpch.<table>'). See generate_and_upload_iceberg_data.py
     # for what actually writes those tables.
     iceberg_catalog_uri = "http://${aws_instance.iceberg_catalog.private_ip}:8181"
-    iceberg_warehouse    = "s3://${local.s3_bucket_name}/warehouse/"
+    iceberg_warehouse   = "s3://${local.s3_bucket_name}/warehouse/"
   })
 
   tags = {

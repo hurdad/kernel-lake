@@ -31,26 +31,37 @@ import boto3
 ESTIMATED_GB_PER_SCALE_FACTOR = 0.35
 
 INSTANCE_TYPES = {
-    # g6.2xlarge, not the originally-planned g6.8xlarge: this account's
+    # g6.xlarge, not the originally-planned g6.8xlarge: this account's
     # G/VT-family vCPU quota was only partially approved (8 vCPUs, not the
-    # 32 requested -- see docs/COST_ESTIMATES.md), and g6.2xlarge (8
-    # vCPUs, same 1x NVIDIA L4 GPU, less host RAM) is the largest g6 size
-    # that fits. Update back to g6.8xlarge here if/when the quota appeal
-    # succeeds.
-    "kernellake": "g6.2xlarge",
-    "spark_master": "m7i.xlarge",
-    "spark_worker": "m7i.4xlarge",
+    # 32 requested -- see docs/COST_ESTIMATES.md). g6.xlarge (4 vCPUs)
+    # uses only half the approved quota per instance, leaving headroom for
+    # the M4 concurrency sweep's first step (2 replicas); g6.2xlarge (8
+    # vCPUs, same GPU, more host RAM) is the largest single size that
+    # still fits, but blocks running 2+ replicas at once. Update back to
+    # g6.8xlarge here if/when the quota appeal succeeds.
+    "kernellake": "g6.xlarge",
+    # spark/duckdb: both single dedicated hosts (terraform/spark_cluster.tf
+    # -- PySpark in local[*] mode, not a distributed standalone cluster;
+    # terraform/duckdb_instance.tf), both m7i.4xlarge, cost-matched to the
+    # KernelLake GPU host's real on-demand rate (confirmed live via the
+    # AWS Pricing API: g6.xlarge $0.8048/hr vs. m7i.4xlarge $0.8064/hr,
+    # 0.2% apart, as of the lookup that picked this default -- see
+    # variables.tf's spark_instance_type/duckdb_instance_type for the full
+    # story, including the real network-performance-rating gap this price
+    # match doesn't close).
+    "spark": "m7i.4xlarge",
+    "duckdb": "m7i.4xlarge",
     "monitoring": "t3.large",
     "data_gen": "c6i.8xlarge",
 }
 
 MILESTONES = {
-    "m1": {"scale_factor": 100, "kernellake_replicas": 1, "spark_workers": 3, "hours": 4},
-    "m2": {"scale_factor": 100, "kernellake_replicas": 1, "spark_workers": 3, "hours": 6},
-    "m3-sf1000": {"scale_factor": 1000, "kernellake_replicas": 1, "spark_workers": 3, "hours": 8},
-    "m3-sf3000": {"scale_factor": 3000, "kernellake_replicas": 1, "spark_workers": 3, "hours": 12},
-    "m3-sf10000": {"scale_factor": 10000, "kernellake_replicas": 1, "spark_workers": 3, "hours": 24},
-    "m4": {"scale_factor": 1000, "kernellake_replicas": 8, "spark_workers": 3, "hours": 3},
+    "m1": {"scale_factor": 100, "kernellake_replicas": 1, "hours": 4},
+    "m2": {"scale_factor": 100, "kernellake_replicas": 1, "hours": 6},
+    "m3-sf1000": {"scale_factor": 1000, "kernellake_replicas": 1, "hours": 8},
+    "m3-sf3000": {"scale_factor": 3000, "kernellake_replicas": 1, "hours": 12},
+    "m3-sf10000": {"scale_factor": 10000, "kernellake_replicas": 1, "hours": 24},
+    "m4": {"scale_factor": 1000, "kernellake_replicas": 8, "hours": 3},
 }
 
 
@@ -129,17 +140,17 @@ def main() -> int:
     pricing = boto3.client("pricing", region_name="us-east-1")  # Pricing API is us-east-1-only
 
     kernellake_rate = on_demand_hourly_price(pricing, INSTANCE_TYPES["kernellake"], args.region)
-    spark_master_rate = on_demand_hourly_price(pricing, INSTANCE_TYPES["spark_master"], args.region)
-    spark_worker_rate = on_demand_hourly_price(pricing, INSTANCE_TYPES["spark_worker"], args.region)
+    spark_rate = on_demand_hourly_price(pricing, INSTANCE_TYPES["spark"], args.region)
+    duckdb_rate = on_demand_hourly_price(pricing, INSTANCE_TYPES["duckdb"], args.region)
     monitoring_rate = on_demand_hourly_price(pricing, INSTANCE_TYPES["monitoring"], args.region)
     data_gen_rate = on_demand_hourly_price(pricing, INSTANCE_TYPES["data_gen"], args.region)
 
     hours = milestone["hours"]
     n_kernellake = milestone["kernellake_replicas"]
-    n_workers = milestone["spark_workers"]
 
     kernellake_cost = kernellake_rate * n_kernellake * hours
-    spark_cost = (spark_master_rate + spark_worker_rate * n_workers) * hours
+    spark_cost = spark_rate * hours
+    duckdb_cost = duckdb_rate * hours
     monitoring_cost = monitoring_rate * hours
     # Data generation runs once per scale factor, separately from the main
     # benchmark run -- estimated at a flat 2 hours for SF100/1000, scaling
@@ -150,15 +161,15 @@ def main() -> int:
     data_gen_cost = data_gen_rate * data_gen_hours
 
     s3 = estimate_s3_cost(milestone["scale_factor"])
-    total = kernellake_cost + spark_cost + monitoring_cost + data_gen_cost + s3["storage_cost_per_month_usd"]
+    total = (
+        kernellake_cost + spark_cost + duckdb_cost + monitoring_cost + data_gen_cost + s3["storage_cost_per_month_usd"]
+    )
 
     print(f"=== Cost estimate: {args.milestone} (region={args.region}) ===")
     print(f"Scale factor: SF{milestone['scale_factor']}")
     print(f"KernelLake replicas: {n_kernellake} x {INSTANCE_TYPES['kernellake']} @ ${kernellake_rate:.4f}/hr x {hours}h = ${kernellake_cost:.2f}")
-    print(
-        f"Spark cluster: 1x {INSTANCE_TYPES['spark_master']} + {n_workers}x {INSTANCE_TYPES['spark_worker']} "
-        f"@ ${hours}h = ${spark_cost:.2f}"
-    )
+    print(f"Spark (local[*], single host): 1x {INSTANCE_TYPES['spark']} @ ${spark_rate:.4f}/hr x {hours}h = ${spark_cost:.2f}")
+    print(f"DuckDB (single host): 1x {INSTANCE_TYPES['duckdb']} @ ${duckdb_rate:.4f}/hr x {hours}h = ${duckdb_cost:.2f}")
     print(f"Monitoring: 1x {INSTANCE_TYPES['monitoring']} @ {hours}h = ${monitoring_cost:.2f}")
     print(f"Data generation (one-time, SF{milestone['scale_factor']}): 1x {INSTANCE_TYPES['data_gen']} @ {data_gen_hours}h = ${data_gen_cost:.2f}")
     print(f"S3 storage (~{s3['estimated_gb']:.0f} GB estimated, first month): ${s3['storage_cost_per_month_usd']:.2f}")
