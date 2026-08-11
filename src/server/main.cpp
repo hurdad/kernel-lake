@@ -39,7 +39,7 @@ std::string read_pem_file(const std::string& path, const char* config_key) {
 // config.server when server.use_tls is set; a no-op (default-constructed,
 // i.e. plaintext) otherwise.
 arrow::flight::FlightServerOptions build_server_options(const arrow::flight::Location& location,
-                                                         const kernellake::ServerSection& config) {
+                                                        const kernellake::ServerSection& config) {
   arrow::flight::FlightServerOptions options(location);
   if (!config.use_tls) {
     return options;
@@ -61,7 +61,8 @@ arrow::flight::FlightServerOptions build_server_options(const arrow::flight::Loc
 // otherwise. Called after build_server_options() populates the TLS fields
 // above, since it mutates the same FlightServerOptions rather than building
 // it from scratch.
-void add_auth_middleware(arrow::flight::FlightServerOptions& options, const kernellake::ServerSection& config) {
+void add_auth_middleware(arrow::flight::FlightServerOptions& options,
+                         const kernellake::ServerSection& config) {
   if (!config.auth_enabled) {
     return;
   }
@@ -153,8 +154,8 @@ int main(int argc, char** argv) {
     server = std::make_unique<kernellake::KernelLakeFlightSqlServer>(config);
 
     auto location_result = config.server.use_tls
-                                ? arrow::flight::Location::ForGrpcTls(config.server.host, config.server.port)
-                                : arrow::flight::Location::ForGrpcTcp(config.server.host, config.server.port);
+                               ? arrow::flight::Location::ForGrpcTls(config.server.host, config.server.port)
+                               : arrow::flight::Location::ForGrpcTcp(config.server.host, config.server.port);
     if (!location_result.ok()) {
       std::fprintf(stderr, "kernellake-server: invalid server.host/server.port: %s\n",
                    location_result.status().ToString().c_str());

@@ -111,6 +111,52 @@ class QueryEngineExecuteCpuTest : public ::testing::Test {
     const arrow::Status managers_status = parquet::arrow::WriteTable(
         *managers_table, arrow::default_memory_pool(), managers_sink, /*chunk_size=*/2);
     ASSERT_TRUE(managers_status.ok()) << managers_status.ToString();
+
+    // Two more tables, both with a column literally named "x" (not the
+    // join key) holding *different* values on each side -- regression
+    // fixture for the JOIN bare-name-collision bug cluster (aggregate
+    // dedup by to_string(), remap_columns() resolving by name against the
+    // combined schema, GROUP BY's ungrouped-column check ignoring the
+    // table qualifier). Unlike "region" above (shared by construction
+    // *because* it's the join key, so both sides always agree on its value
+    // for a matched row), "x" differs across sides specifically so a
+    // collision produces a visibly wrong, distinguishable result instead
+    // of accidentally still looking correct.
+    left_dup_path_ = (dir_ / "left_dup.parquet").string();
+    arrow::Int64Builder left_id_builder;
+    arrow::Int64Builder left_x_builder;
+    for (std::int64_t i = 1; i <= 2; ++i) {
+      ASSERT_TRUE(left_id_builder.Append(i).ok());
+      ASSERT_TRUE(left_x_builder.Append(i * 10).ok());  // 10, 20
+    }
+    std::shared_ptr<arrow::Array> left_id_array, left_x_array;
+    ASSERT_TRUE(left_id_builder.Finish(&left_id_array).ok());
+    ASSERT_TRUE(left_x_builder.Finish(&left_x_array).ok());
+    const auto left_dup_schema =
+        arrow::schema({arrow::field("id", arrow::int64(), false), arrow::field("x", arrow::int64(), false)});
+    const auto left_dup_table = arrow::Table::Make(left_dup_schema, {left_id_array, left_x_array});
+    auto left_dup_sink = arrow::io::FileOutputStream::Open(left_dup_path_).ValueOrDie();
+    const arrow::Status left_dup_status = parquet::arrow::WriteTable(
+        *left_dup_table, arrow::default_memory_pool(), left_dup_sink, /*chunk_size=*/2);
+    ASSERT_TRUE(left_dup_status.ok()) << left_dup_status.ToString();
+
+    right_dup_path_ = (dir_ / "right_dup.parquet").string();
+    arrow::Int64Builder right_id_builder;
+    arrow::Int64Builder right_x_builder;
+    for (std::int64_t i = 1; i <= 2; ++i) {
+      ASSERT_TRUE(right_id_builder.Append(i).ok());
+      ASSERT_TRUE(right_x_builder.Append(i * 100).ok());  // 100, 200
+    }
+    std::shared_ptr<arrow::Array> right_id_array, right_x_array;
+    ASSERT_TRUE(right_id_builder.Finish(&right_id_array).ok());
+    ASSERT_TRUE(right_x_builder.Finish(&right_x_array).ok());
+    const auto right_dup_schema =
+        arrow::schema({arrow::field("id", arrow::int64(), false), arrow::field("x", arrow::int64(), false)});
+    const auto right_dup_table = arrow::Table::Make(right_dup_schema, {right_id_array, right_x_array});
+    auto right_dup_sink = arrow::io::FileOutputStream::Open(right_dup_path_).ValueOrDie();
+    const arrow::Status right_dup_status = parquet::arrow::WriteTable(
+        *right_dup_table, arrow::default_memory_pool(), right_dup_sink, /*chunk_size=*/2);
+    ASSERT_TRUE(right_dup_status.ok()) << right_dup_status.ToString();
   }
 
   void TearDown() override { fs::remove_all(dir_); }
@@ -119,6 +165,8 @@ class QueryEngineExecuteCpuTest : public ::testing::Test {
   std::string path_;
   std::string regions_path_;
   std::string managers_path_;
+  std::string left_dup_path_;
+  std::string right_dup_path_;
   QueryEngine engine_{cpu_backend_config()};
 };
 
@@ -438,6 +486,75 @@ TEST_F(QueryEngineExecuteCpuTest, ThreeTableInnerJoinMatchesExpectedTotals) {
   ASSERT_EQ(totals_by_manager.size(), 2u);
   EXPECT_DOUBLE_EQ(totals_by_manager.at("Ann"), 35.0);  // Alpha: 10+20+5
   EXPECT_DOUBLE_EQ(totals_by_manager.at("Bo"), 110.0);  // Beta: 100+7+3
+}
+
+// Regression test for physical_planner.cpp's remap_columns(): it used to
+// resolve a ColumnExpression above a JOIN by re-looking-up its bare *name*
+// against the combined narrowed schema (Schema::find_field(), first match
+// only) instead of trusting the binder-resolved column_index() already on
+// the expression -- so `l.x`/`r.x` (same name, opposite sides, genuinely
+// different values here) both silently resolved to the left side's "x".
+TEST_F(QueryEngineExecuteCpuTest, JoinSelectsSameNamedColumnFromBothSidesWithoutCollision) {
+  // No ORDER BY here: ORDER BY on a plain (non-aggregate) query only binds
+  // against the pre-projection source schema, not the SELECT list's own
+  // output aliases (see binder.cpp's ORDER BY handling) -- a separate,
+  // pre-existing gap, not something this test is about. l.id is selected
+  // instead so rows can be matched up regardless of output order.
+  const QueryResult result =
+      engine_.execute("SELECT l.id AS row_id, l.x AS lx, r.x AS rx FROM read_parquet('" + left_dup_path_ +
+                      "') AS l JOIN read_parquet('" + right_dup_path_ + "') AS r ON l.id = r.id");
+
+  ASSERT_EQ(result.rows_returned, 2);
+  const std::shared_ptr<arrow::RecordBatch>& batch = result.batches.front();
+  const auto id_column = std::static_pointer_cast<arrow::Int64Array>(batch->GetColumnByName("row_id"));
+  const auto lx_column = std::static_pointer_cast<arrow::Int64Array>(batch->GetColumnByName("lx"));
+  const auto rx_column = std::static_pointer_cast<arrow::Int64Array>(batch->GetColumnByName("rx"));
+  ASSERT_NE(id_column, nullptr);
+  ASSERT_NE(lx_column, nullptr);
+  ASSERT_NE(rx_column, nullptr);
+
+  std::map<std::int64_t, std::pair<std::int64_t, std::int64_t>> by_id;
+  for (std::int64_t i = 0; i < batch->num_rows(); ++i) {
+    by_id[id_column->Value(i)] = {lx_column->Value(i), rx_column->Value(i)};
+  }
+  ASSERT_EQ(by_id.size(), 2u);
+  EXPECT_EQ(by_id.at(1).first, 10);
+  EXPECT_EQ(by_id.at(1).second, 100);
+  EXPECT_EQ(by_id.at(2).first, 20);
+  EXPECT_EQ(by_id.at(2).second, 200);
+}
+
+// Regression test for logical_planner.cpp's register_aggregate()/
+// rewrite_aggregate_refs(): both used to key their dedup maps by
+// Expression::to_string(), under which SUM(l.x) and SUM(r.x) render to the
+// identical string "SUM(x)" once bound -- so the second aggregate silently
+// reused the first one's LogicalAggregate slot instead of getting its own.
+TEST_F(QueryEngineExecuteCpuTest, JoinSumsSameNamedColumnFromBothSidesWithoutCollision) {
+  const QueryResult result =
+      engine_.execute("SELECT SUM(l.x) AS l_total, SUM(r.x) AS r_total FROM read_parquet('" + left_dup_path_ +
+                      "') AS l JOIN read_parquet('" + right_dup_path_ + "') AS r ON l.id = r.id");
+
+  ASSERT_EQ(result.rows_returned, 1);
+  const std::shared_ptr<arrow::RecordBatch>& batch = result.batches.front();
+  const auto l_total_column = std::static_pointer_cast<arrow::Int64Array>(batch->GetColumnByName("l_total"));
+  const auto r_total_column = std::static_pointer_cast<arrow::Int64Array>(batch->GetColumnByName("r_total"));
+  ASSERT_NE(l_total_column, nullptr);
+  ASSERT_NE(r_total_column, nullptr);
+
+  EXPECT_EQ(l_total_column->Value(0), 30);   // 10 + 20
+  EXPECT_EQ(r_total_column->Value(0), 300);  // 100 + 200
+}
+
+// Regression test for binder.cpp's references_ungrouped_column(): it used
+// to compare AstColumnRef::name against GROUP BY's bare column names,
+// ignoring the table qualifier entirely -- so `GROUP BY l.x` was wrongly
+// treated as covering an ungrouped `SELECT r.x`, silently accepting a
+// query that should be rejected (r.x is neither grouped nor aggregated).
+TEST_F(QueryEngineExecuteCpuTest, RejectsGroupByOnOneJoinSideWithSameNamedUngroupedColumnFromTheOther) {
+  EXPECT_THROW((void)(engine_.execute("SELECT r.x, COUNT(*) AS cnt FROM read_parquet('" + left_dup_path_ +
+                                      "') AS l JOIN read_parquet('" + right_dup_path_ +
+                                      "') AS r ON l.id = r.id GROUP BY l.x")),
+               BindingError);
 }
 
 }  // namespace

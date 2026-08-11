@@ -306,6 +306,19 @@ TEST(Binder, DecimalColumnComparedAgainstLiteralCoercesTheLiteral) {
   EXPECT_NO_THROW((void)(bind_query(stmt, priced_sales_schema())));
 }
 
+// Regression test: cast_if_needed() used to retype a literal to a DECIMAL
+// column's precision/scale with no check that the literal's magnitude
+// actually fits -- decimal_raw_value()/make_decimal_scalar()
+// (src/execution_gpu/cudf_adapter.cpp) would then silently narrow the
+// out-of-range scaled value into a 32-bit raw integer via an unchecked
+// static_cast, wrapping it to a huge negative number instead of failing.
+// `price` is DECIMAL(10,2) (max magnitude 99999999.99); this literal
+// overflows it by one order of magnitude.
+TEST(Binder, DecimalLiteralExceedingColumnPrecisionIsRejected) {
+  const auto stmt = sql::parse_sql("SELECT price FROM read_parquet('/x.parquet') WHERE price > 999999999.99");
+  EXPECT_THROW((void)(bind_query(stmt, priced_sales_schema())), BindingError);
+}
+
 TEST(Binder, DecimalColumnComparedAgainstNonLiteralColumnIsRejected) {
   // `amount` is a genuine FLOAT64 column, not a compile-time constant --
   // implicit DECIMAL promotion only retypes literals (see cast_if_needed),

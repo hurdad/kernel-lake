@@ -89,6 +89,11 @@ std::string BinaryExpression::to_string() const {
          right_->to_string() + ")";
 }
 
+std::string BinaryExpression::structural_key() const {
+  return "(" + left_->structural_key() + " " + std::string(kernellake::to_string(op_)) + " " +
+         right_->structural_key() + ")";
+}
+
 std::string_view to_string(UnaryOperator op) noexcept {
   switch (op) {
     case UnaryOperator::Not:
@@ -117,6 +122,20 @@ std::string UnaryExpression::to_string() const {
   return "?";
 }
 
+std::string UnaryExpression::structural_key() const {
+  switch (op_) {
+    case UnaryOperator::Not:
+      return "NOT (" + operand_->structural_key() + ")";
+    case UnaryOperator::Negate:
+      return "-" + operand_->structural_key();
+    case UnaryOperator::IsNull:
+      return operand_->structural_key() + " IS NULL";
+    case UnaryOperator::IsNotNull:
+      return operand_->structural_key() + " IS NOT NULL";
+  }
+  return "?";
+}
+
 std::string_view to_string(AggregateFunction function) noexcept {
   switch (function) {
     case AggregateFunction::Sum:
@@ -141,6 +160,18 @@ std::string AggregateExpression::to_string() const {
     out << "*";
   } else {
     out << argument_->to_string();
+  }
+  out << ")";
+  return out.str();
+}
+
+std::string AggregateExpression::structural_key() const {
+  std::ostringstream out;
+  out << kernellake::to_string(function_) << "(";
+  if (function_ == AggregateFunction::CountStar) {
+    out << "*";
+  } else {
+    out << argument_->structural_key();
   }
   out << ")";
   return out.str();

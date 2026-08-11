@@ -28,7 +28,7 @@ bool ConstantTimeEquals(std::string_view a, std::string_view b) {
 
 }  // namespace
 
-BearerTokenMiddlewareFactory::BearerTokenMiddlewareFactory(std::string token)
+BearerTokenMiddlewareFactory::BearerTokenMiddlewareFactory(const std::string& token)
     : expected_header_("Bearer " + token) {}
 
 arrow::Status BearerTokenMiddlewareFactory::StartCall(

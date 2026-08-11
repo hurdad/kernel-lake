@@ -317,6 +317,36 @@ TEST(Optimizer, IdentifiesPushablePredicatesForPruning) {
   EXPECT_EQ(scan->pushable_predicates()[1].column_name, "amount");
 }
 
+// Regression test: `amount` is FLOAT64, so the integer literal `0` in
+// `amount > 0` gets implicitly wrapped in a CastExpression by the binder to
+// match its type (promote_numeric/cast_if_needed in binder.cpp).
+// collect_pushable_predicates() used to store that still-CAST-wrapped
+// expression into PushablePredicate::literal despite unwrap_cast() already
+// having found the real LiteralExpression underneath -- violating that
+// field's documented "always a LiteralExpression" invariant. Both real
+// consumers (parquet_pruning.cpp, iceberg/partition_pruning.cpp)
+// dynamic_cast .literal to LiteralExpression and silently skip min/max
+// -stats pruning on a null result, with no error -- so this test asserts
+// on .literal's actual runtime type and value directly, which the older,
+// more general IdentifiesPushablePredicatesForPruning test above never did
+// (why this bug shipped unnoticed).
+TEST(Optimizer, PushablePredicateLiteralIsUnwrappedFromImplicitCast) {
+  auto plan = plan_for("SELECT region FROM read_parquet('/x.parquet') WHERE amount > 0", sales_schema());
+  plan = optimize(std::move(plan));
+
+  const LogicalScan* scan = find_scan(plan);
+  ASSERT_NE(scan, nullptr);
+  ASSERT_EQ(scan->pushable_predicates().size(), 1u);
+  const PushablePredicate& predicate = scan->pushable_predicates()[0];
+  EXPECT_EQ(predicate.column_name, "amount");
+
+  const auto* literal = dynamic_cast<const LiteralExpression*>(predicate.literal.get());
+  ASSERT_NE(literal, nullptr) << "literal is " << predicate.literal->to_string()
+                              << " -- still CAST-wrapped instead of unwrapped";
+  ASSERT_TRUE(std::holds_alternative<double>(literal->value()) ||
+              std::holds_alternative<std::int64_t>(literal->value()));
+}
+
 // Regression test for a real SF100 GPU OOM on TPC-H Q3: predicate pushdown
 // used to stop at a join (see push_predicate_through_join's own comment in
 // optimizer.cpp), so a WHERE clause referencing only one side of a

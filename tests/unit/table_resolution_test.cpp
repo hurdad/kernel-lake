@@ -2,6 +2,7 @@
 
 #include <arrow/api.h>
 #include <arrow/io/file.h>
+#include <fmt/format.h>
 #include <parquet/arrow/writer.h>
 
 #include <filesystem>
@@ -62,6 +63,30 @@ TEST_F(TableResolutionTest, PlainNonPartitionedDirectoryHasZeroPartitionColumns)
   EXPECT_EQ(resolved.schema.field(1).name, "amount");
   ASSERT_EQ(resolved.files.size(), 2u);
   EXPECT_TRUE(resolved.files[0].partition_values.empty());
+}
+
+// Regression test for the batched-concurrency fix in resolve_table():
+// metadata inspection used to launch one std::async per file with no cap
+// (risking RLIMIT_NPROC exhaustion for a table with many small files);
+// batching that into fixed-size chunks (kMaxConcurrentFileInspections = 64
+// in table_resolution.cpp) must still preserve exact per-file ordering and
+// correctness across a batch boundary -- this table has more files than
+// one batch holds, so metadata[i]/files[i] lockstep (assumed by the
+// partition-segment extraction right after) actually gets exercised across
+// two batches, not just within a single one.
+TEST_F(TableResolutionTest, ResolvesMoreFilesThanOneInspectionBatchHolds) {
+  constexpr int kFileCount = 130;  // > kMaxConcurrentFileInspections (64)
+  for (int i = 0; i < kFileCount; ++i) {
+    write_file(dir_ / fmt::format("part-{:03d}.parquet", i), i, 1);
+  }
+
+  const ResolvedTable resolved = resolve_table(store_, {dir_.string()});
+  ASSERT_EQ(resolved.files.size(), static_cast<std::size_t>(kFileCount));
+  std::int64_t total_rows = 0;
+  for (const ResolvedFile& file : resolved.files) {
+    total_rows += file.metadata.row_count;
+  }
+  EXPECT_EQ(total_rows, kFileCount);
 }
 
 TEST_F(TableResolutionTest, DetectsHivePartitionColumnWithStringType) {

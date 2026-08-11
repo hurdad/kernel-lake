@@ -86,8 +86,15 @@ class NvmeObjectCache {
  private:
   [[nodiscard]] std::string cache_file_name(const Uri& uri) const;
   void populate(const std::string& cache_path, RandomAccessObject& remote, std::uint64_t size_bytes);
-  void evict_if_over_budget();
-  [[nodiscard]] std::shared_ptr<std::mutex> lock_for(const std::string& cache_key);
+  // `protected_key` (the cache file name -- see cache_file_name() -- this
+  // populate()/get_or_populate() call is currently serving) is never
+  // evicted, even if it's the oldest/only candidate and the cache is over
+  // budget without it: the caller is about to open exactly this file, and
+  // evicting the entry a call is in the middle of serving defeats the
+  // point of populating it in the first place (see this method's own
+  // comment for the real bug that shipped before this parameter existed).
+  void evict_if_over_budget(const std::string& protected_key);
+  [[nodiscard]] std::shared_ptr<std::recursive_mutex> lock_for(const std::string& cache_key);
   // One-time scan of any cache entries already on disk at construction
   // time (a warm restart against a directory a previous process
   // populated) -- seeds current_bytes_/current_entries_ so they reflect
@@ -97,7 +104,21 @@ class NvmeObjectCache {
   CacheSection config_;
   LocalObjectStore cache_store_;
   std::mutex keys_mutex_;
-  std::unordered_map<std::string, std::shared_ptr<std::mutex>> key_locks_;
+  // recursive_mutex, not plain mutex: evict_if_over_budget() (see its own
+  // comment) try_locks each candidate entry's own key lock before removing
+  // it, including -- when populate() just ran over budget -- the very key
+  // get_or_populate() is already holding this lock for on the same thread's
+  // call stack; try_lock() on a plain mutex already held by this thread
+  // would report "busy" and wrongly skip evicting its own just-written
+  // entry.
+  std::unordered_map<std::string, std::shared_ptr<std::recursive_mutex>> key_locks_;
+  // Serializes evict_if_over_budget() sweeps against each other (only, not
+  // against get_or_populate()/populate() -- see that method's own comment
+  // for why it uses try_lock, never a blocking lock, on each candidate
+  // entry's own key lock instead of taking this mutex plus that one
+  // together, which is exactly the lock-order pattern that can deadlock
+  // two threads evicting each other's in-progress key).
+  std::mutex eviction_mutex_;
 
   // mutable: cached_info() is logically read-only (const) but still counts
   // toward the same hit counter get_or_populate() uses.

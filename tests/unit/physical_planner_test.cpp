@@ -145,6 +145,54 @@ TEST_F(PhysicalPlannerTest, AggregateArgumentUsesNarrowedColumnIndexWhenEarlierC
   EXPECT_EQ(argument_column->column_index(), 0u);
 }
 
+// Regression test: convert_scan() used to narrow ParquetScanNode::
+// partition_columns() to only the query's required partition columns, but
+// left every PhysicalFileFragment::partition_values at resolve_table()'s
+// full, unnarrowed per-file list -- silently breaking the positional-
+// parallel relationship PhysicalFileFragment's own doc comment documents.
+// This source is Hive-partitioned by two levels (pregion, then pyear); the
+// query below references only pyear, so pregion must be pruned from
+// *both* partition_columns() and partition_values, in lockstep, or
+// ParquetScanOperator would pair narrowed partition_columns()[0] ("pyear",
+// an int64) with the *unnarrowed* partition_values[0] (pregion's string
+// value) instead.
+TEST_F(PhysicalPlannerTest, PartitionValuesStayAlignedWithNarrowedPartitionColumns) {
+  const fs::path partition_a = dir_ / "partitioned" / "pregion=A" / "pyear=2024";
+  const fs::path partition_b = dir_ / "partitioned" / "pregion=B" / "pyear=2025";
+  fs::create_directories(partition_a);
+  fs::create_directories(partition_b);
+  write_two_row_group_file((partition_a / "part.parquet").string());
+  write_two_row_group_file((partition_b / "part.parquet").string());
+
+  const Schema schema_with_partitions({Field{"id", int64_type(false)}, Field{"amount", float64_type(false)},
+                                       Field{"region", string_type(false)},
+                                       Field{"pregion", string_type(false)},
+                                       Field{"pyear", int64_type(false)}});
+  const std::vector<PartitionColumn> partition_columns = {PartitionColumn{"pregion", string_type(false)},
+                                                          PartitionColumn{"pyear", int64_type(false)}};
+
+  const auto stmt =
+      sql::parse_sql("SELECT pyear FROM read_parquet('" + (dir_ / "partitioned").string() + "')");
+  const BoundQuery bound = bind_query(stmt, schema_with_partitions);
+  LogicalPlanPtr logical = build_logical_plan(bound, schema_with_partitions, partition_columns);
+  logical = optimize(std::move(logical));
+  const PhysicalPlanPtr plan = build_physical_plan(logical, store_);
+
+  const auto* scan = dynamic_cast<const ParquetScanNode*>(find_leaf(plan.get()));
+  ASSERT_NE(scan, nullptr);
+  ASSERT_EQ(scan->partition_columns().size(), 1u);
+  EXPECT_EQ(scan->partition_columns()[0].name, "pyear");
+
+  ASSERT_GE(scan->fragments().size(), 1u);
+  for (const PhysicalFileFragment& fragment : scan->fragments()) {
+    ASSERT_EQ(fragment.partition_values.size(), 1u);
+    ASSERT_TRUE(std::holds_alternative<std::int64_t>(fragment.partition_values[0]))
+        << "partition_values[0] should be pyear's int64 value, not still-unnarrowed pregion's string";
+    const std::int64_t year = std::get<std::int64_t>(fragment.partition_values[0]);
+    EXPECT_TRUE(year == 2024 || year == 2025);
+  }
+}
+
 TEST_F(PhysicalPlannerTest, PruningSkipsWholeRowGroupAtPhysicalLevel) {
   const PhysicalPlanPtr plan = plan_for("SELECT id FROM read_parquet('" + path_ + "') WHERE region = 'B'");
   const auto* scan = dynamic_cast<const ParquetScanNode*>(find_leaf(plan.get()));

@@ -24,6 +24,19 @@ namespace kernellake {
 // the smaller table on the right for best performance -- there is no
 // cost-based optimizer here to choose that automatically.
 //
+// No size cap, chunking, or spill on the build side: a join whose right
+// side is too large to fit fails cleanly with the RMM memory limiter's own
+// OutOfMemoryError (RmmEnvironment/query_memory_limit_bytes -- concatenate()
+// and every cudf allocation here goes through it, same as any other
+// operator), not a crash or silent wrong result, but it does still fail --
+// there is no fallback to a bounded/streaming/spilling join. Real, tracked
+// gap, not an oversight: see docs/ROADMAP.md's "HashJoinOperator streaming
+// gap" ("Not yet started" section) for the TPC-H Q12 SF100 OOM this was
+// found from, and the optimizer's own predicate-pushdown-through-join rule
+// (optimizer.cpp) for the one mitigation that does exist today -- shrinking
+// the build side via a single-sided WHERE predicate when the query happens
+// to have one, not a general fix.
+//
 // Every output batch's rows are the concatenation of a matching (left_row,
 // right_row) pair's columns, left columns first then right -- matching
 // LogicalJoin's/HashJoinNode's own schema concatenation convention, which

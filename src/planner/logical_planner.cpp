@@ -20,27 +20,31 @@ std::vector<LogicalSort::Key> to_sort_keys(const std::vector<BoundOrderByItem>& 
 }
 
 // Recursively rewrites `expr` for the post-aggregation LogicalProjection:
-// every subtree matching a GROUP BY key (by to_string() -- the same
-// convention `LogicalAggregate`'s alias-resolution already uses) becomes a
-// ColumnExpression at that key's position; every AggregateExpression
-// subtree becomes a ColumnExpression at its (deduplicated, so `SUM(x) /
-// SUM(x)` only computes it once) slot in `aggregates`, registered here the
-// first time it's seen; everything else is rebuilt with recursively
-// rewritten children. This is what makes a SELECT item that *combines*
-// multiple aggregates arithmetically (e.g. TPC-H Q14's `100.00 * SUM(CASE
-// WHEN ... THEN ... ELSE 0 END) / SUM(...)`, neither a bare aggregate call
-// nor a bare GROUP BY reference) work, not just a SELECT item that *is*
-// exactly one or the other -- found while adding Q14. A GROUP BY match is
-// checked before recursing, and short-circuits recursion entirely: this is
-// essential for `GROUP BY <alias>` resolving to a computed SELECT-list
-// expression (e.g. a CASE with no column name of its own -- see
-// binder.cpp), whose *own* internals (e.g. a column reference in the
-// CASE's condition) are deliberately exempted from the ungrouped-column
-// check at bind time specifically because the match happens at this whole
-// -subtree level, not by decomposing further.
+// every subtree matching a GROUP BY key (by structural_key() -- see that
+// method's own comment on expression.hpp for why this, not to_string(), is
+// the right identity check: to_string() collapses e.g. `a.x`/`b.x` from a
+// JOIN's two sides to the identical string "x") becomes a ColumnExpression
+// at that key's position; every AggregateExpression subtree becomes a
+// ColumnExpression at its (deduplicated, so `SUM(x) / SUM(x)` only computes
+// it once -- and, thanks to structural_key(), `SUM(a.amount) +
+// SUM(b.amount)` from a JOIN is correctly *not* deduplicated into one slot)
+// slot in `aggregates`, registered here the first time it's seen;
+// everything else is rebuilt with recursively rewritten children. This is
+// what makes a SELECT item that *combines* multiple aggregates
+// arithmetically (e.g. TPC-H Q14's `100.00 * SUM(CASE WHEN ... THEN ...
+// ELSE 0 END) / SUM(...)`, neither a bare aggregate call nor a bare GROUP
+// BY reference) work, not just a SELECT item that *is* exactly one or the
+// other -- found while adding Q14. A GROUP BY match is checked before
+// recursing, and short-circuits recursion entirely: this is essential for
+// `GROUP BY <alias>` resolving to a computed SELECT-list expression (e.g. a
+// CASE with no column name of its own -- see binder.cpp), whose *own*
+// internals (e.g. a column reference in the CASE's condition) are
+// deliberately exempted from the ungrouped-column check at bind time
+// specifically because the match happens at this whole-subtree level, not
+// by decomposing further.
 //
 // Registers `expr` as a LogicalAggregate output slot (or reuses the
-// existing one if this exact aggregate, by to_string(), was already
+// existing one if this exact aggregate, by structural_key(), was already
 // registered -- so `SUM(x) / SUM(x)` only computes it once): whichever
 // name is passed in the *first* time a given aggregate is registered is
 // the one that sticks for its `aggregates`/output-schema field, since a
@@ -53,7 +57,7 @@ std::vector<LogicalSort::Key> to_sort_keys(const std::vector<BoundOrderByItem>& 
 std::size_t register_aggregate(const ExpressionPtr& expr, const std::string& name,
                                std::vector<NamedExpression>& aggregates,
                                std::unordered_map<std::string, std::size_t>& aggregate_positions) {
-  const std::string key = expr->to_string();
+  const std::string key = expr->structural_key();
   if (const auto it = aggregate_positions.find(key); it != aggregate_positions.end()) {
     return it->second;
   }
@@ -68,13 +72,22 @@ std::size_t register_aggregate(const ExpressionPtr& expr, const std::string& nam
 // or an ungrouped column reference -- the latter already rejected earlier,
 // at bind time, by references_ungrouped_column() (see binder.cpp), so it
 // cannot actually occur for a query that bound successfully.
+//
+// `group_by` (the same NamedExpression list finish_logical_plan() below
+// builds, giving each GROUP BY key its own display name) is threaded
+// through purely so the ColumnExpression returned on a GROUP BY match
+// below can carry that name -- group_by_positions itself is keyed by
+// structural_key(), which is not a fit display name (e.g. "#3" for a plain
+// column reference).
 ExpressionPtr rewrite_aggregate_refs(const ExpressionPtr& expr, std::vector<NamedExpression>& aggregates,
                                      std::unordered_map<std::string, std::size_t>& aggregate_positions,
+                                     const std::vector<NamedExpression>& group_by,
                                      const std::unordered_map<std::string, std::size_t>& group_by_positions,
                                      std::size_t group_by_count) {
-  const std::string key = expr->to_string();
+  const std::string key = expr->structural_key();
   if (const auto group_it = group_by_positions.find(key); group_it != group_by_positions.end()) {
-    return std::make_shared<ColumnExpression>(key, group_it->second, expr->result_type());
+    return std::make_shared<ColumnExpression>(group_by[group_it->second].name, group_it->second,
+                                              expr->result_type());
   }
   if (dynamic_cast<const AggregateExpression*>(expr.get()) != nullptr) {
     const std::size_t position = register_aggregate(
@@ -85,37 +98,37 @@ ExpressionPtr rewrite_aggregate_refs(const ExpressionPtr& expr, std::vector<Name
   if (const auto* binary = dynamic_cast<const BinaryExpression*>(expr.get())) {
     return std::make_shared<BinaryExpression>(
         binary->op(),
-        rewrite_aggregate_refs(binary->left(), aggregates, aggregate_positions, group_by_positions,
+        rewrite_aggregate_refs(binary->left(), aggregates, aggregate_positions, group_by, group_by_positions,
                                group_by_count),
-        rewrite_aggregate_refs(binary->right(), aggregates, aggregate_positions, group_by_positions,
+        rewrite_aggregate_refs(binary->right(), aggregates, aggregate_positions, group_by, group_by_positions,
                                group_by_count),
         binary->result_type());
   }
   if (const auto* unary = dynamic_cast<const UnaryExpression*>(expr.get())) {
     return std::make_shared<UnaryExpression>(
         unary->op(),
-        rewrite_aggregate_refs(unary->operand(), aggregates, aggregate_positions, group_by_positions,
-                               group_by_count),
+        rewrite_aggregate_refs(unary->operand(), aggregates, aggregate_positions, group_by,
+                               group_by_positions, group_by_count),
         unary->result_type());
   }
   if (const auto* cast = dynamic_cast<const CastExpression*>(expr.get())) {
     return std::make_shared<CastExpression>(
-        rewrite_aggregate_refs(cast->operand(), aggregates, aggregate_positions, group_by_positions,
+        rewrite_aggregate_refs(cast->operand(), aggregates, aggregate_positions, group_by, group_by_positions,
                                group_by_count),
         cast->result_type());
   }
   if (const auto* between = dynamic_cast<const BetweenExpression*>(expr.get())) {
     return std::make_shared<BetweenExpression>(
-        rewrite_aggregate_refs(between->value(), aggregates, aggregate_positions, group_by_positions,
-                               group_by_count),
-        rewrite_aggregate_refs(between->lower(), aggregates, aggregate_positions, group_by_positions,
-                               group_by_count),
-        rewrite_aggregate_refs(between->upper(), aggregates, aggregate_positions, group_by_positions,
-                               group_by_count));
+        rewrite_aggregate_refs(between->value(), aggregates, aggregate_positions, group_by,
+                               group_by_positions, group_by_count),
+        rewrite_aggregate_refs(between->lower(), aggregates, aggregate_positions, group_by,
+                               group_by_positions, group_by_count),
+        rewrite_aggregate_refs(between->upper(), aggregates, aggregate_positions, group_by,
+                               group_by_positions, group_by_count));
   }
   if (const auto* like = dynamic_cast<const LikeExpression*>(expr.get())) {
     return std::make_shared<LikeExpression>(
-        rewrite_aggregate_refs(like->value(), aggregates, aggregate_positions, group_by_positions,
+        rewrite_aggregate_refs(like->value(), aggregates, aggregate_positions, group_by, group_by_positions,
                                group_by_count),
         like->pattern(), like->negated());
   }
@@ -125,13 +138,13 @@ ExpressionPtr rewrite_aggregate_refs(const ExpressionPtr& expr, std::vector<Name
     for (const CaseExpression::WhenThen& branch : case_expr->when_then()) {
       when_then.push_back(
           CaseExpression::WhenThen{rewrite_aggregate_refs(branch.condition, aggregates, aggregate_positions,
-                                                          group_by_positions, group_by_count),
+                                                          group_by, group_by_positions, group_by_count),
                                    rewrite_aggregate_refs(branch.result, aggregates, aggregate_positions,
-                                                          group_by_positions, group_by_count)});
+                                                          group_by, group_by_positions, group_by_count)});
     }
     ExpressionPtr else_branch =
         case_expr->else_branch() != nullptr
-            ? rewrite_aggregate_refs(case_expr->else_branch(), aggregates, aggregate_positions,
+            ? rewrite_aggregate_refs(case_expr->else_branch(), aggregates, aggregate_positions, group_by,
                                      group_by_positions, group_by_count)
             : nullptr;
     return std::make_shared<CaseExpression>(std::move(when_then), std::move(else_branch),
@@ -163,7 +176,10 @@ LogicalPlanPtr finish_logical_plan(LogicalPlanPtr plan, const BoundQuery& query)
     std::vector<NamedExpression> group_by;
     std::unordered_map<std::string, std::size_t> group_by_positions;
     for (const ExpressionPtr& expr : query.group_by) {
-      group_by_positions[expr->to_string()] = group_by.size();
+      // Keyed by structural_key(), not to_string() -- see that method's own
+      // comment: two different GROUP BY columns from opposite JOIN sides
+      // sharing a bare name (`GROUP BY a.x, b.x`) must not collide here.
+      group_by_positions[expr->structural_key()] = group_by.size();
       group_by.push_back(NamedExpression{expr, expr->to_string()});
     }
 
@@ -192,7 +208,7 @@ LogicalPlanPtr finish_logical_plan(LogicalPlanPtr plan, const BoundQuery& query)
             aggregates[position].name, group_by.size() + position, item.expr->result_type()));
         continue;
       }
-      rewritten_items.push_back(rewrite_aggregate_refs(item.expr, aggregates, aggregate_positions,
+      rewritten_items.push_back(rewrite_aggregate_refs(item.expr, aggregates, aggregate_positions, group_by,
                                                        group_by_positions, group_by.size()));
     }
 

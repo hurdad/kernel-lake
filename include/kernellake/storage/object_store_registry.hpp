@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include <mutex>
 #include <optional>
 
 #include "kernellake/common/config.hpp"
@@ -90,6 +91,16 @@ class ObjectStoreRegistry final : public ObjectStore {
   std::unique_ptr<ObjectStore> gcs_;
   std::unique_ptr<ObjectStore> azure_;
   std::unique_ptr<ObjectStore> hdfs_;
+  // Guards each backend's lazy construction in backend_for() (see that
+  // method's own comment) -- QueryEngine's own `store_` member is one
+  // instance shared across every concurrent Flight SQL RPC handled by
+  // kernellake-server, so two callers racing to touch the same
+  // not-yet-constructed backend for the first time is a real, reachable
+  // case, not hypothetical.
+  std::once_flag s3_once_;
+  std::once_flag gcs_once_;
+  std::once_flag azure_once_;
+  std::once_flag hdfs_once_;
   std::optional<NvmeObjectCache> cache_;
 };
 

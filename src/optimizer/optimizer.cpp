@@ -312,12 +312,22 @@ void collect_columns(const ExpressionPtr& expr, std::unordered_set<std::size_t>&
 
 // Unwraps CastExpression to find the underlying column/literal, for
 // predicate-pushdown pattern matching (`CAST(col AS T) OP literal` still
-// counts as a pushable comparison on `col`).
-const Expression* unwrap_cast(const Expression* expr) {
-  while (const auto* cast = dynamic_cast<const CastExpression*>(expr)) {
-    expr = cast->operand().get();
-  }
-  return expr;
+// counts as a pushable comparison on `col`). Returns the actual
+// ExpressionPtr (not just a raw observer pointer into it) specifically so
+// collect_pushable_predicates() below can store *this* -- the real
+// unwrapped literal -- into PushablePredicate::literal, which is
+// documented to always be a LiteralExpression: storing the original,
+// still-CAST-wrapped expression there instead (an earlier version of this
+// function returned only `const Expression*`, tempting exactly that bug)
+// breaks that invariant, silently defeating min/max-stats pruning for any
+// comparison the binder implicitly wrapped in a CAST (e.g. `WHERE
+// float_col > 100`, where the integer literal gets cast to match
+// float_col's type) -- both pruning consumers (parquet_pruning.cpp,
+// iceberg/partition_pruning.cpp) dynamic_cast this to LiteralExpression
+// and silently skip pruning on a null result, with no error.
+ExpressionPtr unwrap_cast(const ExpressionPtr& expr) {
+  const auto* cast = dynamic_cast<const CastExpression*>(expr.get());
+  return cast != nullptr ? unwrap_cast(cast->operand()) : expr;
 }
 
 BinaryOperator flip(BinaryOperator op) {
@@ -350,17 +360,17 @@ void collect_pushable_predicates(const ExpressionPtr& predicate, std::vector<Pus
     return;
   }
 
-  const Expression* left = unwrap_cast(binary->left().get());
-  const Expression* right = unwrap_cast(binary->right().get());
-  const auto* left_col = dynamic_cast<const ColumnExpression*>(left);
-  const auto* right_col = dynamic_cast<const ColumnExpression*>(right);
-  const auto* left_lit = dynamic_cast<const LiteralExpression*>(left);
-  const auto* right_lit = dynamic_cast<const LiteralExpression*>(right);
+  const ExpressionPtr left = unwrap_cast(binary->left());
+  const ExpressionPtr right = unwrap_cast(binary->right());
+  const auto* left_col = dynamic_cast<const ColumnExpression*>(left.get());
+  const auto* right_col = dynamic_cast<const ColumnExpression*>(right.get());
+  const auto* left_lit = dynamic_cast<const LiteralExpression*>(left.get());
+  const auto* right_lit = dynamic_cast<const LiteralExpression*>(right.get());
 
   if (left_col != nullptr && right_lit != nullptr) {
-    out.push_back(PushablePredicate{left_col->name(), binary->op(), binary->right()});
+    out.push_back(PushablePredicate{left_col->name(), binary->op(), right});
   } else if (right_col != nullptr && left_lit != nullptr) {
-    out.push_back(PushablePredicate{right_col->name(), flip(binary->op()), binary->left()});
+    out.push_back(PushablePredicate{right_col->name(), flip(binary->op()), left});
   }
 }
 

@@ -520,8 +520,7 @@ void validate_config(const EngineConfig& config) {
   if (config.server.max_pending_results == 0) {
     throw ConfigurationError("server.max_pending_results must be > 0");
   }
-  if (config.server.use_tls &&
-      (config.server.tls_cert_path.empty() || config.server.tls_key_path.empty())) {
+  if (config.server.use_tls && (config.server.tls_cert_path.empty() || config.server.tls_key_path.empty())) {
     throw ConfigurationError(
         "server.tls_cert_path and server.tls_key_path must both be set when server.use_tls is true");
   }

@@ -16,7 +16,7 @@ namespace kernellake {
 // needs no changes for this to take effect.
 class BearerTokenMiddlewareFactory : public arrow::flight::ServerMiddlewareFactory {
  public:
-  explicit BearerTokenMiddlewareFactory(std::string token);
+  explicit BearerTokenMiddlewareFactory(const std::string& token);
 
   arrow::Status StartCall(const arrow::flight::CallInfo& info,
                           const arrow::flight::ServerCallContext& context,

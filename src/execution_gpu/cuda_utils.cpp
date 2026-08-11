@@ -1,6 +1,7 @@
 #include "kernellake/execution_gpu/cuda_utils.hpp"
 
 #include <fmt/format.h>
+#include <spdlog/spdlog.h>
 
 #include <string>
 #include <utility>
@@ -21,7 +22,18 @@ CudaDeviceGuard::CudaDeviceGuard(int device_id) {
 }
 
 CudaDeviceGuard::~CudaDeviceGuard() {
-  cudaSetDevice(previous_device_id_);
+  // Unlike every other CUDA call in this file, this one can't route through
+  // check_cuda() (a destructor is implicitly noexcept, so a throw here
+  // would call std::terminate()) -- but silently discarding the error, as
+  // an earlier version of this destructor did, let a failed device restore
+  // pass with no signal at all: a later CUDA call made without its own
+  // explicit device selection could then silently run against the wrong
+  // physical GPU on a multi-GPU host. Logged instead.
+  const cudaError_t status = cudaSetDevice(previous_device_id_);
+  if (status != cudaSuccess) {
+    spdlog::warn("CudaDeviceGuard: cudaSetDevice({}) failed while restoring the previous device: {}",
+                 previous_device_id_, cudaGetErrorString(status));
+  }
 }
 
 // Deliberately plain cudaStreamCreate() (a "blocking" stream, in CUDA's

@@ -3,6 +3,7 @@
 #include <fmt/format.h>
 
 #include <algorithm>
+#include <cmath>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -181,6 +182,35 @@ ExpressionPtr cast_if_needed(ExpressionPtr expr, const DataType& target) {
     // operator for (no CAST_TO_DECIMAL*) -- fails clearly instead of being
     // silently misevaluated. See docs/ARCHITECTURE.md.
     if (const auto* literal = dynamic_cast<const LiteralExpression*>(expr.get())) {
+      // Verify the literal's magnitude actually fits DECIMAL(precision,
+      // scale) before retyping in place. decimal_raw_value()
+      // (src/execution_gpu/cudf_adapter.cpp, GPU execution) scales this
+      // same value by 10^scale and narrows it into a fixed-width (32/64
+      // -bit) cudf raw integer with no range check of its own -- an
+      // out-of-range value here would otherwise silently wrap there
+      // instead of failing clearly at bind time, where the mistake is
+      // obvious (e.g. `WHERE price > 21474836.48` against a DECIMAL(5,2)
+      // column).
+      if (!literal->is_null()) {
+        const double magnitude = std::visit(
+            [](const auto& v) -> double {
+              using T = std::decay_t<decltype(v)>;
+              if constexpr (std::is_same_v<T, std::int64_t>) {
+                return static_cast<double>(v);
+              } else if constexpr (std::is_same_v<T, double>) {
+                return v;
+              } else {
+                return 0.0;
+              }
+            },
+            literal->value());
+        const double scaled_magnitude = std::abs(magnitude) * std::pow(10.0, *target.scale);
+        const double max_raw = std::pow(10.0, *target.precision) - 1.0;
+        if (scaled_magnitude > max_raw) {
+          throw BindingError(fmt::format("numeric literal does not fit in DECIMAL({}, {})", *target.precision,
+                                         *target.scale));
+        }
+      }
       return std::make_shared<LiteralExpression>(literal->value(), target);
     }
     throw BindingError(
@@ -225,57 +255,60 @@ bool contains_aggregate(const AstExprPtr& expr) {
       expr->node);
 }
 
-// Returns true if `expr` (a SELECT-list item in an aggregate query) refers
-// to a source column that is neither wrapped in an aggregate nor listed in
-// GROUP BY.
-bool references_ungrouped_column(const AstExprPtr& expr, const std::vector<std::string>& group_by,
+// Returns true if `expr` (a SELECT-list item in an aggregate query, already
+// bound) refers to a source column that is neither wrapped in an aggregate
+// nor listed in GROUP BY. Walks the *bound* Expression tree (unlike
+// contains_aggregate() above, which walks the raw pre-bind AST) so matching
+// against `group_by_keys` can use ColumnExpression::structural_key() --
+// which encodes the binder-resolved column_index() -- instead of a bare
+// column name: a bare-name check would wrongly treat `GROUP BY a.x` as
+// covering an ungrouped `SELECT b.x` whenever both JOIN sides happen to have
+// a column named `x`. See structural_key()'s own comment on expression.hpp
+// for why to_string() can't be used for this instead.
+bool references_ungrouped_column(const ExpressionPtr& expr,
+                                 const std::unordered_set<std::string>& group_by_keys,
                                  bool inside_aggregate) {
-  return std::visit(
-      [&](const auto& node) -> bool {
-        using T = std::decay_t<decltype(node)>;
-        if constexpr (std::is_same_v<T, AstColumnRef>) {
-          if (inside_aggregate) {
-            return false;
-          }
-          return std::find(group_by.begin(), group_by.end(), node.name) == group_by.end();
-        } else if constexpr (std::is_same_v<T, AstBinary>) {
-          return references_ungrouped_column(node.left, group_by, inside_aggregate) ||
-                 references_ungrouped_column(node.right, group_by, inside_aggregate);
-        } else if constexpr (std::is_same_v<T, AstUnary> || std::is_same_v<T, AstCast>) {
-          return references_ungrouped_column(node.operand, group_by, inside_aggregate);
-        } else if constexpr (std::is_same_v<T, AstBetween>) {
-          return references_ungrouped_column(node.value, group_by, inside_aggregate) ||
-                 references_ungrouped_column(node.lower, group_by, inside_aggregate) ||
-                 references_ungrouped_column(node.upper, group_by, inside_aggregate);
-        } else if constexpr (std::is_same_v<T, AstAggregate>) {
-          if (node.argument == nullptr) {
-            return false;
-          }
-          return references_ungrouped_column(node.argument, group_by, true);
-        } else if constexpr (std::is_same_v<T, AstLike>) {
-          return references_ungrouped_column(node.value, group_by, inside_aggregate) ||
-                 references_ungrouped_column(node.pattern, group_by, inside_aggregate);
-        } else if constexpr (std::is_same_v<T, AstIn>) {
-          if (references_ungrouped_column(node.value, group_by, inside_aggregate)) {
-            return true;
-          }
-          return std::any_of(node.list.begin(), node.list.end(), [&](const AstExprPtr& item) {
-            return references_ungrouped_column(item, group_by, inside_aggregate);
-          });
-        } else if constexpr (std::is_same_v<T, AstCase>) {
-          for (const auto& [condition, result] : node.when_then) {
-            if (references_ungrouped_column(condition, group_by, inside_aggregate) ||
-                references_ungrouped_column(result, group_by, inside_aggregate)) {
-              return true;
-            }
-          }
-          return node.else_branch != nullptr &&
-                 references_ungrouped_column(node.else_branch, group_by, inside_aggregate);
-        } else {
-          return false;
-        }
-      },
-      expr->node);
+  if (const auto* column = dynamic_cast<const ColumnExpression*>(expr.get())) {
+    if (inside_aggregate) {
+      return false;
+    }
+    return group_by_keys.find(column->structural_key()) == group_by_keys.end();
+  }
+  if (const auto* aggregate = dynamic_cast<const AggregateExpression*>(expr.get())) {
+    return aggregate->argument() != nullptr &&
+           references_ungrouped_column(aggregate->argument(), group_by_keys, true);
+  }
+  if (const auto* binary = dynamic_cast<const BinaryExpression*>(expr.get())) {
+    return references_ungrouped_column(binary->left(), group_by_keys, inside_aggregate) ||
+           references_ungrouped_column(binary->right(), group_by_keys, inside_aggregate);
+  }
+  if (const auto* unary = dynamic_cast<const UnaryExpression*>(expr.get())) {
+    return references_ungrouped_column(unary->operand(), group_by_keys, inside_aggregate);
+  }
+  if (const auto* cast = dynamic_cast<const CastExpression*>(expr.get())) {
+    return references_ungrouped_column(cast->operand(), group_by_keys, inside_aggregate);
+  }
+  if (const auto* between = dynamic_cast<const BetweenExpression*>(expr.get())) {
+    return references_ungrouped_column(between->value(), group_by_keys, inside_aggregate) ||
+           references_ungrouped_column(between->lower(), group_by_keys, inside_aggregate) ||
+           references_ungrouped_column(between->upper(), group_by_keys, inside_aggregate);
+  }
+  if (const auto* like = dynamic_cast<const LikeExpression*>(expr.get())) {
+    return references_ungrouped_column(like->value(), group_by_keys, inside_aggregate);
+  }
+  if (const auto* case_expr = dynamic_cast<const CaseExpression*>(expr.get())) {
+    for (const CaseExpression::WhenThen& branch : case_expr->when_then()) {
+      if (references_ungrouped_column(branch.condition, group_by_keys, inside_aggregate) ||
+          references_ungrouped_column(branch.result, group_by_keys, inside_aggregate)) {
+        return true;
+      }
+    }
+    return case_expr->else_branch() != nullptr &&
+           references_ungrouped_column(case_expr->else_branch(), group_by_keys, inside_aggregate);
+  }
+  return false;  // LiteralExpression: no column reference. AstIn is already
+                 // expanded into Binary/Unary nodes by bind time (see
+                 // bind_node(const AstIn&, ...)), so it needs no case here.
 }
 
 // Binds against either one schema (the MVP single-table shape) or two named
@@ -837,18 +870,18 @@ BoundQuery bind_query_common(const sql::AstSelectStatement& stmt, Binder& binder
   // how most SQL engines resolve this ambiguity) and falls back to a
   // SELECT-list alias -- the only way to GROUP BY a computed expression
   // like a CASE, since it has no column name of its own to repeat.
-  std::vector<std::string> group_by_names;
+  //
+  // Keyed by each bound GROUP BY expression's structural_key() (not a bare
+  // AstColumnRef::name) so the ungrouped-column check below correctly
+  // distinguishes `a.x` from `b.x` after a JOIN -- see
+  // references_ungrouped_column()'s own comment.
+  std::unordered_set<std::string> group_by_keys;
   // The SELECT item that *defines* an alias-referenced GROUP BY key (e.g.
   // the CASE itself in `... AS bucket ... GROUP BY bucket`) is exempt from
   // the ungrouped-column check below: it likely references raw columns
   // (e.g. `amount` inside the CASE) that aren't individually listed in
-  // group_by_names, but the expression *as a whole* is exactly what's
-  // being grouped on, which is what actually matters.
-  // Note for JOIN queries: `group_by_names`/the ungrouped-column check below
-  // match by bare name only, not by table qualifier -- grouping by `a.x`
-  // while separately selecting an ungrouped `b.x` (same bare name, opposite
-  // side) would not be flagged. A narrow, pre-existing limitation of this
-  // name-based check, not something JOIN support specifically introduces.
+  // group_by_keys, but the expression *as a whole* is exactly what's being
+  // grouped on, which is what actually matters.
   std::unordered_set<std::size_t> select_indices_used_as_group_by_alias;
   for (const AstExprPtr& item : stmt.group_by) {
     const AstColumnRef& ref = std::get<AstColumnRef>(item->node);
@@ -865,7 +898,7 @@ BoundQuery bind_query_common(const sql::AstSelectStatement& stmt, Binder& binder
     } else {
       throw BindingError(fmt::format("unknown column '{}' in GROUP BY", ref.name));
     }
-    group_by_names.push_back(ref.name);
+    group_by_keys.insert(result.group_by.back()->structural_key());
   }
 
   if (is_aggregate_query) {
@@ -877,7 +910,8 @@ BoundQuery bind_query_common(const sql::AstSelectStatement& stmt, Binder& binder
       if (select_indices_used_as_group_by_alias.count(i) != 0) {
         continue;
       }
-      if (references_ungrouped_column(item, group_by_names, /*inside_aggregate=*/false)) {
+      if (references_ungrouped_column(result.select_list[i].expr, group_by_keys,
+                                      /*inside_aggregate=*/false)) {
         throw BindingError(
             "column referenced in SELECT list must appear in GROUP BY or be used inside an "
             "aggregate function");

@@ -52,11 +52,11 @@ std::string NvmeObjectCache::cache_file_name(const Uri& uri) const {
   return fmt::format("{:016x}{}", fnv1a_64(uri.value()), kCacheFileExtension);
 }
 
-std::shared_ptr<std::mutex> NvmeObjectCache::lock_for(const std::string& cache_key) {
+std::shared_ptr<std::recursive_mutex> NvmeObjectCache::lock_for(const std::string& cache_key) {
   std::lock_guard<std::mutex> guard(keys_mutex_);
-  std::shared_ptr<std::mutex>& slot = key_locks_[cache_key];
+  std::shared_ptr<std::recursive_mutex>& slot = key_locks_[cache_key];
   if (!slot) {
-    slot = std::make_shared<std::mutex>();
+    slot = std::make_shared<std::recursive_mutex>();
   }
   return slot;
 }
@@ -68,9 +68,14 @@ std::unique_ptr<RandomAccessObject> NvmeObjectCache::get_or_populate(const Uri& 
   // Serializes population of *this* key only -- an unrelated key's miss
   // proceeds concurrently. key_locks_ grows by one small entry per distinct
   // object ever cached and is never pruned; acceptable for the working-set
-  // sizes this cache targets (see docs/ARCHITECTURE.md).
-  const std::shared_ptr<std::mutex> key_lock = lock_for(file_name);
-  const std::lock_guard<std::mutex> populate_guard(*key_lock);
+  // sizes this cache targets (see docs/ARCHITECTURE.md). Held across the
+  // fs::exists() check *and* the final cache_store_.open() below (not just
+  // the populate() call in between) so evict_if_over_budget() -- which
+  // takes this same per-key lock for every entry it's about to remove, see
+  // its own comment -- can never delete this key's file out from under a
+  // reader that already found it via fs::exists() but hasn't opened it yet.
+  const std::shared_ptr<std::recursive_mutex> key_lock = lock_for(file_name);
+  const std::lock_guard<std::recursive_mutex> populate_guard(*key_lock);
 
   std::error_code exists_ec;
   if (!fs::exists(cache_path, exists_ec)) {
@@ -200,13 +205,20 @@ void NvmeObjectCache::populate(const std::string& cache_path, RandomAccessObject
   current_bytes_.fetch_add(static_cast<std::uint64_t>(offset), std::memory_order_relaxed);
   current_entries_.fetch_add(1, std::memory_order_relaxed);
 
-  evict_if_over_budget();
+  evict_if_over_budget(fs::path(cache_path).filename().string());
 }
 
-void NvmeObjectCache::evict_if_over_budget() {
+void NvmeObjectCache::evict_if_over_budget(const std::string& protected_key) {
   if (config_.max_size_bytes == 0) {
     return;  // 0 == unbounded, matches this project's existing convention.
   }
+  // Serializes eviction sweeps against each other (only -- every per-key
+  // lock taken below is a non-blocking try_lock, see that loop's own
+  // comment, so this can never combine with one to deadlock). Without
+  // this, two concurrent sweeps could each read a stale current_bytes_/
+  // directory snapshot and independently decide to remove overlapping
+  // entries, double-subtracting from current_bytes_/current_entries_.
+  const std::lock_guard<std::mutex> eviction_guard(eviction_mutex_);
   // Common case: current_bytes_ (maintained incrementally by populate()/
   // eviction itself, seeded from disk at construction) is already known to
   // be under budget, so no directory walk is needed at all. This can drift
@@ -251,10 +263,45 @@ void NvmeObjectCache::evict_if_over_budget() {
   // Unlinking a file a concurrent reader still has open is safe on POSIX:
   // the inode stays valid (and readable) until every open file descriptor
   // against it is closed, only the directory entry disappears -- an
-  // in-flight query reading an evicted entry is never disrupted.
+  // in-flight query reading an evicted entry is never disrupted. What isn't
+  // safe without the per-key try_lock below is deleting a file a concurrent
+  // get_or_populate() call has already found via fs::exists() but hasn't
+  // opened yet -- a bare fs::remove() here raced that window and turned a
+  // transparent cache hit into a spurious StorageError.
+  //
+  // try_lock, deliberately never a blocking lock: two threads evicting
+  // concurrently (thread A populating key X, sweeping into key Y; thread B
+  // populating key Y, sweeping into key X) could otherwise each block
+  // forever waiting for the other's key lock -- a real deadlock hit by an
+  // earlier version of this fix under exactly this pattern. A busy entry
+  // (try_lock fails) is simply left alone this round rather than waited
+  // for; a later populate()'s eviction sweep will pick it up once
+  // whatever's using it finishes. (The lock is still a recursive_mutex as
+  // a defensive backstop against any other same-thread reentry, even
+  // though `protected_key` below is what actually keeps this call from
+  // ever trying to lock/remove its own in-flight entry in the first
+  // place.)
   for (const Entry& entry : entries) {
     if (total <= config_.max_size_bytes) {
       break;
+    }
+    const std::string entry_key = entry.path.filename().string();
+    if (entry_key == protected_key) {
+      // Never evict the entry this call is about to open and return --
+      // see this method's own doc comment (evict_if_over_budget()'s
+      // declaration in the header) for the real bug that shipped before
+      // this check existed: a single object whose size alone exceeds
+      // max_size_bytes would get written, then immediately evicted by
+      // this same sweep, then fail to open with a bare StorageError.
+      // Leaving it means the cache can transiently sit one entry over
+      // budget until the *next* populate() call's sweep gets a fair shot
+      // at it (by which point it's no longer anyone's protected key).
+      continue;
+    }
+    const std::shared_ptr<std::recursive_mutex> entry_lock = lock_for(entry_key);
+    std::unique_lock<std::recursive_mutex> entry_guard(*entry_lock, std::try_to_lock);
+    if (!entry_guard.owns_lock()) {
+      continue;
     }
     std::error_code remove_ec;
     if (fs::remove(entry.path, remove_ec) && !remove_ec) {

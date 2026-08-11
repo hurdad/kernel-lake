@@ -173,16 +173,39 @@ ResolvedTable resolve_table(ObjectStore& store, const std::vector<std::string>& 
   // future here targets a different, independent file. Order preserved
   // (metadata[i] corresponds to files[i]) since callers below (partition
   // segment extraction) assume that lockstep.
-  std::vector<std::future<FileMetadata>> metadata_futures;
-  metadata_futures.reserve(files.size());
-  for (const ObjectInfo& file : files) {
-    metadata_futures.push_back(std::async(
-        std::launch::async, [&store, uri = file.uri] { return inspect_parquet_file(store, uri); }));
-  }
+  //
+  // Processed in fixed-size batches, not one giant std::async-per-file
+  // burst: a table accumulated over time with several thousand small
+  // files (unlike SF100's own 120 files/table, which never exercised
+  // this) would otherwise spawn that many OS threads at once, risking
+  // RLIMIT_NPROC exhaustion and a thundering-herd burst against one
+  // object-store prefix. Each batch is fully awaited (the future.get()
+  // loop below) before the next batch's std::async calls are even made,
+  // so at most kMaxConcurrentFileInspections OS threads for this purpose
+  // exist at any one time -- no separate thread-pool abstraction needed.
+  // Higher than a typical core-count-based cap on purpose: this work is
+  // network-round-trip-bound, not CPU-bound (same reasoning as using
+  // threads here at all), so a larger number of concurrently in-flight
+  // requests is still a real win. This also bounds how long an early
+  // file's exception can stay masked by std::async's own "futures block
+  // on destruction" behavior -- at most one batch's worth of in-flight
+  // work now, not the entire file set's.
+  constexpr std::size_t kMaxConcurrentFileInspections = 64;
   std::vector<FileMetadata> metadata;
   metadata.reserve(files.size());
-  for (std::future<FileMetadata>& future : metadata_futures) {
-    metadata.push_back(future.get());
+  for (std::size_t batch_start = 0; batch_start < files.size();
+       batch_start += kMaxConcurrentFileInspections) {
+    const std::size_t batch_end = std::min(batch_start + kMaxConcurrentFileInspections, files.size());
+    std::vector<std::future<FileMetadata>> metadata_futures;
+    metadata_futures.reserve(batch_end - batch_start);
+    for (std::size_t i = batch_start; i < batch_end; ++i) {
+      const ObjectInfo& file = files[i];
+      metadata_futures.push_back(std::async(
+          std::launch::async, [&store, uri = file.uri] { return inspect_parquet_file(store, uri); }));
+    }
+    for (std::future<FileMetadata>& future : metadata_futures) {
+      metadata.push_back(future.get());
+    }
   }
   validate_schema_compatibility(metadata);
 

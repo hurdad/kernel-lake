@@ -1,6 +1,7 @@
 #include "kernellake/execution_gpu/cudf_adapter.hpp"
 
 #include <cmath>
+#include <limits>
 
 #include "kernellake/common/errors.hpp"
 
@@ -85,11 +86,24 @@ std::unique_ptr<cudf::scalar> make_decimal_scalar(const DataType& type, const Li
                                                   bool is_valid) {
   const DecimalRawValue raw_value = decimal_raw_value(type, value);
   const numeric::scale_type scale{raw_value.cudf_scale};
+  // binder.cpp's cast_if_needed() already rejects an out-of-range literal
+  // at bind time (the normal path here), but this is the last point before
+  // an unchecked narrowing static_cast would otherwise silently wrap a
+  // too-large raw value instead of failing -- kept as defense-in-depth for
+  // any DECIMAL literal construction path that bypasses that check.
   switch (raw_value.type_id) {
     case cudf::type_id::DECIMAL32:
+      if (raw_value.raw < std::numeric_limits<std::int32_t>::min() ||
+          raw_value.raw > std::numeric_limits<std::int32_t>::max()) {
+        throw PlanningError("DECIMAL literal value out of range for its declared precision (internal error)");
+      }
       return std::make_unique<cudf::fixed_point_scalar<numeric::decimal32>>(
           static_cast<std::int32_t>(raw_value.raw), scale, is_valid);
     case cudf::type_id::DECIMAL64:
+      if (raw_value.raw < std::numeric_limits<std::int64_t>::min() ||
+          raw_value.raw > std::numeric_limits<std::int64_t>::max()) {
+        throw PlanningError("DECIMAL literal value out of range for its declared precision (internal error)");
+      }
       return std::make_unique<cudf::fixed_point_scalar<numeric::decimal64>>(
           static_cast<std::int64_t>(raw_value.raw), scale, is_valid);
     default:

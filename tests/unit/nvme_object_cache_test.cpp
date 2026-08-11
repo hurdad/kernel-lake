@@ -1,6 +1,7 @@
 #include "kernellake/storage/nvme_object_cache.hpp"
 
 #include <arrow/buffer.h>
+#include <fmt/format.h>
 #include <gtest/gtest.h>
 
 #include <atomic>
@@ -259,6 +260,78 @@ TEST_F(NvmeObjectCacheTest, ZeroMaxSizeBytesMeansUnbounded) {
   static_cast<void>(cache.get_or_populate(Uri((remote_dir_ / "b.parquet").string()), remote_store));
 
   EXPECT_EQ(count_cache_files(cache_dir_), 2u);
+}
+
+// Regression test: populate() calls evict_if_over_budget() immediately
+// after renaming a new entry into place, and the eviction scan used to
+// delete files with a bare fs::remove() -- no coordination with
+// get_or_populate()'s own per-key lock at all. When a single object's size
+// alone exceeds max_size_bytes, the eviction loop must eventually reach
+// (and remove) that same just-written entry -- previously this raced with
+// the fact that both the populating call and the eviction sweep were
+// running on the very same call stack/thread, and any *other* concurrent
+// caller for a different key could equally have its not-yet-opened cache
+// file deleted out from under it (see the concurrent-callers test below).
+// This test just proves the single-threaded "evict what I just wrote"
+// path completes cleanly rather than deadlocking or throwing.
+TEST_F(NvmeObjectCacheTest, PopulatingAnObjectLargerThanBudgetDoesNotDeadlockOrThrow) {
+  write_remote_file("huge.parquet", std::string(1000, 'x'));
+  LocalObjectStore remote_store(remote_dir_.string());
+  NvmeObjectCache cache(cache_config(/*max_size_bytes=*/100));
+
+  const Uri uri((remote_dir_ / "huge.parquet").string());
+  std::unique_ptr<RandomAccessObject> object;
+  EXPECT_NO_THROW(object = cache.get_or_populate(uri, remote_store));
+  ASSERT_NE(object, nullptr);
+  EXPECT_EQ(read_all(*object), std::string(1000, 'x'));
+}
+
+// Regression test: many threads hammering get_or_populate() against a
+// small, shared set of keys under a tight budget -- every call is either a
+// fresh population (racing eviction of its own just-written entry) or a
+// cache hit that must not have its file deleted between the fs::exists()
+// check and cache_store_.open() by another thread's concurrent eviction
+// sweep. Before the per-key recursive_mutex fix, this reliably threw
+// StorageError ("failed to open" a file eviction had just unlinked) within
+// a handful of iterations; success here means every call either genuinely
+// succeeded or hit the LocalObjectStore's own not-a-race "file doesn't
+// exist" path is never reached at all -- get_or_populate() itself never
+// surfaces a torn read.
+TEST_F(NvmeObjectCacheTest, ConcurrentCallersAgainstATightBudgetNeverThrow) {
+  constexpr int kKeyCount = 4;
+  constexpr int kThreadCount = 8;
+  constexpr int kCallsPerThread = 50;
+  for (int i = 0; i < kKeyCount; ++i) {
+    write_remote_file(fmt::format("k{}.parquet", i), std::string(200, static_cast<char>('a' + i)));
+  }
+  LocalObjectStore remote_store(remote_dir_.string());
+  // Budget fits roughly one entry at a time -- every population is likely
+  // to immediately trigger an eviction of some other (or its own) entry.
+  NvmeObjectCache cache(cache_config(/*max_size_bytes=*/200));
+
+  std::atomic<bool> failed{false};
+  std::vector<std::thread> threads;
+  threads.reserve(kThreadCount);
+  for (int t = 0; t < kThreadCount; ++t) {
+    threads.emplace_back([&, t] {
+      for (int call = 0; call < kCallsPerThread; ++call) {
+        const int key = (t + call) % kKeyCount;
+        try {
+          const std::unique_ptr<RandomAccessObject> object = cache.get_or_populate(
+              Uri((remote_dir_ / fmt::format("k{}.parquet", key)).string()), remote_store);
+          if (object == nullptr || object->size() != 200) {
+            failed.store(true, std::memory_order_relaxed);
+          }
+        } catch (const std::exception&) {
+          failed.store(true, std::memory_order_relaxed);
+        }
+      }
+    });
+  }
+  for (std::thread& thread : threads) {
+    thread.join();
+  }
+  EXPECT_FALSE(failed.load());
 }
 
 TEST_F(NvmeObjectCacheTest, SnapshotStartsAtAllZeros) {

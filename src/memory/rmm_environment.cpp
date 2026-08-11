@@ -6,6 +6,7 @@
 #include <rmm/mr/per_device_resource.hpp>
 #include <rmm/mr/pool_memory_resource.hpp>
 #include <rmm/mr/statistics_resource_adaptor.hpp>
+#include <spdlog/spdlog.h>
 
 #include "kernellake/common/errors.hpp"
 #include "kernellake/execution_gpu/cuda_utils.hpp"
@@ -125,14 +126,44 @@ RmmEnvironment::~RmmEnvironment() {
     // deep inside an unrelated later test with a driver-level GPF; every
     // test passes individually or in small combinations because there is no
     // still-in-flight work left to race against.
-    check_cuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize before tearing down RmmEnvironment");
+    //
+    // check_cuda() throws on failure; a destructor is implicitly noexcept,
+    // so letting that propagate would call std::terminate() and crash the
+    // whole process (kernellake-server keeps one long-lived RmmEnvironment
+    // for its entire lifetime, so this runs at shutdown/restart, not just
+    // in a short-lived CLI process) instead of just failing to restore the
+    // previous resource cleanly. Caught and logged instead -- if the CUDA
+    // context is already in a broken enough state for this to fail, the
+    // set_current_device_resource() call below is unlikely to succeed
+    // either, but a log line beats a hard crash.
+    try {
+      check_cuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize before tearing down RmmEnvironment");
+    } catch (const CudaError& e) {
+      spdlog::error(
+          "RmmEnvironment teardown: {} -- device memory may not be safe to reuse; continuing anyway rather "
+          "than crashing the process",
+          e.what());
+    }
     rmm::mr::set_current_device_resource(impl_->previous_resource);
   }
 }
 
 MemoryUsage RmmEnvironment::track_query(const std::function<void()>& query) {
   impl_->stats.push_counters();
-  query();
+  // query() throwing (e.g. the memory limiter's own OutOfMemoryError, or a
+  // GPU operator's own exception) must not skip pop_counters(): without
+  // this try/catch, the push/pop stack goes permanently unbalanced after
+  // the first failing query, corrupting peak/current byte accounting
+  // (current_usage()) for the rest of this RmmEnvironment's lifetime --
+  // exactly the kind of failure kernellake-server's own per-query
+  // exception handling (flight_sql_server.cpp) is designed to survive and
+  // keep serving after.
+  try {
+    query();
+  } catch (...) {
+    impl_->stats.pop_counters();
+    throw;
+  }
   const auto [bytes, allocations] = impl_->stats.pop_counters();
   (void)allocations;
   return MemoryUsage{bytes.value, bytes.peak};

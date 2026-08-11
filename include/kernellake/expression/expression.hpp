@@ -24,6 +24,19 @@ class Expression {
 
   [[nodiscard]] virtual const DataType& result_type() const = 0;
   [[nodiscard]] virtual std::string to_string() const = 0;
+  // Like to_string(), but ColumnExpression's override additionally encodes
+  // its resolved column_index() rather than just its bare name; every other
+  // expression kind mirrors to_string()'s own recursive structure, just
+  // composing structural_key() on its children instead of to_string(), so
+  // the disambiguation propagates through composite expressions too (e.g.
+  // SUM(a.amount) vs. SUM(b.amount) after a JOIN). Used only for internal
+  // identity comparisons -- aggregate-slot dedup, GROUP BY key matching --
+  // where two same-named columns from different JOIN sides must never
+  // compare equal; never for anything user-visible (column aliases,
+  // EXPLAIN output), which should keep using to_string(). Pure virtual
+  // (not defaulted to to_string()) so a newly added Expression subtype
+  // fails to compile here rather than silently reintroducing this bug.
+  [[nodiscard]] virtual std::string structural_key() const = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -39,6 +52,7 @@ class ColumnExpression final : public Expression {
   [[nodiscard]] std::size_t column_index() const noexcept { return column_index_; }
   [[nodiscard]] const DataType& result_type() const override { return type_; }
   [[nodiscard]] std::string to_string() const override { return name_; }
+  [[nodiscard]] std::string structural_key() const override { return "#" + std::to_string(column_index_); }
 
  private:
   std::string name_;
@@ -85,6 +99,9 @@ class LiteralExpression final : public Expression {
   [[nodiscard]] const LiteralStorage& value() const noexcept { return value_; }
   [[nodiscard]] const DataType& result_type() const override { return type_; }
   [[nodiscard]] std::string to_string() const override;
+  // Literals carry no column identity, so to_string()'s own rendering is
+  // already an unambiguous key -- no separate implementation needed.
+  [[nodiscard]] std::string structural_key() const override { return to_string(); }
 
  private:
   LiteralStorage value_;
@@ -125,6 +142,7 @@ class BinaryExpression final : public Expression {
   [[nodiscard]] const ExpressionPtr& right() const noexcept { return right_; }
   [[nodiscard]] const DataType& result_type() const override { return type_; }
   [[nodiscard]] std::string to_string() const override;
+  [[nodiscard]] std::string structural_key() const override;
 
  private:
   BinaryOperator op_;
@@ -155,6 +173,7 @@ class UnaryExpression final : public Expression {
   [[nodiscard]] const ExpressionPtr& operand() const noexcept { return operand_; }
   [[nodiscard]] const DataType& result_type() const override { return type_; }
   [[nodiscard]] std::string to_string() const override;
+  [[nodiscard]] std::string structural_key() const override;
 
  private:
   UnaryOperator op_;
@@ -175,6 +194,9 @@ class CastExpression final : public Expression {
   [[nodiscard]] const DataType& result_type() const override { return type_; }
   [[nodiscard]] std::string to_string() const override {
     return "CAST(" + operand_->to_string() + " AS " + type_.to_string() + ")";
+  }
+  [[nodiscard]] std::string structural_key() const override {
+    return "CAST(" + operand_->structural_key() + " AS " + type_.to_string() + ")";
   }
 
  private:
@@ -200,6 +222,10 @@ class BetweenExpression final : public Expression {
   [[nodiscard]] const DataType& result_type() const override { return type_; }
   [[nodiscard]] std::string to_string() const override {
     return value_->to_string() + " BETWEEN " + lower_->to_string() + " AND " + upper_->to_string();
+  }
+  [[nodiscard]] std::string structural_key() const override {
+    return value_->structural_key() + " BETWEEN " + lower_->structural_key() + " AND " +
+           upper_->structural_key();
   }
 
  private:
@@ -231,6 +257,9 @@ class LikeExpression final : public Expression {
   [[nodiscard]] const DataType& result_type() const override { return type_; }
   [[nodiscard]] std::string to_string() const override {
     return value_->to_string() + (negated_ ? " NOT LIKE '" : " LIKE '") + pattern_ + "'";
+  }
+  [[nodiscard]] std::string structural_key() const override {
+    return value_->structural_key() + (negated_ ? " NOT LIKE '" : " LIKE '") + pattern_ + "'";
   }
 
  private:
@@ -271,6 +300,16 @@ class CaseExpression final : public Expression {
     }
     return text + " END";
   }
+  [[nodiscard]] std::string structural_key() const override {
+    std::string text = "CASE";
+    for (const WhenThen& branch : when_then_) {
+      text += " WHEN " + branch.condition->structural_key() + " THEN " + branch.result->structural_key();
+    }
+    if (else_branch_ != nullptr) {
+      text += " ELSE " + else_branch_->structural_key();
+    }
+    return text + " END";
+  }
 
  private:
   std::vector<WhenThen> when_then_;
@@ -303,6 +342,7 @@ class AggregateExpression final : public Expression {
   [[nodiscard]] const ExpressionPtr& argument() const noexcept { return argument_; }
   [[nodiscard]] const DataType& result_type() const override { return type_; }
   [[nodiscard]] std::string to_string() const override;
+  [[nodiscard]] std::string structural_key() const override;
 
  private:
   AggregateFunction function_;

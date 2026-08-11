@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -51,12 +52,14 @@ struct PhysicalFileFragment {
 class ParquetScanNode final : public PhysicalPlanNode {
  public:
   ParquetScanNode(std::vector<PhysicalFileFragment> fragments, std::vector<std::string> columns,
-                  Schema schema, int files_considered, std::vector<PartitionColumn> partition_columns = {})
+                  Schema schema, int files_considered, std::vector<PartitionColumn> partition_columns = {},
+                  std::vector<std::optional<std::size_t>> original_column_map = {})
       : fragments_(std::move(fragments)),
         columns_(std::move(columns)),
         schema_(std::move(schema)),
         files_considered_(files_considered),
-        partition_columns_(std::move(partition_columns)) {}
+        partition_columns_(std::move(partition_columns)),
+        original_column_map_(std::move(original_column_map)) {}
 
   [[nodiscard]] const std::vector<PhysicalFileFragment>& fragments() const noexcept { return fragments_; }
   // Physical columns to actually read from each fragment's Parquet file --
@@ -72,6 +75,18 @@ class ParquetScanNode final : public PhysicalPlanNode {
   }
   [[nodiscard]] int files_considered() const noexcept { return files_considered_; }
   [[nodiscard]] std::size_t files_scanned() const noexcept { return fragments_.size(); }
+  // Maps this scan's *original* (pre-narrowing) LogicalScan column index to
+  // its position in this node's own (possibly narrowed) output_schema(), or
+  // nullopt if that original column was pruned away. A ColumnExpression
+  // sitting above this scan still carries the original index the binder
+  // resolved it to (see physical_planner.cpp's remap_columns()); this map is
+  // what translates that back to a real position without going through
+  // Schema::find_field()'s first-name-match lookup, which is ambiguous once
+  // a JOIN puts two same-named columns from different sides into one
+  // combined schema (see HashJoinNode's own identical field below).
+  [[nodiscard]] const std::vector<std::optional<std::size_t>>& original_column_map() const noexcept {
+    return original_column_map_;
+  }
 
   [[nodiscard]] const Schema& output_schema() const override { return schema_; }
   [[nodiscard]] std::string_view node_name() const noexcept override { return "ParquetScan"; }
@@ -84,25 +99,28 @@ class ParquetScanNode final : public PhysicalPlanNode {
   Schema schema_;
   int files_considered_;
   std::vector<PartitionColumn> partition_columns_;
+  std::vector<std::optional<std::size_t>> original_column_map_;
 };
 
 // A two-table INNER equi-join (see LogicalJoin). `left_key_index`/
 // `right_key_index` are into each side's *own already-narrowed* physical
 // scan schema (unlike LogicalJoin's, which are into the original,
-// pre-pruning logical schema) -- the physical planner translates by name
-// when converting a LogicalJoin, since narrowing can shift a column's
-// position. Output schema is the plain concatenation of the two children's
-// (already narrowed) schemas, in that order, matching exactly what
-// HashJoinOperator gathers into its output batch.
+// pre-pruning logical schema) -- the physical planner translates via each
+// side's own original_column_map() when converting a LogicalJoin, since
+// narrowing can shift a column's position. Output schema is the plain
+// concatenation of the two children's (already narrowed) schemas, in that
+// order, matching exactly what HashJoinOperator gathers into its output
+// batch.
 class HashJoinNode final : public PhysicalPlanNode {
  public:
   HashJoinNode(PhysicalPlanPtr left, PhysicalPlanPtr right, std::size_t left_key_index,
-               std::size_t right_key_index)
+               std::size_t right_key_index, std::vector<std::optional<std::size_t>> original_column_map = {})
       : left_(std::move(left)),
         right_(std::move(right)),
         left_key_index_(left_key_index),
         right_key_index_(right_key_index),
-        schema_(build_schema(left_->output_schema(), right_->output_schema())) {}
+        schema_(build_schema(left_->output_schema(), right_->output_schema())),
+        original_column_map_(std::move(original_column_map)) {}
 
   [[nodiscard]] const PhysicalPlanPtr& left() const noexcept { return left_; }
   [[nodiscard]] const PhysicalPlanPtr& right() const noexcept { return right_; }
@@ -115,6 +133,17 @@ class HashJoinNode final : public PhysicalPlanNode {
     return {{"type", "INNER"},
             {"left_key", left_->output_schema().field(left_key_index_).name},
             {"right_key", right_->output_schema().field(right_key_index_).name}};
+  }
+  // Maps the *original* combined pre-join logical schema's column index
+  // (left's original fields first, then right's -- the domain
+  // LogicalJoin's ON condition and everything above this node was resolved
+  // against, see LogicalJoin's own doc comment) to this node's own actual
+  // output_schema() position, or nullopt if pruned. Built by combining
+  // left/right's own original_column_map()s (see the physical planner's
+  // JOIN conversion) -- see ParquetScanNode::original_column_map()'s own
+  // comment for why this exists instead of Schema::find_field().
+  [[nodiscard]] const std::vector<std::optional<std::size_t>>& original_column_map() const noexcept {
+    return original_column_map_;
   }
 
  private:
@@ -130,6 +159,7 @@ class HashJoinNode final : public PhysicalPlanNode {
   std::size_t left_key_index_;
   std::size_t right_key_index_;
   Schema schema_;
+  std::vector<std::optional<std::size_t>> original_column_map_;
 };
 
 class FilterNode final : public PhysicalPlanNode {

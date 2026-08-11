@@ -11,6 +11,8 @@
 #include <algorithm>
 #include <chrono>
 #include <mutex>
+#include <unordered_map>
+#include <unordered_set>
 
 #include "kernellake/common/errors.hpp"
 #include "kernellake/execution_cpu/expression_compiler_cpu.hpp"
@@ -278,15 +280,16 @@ std::shared_ptr<arrow::RecordBatchReader> make_streaming_scan_reader(const Parqu
 }
 
 // Resolves a NamedExpression that must be a plain column reference (a
-// GROUP BY key or ORDER BY key) to its field name -- Acero's
-// AggregateNodeOptions::keys and SortKey both take a FieldRef, which this
-// backend always resolves by name (not by the GPU path's index-based
-// remapping: Acero's Declaration tree is built purely out of real Arrow
-// schemas with real field names at every stage, so there is no equivalent
-// of the GPU path's remap_columns()/find_scan_schema() problem to solve
-// here at all). Throws PlanningError for anything else (e.g. a computed
-// CASE-derived GROUP BY alias) -- not yet supported by this backend.
-const std::string& require_plain_column_name(const ExpressionPtr& expr, const char* context) {
+// GROUP BY key or ORDER BY key) to its column_index() -- Acero's
+// AggregateNodeOptions::keys and SortKey both take a FieldRef, referenced
+// here *by position* (see compile_expression_cpu's identical reasoning):
+// a JOIN's combined physical schema can have two same-named columns from
+// opposite sides, which a by-name FieldRef can't disambiguate (Acero
+// itself throws "Multiple matches" for it) even though column_index()
+// already unambiguously identifies the right one. Throws PlanningError for
+// anything else (e.g. a computed CASE-derived GROUP BY alias) -- not yet
+// supported by this backend.
+std::size_t require_plain_column_index(const ExpressionPtr& expr, const char* context) {
   const auto* column = dynamic_cast<const ColumnExpression*>(expr.get());
   if (column == nullptr) {
     throw PlanningError(
@@ -294,7 +297,7 @@ const std::string& require_plain_column_name(const ExpressionPtr& expr, const ch
                     "(only a plain column reference is) -- see docs/ARCHITECTURE.md",
                     context));
   }
-  return column->name();
+  return column->column_index();
 }
 
 std::shared_ptr<arrow::compute::FunctionOptions> count_options() {
@@ -318,23 +321,65 @@ std::shared_ptr<arrow::compute::FunctionOptions> count_options() {
 struct AggregateInputPlan {
   std::vector<arrow::compute::Expression> project_expressions;
   std::vector<std::string> project_names;
+  // Keyed by source *position* rather than name, so a repeated reference
+  // to the same original column (e.g. used as both a GROUP BY key and an
+  // aggregate argument) reuses one projected slot instead of projecting it
+  // twice.
+  std::unordered_map<std::size_t, std::string> projected_index_to_name;
+  // Every *original* bare name already claimed by a projected column, so a
+  // genuine collision -- two different source positions sharing a bare
+  // name, only possible after a JOIN -- gets a synthetic name instead of
+  // colliding. The common (non-colliding) case keeps its original name
+  // unchanged: HashAggregateNode's own group_by/aggregate output field
+  // names are decided at the logical layer (logical_planner.cpp) and
+  // assumed to already match 1:1 with whatever Acero actually names its
+  // output columns once the redundant final re-projection is elided (see
+  // is_identity_projection()'s comment in physical_planner.cpp) --
+  // renaming every pass-through column unconditionally broke that
+  // assumption even for a plain, non-JOIN GROUP BY (confirmed by a real
+  // test failure before this comment was added).
+  //
+  // Residual gap, not fixed here: if two GROUP BY keys sharing a bare name
+  // from opposite JOIN sides are *both* selected together (e.g. `SELECT
+  // l.x, r.x, COUNT(*) ... GROUP BY l.x, r.x`), the second one's synthetic
+  // name here won't match its own HashAggregateNode::output_schema() field
+  // name (which is unaware of any physical collision) -- a real caller
+  // would hit a GetColumnByName() mismatch downstream. Aggregate
+  // arguments and any non-aggregate SELECT (both handled elsewhere) are
+  // unaffected. Closing this would need Field-level qualification, out of
+  // scope here.
+  std::unordered_set<std::string> claimed_names;
   int next_synthetic_id = 0;
 };
 
-void ensure_column_projected(AggregateInputPlan& plan, const std::string& name) {
-  if (std::find(plan.project_names.begin(), plan.project_names.end(), name) != plan.project_names.end()) {
-    return;
+std::string next_synthetic_name(AggregateInputPlan& plan) {
+  return fmt::format("__kernellake_agg_input_{}", plan.next_synthetic_id++);
+}
+
+// Projects `column` (by position, see compile_expression_cpu's identical
+// reasoning) under its own original name, unless that name is already
+// claimed by a *different* source position projected earlier in this same
+// plan, in which case it gets a synthetic name instead -- see
+// AggregateInputPlan::claimed_names's own comment for why.
+const std::string& ensure_column_projected(AggregateInputPlan& plan, const ColumnExpression& column) {
+  const auto it = plan.projected_index_to_name.find(column.column_index());
+  if (it != plan.projected_index_to_name.end()) {
+    return it->second;
   }
-  plan.project_expressions.push_back(arrow::compute::field_ref(name));
+  std::string name = plan.claimed_names.find(column.name()) == plan.claimed_names.end()
+                         ? column.name()
+                         : next_synthetic_name(plan);
+  plan.claimed_names.insert(name);
+  plan.project_expressions.push_back(arrow::compute::field_ref(static_cast<int>(column.column_index())));
   plan.project_names.push_back(name);
+  return plan.projected_index_to_name.emplace(column.column_index(), std::move(name)).first->second;
 }
 
 std::string resolve_aggregate_target(AggregateInputPlan& plan, const ExpressionPtr& expr) {
   if (const auto* column = dynamic_cast<const ColumnExpression*>(expr.get())) {
-    ensure_column_projected(plan, column->name());
-    return column->name();
+    return ensure_column_projected(plan, *column);
   }
-  const std::string synthetic_name = fmt::format("__kernellake_agg_arg_{}", plan.next_synthetic_id++);
+  const std::string synthetic_name = next_synthetic_name(plan);
   plan.project_expressions.push_back(compile_expression_cpu(*expr));
   plan.project_names.push_back(synthetic_name);
   return synthetic_name;
@@ -390,14 +435,17 @@ arrow::acero::Declaration translate(const PhysicalPlanPtr& node, ObjectStore& st
   // HashJoinNode::build_schema()'s convention exactly, so no left_output/
   // right_output list needs to be built here.
   if (const auto* hash_join = dynamic_cast<const HashJoinNode*>(node.get())) {
-    const std::string& left_key = hash_join->left()->output_schema().field(hash_join->left_key_index()).name;
-    const std::string& right_key =
-        hash_join->right()->output_schema().field(hash_join->right_key_index()).name;
+    // By position (see compile_expression_cpu's identical reasoning): if
+    // `hash_join->left()`/`right()` is itself a nested HashJoinNode (a 3+
+    // -way join), its own combined schema can already have two same-named
+    // columns from its own two children, making a by-name FieldRef here
+    // ambiguous too, not just at the outer join.
     return arrow::acero::Declaration{
         "hashjoin",
         {translate(hash_join->left(), store), translate(hash_join->right(), store)},
-        arrow::acero::HashJoinNodeOptions{
-            arrow::acero::JoinType::INNER, {arrow::FieldRef(left_key)}, {arrow::FieldRef(right_key)}}};
+        arrow::acero::HashJoinNodeOptions{arrow::acero::JoinType::INNER,
+                                          {arrow::FieldRef(static_cast<int>(hash_join->left_key_index()))},
+                                          {arrow::FieldRef(static_cast<int>(hash_join->right_key_index()))}}};
   }
   if (const auto* filter = dynamic_cast<const FilterNode*>(node.get())) {
     return arrow::acero::Declaration{
@@ -424,9 +472,13 @@ arrow::acero::Declaration translate(const PhysicalPlanPtr& node, ObjectStore& st
     std::vector<arrow::FieldRef> keys;
     keys.reserve(hash_aggregate->group_by().size());
     for (const NamedExpression& item : hash_aggregate->group_by()) {
-      const std::string& key_name = require_plain_column_name(item.expr, "GROUP BY");
-      ensure_column_projected(plan, key_name);
-      keys.emplace_back(key_name);
+      const auto* column = dynamic_cast<const ColumnExpression*>(item.expr.get());
+      if (column == nullptr) {
+        throw PlanningError(
+            "GROUP BY by a computed expression is not yet supported by the CPU execution backend "
+            "(only a plain column reference is) -- see docs/ARCHITECTURE.md");
+      }
+      keys.emplace_back(ensure_column_projected(plan, *column));
     }
     std::vector<arrow::compute::Aggregate> aggregates;
     aggregates.reserve(hash_aggregate->aggregates().size());
@@ -478,14 +530,14 @@ arrow::acero::Declaration translate(const PhysicalPlanPtr& node, ObjectStore& st
     std::vector<arrow::compute::SortKey> keys;
     keys.reserve(sort->keys().size());
     for (const LogicalSort::Key& key : sort->keys()) {
-      const std::string& name = require_plain_column_name(key.expr, "ORDER BY");
+      const std::size_t index = require_plain_column_index(key.expr, "ORDER BY");
       const arrow::compute::SortOrder order =
           key.ascending ? arrow::compute::SortOrder::Ascending : arrow::compute::SortOrder::Descending;
       // Matches the GPU SortOperator's convention (and standard SQL
       // behavior): NULLs sort last in ASC order, first in DESC order.
       const arrow::compute::NullPlacement null_placement =
           key.ascending ? arrow::compute::NullPlacement::AtEnd : arrow::compute::NullPlacement::AtStart;
-      keys.emplace_back(arrow::FieldRef(name), order, null_placement);
+      keys.emplace_back(arrow::FieldRef(static_cast<int>(index)), order, null_placement);
     }
     return arrow::acero::Declaration{
         "order_by",

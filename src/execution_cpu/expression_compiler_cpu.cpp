@@ -114,7 +114,16 @@ std::string binary_function_name(BinaryOperator op) {
 
 arrow::compute::Expression compile_expression_cpu(const Expression& expr) {
   if (const auto* column = dynamic_cast<const ColumnExpression*>(&expr)) {
-    return arrow::compute::field_ref(column->name());
+    // By position, not by name: a JOIN's combined physical schema can have
+    // two columns with the same bare name from opposite sides (see
+    // physical_planner.cpp's remap_columns(), which is what already
+    // guarantees column_index() here is the correct position into
+    // whatever Arrow schema this expression is actually evaluated
+    // against) -- arrow::compute::field_ref(name) would throw "Multiple
+    // matches" for exactly that case instead of silently resolving to the
+    // wrong one, but it's still wrong to rely on names being unique here
+    // at all.
+    return arrow::compute::field_ref(static_cast<int>(column->column_index()));
   }
   if (const auto* literal = dynamic_cast<const LiteralExpression*>(&expr)) {
     return arrow::compute::literal(literal_to_arrow_datum(*literal));

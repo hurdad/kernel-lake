@@ -73,73 +73,89 @@ KernelLakeFlightSqlServer::~KernelLakeFlightSqlServer() = default;
 
 arrow::Result<std::unique_ptr<flight::FlightInfo>> KernelLakeFlightSqlServer::ExecuteAndBuffer(
     const PhysicalPlanPtr& physical, std::string_view sql, const flight::FlightDescriptor& descriptor) {
-  QueryResult result;
-  observability::QuerySpan span =
-      observability::start_query_span("kernellake.flight_sql.get_flight_info_statement");
-  bool reserved = false;
+  // Outer try/catch wraps the *whole* function body -- including
+  // start_query_span() below and the results_.emplace()/FlightInfo::Make()
+  // tail after the inner try/catch -- so nothing here can throw out of an
+  // RPC handler uncaught (which crashes the whole gRPC server process, not
+  // just this one call). Kept separate from the inner try/catch (which
+  // still does its own finer-grained span.finish_error() handling for the
+  // execute() path) because `span` doesn't exist yet if start_query_span()
+  // itself is what throws.
   try {
-    // Reject before doing any work if the buffered-but-unfetched result
-    // registry is already full (see ServerSection::max_pending_results'
-    // own comment) -- a client that never calls DoGetStatement to drain it
-    // must not be able to grow this map without bound. The reservation
-    // (pending_count_) is incremented in the SAME critical section as the
-    // check, not just checked and inserted later once the (potentially
-    // slow) query finishes: two concurrent callers that both see
-    // results_.size() below the cap before either has inserted yet would
-    // otherwise both proceed to execute and both insert, defeating the cap
-    // under concurrent load even though it holds sequentially -- confirmed
-    // via a concurrent-caller stress test before this fix (20 of 20 calls
-    // succeeded against a cap of 2).
+    QueryResult result;
+    observability::QuerySpan span =
+        observability::start_query_span("kernellake.flight_sql.get_flight_info_statement");
+    bool reserved = false;
+    try {
+      // Reject before doing any work if the buffered-but-unfetched result
+      // registry is already full (see ServerSection::max_pending_results'
+      // own comment) -- a client that never calls DoGetStatement to drain
+      // it must not be able to grow this map without bound. The
+      // reservation (pending_count_) is incremented in the SAME critical
+      // section as the check, not just checked and inserted later once
+      // the (potentially slow) query finishes: two concurrent callers
+      // that both see results_.size() below the cap before either has
+      // inserted yet would otherwise both proceed to execute and both
+      // insert, defeating the cap under concurrent load even though it
+      // holds sequentially -- confirmed via a concurrent-caller stress
+      // test before this fix (20 of 20 calls succeeded against a cap of
+      // 2).
+      {
+        const std::lock_guard<std::mutex> lock(results_mutex_);
+        if (results_.size() + pending_count_ >= config_.server.max_pending_results) {
+          throw OutOfMemoryError(fmt::format(
+              "too many buffered query results awaiting fetch (limit: {}); fetch or abandon existing "
+              "results before issuing more statements",
+              config_.server.max_pending_results));
+        }
+        ++pending_count_;
+        reserved = true;
+      }
+      result = config_.engine.backend == "cpu" ? engine_.execute_cpu(physical)
+                                               : gpu_coordinator_->execute(engine_, physical);
+      span.finish(result, sql, config_.engine.backend);
+    } catch (const KernelLakeError& e) {
+      span.finish_error(e, sql, config_.engine.backend);
+      if (reserved) {
+        const std::lock_guard<std::mutex> lock(results_mutex_);
+        --pending_count_;
+      }
+      return ToFlightStatus(e);
+    } catch (const std::exception& e) {
+      span.finish_error(e, sql, config_.engine.backend);
+      if (reserved) {
+        const std::lock_guard<std::mutex> lock(results_mutex_);
+        --pending_count_;
+      }
+      return arrow::Status::UnknownError(e.what());
+    }
+
+    std::int64_t total_records = 0;
+    for (const auto& batch : result.batches) {
+      total_records += batch->num_rows();
+    }
+
+    std::string handle;
+    std::shared_ptr<arrow::Schema> schema = result.schema;
     {
       const std::lock_guard<std::mutex> lock(results_mutex_);
-      if (results_.size() + pending_count_ >= config_.server.max_pending_results) {
-        throw OutOfMemoryError(fmt::format(
-            "too many buffered query results awaiting fetch (limit: {}); fetch or abandon existing "
-            "results before issuing more statements",
-            config_.server.max_pending_results));
-      }
-      ++pending_count_;
-      reserved = true;
-    }
-    result = config_.engine.backend == "cpu" ? engine_.execute_cpu(physical)
-                                             : gpu_coordinator_->execute(engine_, physical);
-    span.finish(result, sql, config_.engine.backend);
-  } catch (const KernelLakeError& e) {
-    span.finish_error(e, sql, config_.engine.backend);
-    if (reserved) {
-      const std::lock_guard<std::mutex> lock(results_mutex_);
       --pending_count_;
+      handle = "q-" + std::to_string(next_handle_++);
+      results_.emplace(handle, std::move(result));
     }
+
+    ARROW_ASSIGN_OR_RAISE(std::string ticket_string, flight_sql::CreateStatementQueryTicket(handle));
+    const flight::FlightEndpoint endpoint{flight::Ticket{std::move(ticket_string)}, {}, std::nullopt, ""};
+
+    ARROW_ASSIGN_OR_RAISE(
+        flight::FlightInfo info,
+        flight::FlightInfo::Make(*schema, descriptor, {endpoint}, total_records, /*total_bytes=*/-1));
+    return std::make_unique<flight::FlightInfo>(std::move(info));
+  } catch (const KernelLakeError& e) {
     return ToFlightStatus(e);
   } catch (const std::exception& e) {
-    span.finish_error(e, sql, config_.engine.backend);
-    if (reserved) {
-      const std::lock_guard<std::mutex> lock(results_mutex_);
-      --pending_count_;
-    }
     return arrow::Status::UnknownError(e.what());
   }
-
-  std::int64_t total_records = 0;
-  for (const auto& batch : result.batches) {
-    total_records += batch->num_rows();
-  }
-
-  std::string handle;
-  std::shared_ptr<arrow::Schema> schema = result.schema;
-  {
-    const std::lock_guard<std::mutex> lock(results_mutex_);
-    --pending_count_;
-    handle = "q-" + std::to_string(next_handle_++);
-    results_.emplace(handle, std::move(result));
-  }
-
-  ARROW_ASSIGN_OR_RAISE(std::string ticket_string, flight_sql::CreateStatementQueryTicket(handle));
-  const flight::FlightEndpoint endpoint{flight::Ticket{std::move(ticket_string)}, {}, std::nullopt, ""};
-
-  ARROW_ASSIGN_OR_RAISE(flight::FlightInfo info, flight::FlightInfo::Make(*schema, descriptor, {endpoint},
-                                                                          total_records, /*total_bytes=*/-1));
-  return std::make_unique<flight::FlightInfo>(std::move(info));
 }
 
 arrow::Result<std::unique_ptr<flight::FlightInfo>> KernelLakeFlightSqlServer::GetFlightInfoStatement(

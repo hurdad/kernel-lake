@@ -96,7 +96,8 @@ TEST_F(AuthMiddlewareTest, RejectsCallWithNoAuthorizationHeader) {
   const flight::FlightCallOptions call_options;
   auto info = client_->Execute(call_options, "SELECT id FROM read_parquet('" + path_ + "')");
   ASSERT_FALSE(info.ok());
-  EXPECT_TRUE(info.status().IsIOError() || info.status().ToString().find("Unauthenticated") != std::string::npos)
+  EXPECT_TRUE(info.status().IsIOError() ||
+              info.status().ToString().find("Unauthenticated") != std::string::npos)
       << info.status().ToString();
 }
 
