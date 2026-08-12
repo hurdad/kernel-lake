@@ -596,6 +596,15 @@ def main() -> int:
         "at the previous unconfigured default)",
     )
     parser.add_argument(
+        "--cpu-cores",
+        type=int,
+        default=None,
+        help="Cap PySpark (local[N] instead of local[*]) and DuckDB (SET threads TO N) to this many "
+        "cores. Only affects the two CPU-bound engines -- KernelLake-GPU's own CPU-side work "
+        "(query planning, Arrow/Flight SQL marshalling) is unaffected, since its real bottleneck is "
+        "the GPU, not host cores. Default: no cap, each engine uses every core it can see.",
+    )
+    parser.add_argument(
         "--kernellake-server",
         default=None,
         help="Path to the kernellake-server binary (gpu-dev build, at "
@@ -710,9 +719,10 @@ def main() -> int:
             # by an actual run, not a hypothetical concern. args.driver_memory
             # is left tunable rather than hardcoded, since the right value
             # scales with both the dataset size and the host's available RAM.
+            spark_master = f"local[{args.cpu_cores}]" if args.cpu_cores else "local[*]"
             spark = (
                 SparkSession.builder.appName("kernellake-benchmark-three-way")
-                .master("local[*]")
+                .master(spark_master)
                 .config("spark.ui.showConsoleProgress", "false")
                 .config("spark.driver.memory", args.spark_driver_memory)
                 .getOrCreate()
@@ -725,6 +735,17 @@ def main() -> int:
                 spark.read.parquet(args.orders_data).createOrReplaceTempView("orders")
             if args.customer_data:
                 spark.read.parquet(args.customer_data).createOrReplaceTempView("customer")
+
+        if "duckdb" in backends and args.cpu_cores:
+            # run_duckdb() (tools/duckdb_compare.py) runs every query
+            # against DuckDB's own global default connection via
+            # duckdb.sql(...), not a connection this script holds a handle
+            # to -- so the thread cap has to be set on that same global
+            # connection, once, before any query runs, rather than passed
+            # per-call.
+            import duckdb
+
+            duckdb.sql(f"SET threads TO {args.cpu_cores}")
 
         if "kernellake-gpu-server" in backends:
             print(f"=== Starting kernellake-server on port {args.server_port} ===")
