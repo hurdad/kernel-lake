@@ -3377,6 +3377,49 @@ log` is the authoritative chronology if that ordering ever matters.
   per-instance-only local token cache) -- untouched here, still tracked
   as its own accepted trade-off where those entries already document it.
 
+- **TPC-H Q5** -- picked as the next query specifically because it needed
+  no new SQL engine feature at all, the same "cheap" shape Q10 was: a
+  6-table `customer`/`orders`/`lineitem`/`supplier`/`nation`/`region`
+  `INNER JOIN` chain (each step still a single equality key, matching
+  every join already supported), `GROUP BY n_name`, `ORDER BY revenue
+  DESC`. Only new work was two more dimension tables in
+  `tools/generate_tpch.py`: `generate_supplier_table()` (a fixed
+  `SUPPLIER_ROWS = 10_000`, matching `generate_lineitem_batch()`'s own
+  pre-existing, not-SF-scaled `l_suppkey` range -- same no-dangling-
+  foreign-key rationale `CUSTOMER_ROWS` already documents) and
+  `generate_region_table()` (5 fixed rows, real `dbgen` reference names/
+  keys verbatim, same rationale `NATIONS` already uses -- `REGIONS`'
+  `r_regionkey` values were already implicitly required to match every
+  `NATIONS` row's own `n_regionkey`, confirmed rather than assumed).
+
+  One real modeling wrinkle canonical Q5 has that Q10 didn't: a second
+  join-like condition (`c_nationkey = s_nationkey`, the "local supplier"
+  requirement -- the order's customer and the line's supplier must share
+  a nation) that can't be folded into either JOIN step's own `ON` clause,
+  since each step here is already a single equality against the
+  newly-joined table (see `docs/ARCHITECTURE.md`'s "Hash joins" scope
+  note on multi-key conditions). Moved into `WHERE` instead -- an
+  ordinary filter over the already-joined row, not a join mechanism of
+  its own, the same shape Q10's own `WHERE` clause already uses for
+  predicates spanning more than one joined source. No parser/binder/
+  logical-plan change needed; this was already legal.
+
+  `--supplier-data`/`--region-data` threaded through
+  `tools/validate_tpch.py` and `kernellake benchmark tpch`
+  (`src/cli/benchmark_tpch_command.cpp`), mirroring `--nation-data`'s own
+  plumbing exactly (placeholder substitution, file discovery, JSON report
+  field). Verified for real: `tools/validate_tpch.py --query 5` exact
+  match against DuckDB on both the CPU and GPU backends at SF0.01, and
+  `--query all` (now 8 queries: Q1/Q3/Q5/Q6/Q10/Q12/Q14/Q19) still all
+  match with zero regressions; `kernellake benchmark tpch --query 5`
+  confirmed to run end to end and report the new `supplier_data`/
+  `region_data` fields. No C++ unit tests needed changes -- TPC-H
+  correctness is validated entirely through this DuckDB cross-check
+  tooling, not gtest, and no execution-engine code changed (the
+  `kernellake_unit_tests` 413/413 pass from the entry above is
+  unaffected). Not yet wired into `tools/benchmark_three_way.py`'s
+  PySpark/DuckDB three-way comparison (same gap Q10 already has).
+
 ## Not yet started
 
 - **Unity Catalog support: remaining gaps** -- the core read path (Phase 5
