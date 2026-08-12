@@ -222,7 +222,8 @@ arrow::compute::Expression compile_expression_cpu(const Expression& expr) {
     // matching ExtractExpression::result_type() exactly -- no extra cast
     // needed, unlike the GPU backend's cudf::datetime::extract_datetime_component
     // (see expression_compiler.cpp), which returns INT16.
-    return arrow::compute::call(extract_function_name(extract->part()), {compile_expression_cpu(*extract->operand())});
+    return arrow::compute::call(extract_function_name(extract->part()),
+                                {compile_expression_cpu(*extract->operand())});
   }
   throw ExecutionError(
       "unrecognized expression type in CPU expression compiler (IN/DECIMAL are not yet supported "

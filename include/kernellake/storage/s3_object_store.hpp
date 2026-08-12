@@ -29,7 +29,7 @@ class S3ObjectStore final : public ObjectStore {
   // instead of environment variables. Intended to be constructed fresh per
   // use and discarded, never cached past the credentials' own TTL.
   S3ObjectStore(const arrow::fs::S3Options& base_options, const std::string& access_key_id,
-               const std::string& secret_access_key, const std::string& session_token);
+                const std::string& secret_access_key, const std::string& session_token);
 
   [[nodiscard]] std::vector<ObjectInfo> list(const Uri& prefix) override;
   [[nodiscard]] std::vector<ObjectInfo> list_recursive(const Uri& prefix) override;

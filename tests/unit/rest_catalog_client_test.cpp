@@ -13,9 +13,9 @@
 namespace kernellake::iceberg {
 namespace {
 
-using kernellake::LoopbackHttpServer;
 using kernellake::http_ok_json;
 using kernellake::http_status;
+using kernellake::LoopbackHttpServer;
 
 constexpr const char* kLoadTableResultJson = R"({
   "metadata": {

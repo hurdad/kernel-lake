@@ -28,7 +28,8 @@ TEST(UnityCatalogSourceResolver, CanResolveOnlyClaimsUnityCatalogSchemeSources) 
 TEST(UnityCatalogSourceResolver, ThrowsOnUnknownInstance) {
   UnityCatalogSourceResolver resolver = make_resolver();
   LocalObjectStore store;
-  EXPECT_THROW((void)(resolver.resolve(store, {"unitycatalog://prod.main.db.orders"}, {})), ConfigurationError);
+  EXPECT_THROW((void)(resolver.resolve(store, {"unitycatalog://prod.main.db.orders"}, {})),
+               ConfigurationError);
 }
 
 TEST(UnityCatalogSourceResolver, ThrowsOnTooFewQualifiedNameParts) {

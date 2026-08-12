@@ -39,7 +39,7 @@ std::string iceberg_http_request(const std::string& url, const std::string& bear
     headers.push_back(fmt::format("Authorization: Bearer {}", bearer_token));
   }
   if (post_body != nullptr) {
-    headers.push_back("Content-Type: application/x-www-form-urlencoded");
+    headers.emplace_back("Content-Type: application/x-www-form-urlencoded");
   }
   return http_request(url, headers, post_body, kErrorPrefix);
 }

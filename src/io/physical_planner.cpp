@@ -339,11 +339,10 @@ PhysicalPlanPtr convert_scan(const LogicalScan& scan, ObjectStore& store,
     narrowed_columns.push_back(fallback.name);
   }
 
-  return std::make_shared<ParquetScanNode>(std::move(fragments), std::move(narrowed_columns),
-                                           Schema(std::move(narrowed_fields)),
-                                           static_cast<int>(resolved.files.size()),
-                                           std::move(narrowed_partitions), std::move(original_column_map),
-                                           resolved.owned_store);
+  return std::make_shared<ParquetScanNode>(
+      std::move(fragments), std::move(narrowed_columns), Schema(std::move(narrowed_fields)),
+      static_cast<int>(resolved.files.size()), std::move(narrowed_partitions), std::move(original_column_map),
+      resolved.owned_store);
 }
 
 PhysicalPlanPtr convert(const LogicalPlanPtr& node, ObjectStore& store, TableSourceResolver* extra_resolver) {

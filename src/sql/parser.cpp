@@ -250,9 +250,9 @@ Preprocessed preprocess_from_read_parquet(const std::string& sql) {
       continue;
     }
     const std::string_view function_name = is_parquet   ? kParquetFunctionName
-                                           : is_iceberg  ? kIcebergFunctionName
-                                           : is_delta    ? kDeltaFunctionName
-                                                         : kUnityCatalogFunctionName;
+                                           : is_iceberg ? kIcebergFunctionName
+                                           : is_delta   ? kDeltaFunctionName
+                                                        : kUnityCatalogFunctionName;
     std::optional<std::pair<std::vector<std::string>, std::size_t>> parsed =
         try_parse_read_parquet_args(sql, pos + function_name.size());
     if (!parsed || ((is_iceberg || is_delta || is_unity_catalog) && parsed->first.size() != 1)) {
@@ -294,10 +294,10 @@ Preprocessed preprocess_from_read_parquet(const std::string& sql) {
   // kMaxParenDepth above.
   constexpr std::size_t kMaxJoinSources = 12;
   if (sources.size() > kMaxJoinSources) {
-    throw SqlError(fmt::format(
-        "KernelLake supports at most {} read_parquet(...)/read_iceberg(...)/read_delta(...)/"
-        "read_unity_catalog(...) sources in a JOIN chain, got {}",
-        kMaxJoinSources, sources.size()));
+    throw SqlError(
+        fmt::format("KernelLake supports at most {} read_parquet(...)/read_iceberg(...)/read_delta(...)/"
+                    "read_unity_catalog(...) sources in a JOIN chain, got {}",
+                    kMaxJoinSources, sources.size()));
   }
   return Preprocessed{std::move(rewritten), std::move(sources)};
 }
@@ -597,13 +597,15 @@ AstExprPtr convert_expr(const hsql::Expr* e) {
           // component (every date column is DATE, not DATETIME/TIMESTAMP),
           // so these fields are structurally meaningless here, not just
           // unimplemented.
-          unsupported("EXTRACT field (only YEAR/MONTH/DAY are supported -- no generated table has a "
-                      "time-of-day component)");
+          unsupported(
+              "EXTRACT field (only YEAR/MONTH/DAY are supported -- no generated table has a "
+              "time-of-day component)");
       }
       return wrap(AstExtract{field, convert_expr(e->expr)}, alias_of(*e));
     }
     default:
-      unsupported("expression type not in the supported grammar (subqueries and arrays are not yet supported)");
+      unsupported(
+          "expression type not in the supported grammar (subqueries and arrays are not yet supported)");
   }
 }
 

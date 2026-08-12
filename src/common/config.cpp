@@ -519,16 +519,16 @@ void validate_config(const EngineConfig& config) {
     }
     if (std::find(kIcebergCredentialsKinds.begin(), kIcebergCredentialsKinds.end(),
                   instance.credentials_kind) == kIcebergCredentialsKinds.end()) {
-      throw ConfigurationError(fmt::format(
-          "unity_catalog.instances.{}.credentials_kind '{}' is unsupported (expected 'none', "
-          "'bearer_token', or 'oauth2_client_credentials')",
-          name, instance.credentials_kind));
+      throw ConfigurationError(
+          fmt::format("unity_catalog.instances.{}.credentials_kind '{}' is unsupported (expected 'none', "
+                      "'bearer_token', or 'oauth2_client_credentials')",
+                      name, instance.credentials_kind));
     }
     if (instance.credentials_kind == "bearer_token" && instance.bearer_token.empty()) {
-      throw ConfigurationError(fmt::format(
-          "unity_catalog.instances.{}.bearer_token must not be empty when credentials_kind is "
-          "'bearer_token'",
-          name));
+      throw ConfigurationError(
+          fmt::format("unity_catalog.instances.{}.bearer_token must not be empty when credentials_kind is "
+                      "'bearer_token'",
+                      name));
     }
     if (instance.credentials_kind == "oauth2_client_credentials") {
       if (instance.oauth2_client_id.empty() || instance.oauth2_client_secret.empty()) {

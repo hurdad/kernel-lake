@@ -124,9 +124,8 @@ ResolvedTable UnityCatalogSourceResolver::resolve(ObjectStore& store, const std:
   // file bytes through it.
   std::shared_ptr<ObjectStore> temp_store;
   ObjectStore* data_store = &store;
-  const bool is_delta_or_parquet =
-      table.data_source_format == "DELTA" || table.data_source_format == "PARQUET" ||
-      table.data_source_format.empty();
+  const bool is_delta_or_parquet = table.data_source_format == "DELTA" ||
+                                   table.data_source_format == "PARQUET" || table.data_source_format.empty();
   // Copied into an owned std::string, not left as the Uri::scheme()
   // string_view -- that view points into the temporary Uri object above,
   // which is destroyed at the end of this statement, making a
@@ -136,7 +135,8 @@ ResolvedTable UnityCatalogSourceResolver::resolve(ObjectStore& store, const std:
   // never got stripped).
   const std::string storage_scheme(Uri(table.storage_location).scheme());
   const bool is_cloud_scheme = storage_scheme == "s3" || storage_scheme == "gs" || storage_scheme == "gcs" ||
-                               storage_scheme == "abfs" || storage_scheme == "abfss" || storage_scheme == "az";
+                               storage_scheme == "abfs" || storage_scheme == "abfss" ||
+                               storage_scheme == "az";
   if (is_delta_or_parquet && is_cloud_scheme) {
     // Same scheme-set ObjectStoreRegistry itself dispatches on
     // (object_store_registry.cpp) -- "gs"/"gcs" both mean GCS, "abfs"/
@@ -153,8 +153,7 @@ ResolvedTable UnityCatalogSourceResolver::resolve(ObjectStore& store, const std:
             "response carried no gcp_oauth_token",
             source));
       }
-      temp_store =
-          std::make_shared<GcsObjectStore>(gcs_config_.options, credentials.gcp_oauth_token);
+      temp_store = std::make_shared<GcsObjectStore>(gcs_config_.options, credentials.gcp_oauth_token);
     } else {
       if (credentials.azure_sas_token.empty()) {
         throw StorageError(fmt::format(
@@ -162,8 +161,7 @@ ResolvedTable UnityCatalogSourceResolver::resolve(ObjectStore& store, const std:
             "response carried no azure_sas_token",
             source));
       }
-      temp_store =
-          std::make_shared<AzureObjectStore>(azure_config_.options, credentials.azure_sas_token);
+      temp_store = std::make_shared<AzureObjectStore>(azure_config_.options, credentials.azure_sas_token);
     }
     data_store = temp_store.get();
   }
@@ -172,11 +170,11 @@ ResolvedTable UnityCatalogSourceResolver::resolve(ObjectStore& store, const std:
 
   if (table.data_source_format == "DELTA") {
     if (delta_config_.grpc_endpoint.empty()) {
-      throw ConfigurationError(fmt::format(
-          "read_unity_catalog(...): table '{}' is Delta-formatted, but no delta.grpc_endpoint is "
-          "configured (see DeltaSection in config.hpp) -- Unity Catalog only brokers the table's "
-          "identity/credentials, not the Delta log itself",
-          source));
+      throw ConfigurationError(
+          fmt::format("read_unity_catalog(...): table '{}' is Delta-formatted, but no delta.grpc_endpoint is "
+                      "configured (see DeltaSection in config.hpp) -- Unity Catalog only brokers the table's "
+                      "identity/credentials, not the Delta log itself",
+                      source));
     }
     delta::DeltaTxnClient delta_client(delta_config_);
     ResolvedTable result = delta::resolve_delta_table(*data_store, delta_client, effective_location);

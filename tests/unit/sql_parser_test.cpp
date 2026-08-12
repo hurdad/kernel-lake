@@ -106,7 +106,8 @@ TEST(SqlParser, ParsesReadUnityCatalogSource) {
 }
 
 TEST(SqlParser, RejectsReadUnityCatalogWithMultipleArguments) {
-  EXPECT_THROW((void)(parse_sql("SELECT a FROM read_unity_catalog('prod.main.db.orders', 'extra')")), SqlError);
+  EXPECT_THROW((void)(parse_sql("SELECT a FROM read_unity_catalog('prod.main.db.orders', 'extra')")),
+               SqlError);
 }
 
 TEST(SqlParser, ParsesJoinBetweenParquetAndUnityCatalogSources) {

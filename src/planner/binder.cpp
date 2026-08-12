@@ -231,7 +231,8 @@ bool contains_aggregate(const AstExprPtr& expr) {
           return true;
         } else if constexpr (std::is_same_v<T, AstBinary>) {
           return contains_aggregate(node.left) || contains_aggregate(node.right);
-        } else if constexpr (std::is_same_v<T, AstUnary> || std::is_same_v<T, AstCast>) {
+        } else if constexpr (std::is_same_v<T, AstUnary> || std::is_same_v<T, AstCast> ||
+                             std::is_same_v<T, AstExtract>) {
           return contains_aggregate(node.operand);
         } else if constexpr (std::is_same_v<T, AstBetween>) {
           return contains_aggregate(node.value) || contains_aggregate(node.lower) ||
@@ -250,8 +251,6 @@ bool contains_aggregate(const AstExprPtr& expr) {
             }
           }
           return node.else_branch != nullptr && contains_aggregate(node.else_branch);
-        } else if constexpr (std::is_same_v<T, AstExtract>) {
-          return contains_aggregate(node.operand);
         } else {
           return false;
         }

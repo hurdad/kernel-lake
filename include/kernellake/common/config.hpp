@@ -202,7 +202,7 @@ struct IcebergSection {
 // an explicit field, required whenever credentials_kind is
 // "oauth2_client_credentials".
 struct UnityCatalogInstanceSection {
-  std::string uc_url;               // e.g. "https://<workspace>/api/2.1/unity-catalog"
+  std::string uc_url;                 // e.g. "https://<workspace>/api/2.1/unity-catalog"
   std::string oauth2_token_endpoint;  // required for "oauth2_client_credentials"; e.g. ".../oidc/v1/token"
   // "none" | "bearer_token" | "oauth2_client_credentials" (mirrors
   // IcebergCatalogSection::credentials_kind's own convention).

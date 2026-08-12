@@ -237,9 +237,9 @@ TEST_F(QueryEngineExecuteTest, CaseWithGroupByAliasBucketsRows) {
 // via cudf::datetime::extract_datetime_component(), mirroring CASE's own
 // CompiledCase fast path just above).
 TEST_F(QueryEngineExecuteTest, ExtractYearAsGroupByKeyMatchesExpectedTotals) {
-  const QueryResult result = engine_.execute(
-      "SELECT EXTRACT(YEAR FROM event_date) AS y, SUM(amount) AS total FROM read_parquet('" + path_ +
-      "') GROUP BY y ORDER BY y");
+  const QueryResult result =
+      engine_.execute("SELECT EXTRACT(YEAR FROM event_date) AS y, SUM(amount) AS total FROM read_parquet('" +
+                      path_ + "') GROUP BY y ORDER BY y");
 
   ASSERT_EQ(result.rows_returned, 2);
   ASSERT_EQ(result.batches.size(), 1u);

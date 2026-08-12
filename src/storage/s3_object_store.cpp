@@ -24,7 +24,7 @@ void ensure_s3_initialized() {
   });
 }
 
-std::shared_ptr<arrow::fs::FileSystem> make_s3_filesystem_from_options(arrow::fs::S3Options options) {
+std::shared_ptr<arrow::fs::FileSystem> make_s3_filesystem_from_options(const arrow::fs::S3Options& options) {
   ensure_s3_initialized();
   const arrow::Result<std::shared_ptr<arrow::fs::S3FileSystem>> result =
       arrow::fs::S3FileSystem::Make(options);
@@ -65,7 +65,7 @@ std::shared_ptr<arrow::fs::FileSystem> make_s3_filesystem(const S3Section& confi
     options.ConfigureDefaultCredentials();
   }
 
-  return make_s3_filesystem_from_options(std::move(options));
+  return make_s3_filesystem_from_options(options);
 }
 
 }  // namespace
@@ -77,7 +77,7 @@ S3ObjectStore::S3ObjectStore(const arrow::fs::S3Options& base_options, const std
     : fs_([&] {
         arrow::fs::S3Options options = base_options;
         options.ConfigureAccessKey(access_key_id, secret_access_key, session_token);
-        return make_s3_filesystem_from_options(std::move(options));
+        return make_s3_filesystem_from_options(options);
       }()) {}
 
 std::vector<ObjectInfo> S3ObjectStore::list(const Uri& prefix) {

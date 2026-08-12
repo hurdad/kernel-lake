@@ -86,8 +86,8 @@ std::string http_request(const std::string& url, const std::vector<std::string>&
   long status_code = 0;
   curl_easy_getinfo(handle.get(), CURLINFO_RESPONSE_CODE, &status_code);
   if (status_code < 200 || status_code >= 300) {
-    throw StorageError(
-        fmt::format("{}: request to '{}' returned HTTP {}: {}", error_prefix, url, status_code, response_body));
+    throw StorageError(fmt::format("{}: request to '{}' returned HTTP {}: {}", error_prefix, url, status_code,
+                                   response_body));
   }
   return response_body;
 }

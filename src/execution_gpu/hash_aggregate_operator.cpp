@@ -199,11 +199,12 @@ std::unique_ptr<cudf::column> HashAggregateOperator::materialize_like(const Comp
 // Mirrors ProjectionOperator::materialize_extract's exact algorithm -- see
 // that function's own comment for why the INT16->INT64 cast is needed.
 std::unique_ptr<cudf::column> HashAggregateOperator::materialize_extract(const CompiledExtract& extract_expr,
-                                                                          const DeviceBatch& batch,
-                                                                          ExecutionContext& context) {
+                                                                         const DeviceBatch& batch,
+                                                                         ExecutionContext& context) {
   const std::unique_ptr<cudf::column> operand = materialize(extract_expr.operand, batch, context);
   std::unique_ptr<cudf::column> extracted = cudf::datetime::extract_datetime_component(
-      operand->view(), to_cudf_datetime_component(extract_expr.part), context.stream, context.memory_resource);
+      operand->view(), to_cudf_datetime_component(extract_expr.part), context.stream,
+      context.memory_resource);
   return cudf::cast(extracted->view(), cudf::data_type{cudf::type_id::INT64}, context.stream,
                     context.memory_resource);
 }

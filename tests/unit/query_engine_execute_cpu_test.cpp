@@ -432,9 +432,9 @@ TEST_F(QueryEngineExecuteCpuTest, CaseInGroupedAggregateWhereAndScalarAggregateM
 // synthetic name (which would have silently renamed this key's actual
 // output column -- see require_plain_column_index's own comment).
 TEST_F(QueryEngineExecuteCpuTest, ExtractYearAsGroupByKeyMatchesExpectedTotals) {
-  const QueryResult result = engine_.execute(
-      "SELECT EXTRACT(YEAR FROM event_date) AS y, SUM(amount) AS total FROM read_parquet('" + path_ +
-      "') GROUP BY y ORDER BY y");
+  const QueryResult result =
+      engine_.execute("SELECT EXTRACT(YEAR FROM event_date) AS y, SUM(amount) AS total FROM read_parquet('" +
+                      path_ + "') GROUP BY y ORDER BY y");
 
   ASSERT_EQ(result.rows_returned, 2);
   ASSERT_EQ(result.batches.size(), 1u);

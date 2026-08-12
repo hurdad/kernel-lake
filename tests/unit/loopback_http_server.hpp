@@ -98,8 +98,8 @@ inline std::string http_ok_json(const std::string& json_body) {
 }
 
 inline std::string http_status(int status_code, const std::string& reason, const std::string& body = "") {
-  return fmt::format("HTTP/1.1 {} {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", status_code, reason,
-                     body.size(), body);
+  return fmt::format("HTTP/1.1 {} {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", status_code,
+                     reason, body.size(), body);
 }
 
 }  // namespace kernellake

@@ -40,7 +40,7 @@ struct UnityCatalogColumn {
 // endpoint below.
 struct UnityCatalogTableInfo {
   std::string table_id;
-  std::string table_type;         // e.g. "MANAGED", "EXTERNAL"
+  std::string table_type;          // e.g. "MANAGED", "EXTERNAL"
   std::string data_source_format;  // e.g. "DELTA", "PARQUET", "ICEBERG"
   std::string storage_location;
   std::vector<UnityCatalogColumn> columns;
@@ -119,7 +119,8 @@ class UnityCatalogClient final {
   // client instance only (this constructor's original behavior, before
   // this parameter existed), so every existing call site and test keeps
   // compiling and behaving identically without passing one.
-  explicit UnityCatalogClient(UnityCatalogInstanceSection config, const UnityCatalogTokenCache* token_cache = nullptr);
+  explicit UnityCatalogClient(UnityCatalogInstanceSection config,
+                              const UnityCatalogTokenCache* token_cache = nullptr);
 
   UnityCatalogClient(const UnityCatalogClient&) = delete;
   UnityCatalogClient& operator=(const UnityCatalogClient&) = delete;
@@ -132,8 +133,8 @@ class UnityCatalogClient final {
   // `operation` is Unity Catalog's own vocabulary ("READ" is the only value
   // this project ever sends -- write support is out of scope, see
   // docs/ROADMAP.md).
-  [[nodiscard]] UnityCatalogTemporaryCredentials get_temporary_table_credentials(const std::string& table_id,
-                                                                                 const std::string& operation);
+  [[nodiscard]] UnityCatalogTemporaryCredentials get_temporary_table_credentials(
+      const std::string& table_id, const std::string& operation);
 
   // list_catalogs()/list_schemas()/list_tables() each follow Unity
   // Catalog's own cursor-style pagination (a "next_page_token" in every
@@ -147,7 +148,7 @@ class UnityCatalogClient final {
   [[nodiscard]] std::vector<UnityCatalogCatalogInfo> list_catalogs();
   [[nodiscard]] std::vector<UnityCatalogSchemaInfo> list_schemas(const std::string& catalog);
   [[nodiscard]] std::vector<UnityCatalogTableInfo> list_tables(const std::string& catalog,
-                                                                const std::string& schema);
+                                                               const std::string& schema);
 
   // Exposed (not just used internally by get_table()/
   // get_temporary_table_credentials() above) so UnityCatalogSourceResolver

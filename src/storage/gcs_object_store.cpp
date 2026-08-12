@@ -79,8 +79,10 @@ arrow::fs::GcsOptions build_options(const GcsSection& config) {
   return options;
 }
 
-std::shared_ptr<arrow::fs::FileSystem> make_gcs_filesystem_from_options(const arrow::fs::GcsOptions& options) {
-  const arrow::Result<std::shared_ptr<arrow::fs::GcsFileSystem>> result = arrow::fs::GcsFileSystem::Make(options);
+std::shared_ptr<arrow::fs::FileSystem> make_gcs_filesystem_from_options(
+    const arrow::fs::GcsOptions& options) {
+  const arrow::Result<std::shared_ptr<arrow::fs::GcsFileSystem>> result =
+      arrow::fs::GcsFileSystem::Make(options);
   if (!result.ok()) {
     throw StorageError(fmt::format("gcs: failed to construct filesystem: {}", result.status().ToString()));
   }

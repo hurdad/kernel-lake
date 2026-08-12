@@ -149,7 +149,7 @@ class QueryEngineUnityCatalogTest : public ::testing::Test {
         {{"name": "amount", "type_name": "DOUBLE", "nullable": true, "position": 1}}
       ]
     }})json",
-                      data_source_format, dir_.string());
+                       data_source_format, dir_.string());
   }
 
   EngineConfig config_with_instance(const std::string& uc_url) {
@@ -339,7 +339,8 @@ TEST_F(QueryEngineUnityCatalogTest, MinioBackedExplainProducesPhysicalPlanWithVe
   }
 
   LoopbackHttpServer server;
-  server.respond({minio_table_info(), minio_temp_credentials(), minio_table_info(), minio_temp_credentials()});
+  server.respond(
+      {minio_table_info(), minio_temp_credentials(), minio_table_info(), minio_temp_credentials()});
 
   QueryEngine engine(config_with_minio_instance(server.base_url()));
   const PhysicalPlanPtr plan =
@@ -373,7 +374,8 @@ TEST_F(QueryEngineUnityCatalogTest, MinioBackedExecuteReadsRealDataThroughVended
   }
 
   LoopbackHttpServer server;
-  server.respond({minio_table_info(), minio_temp_credentials(), minio_table_info(), minio_temp_credentials()});
+  server.respond(
+      {minio_table_info(), minio_temp_credentials(), minio_table_info(), minio_temp_credentials()});
 
   EngineConfig config = config_with_minio_instance(server.base_url());
   config.engine.backend = "cpu";
@@ -400,7 +402,8 @@ TEST_F(QueryEngineUnityCatalogTest, MinioBackedExecuteReadsRealDataThroughVended
 // ever ignored at execution time (the exact bug this fix closes), this
 // would either fail to authenticate against MinIO or -- worse -- silently
 // pass by reusing connection state left over from a different test.
-TEST_F(QueryEngineUnityCatalogTest, MinioBackedExecuteFailsWithoutVendedCredentialsWhenDefaultStoreLacksAccess) {
+TEST_F(QueryEngineUnityCatalogTest,
+       MinioBackedExecuteFailsWithoutVendedCredentialsWhenDefaultStoreLacksAccess) {
   if (!minio_reachable()) {
     GTEST_SKIP() << "MinIO not reachable at 127.0.0.1:9000 -- run `docker compose up -d minio minio-init` "
                     "from benchmarks/local/ first";
@@ -448,9 +451,8 @@ TEST_F(QueryEngineUnityCatalogTest, ExplainLogicalThrowsOnUnknownColumn) {
 
 TEST_F(QueryEngineUnityCatalogTest, ExplainLogicalThrowsOnUnknownInstanceName) {
   QueryEngine engine(default_config());  // no "prod" instance configured
-  EXPECT_THROW(
-      (void)(engine.explain_logical("SELECT id FROM read_unity_catalog('prod.main.db.orders')")),
-      ConfigurationError);
+  EXPECT_THROW((void)(engine.explain_logical("SELECT id FROM read_unity_catalog('prod.main.db.orders')")),
+               ConfigurationError);
 }
 
 TEST_F(QueryEngineUnityCatalogTest, ExplainLogicalThrowsWhenDeltaGrpcEndpointIsNotConfigured) {

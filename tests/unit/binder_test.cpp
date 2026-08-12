@@ -415,8 +415,7 @@ TEST(Binder, ExtractYearOverDateColumnMatchesExpectedGroupByKeyAndType) {
 }
 
 TEST(Binder, ExtractOverNonDateColumnIsRejected) {
-  const auto stmt =
-      sql::parse_sql("SELECT EXTRACT(YEAR FROM amount) FROM read_parquet('/x.parquet')");
+  const auto stmt = sql::parse_sql("SELECT EXTRACT(YEAR FROM amount) FROM read_parquet('/x.parquet')");
   EXPECT_THROW((void)bind_query(stmt, sales_schema()), BindingError);
 }
 

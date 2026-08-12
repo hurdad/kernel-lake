@@ -10,7 +10,7 @@ namespace kernellake {
 
 namespace {
 
-std::shared_ptr<arrow::fs::FileSystem> make_azure_filesystem_from_options(arrow::fs::AzureOptions options) {
+std::shared_ptr<arrow::fs::FileSystem> make_azure_filesystem_from_options(const arrow::fs::AzureOptions& options) {
   const arrow::Result<std::shared_ptr<arrow::fs::AzureFileSystem>> result =
       arrow::fs::AzureFileSystem::Make(options);
   if (!result.ok()) {
@@ -61,7 +61,7 @@ std::shared_ptr<arrow::fs::FileSystem> make_azure_filesystem(const AzureSection&
                                    status.ToString()));
   }
 
-  return make_azure_filesystem_from_options(std::move(options));
+  return make_azure_filesystem_from_options(options);
 }
 
 }  // namespace
@@ -73,10 +73,10 @@ AzureObjectStore::AzureObjectStore(const arrow::fs::AzureOptions& base_options, 
         arrow::fs::AzureOptions options = base_options;
         const arrow::Status status = options.ConfigureSASCredential(sas_token);
         if (!status.ok()) {
-          throw StorageError(fmt::format("azure: failed to configure vended SAS credentials: {}",
-                                         status.ToString()));
+          throw StorageError(
+              fmt::format("azure: failed to configure vended SAS credentials: {}", status.ToString()));
         }
-        return make_azure_filesystem_from_options(std::move(options));
+        return make_azure_filesystem_from_options(options);
       }()) {}
 
 std::vector<ObjectInfo> AzureObjectStore::list(const Uri& prefix) {

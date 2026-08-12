@@ -19,7 +19,8 @@ nlohmann::json parse_json_response(const std::string& url, const std::string& bo
   try {
     return nlohmann::json::parse(body);
   } catch (const nlohmann::json::exception& e) {
-    throw StorageError(fmt::format("{}: response from '{}' is not valid JSON: {}", kErrorPrefix, url, e.what()));
+    throw StorageError(
+        fmt::format("{}: response from '{}' is not valid JSON: {}", kErrorPrefix, url, e.what()));
   }
 }
 
@@ -57,9 +58,8 @@ std::vector<UnityCatalogColumn> parse_columns(const nlohmann::json& table_json, 
       column.position = column_json.value("position", 0);
       columns.push_back(std::move(column));
     } catch (const nlohmann::json::exception& e) {
-      throw StorageError(
-          fmt::format("{}: a 'columns' entry from '{}' is missing a required attribute: {}", kErrorPrefix, url,
-                      e.what()));
+      throw StorageError(fmt::format("{}: a 'columns' entry from '{}' is missing a required attribute: {}",
+                                     kErrorPrefix, url, e.what()));
     }
   }
   return columns;
@@ -84,7 +84,8 @@ UnityCatalogTableInfo parse_table_info(const nlohmann::json& table_json, const s
 
 }  // namespace
 
-UnityCatalogClient::UnityCatalogClient(UnityCatalogInstanceSection config, const UnityCatalogTokenCache* token_cache)
+UnityCatalogClient::UnityCatalogClient(UnityCatalogInstanceSection config,
+                                       const UnityCatalogTokenCache* token_cache)
     : config_(std::move(config)), token_cache_(token_cache) {}
 
 std::string UnityCatalogClient::fetch_oauth2_token() {
@@ -133,12 +134,13 @@ std::string UnityCatalogClient::fetch_oauth2_token() {
 
   const std::vector<std::string> headers = {"Accept: application/json",
                                             "Content-Type: application/x-www-form-urlencoded"};
-  const nlohmann::json response = parse_json_response(
-      config_.oauth2_token_endpoint, http_request(config_.oauth2_token_endpoint, headers, &body, kErrorPrefix));
+  const nlohmann::json response =
+      parse_json_response(config_.oauth2_token_endpoint,
+                          http_request(config_.oauth2_token_endpoint, headers, &body, kErrorPrefix));
 
   if (!response.contains("access_token")) {
-    throw StorageError(fmt::format("{}: oauth2 token response from '{}' is missing 'access_token'", kErrorPrefix,
-                                   config_.oauth2_token_endpoint));
+    throw StorageError(fmt::format("{}: oauth2 token response from '{}' is missing 'access_token'",
+                                   kErrorPrefix, config_.oauth2_token_endpoint));
   }
   cached_oauth2_token_ = response.at("access_token").get<std::string>();
   const double expires_in_seconds = response.value("expires_in", 3600.0);
@@ -249,7 +251,7 @@ std::vector<UnityCatalogSchemaInfo> UnityCatalogClient::list_schemas(const std::
 }
 
 std::vector<UnityCatalogTableInfo> UnityCatalogClient::list_tables(const std::string& catalog,
-                                                                    const std::string& schema) {
+                                                                   const std::string& schema) {
   std::vector<UnityCatalogTableInfo> tables;
   std::string page_token;
   do {
@@ -286,8 +288,7 @@ UnityCatalogTemporaryCredentials UnityCatalogClient::get_temporary_table_credent
   if (!bearer_token.empty()) {
     headers.push_back(fmt::format("Authorization: Bearer {}", bearer_token));
   }
-  const nlohmann::json response =
-      parse_json_response(url, http_request(url, headers, &body, kErrorPrefix));
+  const nlohmann::json response = parse_json_response(url, http_request(url, headers, &body, kErrorPrefix));
 
   UnityCatalogTemporaryCredentials credentials;
   if (response.contains("aws_temp_credentials") && !response.at("aws_temp_credentials").is_null()) {
@@ -316,16 +317,16 @@ UnityCatalogTemporaryCredentials UnityCatalogClient::get_temporary_table_credent
       credentials.azure_sas_token =
           response.at("azure_user_delegation_sas").at("sas_token").get<std::string>();
     } catch (const nlohmann::json::exception& e) {
-      throw StorageError(fmt::format(
-          "{}: 'azure_user_delegation_sas' from '{}' is missing a required field: {}", kErrorPrefix, url,
-          e.what()));
+      throw StorageError(
+          fmt::format("{}: 'azure_user_delegation_sas' from '{}' is missing a required field: {}",
+                      kErrorPrefix, url, e.what()));
     }
     return credentials;
   }
-  throw StorageError(fmt::format(
-      "{}: temporary-table-credentials response from '{}' has none of 'aws_temp_credentials'/"
-      "'gcp_oauth_token'/'azure_user_delegation_sas' -- unrecognized or unsupported cloud",
-      kErrorPrefix, url));
+  throw StorageError(
+      fmt::format("{}: temporary-table-credentials response from '{}' has none of 'aws_temp_credentials'/"
+                  "'gcp_oauth_token'/'azure_user_delegation_sas' -- unrecognized or unsupported cloud",
+                  kErrorPrefix, url));
 }
 
 }  // namespace kernellake::unitycatalog

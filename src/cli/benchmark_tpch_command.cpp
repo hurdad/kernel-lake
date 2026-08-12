@@ -62,14 +62,11 @@ std::string substitute_placeholder(std::string text, const std::string& placehol
 // placeholder to begin with. `{nation_data}` is substituted into every
 // occurrence of the placeholder, which for Q7 (its own two nation JOIN
 // steps, one per alias) means both get the same real table.
-std::string strip_comments_and_substitute(const std::string& text, const std::string& data_glob,
-                                          const std::string& part_data_glob,
-                                          const std::string& orders_data_glob,
-                                          const std::string& customer_data_glob,
-                                          const std::string& nation_data_glob,
-                                          const std::string& supplier_data_glob,
-                                          const std::string& region_data_glob,
-                                          const std::string& partsupp_data_glob) {
+std::string strip_comments_and_substitute(
+    const std::string& text, const std::string& data_glob, const std::string& part_data_glob,
+    const std::string& orders_data_glob, const std::string& customer_data_glob,
+    const std::string& nation_data_glob, const std::string& supplier_data_glob,
+    const std::string& region_data_glob, const std::string& partsupp_data_glob) {
   static const std::regex comment_line(R"(--[^\n]*\n)");
   std::string stripped = std::regex_replace(text, comment_line, "\n");
   stripped = substitute_placeholder(std::move(stripped), "{data}", data_glob);
@@ -232,9 +229,9 @@ int run_benchmark_tpch(const std::vector<std::string_view>& args, const EngineCo
   const std::string query_file = query_file_override.empty() ? default_query_file : query_file_override;
 
   try {
-    const std::string sql = strip_comments_and_substitute(read_file_or_throw(query_file), data, part_data,
-                                                          orders_data, customer_data, nation_data,
-                                                          supplier_data, region_data, partsupp_data);
+    const std::string sql =
+        strip_comments_and_substitute(read_file_or_throw(query_file), data, part_data, orders_data,
+                                      customer_data, nation_data, supplier_data, region_data, partsupp_data);
 
     ObjectStoreRegistry store(config.storage);
     std::vector<ObjectInfo> files = discover_parquet_files(store, {data});

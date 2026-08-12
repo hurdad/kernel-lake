@@ -13,9 +13,9 @@
 namespace kernellake::unitycatalog {
 namespace {
 
-using kernellake::LoopbackHttpServer;
 using kernellake::http_ok_json;
 using kernellake::http_status;
+using kernellake::LoopbackHttpServer;
 
 constexpr const char* kTableInfoJson = R"({
   "table_id": "table-uuid-1",
@@ -241,8 +241,8 @@ TEST(UnityCatalogClient, GetTemporaryTableCredentialsParsesGcpOauthToken) {
 
 TEST(UnityCatalogClient, GetTemporaryTableCredentialsParsesAzureSasToken) {
   LoopbackHttpServer server;
-  server.respond(
-      {http_ok_json(R"({"azure_user_delegation_sas": {"sas_token": "sv=2024-01-01&sig=vended-azure-sas"}})")});
+  server.respond({http_ok_json(
+      R"({"azure_user_delegation_sas": {"sas_token": "sv=2024-01-01&sig=vended-azure-sas"}})")});
 
   UnityCatalogClient client(instance_config(server.base_url()));
   const UnityCatalogTemporaryCredentials credentials =
@@ -311,7 +311,8 @@ TEST(UnityCatalogClient, ListCatalogsParsesSinglePage) {
   })")},
                  &requests);
 
-  const std::vector<UnityCatalogCatalogInfo> catalogs = UnityCatalogClient(instance_config(server.base_url())).list_catalogs();
+  const std::vector<UnityCatalogCatalogInfo> catalogs =
+      UnityCatalogClient(instance_config(server.base_url())).list_catalogs();
   server.join();
 
   ASSERT_EQ(catalogs.size(), 2u);
@@ -324,18 +325,18 @@ TEST(UnityCatalogClient, ListCatalogsParsesSinglePage) {
 TEST(UnityCatalogClient, ListSchemasFollowsPaginationAcrossMultiplePages) {
   LoopbackHttpServer server;
   std::vector<std::string> requests(2);
-  server.respond(
-      {http_ok_json(R"({
+  server.respond({http_ok_json(R"({
         "schemas": [{"name": "default", "catalog_name": "unity", "full_name": "unity.default"}],
         "next_page_token": "default"
       })"),
-       http_ok_json(R"({
+                  http_ok_json(R"({
         "schemas": [{"name": "other_schema", "catalog_name": "unity", "full_name": "unity.other_schema"}],
         "next_page_token": null
       })")},
-      &requests);
+                 &requests);
 
-  const std::vector<UnityCatalogSchemaInfo> schemas = UnityCatalogClient(instance_config(server.base_url())).list_schemas("unity");
+  const std::vector<UnityCatalogSchemaInfo> schemas =
+      UnityCatalogClient(instance_config(server.base_url())).list_schemas("unity");
   server.join();
 
   ASSERT_EQ(schemas.size(), 2u);
