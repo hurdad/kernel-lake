@@ -50,9 +50,9 @@ QueryResult QueryEngine::execute(std::string_view sql) const {
   // build_physical_plan()'s `extra_resolver` defaults to nullptr.
   iceberg::IcebergSourceResolver iceberg_resolver(config_.iceberg);
   delta::DeltaSourceResolver delta_resolver(config_.delta);
-  unitycatalog::UnityCatalogSourceResolver unity_catalog_resolver(config_.unity_catalog, config_.delta,
-                                                                  config_.storage.s3, config_.storage.gcs,
-                                                                  config_.storage.azure);
+  unitycatalog::UnityCatalogSourceResolver unity_catalog_resolver(
+      config_.unity_catalog, config_.delta, config_.storage.s3, config_.storage.gcs, config_.storage.azure,
+      &unity_catalog_token_cache_);
   CompositeSourceResolver resolver(iceberg_resolver, delta_resolver, unity_catalog_resolver);
   const PhysicalPlanPtr physical = build_physical_plan(logical, store_, &resolver);
 

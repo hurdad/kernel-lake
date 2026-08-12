@@ -425,9 +425,17 @@ arrow::compute::Aggregate translate_aggregate(AggregateInputPlan& plan, const Ag
 
 arrow::acero::Declaration translate(const PhysicalPlanPtr& node, ObjectStore& store) {
   if (const auto* scan = dynamic_cast<const ParquetScanNode*>(node.get())) {
+    // Most scans read through the caller's own default `store`; a scan
+    // resolved with per-table vended credentials (see
+    // ParquetScanNode::owned_store()'s own doc comment -- currently only
+    // Unity Catalog's S3/GCS/Azure vended credentials) must read through
+    // that store instead, or it would silently fall back to whatever
+    // static access the engine's own default config happens to have (or
+    // fail outright, if it has none).
+    ObjectStore& effective_store = scan->owned_store() != nullptr ? *scan->owned_store() : store;
     return arrow::acero::Declaration{
         "record_batch_reader_source",
-        arrow::acero::RecordBatchReaderSourceNodeOptions{make_streaming_scan_reader(*scan, store)}};
+        arrow::acero::RecordBatchReaderSourceNodeOptions{make_streaming_scan_reader(*scan, effective_store)}};
   }
   // Acero's own "hashjoin" node (HashJoinNodeOptions) implements exactly the
   // two-table INNER equi-join HashJoinNode describes; output_all defaults to

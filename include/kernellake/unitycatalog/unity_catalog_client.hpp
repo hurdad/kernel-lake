@@ -7,6 +7,7 @@
 #include <nlohmann/json_fwd.hpp>
 
 #include "kernellake/common/config.hpp"
+#include "kernellake/unitycatalog/unity_catalog_token_cache.hpp"
 
 namespace kernellake::unitycatalog {
 
@@ -108,7 +109,17 @@ struct UnityCatalogSchemaInfo {
 // already validated (see validate_config() in src/common/config.cpp).
 class UnityCatalogClient final {
  public:
-  explicit UnityCatalogClient(UnityCatalogInstanceSection config);
+  // `token_cache`, when non-null, is consulted/updated by
+  // fetch_oauth2_token() (only relevant when config.credentials_kind ==
+  // "oauth2_client_credentials") so an OAuth2 token survives past this
+  // one client's own lifetime -- the caller (UnityCatalogSourceResolver,
+  // itself given one by QueryEngine) owns it and must keep it alive for
+  // at least as long as every UnityCatalogClient it hands the pointer to.
+  // Defaults to nullptr: token caching then stays scoped to this one
+  // client instance only (this constructor's original behavior, before
+  // this parameter existed), so every existing call site and test keeps
+  // compiling and behaving identically without passing one.
+  explicit UnityCatalogClient(UnityCatalogInstanceSection config, const UnityCatalogTokenCache* token_cache = nullptr);
 
   UnityCatalogClient(const UnityCatalogClient&) = delete;
   UnityCatalogClient& operator=(const UnityCatalogClient&) = delete;
@@ -155,6 +166,7 @@ class UnityCatalogClient final {
   [[nodiscard]] nlohmann::json authenticated_get_json(const std::string& url);
 
   UnityCatalogInstanceSection config_;
+  const UnityCatalogTokenCache* token_cache_ = nullptr;
   std::string cached_oauth2_token_;
   double oauth2_token_expiry_unix_seconds_ = 0.0;
 };

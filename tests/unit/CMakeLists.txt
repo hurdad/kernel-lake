@@ -18,6 +18,7 @@ add_executable(kernellake_unit_tests
   table_resolution_test.cpp
   rest_catalog_client_test.cpp
   unity_catalog_client_test.cpp
+  unity_catalog_token_cache_test.cpp
   unity_catalog_source_resolver_test.cpp
   manifest_reader_test.cpp
   position_delete_reader_test.cpp

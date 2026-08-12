@@ -53,13 +53,15 @@ class ParquetScanNode final : public PhysicalPlanNode {
  public:
   ParquetScanNode(std::vector<PhysicalFileFragment> fragments, std::vector<std::string> columns,
                   Schema schema, int files_considered, std::vector<PartitionColumn> partition_columns = {},
-                  std::vector<std::optional<std::size_t>> original_column_map = {})
+                  std::vector<std::optional<std::size_t>> original_column_map = {},
+                  std::shared_ptr<ObjectStore> owned_store = nullptr)
       : fragments_(std::move(fragments)),
         columns_(std::move(columns)),
         schema_(std::move(schema)),
         files_considered_(files_considered),
         partition_columns_(std::move(partition_columns)),
-        original_column_map_(std::move(original_column_map)) {}
+        original_column_map_(std::move(original_column_map)),
+        owned_store_(std::move(owned_store)) {}
 
   [[nodiscard]] const std::vector<PhysicalFileFragment>& fragments() const noexcept { return fragments_; }
   // Physical columns to actually read from each fragment's Parquet file --
@@ -87,6 +89,15 @@ class ParquetScanNode final : public PhysicalPlanNode {
   [[nodiscard]] const std::vector<std::optional<std::size_t>>& original_column_map() const noexcept {
     return original_column_map_;
   }
+  // Non-null only when this scan's files must be read through different
+  // credentials than the query's own default ObjectStore -- see
+  // ResolvedTable::owned_store's own doc comment for why and how this gets
+  // populated. Execution (acero_query_executor.cpp's translate(),
+  // operator_builder.cpp's build()) must check this per scan node instead
+  // of assuming the one ObjectStore threaded through the rest of the
+  // physical plan tree is always the right one to read this scan's files
+  // with.
+  [[nodiscard]] ObjectStore* owned_store() const noexcept { return owned_store_.get(); }
 
   [[nodiscard]] const Schema& output_schema() const override { return schema_; }
   [[nodiscard]] std::string_view node_name() const noexcept override { return "ParquetScan"; }
@@ -100,6 +111,7 @@ class ParquetScanNode final : public PhysicalPlanNode {
   int files_considered_;
   std::vector<PartitionColumn> partition_columns_;
   std::vector<std::optional<std::size_t>> original_column_map_;
+  std::shared_ptr<ObjectStore> owned_store_;
 };
 
 // A two-table INNER equi-join (see LogicalJoin). `left_key_index`/

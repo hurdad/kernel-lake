@@ -3250,17 +3250,138 @@ log` is the authoritative chronology if that ordering ever matters.
   `GcsObjectStore` construction tests already use). `cpu-dev` and a real
   `gpu-dev-wsl2` rebuild both 404/404, zero regressions.
 
-  Not done here, deliberately out of scope for this item: threading these
-  vended stores through to actual scan *execution* (same pre-existing gap
-  the AWS/S3 path already has -- see "Scan execution doesn't use vended
-  credentials" below, unaffected by this change either way).
+  Threading these vended stores through to actual scan *execution* was
+  deliberately out of scope for this item -- see "Unity Catalog:
+  scan-execution credentials" below, which closes that gap for S3/GCS/
+  Azure alike, since it's the same seam regardless of which cloud vended
+  the credentials.
+
+- **Unity Catalog: scan-execution credentials** -- closes the real
+  architectural gap this session's live-MinIO verification found (see
+  "Unity Catalog: live-server and real-MinIO verification..." above):
+  resolve time (schema discovery, physical planning) always correctly
+  built and used a temporary, vended-credentialed store, but actual scan
+  *execution* always read through `QueryEngine`'s own long-lived
+  `store_`, which had no idea those credentials existed. Concretely: a
+  real `read_unity_catalog(...)` query against an S3-backed table worked
+  for `kernellake explain`/`explain_logical` but a real `kernellake query`
+  (`QueryEngine::execute()`) failed once it reached the actual data read,
+  unless the engine's own `storage.s3.credentials_kind` happened to
+  already have independent access to that same bucket.
+
+  Fixed by threading "which store resolved this file" from `ResolvedTable`
+  through to execution, per scan node rather than once for the whole
+  query: `ResolvedTable` gained an `owned_store` field (a
+  `std::shared_ptr<ObjectStore>`, null for every path that doesn't need
+  one -- plain `read_parquet(...)`, Iceberg, Delta, and Unity-Catalog
+  tables with no vended credentials), populated by
+  `UnityCatalogSourceResolver::resolve()` for its DELTA/PARQUET dispatch
+  targets whenever it built a temporary vended store (unchanged for its
+  ICEBERG dispatch target, which never fetches vended credentials in the
+  first place -- see that resolver's own comment). `convert_scan()`
+  (`physical_planner.cpp`) carries it onto the new `ParquetScanNode`.
+  Execution then picks per scan node instead of assuming one
+  query-wide store is always right: both
+  `acero_query_executor.cpp`'s `translate()` (CPU/Acero) and
+  `operator_builder.cpp`'s `build()` (GPU) now do
+  `scan->owned_store() != nullptr ? *scan->owned_store() : store` at the
+  `ParquetScanNode` case, identical logic in both backends. A `shared_ptr`
+  (not `unique_ptr`) since the physical plan is itself a `shared_ptr`
+  tree that can be referenced more than once during one query's
+  execution; ownership keeps the vended store alive for exactly as long
+  as that query's own physical plan is, no longer.
+
+  **Verified for real against MinIO, not just by compiling**: the old
+  pinned-failure regression test
+  (`MinioBackedExecuteFailsBecauseScanExecutionBypassesVendedCredentials`)
+  now genuinely succeeds, so it was replaced with two tests that prove
+  the fix is real per-scan dispatch rather than an accidental global
+  fallback: `MinioBackedExecuteReadsRealDataThroughVendedCredentials`
+  (asserts the correct `SUM(amount) = 150.0` result, reading real bytes
+  off real MinIO through the vended-credentialed store) and
+  `MinioBackedExecuteFailsWithoutVendedCredentialsWhenDefaultStoreLacksAccess`
+  (feeds back deliberately wrong vended credentials and confirms MinIO
+  itself rejects them -- proving the credentials handed to
+  `UnityCatalogClient::get_temporary_table_credentials()`'s response are
+  the ones actually used, not some other correct source reused
+  underneath). `cpu-dev` 405/405 and a real `gpu-dev-wsl2` rebuild
+  405/405, zero regressions. The GPU-side `operator_builder.cpp` change
+  itself is not separately exercised by a dedicated real-MinIO GPU test
+  (would need duplicating `LoopbackHttpServer`/Unity-Catalog test infra
+  into `tests/gpu/`, which has no such fixture today) -- it's the
+  identical one-line dispatch as the CPU path, feeding the same
+  `ObjectStore&` interface `ParquetScanOperator` already took before this
+  change, and is covered by compilation plus the full `gpu-dev-wsl2` test
+  suite passing unchanged.
+
+- **Unity Catalog: OAuth2 token caching across queries** -- closes the
+  "Caching `UnityCatalogClient`/its OAuth2 token across queries" gap
+  listed below, scoped narrowly to just the token (not the whole client):
+  `get_table()`/`list_*()` must always hit the real server to reflect
+  current catalog state, so those stay uncached; only the *authentication*
+  step -- which a fresh `UnityCatalogClient` otherwise repeats on every
+  `resolve()` call, and every query already makes at least two of those
+  (`plan_logical()`'s schema-discovery resolve, then
+  `build_physical_plan()`'s own real resolve) -- was worth sharing.
+
+  New `UnityCatalogTokenCache` (`kernellake/unitycatalog/unity_catalog_token_cache.hpp`,
+  header-only): a small `std::mutex`-guarded map from a Unity Catalog
+  instance's `uc_url` to its currently-valid token + expiry. Every public
+  method is `const` (mutex/map are the `mutable` members, not the class
+  itself), so `QueryEngine` can hold one as a plain, non-`mutable`
+  member (`unity_catalog_token_cache_`) safely touched from its own
+  `const` methods -- the same "safe shared mutable state behind its own
+  synchronization" pattern `QueryEngine`'s existing `mutable ObjectStoreRegistry
+  store_` member already relies on, so `explain()`'s documented
+  reentrancy claim (see `docs/ARCHITECTURE.md`'s Concurrency notes) stays
+  true: every access is mutex-guarded, so concurrent callers (e.g. the
+  Flight SQL server's concurrently-planned queries) see no data race,
+  only real cache sharing.
+
+  `UnityCatalogClient` gained an optional `const UnityCatalogTokenCache*`
+  constructor parameter (defaults to `nullptr`, preserving every existing
+  call site's behavior unchanged), consulted/updated by
+  `fetch_oauth2_token()` only when `credentials_kind ==
+  "oauth2_client_credentials"` (the static `bearer_token` kind needs no
+  fetch at all, so nothing to cache there). `UnityCatalogSourceResolver`
+  gained the identical optional parameter, passed straight through to
+  every `UnityCatalogClient` it constructs. `QueryEngine` passes
+  `&unity_catalog_token_cache_` at all four of its own
+  `UnityCatalogSourceResolver` construction sites
+  (`plan_logical()`/`explain()` in `query_engine.cpp`, and each of
+  `query_engine_execute_gpu.cpp`/`query_engine_execute_stub.cpp`'s own
+  `execute(sql)`).
+
+  Verified for real, not just by construction: `UnityCatalogClient.
+  TwoClientsSharingATokenCacheOnlyFetchTheTokenOnce` constructs two
+  entirely separate `UnityCatalogClient` instances sharing one cache and
+  confirms only one real token-endpoint request happens between them (the
+  test's `LoopbackHttpServer` token stub is only handed one canned
+  response -- a second, wrongly-uncached fetch would find nothing
+  listening and fail/hang instead of silently passing), with a companion
+  `TwoClientsWithoutASharedCacheEachFetchTheirOwnToken` confirming the
+  `nullptr`-default path is unchanged. `QueryEngineUnityCatalogTest.
+  ExecuteOnlyFetchesTheOauth2TokenOnceAcrossBothInternalResolves` proves
+  the same thing at the real `QueryEngine::execute()` level: a single
+  query against an `oauth2_client_credentials`-configured instance, which
+  resolves twice internally, authenticates to the token endpoint only
+  once. Five new `UnityCatalogTokenCache`-only unit tests cover
+  `try_get`/`store` semantics directly (unknown key, before/at/past
+  expiry, independent keys, overwrite). `cpu-dev` and a real
+  `gpu-dev-wsl2` rebuild both 413/413, zero regressions.
+
+  Deliberately out of scope, matching the task's own naming: Iceberg's
+  `IcebergRestCatalogClient` and Delta's `DeltaTxnClient` have the
+  identical "fresh client per `resolve()` call" simplification (and, for
+  Iceberg's own OAuth2 client-credentials path, the identical
+  per-instance-only local token cache) -- untouched here, still tracked
+  as its own accepted trade-off where those entries already document it.
 
 ## Not yet started
 
 - **Unity Catalog support: remaining gaps** -- the core read path (Phase 5
   of the lakehouse roadmap) is now done, see "Unity Catalog support,
-  read-only, first vertical slice" in "Done" above. What's left, not
-  attempted this session:
+  read-only, first vertical slice" in "Done" above. What's left:
   - ~~GCS/Azure temporary credentials~~ -- done, see "Unity Catalog:
     GCS/Azure vended-credential support" in "Done" above.
   - ~~Catalog/schema `LIST` operations~~ -- done, see
@@ -3269,36 +3390,14 @@ log` is the authoritative chronology if that ordering ever matters.
     exposes these yet (no UC equivalent of `SHOW TABLES` reachable from
     `kernellake query`), matching how Iceberg/Delta also have no `LIST`
     SQL surface.
-  - **Caching `UnityCatalogClient`/its OAuth2 token across queries** --
-    constructed fresh per `resolve()` call today, the same deliberate MVP
-    simplification `IcebergSourceResolver`'s `IcebergRestCatalogClient` and
-    `DeltaSourceResolver`'s `DeltaTxnClient` already accept (see
-    `docs/ROADMAP.md`'s Iceberg REST catalog entries for the same
-    trade-off spelled out there).
-  - **Scan execution doesn't use vended credentials** -- the real gap
-    found by this session's live-MinIO verification (see "Unity Catalog:
-    live-server and real-MinIO verification..." in "Done" above): resolve
-    time (schema discovery, physical planning) correctly builds and uses
-    a temporary, vended-credentialed `S3ObjectStore`, but actual scan
-    *execution* always reads through `QueryEngine`'s own long-lived
-    `store_`, which has no idea those credentials exist. Concretely: a
-    real `read_unity_catalog(...)` query against an S3-backed table
-    currently works for `kernellake explain`/`explain_logical`, but a
-    real `kernellake query` (`QueryEngine::execute()`) fails once it
-    reaches the actual data read, unless the engine's own
-    `storage.s3.credentials_kind` happens to already have independent
-    access to that same bucket. Fixing this needs a real seam threading
-    "which credentials resolved this file" from `ResolvedTable`/the
-    physical plan through to whichever `ParquetScanOperator`/
-    `resolve_delta_table()` call actually reads bytes at execution time
-    (both CPU and GPU scan operators) -- a cross-cutting change on the
-    order of the per-row-delete-filtering entry below, not a quick patch,
-    and the reason it wasn't attempted this session. Two regression tests
-    pin down the exact current boundary:
-    `MinioBackedExplainProducesPhysicalPlanWithVendedCredentials` (passes)
-    and `MinioBackedExecuteFailsBecauseScanExecutionBypassesVendedCredentials`
-    (asserts today's `StorageError`, written to fail loudly once this is
-    fixed and needs replacing with a real-result assertion instead).
+  - ~~Scan execution doesn't use vended credentials~~ -- done, see "Unity
+    Catalog: scan-execution credentials" in "Done" above.
+  - ~~Caching `UnityCatalogClient`/its OAuth2 token across queries~~ --
+    done (the token specifically, not the whole client -- `get_table()`/
+    `list_*()` still always hit the real server), see "Unity Catalog:
+    OAuth2 token caching across queries" in "Done" above. Iceberg's
+    `IcebergRestCatalogClient`/Delta's `DeltaTxnClient` still have the
+    identical fresh-per-call simplification, untouched by this change.
   - Live-server/real-MinIO verification itself is now done (see "Done"
     above) -- two real bugs found and fixed there (a `"file://"`-prefixed
     `storage_location` from a real server, and a dangling `string_view`

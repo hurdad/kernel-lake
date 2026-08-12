@@ -1,5 +1,6 @@
 #pragma once
 
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -34,6 +35,21 @@ struct ResolvedTable {
   std::vector<ResolvedFile> files;
   Schema schema;
   std::vector<PartitionColumn> partition_columns;
+  // Non-null only when this table's file bytes must be read through a
+  // *different* ObjectStore than the query's own default (e.g. Unity
+  // Catalog's per-table vended S3/GCS/Azure credentials -- see
+  // kernellake::unitycatalog::UnityCatalogSourceResolver::resolve()) --
+  // null for the plain read_parquet(...)/read_iceberg(...)/read_delta(...)
+  // paths, which all read through whichever ObjectStore the caller already
+  // supplies. Carried into ParquetScanNode (see physical_planner.cpp's
+  // convert_scan()) so scan *execution* -- not just resolve-time schema
+  // discovery/physical planning, which already had access to whatever
+  // store resolve() itself used internally -- can read each table's files
+  // through the credentials that were actually able to see them. A
+  // shared_ptr (not unique_ptr) since ParquetScanNode is reached through a
+  // shared_ptr physical-plan tree that may be referenced from more than
+  // one place during one query's execution.
+  std::shared_ptr<ObjectStore> owned_store;
 };
 
 // Resolves `sources` (as given to `read_parquet(...)`) into concrete files,

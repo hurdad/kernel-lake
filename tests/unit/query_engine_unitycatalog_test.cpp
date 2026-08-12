@@ -56,7 +56,7 @@ const ::testing::Environment* const kS3FinalizeEnvironment =
 // storage_location (UnityCatalogSourceResolver never fetches temporary
 // credentials for one -- see that class's own comment) for the always-run
 // tests below, and a real "s3://..." one against a real local MinIO for
-// the two Minio*-prefixed tests (skipped if MinIO isn't reachable -- see
+// the Minio*-prefixed tests (skipped if MinIO isn't reachable -- see
 // minio_reachable() below). Either way, the DELTA/ICEBERG dispatch
 // targets' own resolution logic (resolve_delta_table(),
 // resolve_iceberg_table()) is already covered end to end by
@@ -68,17 +68,19 @@ const ::testing::Environment* const kS3FinalizeEnvironment =
 // server (not captured as an automated test -- that server's own real
 // temporary-table-credentials vending is AWS-IAM-role/STS-based, which
 // MinIO doesn't support without much deeper setup; see docs/ROADMAP.md).
-// That live-server verification found a real architectural gap the two
-// Minio*-prefixed tests below pin down precisely: vended credentials are
-// correctly used for schema discovery and physical planning (both go
-// through TableSourceResolver::resolve(), which UnityCatalogSourceResolver
-// builds a temporary, vended-credentialed S3ObjectStore for), but the
-// *actual scan execution* reads through QueryEngine's own long-lived,
-// statically-configured ObjectStore instead -- the physical plan carries
-// file paths, not a reference to which store resolved them. So `explain`/
-// `explain_logical` (resolve-only) succeed against a bucket only the
-// vended credentials can reach; a real `execute()` fails once it tries to
-// actually read the data. See docs/ROADMAP.md's Unity Catalog entry.
+// That live-server verification originally found a real architectural gap
+// (vended credentials were only used for schema discovery/physical
+// planning, never for actual scan execution, which always read through
+// QueryEngine's own long-lived, statically-configured ObjectStore instead)
+// -- since closed by threading ResolvedTable::owned_store through
+// ParquetScanNode into both the CPU and GPU execution paths (see
+// docs/ROADMAP.md's Unity Catalog entry). The Minio*-prefixed tests below
+// now cover both a real vended-credentials read succeeding
+// (MinioBackedExecuteReadsRealDataThroughVendedCredentials) and a real
+// wrong-credentials read still failing
+// (MinioBackedExecuteFailsWithoutVendedCredentialsWhenDefaultStoreLacksAccess),
+// proving execution genuinely dispatches per scan rather than falling back
+// to some other, accidentally-correct default.
 namespace kernellake {
 namespace {
 
@@ -262,6 +264,51 @@ TEST_F(QueryEngineUnityCatalogTest, ExecuteRunsQueryEndToEndOverRealDataFiles) {
   EXPECT_DOUBLE_EQ(total_column->Value(0), 28.0);
 }
 
+// Proves QueryEngine's own unity_catalog_token_cache_ member is real, not
+// just plumbing: one execute() call resolves twice internally
+// (plan_logical()'s schema-discovery resolve, then build_physical_plan()'s
+// own real resolve -- see those methods' own comments), each constructing
+// a fresh UnityCatalogClient, so without a token shared across them, an
+// oauth2_client_credentials-configured instance would authenticate twice
+// for one query. The token server below is only handed one canned
+// response; if the shared cache weren't wired through, the second
+// UnityCatalogClient's own token fetch would find nothing listening
+// there and this test would fail (either a thrown StorageError, since
+// LoopbackHttpServer::respond() services only as many connections as it's
+// given responses for, or -- if some earlier queued TCP SYN happened to
+// still complete a handshake -- a slow ~30s CURLOPT_TIMEOUT failure; see
+// http_client.cpp).
+TEST_F(QueryEngineUnityCatalogTest, ExecuteOnlyFetchesTheOauth2TokenOnceAcrossBothInternalResolves) {
+  write_data_file("data-0.parquet", 0, 5);
+  LoopbackHttpServer token_server;
+  LoopbackHttpServer table_server;
+  std::vector<std::string> token_requests(1);
+  token_server.respond({http_ok_json(R"({"access_token": "one-shot-token", "expires_in": 3600})")},
+                       &token_requests);
+  const std::string table_response = http_ok_json(table_info_json("PARQUET"));
+  std::vector<std::string> table_requests(2);
+  table_server.respond({table_response, table_response}, &table_requests);
+
+  EngineConfig config = config_with_instance(table_server.base_url());
+  config.unity_catalog.instances["prod"].oauth2_token_endpoint = token_server.base_url() + "/oidc/v1/token";
+  config.unity_catalog.instances["prod"].credentials_kind = "oauth2_client_credentials";
+  config.unity_catalog.instances["prod"].oauth2_client_id = "my-client";
+  config.unity_catalog.instances["prod"].oauth2_client_secret = "my-secret";
+  config.engine.backend = "cpu";
+  QueryEngine engine(config);
+
+  const QueryResult result =
+      engine.execute("SELECT SUM(amount) AS total FROM read_unity_catalog('prod.main.db.orders')");
+  token_server.join();
+  table_server.join();
+
+  ASSERT_EQ(result.rows_returned, 1);
+  // Both resolves authenticated against the real table server with the
+  // one token the shared cache handed back the second time.
+  EXPECT_NE(table_requests[0].find("Authorization: Bearer one-shot-token"), std::string::npos);
+  EXPECT_NE(table_requests[1].find("Authorization: Bearer one-shot-token"), std::string::npos);
+}
+
 // The one piece query_engine_unitycatalog_test.cpp's other tests can't
 // cover: a real S3-vended-credentials round trip. UnityCatalogClient's own
 // parsing of a real "aws_temp_credentials" response is already verified in
@@ -304,20 +351,22 @@ TEST_F(QueryEngineUnityCatalogTest, MinioBackedExplainProducesPhysicalPlanWithVe
   EXPECT_NE(text.find("ParquetScan"), std::string::npos);
 }
 
-// Pins down the real gap this session's live-server verification found
-// (see this file's own header comment): a real `execute()` currently
-// fails once it reaches actual scan execution, because that step reads
-// through QueryEngine's own long-lived, statically-configured
-// ObjectStore -- never through the resolver's temporary, vended-
-// credentialed one, which only `resolve()` (schema discovery, physical
-// planning -- see the test above) ever sees. This is a real limitation of
-// this vertical slice, not desired behavior: this test exists so it fails
-// loudly (not silently) once someone threads per-query object-store
-// credentials through to execution and this stops throwing -- at which
-// point this test should be replaced with one asserting a correct
-// SUM(amount) = 150.0 result, the same shape as
-// ExecuteRunsQueryEndToEndOverRealDataFiles above.
-TEST_F(QueryEngineUnityCatalogTest, MinioBackedExecuteFailsBecauseScanExecutionBypassesVendedCredentials) {
+// Closes the real gap an earlier session's live-server verification found
+// (see this file's own header comment, and docs/ROADMAP.md's "Unity
+// Catalog: scan-execution credentials" entry): `execute()` used to fail
+// once it reached actual scan execution, because that step read through
+// QueryEngine's own long-lived, statically-configured ObjectStore --
+// never through the resolver's temporary, vended-credentialed one, which
+// only `resolve()` (schema discovery, physical planning -- see the test
+// above) ever saw. Fixed by carrying the resolver's vended store through
+// ResolvedTable::owned_store into ParquetScanNode, so both the CPU
+// (acero_query_executor.cpp) and GPU (operator_builder.cpp) execution
+// paths read each scan through whichever store actually resolved it,
+// instead of a single store threaded uniformly through the whole
+// physical plan tree. This test replaces the old
+// MinioBackedExecuteFailsBecauseScanExecutionBypassesVendedCredentials,
+// which pinned down the failure this fix closes.
+TEST_F(QueryEngineUnityCatalogTest, MinioBackedExecuteReadsRealDataThroughVendedCredentials) {
   if (!minio_reachable()) {
     GTEST_SKIP() << "MinIO not reachable at 127.0.0.1:9000 -- run `docker compose up -d minio minio-init` "
                     "from benchmarks/local/ first";
@@ -325,6 +374,55 @@ TEST_F(QueryEngineUnityCatalogTest, MinioBackedExecuteFailsBecauseScanExecutionB
 
   LoopbackHttpServer server;
   server.respond({minio_table_info(), minio_temp_credentials(), minio_table_info(), minio_temp_credentials()});
+
+  EngineConfig config = config_with_minio_instance(server.base_url());
+  config.engine.backend = "cpu";
+  QueryEngine engine(config);
+
+  const QueryResult result =
+      engine.execute("SELECT SUM(amount) AS total FROM read_unity_catalog('prod.main.db.orders')");
+  server.join();
+
+  ASSERT_EQ(result.rows_returned, 1);
+  const auto total_column =
+      std::static_pointer_cast<arrow::DoubleArray>(result.batches.front()->GetColumnByName("total"));
+  ASSERT_NE(total_column, nullptr);
+  // Real fixture data (see minio_table_info()'s own comment): amounts
+  // 10..50 in steps of 10, sum = 150.
+  EXPECT_DOUBLE_EQ(total_column->Value(0), 150.0);
+}
+
+// Deliberately reuses the *same* QueryEngine's default S3 config (no
+// vended credentials at all, MinIO's endpoint but no valid credentials)
+// to prove the fix above is real per-scan dispatch, not an accidental
+// global fallback that happens to work because MinIO's own credentials
+// were configured somewhere else. If ParquetScanNode::owned_store() were
+// ever ignored at execution time (the exact bug this fix closes), this
+// would either fail to authenticate against MinIO or -- worse -- silently
+// pass by reusing connection state left over from a different test.
+TEST_F(QueryEngineUnityCatalogTest, MinioBackedExecuteFailsWithoutVendedCredentialsWhenDefaultStoreLacksAccess) {
+  if (!minio_reachable()) {
+    GTEST_SKIP() << "MinIO not reachable at 127.0.0.1:9000 -- run `docker compose up -d minio minio-init` "
+                    "from benchmarks/local/ first";
+  }
+
+  LoopbackHttpServer server;
+  // A temporary-credentials response carrying deliberately wrong secrets --
+  // proves this test's failure comes from *these* credentials actually
+  // being used (and rejected by MinIO), not from some other, correct
+  // credential source being reused underneath. Four responses, matching
+  // the two full get_table()+get_temporary_table_credentials() rounds
+  // execute() makes (plan_logical()'s schema-discovery resolve, then
+  // build_physical_plan()'s own real resolve -- same shape every other
+  // Minio*/Explain* test in this file already relies on).
+  const std::string wrong_credentials = http_ok_json(R"json({
+      "aws_temp_credentials": {
+        "access_key_id": "wrong-access-key",
+        "secret_access_key": "wrong-secret-key",
+        "session_token": ""
+      }
+    })json");
+  server.respond({minio_table_info(), wrong_credentials, minio_table_info(), wrong_credentials});
 
   EngineConfig config = config_with_minio_instance(server.base_url());
   config.engine.backend = "cpu";

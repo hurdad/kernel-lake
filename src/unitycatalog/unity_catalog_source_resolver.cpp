@@ -96,11 +96,15 @@ ResolvedTable UnityCatalogSourceResolver::resolve(ObjectStore& store, const std:
         "read_unity_catalog(...): no unity_catalog.instances entry named '{}' is configured", name.instance));
   }
 
-  // Constructed fresh per call rather than cached across queries -- same
-  // deliberate MVP simplification IcebergSourceResolver's own
-  // IcebergRestCatalogClient and DeltaSourceResolver's own DeltaTxnClient
-  // already use.
-  UnityCatalogClient client(it->second);
+  // The client itself is still constructed fresh per call (unlike
+  // IcebergSourceResolver's IcebergRestCatalogClient/DeltaSourceResolver's
+  // DeltaTxnClient, which this class used to match exactly) -- get_table()/
+  // list_*() must always hit the real server, so there's nothing else
+  // worth caching here. Its OAuth2 *token*, though, can genuinely outlive
+  // one client -- token_cache_, when non-null, lets it survive across
+  // resolve() calls and separate queries (see UnityCatalogTokenCache's
+  // own class comment).
+  UnityCatalogClient client(it->second, token_cache_);
   const UnityCatalogTableInfo table = client.get_table(name.catalog, name.schema, name.table);
 
   // Only fetch and apply Unity Catalog's vended temporary credentials when
@@ -112,7 +116,13 @@ ResolvedTable UnityCatalogSourceResolver::resolve(ObjectStore& store, const std:
   // the shared `store` parameter (the caller's own ObjectStoreRegistry) in
   // that case, exactly like a plain read_parquet(...)/read_delta(...)
   // source already is.
-  std::unique_ptr<ObjectStore> temp_store;
+  // A shared_ptr (not unique_ptr): once this table's ResolvedTable carries
+  // it onward as ResolvedTable::owned_store (see that field's own doc
+  // comment), it needs to survive past this function's own return long
+  // enough for scan *execution* -- not just this resolve() call's own
+  // metadata reads through data_store below -- to read the table's actual
+  // file bytes through it.
+  std::shared_ptr<ObjectStore> temp_store;
   ObjectStore* data_store = &store;
   const bool is_delta_or_parquet =
       table.data_source_format == "DELTA" || table.data_source_format == "PARQUET" ||
@@ -134,7 +144,7 @@ ResolvedTable UnityCatalogSourceResolver::resolve(ObjectStore& store, const std:
     const UnityCatalogTemporaryCredentials credentials =
         client.get_temporary_table_credentials(table.table_id, "READ");
     if (storage_scheme == "s3") {
-      temp_store = std::make_unique<S3ObjectStore>(s3_config_.options, credentials.access_key_id,
+      temp_store = std::make_shared<S3ObjectStore>(s3_config_.options, credentials.access_key_id,
                                                    credentials.secret_access_key, credentials.session_token);
     } else if (storage_scheme == "gs" || storage_scheme == "gcs") {
       if (credentials.gcp_oauth_token.empty()) {
@@ -144,7 +154,7 @@ ResolvedTable UnityCatalogSourceResolver::resolve(ObjectStore& store, const std:
             source));
       }
       temp_store =
-          std::make_unique<GcsObjectStore>(gcs_config_.options, credentials.gcp_oauth_token);
+          std::make_shared<GcsObjectStore>(gcs_config_.options, credentials.gcp_oauth_token);
     } else {
       if (credentials.azure_sas_token.empty()) {
         throw StorageError(fmt::format(
@@ -153,7 +163,7 @@ ResolvedTable UnityCatalogSourceResolver::resolve(ObjectStore& store, const std:
             source));
       }
       temp_store =
-          std::make_unique<AzureObjectStore>(azure_config_.options, credentials.azure_sas_token);
+          std::make_shared<AzureObjectStore>(azure_config_.options, credentials.azure_sas_token);
     }
     data_store = temp_store.get();
   }
@@ -169,7 +179,9 @@ ResolvedTable UnityCatalogSourceResolver::resolve(ObjectStore& store, const std:
           source));
     }
     delta::DeltaTxnClient delta_client(delta_config_);
-    return delta::resolve_delta_table(*data_store, delta_client, effective_location);
+    ResolvedTable result = delta::resolve_delta_table(*data_store, delta_client, effective_location);
+    result.owned_store = temp_store;
+    return result;
   }
 
   if (table.data_source_format == "ICEBERG") {
@@ -179,11 +191,18 @@ ResolvedTable UnityCatalogSourceResolver::resolve(ObjectStore& store, const std:
     iceberg_config.credentials_kind = "bearer_token";
     iceberg_config.bearer_token = client.bearer_token_for_request();
     iceberg::IcebergRestCatalogClient iceberg_client(iceberg_config);
+    // No temporary-credential fetch on this path (see this resolver's own
+    // class-level doc comment) -- relies on static storage.s3/gcs/azure
+    // config, same as a plain Iceberg REST catalog does today, so `store`
+    // (the caller's own default) is the right one for execution too; no
+    // owned_store to attach.
     return iceberg::resolve_iceberg_table(store, iceberg_client, {name.schema}, name.table, {});
   }
 
   if (is_delta_or_parquet) {
-    return resolve_table(*data_store, {effective_location});
+    ResolvedTable result = resolve_table(*data_store, {effective_location});
+    result.owned_store = temp_store;
+    return result;
   }
 
   throw StorageError(fmt::format(

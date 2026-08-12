@@ -11,6 +11,7 @@
 #include "kernellake/planner/physical_plan.hpp"
 #include "kernellake/storage/object_store_registry.hpp"
 #include "kernellake/types/schema.hpp"
+#include "kernellake/unitycatalog/unity_catalog_token_cache.hpp"
 
 namespace arrow {
 class Schema;
@@ -141,6 +142,20 @@ class QueryEngine {
   // ObjectStoreRegistry keeps a reference to config_.storage, valid for
   // QueryEngine's whole lifetime since both are members of the same object.
   mutable ObjectStoreRegistry store_;
+  // Shared across every UnityCatalogSourceResolver this QueryEngine
+  // constructs (plan_logical()/explain()/execute(sql), each of which
+  // builds its own resolver instance today -- see those methods' own
+  // comments) so a Unity Catalog instance's OAuth2 token, once fetched,
+  // survives past the one resolve() call that fetched it -- both across
+  // the multiple resolves a single query already makes and across
+  // separate queries against the same QueryEngine. Not `mutable`: every
+  // public method of UnityCatalogTokenCache is const and internally
+  // synchronized (see its own class comment), so this member needs no
+  // extra help staying safely touchable from QueryEngine's own const
+  // methods, the same way `store_` above already relies on
+  // ObjectStoreRegistry's own internal synchronization rather than being
+  // plain-const itself.
+  unitycatalog::UnityCatalogTokenCache unity_catalog_token_cache_;
 };
 
 }  // namespace kernellake

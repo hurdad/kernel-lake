@@ -109,6 +109,81 @@ TEST(UnityCatalogClient, GetTablePerformsOauth2ClientCredentialsFlowAgainstConfi
   EXPECT_NE(table_requests[0].find("Authorization: Bearer minted-token"), std::string::npos);
 }
 
+// Proves UnityCatalogTokenCache actually closes the cross-instance gap
+// this client's own local cached_oauth2_token_/oauth2_token_expiry_
+// unix_seconds_ can't: two separate UnityCatalogClient objects sharing
+// one UnityCatalogTokenCache (the shape UnityCatalogSourceResolver/
+// QueryEngine actually use -- see UnityCatalogTokenCache's own class
+// comment) issue only *one* real token-endpoint request between them, not
+// two. The token server is only handed one canned response
+// (LoopbackHttpServer::respond()'s own doc comment: it services exactly
+// `responses.size()` connections and no more) -- if the shared cache were
+// ignored and a second client instance re-fetched, that second request
+// would find nothing listening and fail/hang instead of silently passing.
+TEST(UnityCatalogClient, TwoClientsSharingATokenCacheOnlyFetchTheTokenOnce) {
+  LoopbackHttpServer token_server;
+  LoopbackHttpServer table_server;
+  std::vector<std::string> token_requests(1);
+  std::vector<std::string> table_requests(2);
+  const std::string token_response = R"({"access_token": "shared-token", "expires_in": 3600})";
+  token_server.respond({http_ok_json(token_response)}, &token_requests);
+  table_server.respond({http_ok_json(kTableInfoJson), http_ok_json(kTableInfoJson)}, &table_requests);
+
+  UnityCatalogInstanceSection config = instance_config(table_server.base_url());
+  config.oauth2_token_endpoint = token_server.base_url() + "/oidc/v1/token";
+  config.credentials_kind = "oauth2_client_credentials";
+  config.oauth2_client_id = "my-client";
+  config.oauth2_client_secret = "my-secret";
+
+  const UnityCatalogTokenCache shared_cache;
+  UnityCatalogClient first_client(config, &shared_cache);
+  (void)first_client.get_table("main", "db", "orders");
+
+  // A second, entirely separate client instance -- mirrors a fresh
+  // UnityCatalogClient constructed by a *different* resolve() call (or a
+  // different query entirely), the exact case this client's own local
+  // token cache can never help with.
+  UnityCatalogClient second_client(config, &shared_cache);
+  (void)second_client.get_table("main", "db", "orders");
+
+  token_server.join();
+  table_server.join();
+
+  EXPECT_NE(token_requests[0].find("POST /oidc/v1/token"), std::string::npos);
+  EXPECT_NE(table_requests[0].find("Authorization: Bearer shared-token"), std::string::npos);
+  EXPECT_NE(table_requests[1].find("Authorization: Bearer shared-token"), std::string::npos);
+}
+
+// The default (nullptr token_cache) behavior is unchanged: two separate
+// clients with no shared cache each fetch their own token, so the token
+// server needs two canned responses, not one.
+TEST(UnityCatalogClient, TwoClientsWithoutASharedCacheEachFetchTheirOwnToken) {
+  LoopbackHttpServer token_server;
+  LoopbackHttpServer table_server;
+  std::vector<std::string> token_requests(2);
+  std::vector<std::string> table_requests(2);
+  const std::string token_response = R"({"access_token": "independent-token", "expires_in": 3600})";
+  token_server.respond({http_ok_json(token_response), http_ok_json(token_response)}, &token_requests);
+  table_server.respond({http_ok_json(kTableInfoJson), http_ok_json(kTableInfoJson)}, &table_requests);
+
+  UnityCatalogInstanceSection config = instance_config(table_server.base_url());
+  config.oauth2_token_endpoint = token_server.base_url() + "/oidc/v1/token";
+  config.credentials_kind = "oauth2_client_credentials";
+  config.oauth2_client_id = "my-client";
+  config.oauth2_client_secret = "my-secret";
+
+  UnityCatalogClient first_client(config);
+  (void)first_client.get_table("main", "db", "orders");
+  UnityCatalogClient second_client(config);
+  (void)second_client.get_table("main", "db", "orders");
+
+  token_server.join();
+  table_server.join();
+
+  EXPECT_NE(token_requests[0].find("POST /oidc/v1/token"), std::string::npos);
+  EXPECT_NE(token_requests[1].find("POST /oidc/v1/token"), std::string::npos);
+}
+
 TEST(UnityCatalogClient, GetTemporaryTableCredentialsParsesAwsCredentials) {
   LoopbackHttpServer server;
   std::vector<std::string> requests(1);

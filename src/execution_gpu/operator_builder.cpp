@@ -128,9 +128,14 @@ std::unique_ptr<PhysicalOperator> build(const PhysicalPlanPtr& node, ObjectStore
   };
 
   if (const auto* scan = dynamic_cast<const ParquetScanNode*>(node.get())) {
+    // See acero_query_executor.cpp's translate() for the identical
+    // reasoning: a scan resolved with per-table vended credentials (Unity
+    // Catalog's S3/GCS/Azure) must read through that store, not the
+    // caller's own default.
+    ObjectStore& effective_store = scan->owned_store() != nullptr ? *scan->owned_store() : store;
     return instrument(std::make_unique<ParquetScanOperator>(
         next_id++, scan->fragments(), scan->columns(), std::make_shared<const Schema>(scan->output_schema()),
-        store, pass_read_limit_bytes, scan->partition_columns()));
+        effective_store, pass_read_limit_bytes, scan->partition_columns()));
   }
   if (const auto* join = dynamic_cast<const HashJoinNode*>(node.get())) {
     // Built as two separate statements, not two arguments of the same

@@ -84,7 +84,8 @@ UnityCatalogTableInfo parse_table_info(const nlohmann::json& table_json, const s
 
 }  // namespace
 
-UnityCatalogClient::UnityCatalogClient(UnityCatalogInstanceSection config) : config_(std::move(config)) {}
+UnityCatalogClient::UnityCatalogClient(UnityCatalogInstanceSection config, const UnityCatalogTokenCache* token_cache)
+    : config_(std::move(config)), token_cache_(token_cache) {}
 
 std::string UnityCatalogClient::fetch_oauth2_token() {
   const double now =
@@ -94,6 +95,29 @@ std::string UnityCatalogClient::fetch_oauth2_token() {
   // IcebergRestCatalogClient::fetch_oauth2_token() uses.
   if (!cached_oauth2_token_.empty() && now < oauth2_token_expiry_unix_seconds_ - 30.0) {
     return cached_oauth2_token_;
+  }
+
+  // This instance's own local cache (above) is empty or stale -- before
+  // making a real network round trip, check the caller-shared cache (if
+  // any), which may already hold a still-valid token fetched by a
+  // *different* UnityCatalogClient instance (a previous resolve() call,
+  // possibly for a previous query entirely -- see
+  // UnityCatalogTokenCache's own class comment for why this exists).
+  // config_.uc_url uniquely identifies which configured instance this is,
+  // the same identity UnityCatalogSection::instances is itself keyed by.
+  if (token_cache_ != nullptr) {
+    if (const std::optional<std::string> shared = token_cache_->try_get(config_.uc_url, now)) {
+      cached_oauth2_token_ = *shared;
+      // oauth2_token_expiry_unix_seconds_ deliberately left at its default
+      // (0.0): this instance doesn't know the real expiry the token was
+      // originally fetched with, only that the shared cache says it's
+      // still valid *right now*. Leaving it at 0.0 means this instance's
+      // own fast-path check above always treats it as stale on any next
+      // call, falling back to re-checking the (cheap, mutex-guarded)
+      // shared cache rather than risking a use-past-expiry from a stale
+      // local guess.
+      return cached_oauth2_token_;
+    }
   }
 
   std::string body;
@@ -119,6 +143,13 @@ std::string UnityCatalogClient::fetch_oauth2_token() {
   cached_oauth2_token_ = response.at("access_token").get<std::string>();
   const double expires_in_seconds = response.value("expires_in", 3600.0);
   oauth2_token_expiry_unix_seconds_ = now + expires_in_seconds;
+  if (token_cache_ != nullptr) {
+    // Margin-adjusted the same way this instance's own fast-path check
+    // above is (see that comment), so a future UnityCatalogClient reading
+    // this shared entry never treats a token as valid right up to the
+    // literal expiry instant the server gave.
+    token_cache_->store(config_.uc_url, cached_oauth2_token_, oauth2_token_expiry_unix_seconds_ - 30.0);
+  }
   return cached_oauth2_token_;
 }
 

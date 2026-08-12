@@ -110,21 +110,22 @@ Iceberg-REST-compatible endpoint, reusing the same
 still deferred (catalog/schema `LIST` operations have no SQL surface;
 only the AWS `aws_temp_credentials` vended-credential shape has been
 verified against a real live server, the GCS/Azure shapes are
-parsing-tested only). **A real, currently-open gap, confirmed against a
-live Unity Catalog server and a real MinIO, not just reasoned about**:
-the vended credentials are only ever used at *resolve* time (schema
-discovery, physical planning -- `TableSourceResolver::resolve()`'s own
-temporary `S3ObjectStore`/`GcsObjectStore`/`AzureObjectStore`); actual
-scan *execution* always reads through
-`QueryEngine`'s own long-lived, statically-configured `ObjectStore`
-(`store_`), which has no reference to those vended credentials at all.
-So `kernellake explain`/`explain_logical` against an S3-backed
-Unity-Catalog table works today; a real `kernellake query` fails at the
-actual data read unless the engine's own `storage.s3` config happens to
-already have independent access to that bucket. See `docs/ROADMAP.md`'s
-Unity Catalog entry for the root cause and why closing it needs a real
-seam threading "which store resolved this file" through to the scan
-operators, not a quick patch.
+parsing-tested only; `UnityCatalogClient` itself is still constructed
+fresh per `resolve()` call, since `get_table()`/`list_*()` must always
+reflect current catalog state -- only its OAuth2 *token* is shared across
+calls and queries, via a `UnityCatalogTokenCache` `QueryEngine` owns and
+hands to every resolver it constructs). Vended credentials are used at
+both *resolve* time (schema discovery, physical planning) and actual scan
+*execution*: `ResolvedTable::owned_store` carries the resolver's
+temporary `S3ObjectStore`/`GcsObjectStore`/`AzureObjectStore` (when one
+was built) onto the `ParquetScanNode` it produces
+(`ParquetScanNode::owned_store()`), and both scan-execution backends pick
+it per scan node -- `acero_query_executor.cpp`'s `translate()` (CPU) and
+`operator_builder.cpp`'s `build()` (GPU) -- instead of assuming the one
+`ObjectStore` threaded through the rest of the physical plan tree is
+always the right one for every scan. Confirmed against a real live Unity
+Catalog server and a real MinIO, not just reasoned about: see
+`docs/ROADMAP.md`'s "Unity Catalog: scan-execution credentials" entry.
 
 - Column references, aliases, `*`
 - Numeric, string, boolean, date (`DATE 'YYYY-MM-DD'`), and `NULL` literals
