@@ -229,6 +229,35 @@ TEST_F(QueryEngineExecuteTest, CaseWithGroupByAliasBucketsRows) {
   EXPECT_EQ(counts_by_bucket.at("low"), 4);
 }
 
+// EXTRACT(YEAR FROM ...) as a GROUP BY key -- exactly TPC-H Q7/Q9's shape
+// (`GROUP BY ..., EXTRACT(YEAR FROM l_shipdate)`). event_date: two 2025
+// rows (10, 100 -> 110), four 2026 rows (20, 5, 7, 3 -> 35). cudf::ast has
+// no datetime-extraction operator, so this exercises
+// HashAggregateOperator's CompiledExtract fast path (materialized directly
+// via cudf::datetime::extract_datetime_component(), mirroring CASE's own
+// CompiledCase fast path just above).
+TEST_F(QueryEngineExecuteTest, ExtractYearAsGroupByKeyMatchesExpectedTotals) {
+  const QueryResult result = engine_.execute(
+      "SELECT EXTRACT(YEAR FROM event_date) AS y, SUM(amount) AS total FROM read_parquet('" + path_ +
+      "') GROUP BY y ORDER BY y");
+
+  ASSERT_EQ(result.rows_returned, 2);
+  ASSERT_EQ(result.batches.size(), 1u);
+  const std::shared_ptr<arrow::RecordBatch>& batch = result.batches.front();
+  const auto year_column = std::static_pointer_cast<arrow::Int64Array>(batch->GetColumnByName("y"));
+  const auto total_column = std::static_pointer_cast<arrow::DoubleArray>(batch->GetColumnByName("total"));
+  ASSERT_NE(year_column, nullptr);
+  ASSERT_NE(total_column, nullptr);
+
+  std::map<std::int64_t, double> total_by_year;
+  for (std::int64_t i = 0; i < batch->num_rows(); ++i) {
+    total_by_year[year_column->Value(i)] = total_column->Value(i);
+  }
+  ASSERT_EQ(total_by_year.size(), 2u);
+  EXPECT_DOUBLE_EQ(total_by_year.at(2025), 110.0);
+  EXPECT_DOUBLE_EQ(total_by_year.at(2026), 35.0);
+}
+
 // Regression test: ScalarAggregateOperator (the no-GROUP-BY aggregate path)
 // used to compile a non-plain-column aggregate argument via the plain
 // cudf::ast ExpressionCompiler directly, which has no CASE support at all

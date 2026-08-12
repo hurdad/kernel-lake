@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cudf/datetime.hpp>
 #include <cudf/fixed_point/fixed_point.hpp>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/types.hpp>
@@ -10,6 +11,12 @@
 #include "kernellake/types/schema.hpp"
 
 namespace kernellake {
+
+// Shared by every GPU operator that materializes an ExtractExpression
+// directly (ProjectionOperator, HashAggregateOperator,
+// ScalarAggregateOperator -- cudf::ast has no datetime-extraction operator,
+// so none of them can go through cudf::ast::compute_column for this).
+[[nodiscard]] cudf::datetime::datetime_component to_cudf_datetime_component(DatePart part);
 
 // Throws PlanningError for TypeId::Decimal -- picking DECIMAL32/64/128
 // needs the type's precision, which a bare TypeId doesn't carry; use

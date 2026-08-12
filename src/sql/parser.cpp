@@ -293,7 +293,7 @@ Preprocessed preprocess_from_read_parquet(const std::string& sql) {
 }
 
 AstExprPtr wrap(std::variant<AstColumnRef, AstStar, AstLiteral, AstBinary, AstUnary, AstBetween, AstAggregate,
-                             AstLike, AstIn, AstCase, AstCast>
+                             AstLike, AstIn, AstCase, AstCast, AstExtract>
                     node,
                 std::optional<std::string> alias = std::nullopt) {
   auto expr = std::make_shared<AstExpr>();
@@ -563,10 +563,33 @@ AstExprPtr convert_expr(const hsql::Expr* e) {
                           e->columnType.precision, e->columnType.scale},
                   alias_of(*e));
     }
+    case hsql::kExprExtract: {
+      if (e->expr == nullptr) {
+        unsupported("malformed EXTRACT expression");
+      }
+      AstExtractField field;
+      switch (e->datetimeField) {
+        case hsql::kDatetimeYear:
+          field = AstExtractField::Year;
+          break;
+        case hsql::kDatetimeMonth:
+          field = AstExtractField::Month;
+          break;
+        case hsql::kDatetimeDay:
+          field = AstExtractField::Day;
+          break;
+        default:
+          // HOUR/MINUTE/SECOND: no generated table has a time-of-day
+          // component (every date column is DATE, not DATETIME/TIMESTAMP),
+          // so these fields are structurally meaningless here, not just
+          // unimplemented.
+          unsupported("EXTRACT field (only YEAR/MONTH/DAY are supported -- no generated table has a "
+                      "time-of-day component)");
+      }
+      return wrap(AstExtract{field, convert_expr(e->expr)}, alias_of(*e));
+    }
     default:
-      unsupported(
-          "expression type not in the supported grammar (subqueries, EXTRACT, and arrays are not "
-          "yet supported)");
+      unsupported("expression type not in the supported grammar (subqueries and arrays are not yet supported)");
   }
 }
 

@@ -110,6 +110,18 @@ std::string binary_function_name(BinaryOperator op) {
   throw ExecutionError("unreachable: unknown BinaryOperator in CPU expression compiler");
 }
 
+std::string extract_function_name(DatePart part) {
+  switch (part) {
+    case DatePart::Year:
+      return "year";
+    case DatePart::Month:
+      return "month";
+    case DatePart::Day:
+      return "day";
+  }
+  throw ExecutionError("unreachable: unknown DatePart in CPU expression compiler");
+}
+
 }  // namespace
 
 arrow::compute::Expression compile_expression_cpu(const Expression& expr) {
@@ -204,6 +216,13 @@ arrow::compute::Expression compile_expression_cpu(const Expression& expr) {
         arrow::compute::call("match_like", {compile_expression_cpu(*like->value())},
                              arrow::compute::MatchSubstringOptions(like->pattern()));
     return like->negated() ? arrow::compute::call("invert", {matched}) : matched;
+  }
+  if (const auto* extract = dynamic_cast<const ExtractExpression*>(&expr)) {
+    // Arrow Compute's year()/month()/day() kernels all return INT64,
+    // matching ExtractExpression::result_type() exactly -- no extra cast
+    // needed, unlike the GPU backend's cudf::datetime::extract_datetime_component
+    // (see expression_compiler.cpp), which returns INT16.
+    return arrow::compute::call(extract_function_name(extract->part()), {compile_expression_cpu(*extract->operand())});
   }
   throw ExecutionError(
       "unrecognized expression type in CPU expression compiler (IN/DECIMAL are not yet supported "

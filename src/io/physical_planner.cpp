@@ -94,6 +94,10 @@ ExpressionPtr remap_columns(const ExpressionPtr& expr, const ScanBoundary& bound
     return std::make_shared<CaseExpression>(std::move(branches), std::move(else_branch),
                                             case_expr->result_type());
   }
+  if (const auto* extract = dynamic_cast<const ExtractExpression*>(expr.get())) {
+    return std::make_shared<ExtractExpression>(extract->part(), remap_columns(extract->operand(), boundary),
+                                               extract->result_type());
+  }
   return expr;  // LiteralExpression: no column reference to remap.
 }
 

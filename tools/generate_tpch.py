@@ -1,26 +1,36 @@
 #!/usr/bin/env python3
-"""Generate a synthetic, TPC-H-*derived* `lineitem`/`part`/`orders`/`customer` set as Parquet.
+"""Generate a synthetic, TPC-H-*derived* `lineitem`/`part`/`orders`/`customer`/`nation` set as Parquet.
 
 **This is not the official TPC-H `dbgen` tool and does not produce
-certified TPC-H data.** It generates four tables (`lineitem`, `part`,
-`orders`, `customer`) with TPC-H's column names/types (decimal columns as
-DOUBLE -- see "Deviations" below) and roughly TPC-H-shaped value
-distributions, sized approximately like real TPC-H at the requested scale
-factor. This is sufficient for the queries KernelLake currently supports
-(Q6, Q1 -- single-table scans over `lineitem`; Q19/Q14 -- a two-table
-`lineitem`/`part` join; Q12 -- a two-table `orders`/`lineitem` join; Q3 --
-a three-table `customer`/`orders`/`lineitem` join), but must never be
-described or published as an official TPC-H benchmark dataset.
+certified TPC-H data.** It generates five tables (`lineitem`, `part`,
+`orders`, `customer`, `nation`) with TPC-H's column names/types (decimal
+columns as DOUBLE -- see "Deviations" below) and roughly TPC-H-shaped
+value distributions, sized approximately like real TPC-H at the requested
+scale factor. This is sufficient for the queries KernelLake currently
+supports (Q6, Q1 -- single-table scans over `lineitem`; Q19/Q14 -- a
+two-table `lineitem`/`part` join; Q12 -- a two-table `orders`/`lineitem`
+join; Q3 -- a three-table `customer`/`orders`/`lineitem` join; Q10 -- a
+four-table `customer`/`orders`/`lineitem`/`nation` join), but must never
+be described or published as an official TPC-H benchmark dataset.
 
 Deviations from canonical TPC-H, documented per the spec's requirement to
 record every one:
-  - Only `lineitem`, `part`, `orders`, and `customer` are generated.
-    `supplier`/`partsupp`/`nation`/`region` are not, since every currently
-    supported TPC-H query (Q1/Q3/Q6/Q12/Q14/Q19) needs only these four
-    tables. KernelLake does support N-way hash joins now (see
+  - Only `lineitem`, `part`, `orders`, `customer`, and `nation` are
+    generated. `supplier`/`partsupp`/`region` are not, since no currently
+    supported TPC-H query (Q1/Q3/Q6/Q10/Q12/Q14/Q19) needs them.
+    KernelLake does support N-way hash joins now (see
     docs/ROADMAP.md/docs/ARCHITECTURE.md's "Hash joins"), but wiring up
-    TPC-H's queries needing tables beyond these four is separate,
+    TPC-H's queries needing tables beyond these five is separate,
     not-yet-done work, not a generator limitation as such.
+  - `nation` uses real TPC-H `dbgen` reference data (all 25 nations'
+    names and region keys, verbatim -- unlike every other table's rows,
+    which are independently sampled, not reproduced from `dbgen`) since
+    it's a small, fixed lookup table where hardcoding the real values is
+    simpler than inventing synthetic ones, the same rationale already
+    applied to `MKTSEGMENTS`/`ORDER_PRIORITIES`/`SHIP_MODES` below.
+    `n_regionkey` is generated (matching real `dbgen`'s schema) even
+    though no query needs it yet, since `region` isn't generated and
+    there's nothing to join it against.
   - l_quantity/l_extendedprice/l_discount/l_tax/p_retailprice/
     o_totalprice/c_acctbal are DOUBLE, not DECIMAL. KernelLake's GPU
     execution layer does support DECIMAL now (see docs/ARCHITECTURE.md's
@@ -122,6 +132,20 @@ RETURNFLAG_THRESHOLD = CURRENT_DATE - datetime.timedelta(days=90)
 
 SHIP_INSTRUCTS = ["DELIVER IN PERSON", "COLLECT COD", "NONE", "TAKE BACK RETURN"]
 SHIP_MODES = ["REG AIR", "AIR", "RAIL", "SHIP", "TRUCK", "MAIL", "FOB"]
+
+# Real TPC-H dbgen nation.tbl, verbatim: (n_nationkey, n_name, n_regionkey).
+# c_nationkey above is drawn from randint(0, 24), so this must cover exactly
+# nationkeys 0-24 for every customer row to have a real nation to join
+# against (same no-dangling-foreign-key rationale as CUSTOMER_ROWS).
+NATIONS = [
+    (0, "ALGERIA", 0), (1, "ARGENTINA", 1), (2, "BRAZIL", 1), (3, "CANADA", 1),
+    (4, "EGYPT", 4), (5, "ETHIOPIA", 0), (6, "FRANCE", 3), (7, "GERMANY", 3),
+    (8, "INDIA", 2), (9, "INDONESIA", 2), (10, "IRAN", 4), (11, "IRAQ", 4),
+    (12, "JAPAN", 2), (13, "JORDAN", 4), (14, "KENYA", 0), (15, "MOROCCO", 0),
+    (16, "MOZAMBIQUE", 0), (17, "PERU", 1), (18, "CHINA", 2), (19, "ROMANIA", 3),
+    (20, "SAUDI ARABIA", 4), (21, "VIETNAM", 2), (22, "RUSSIA", 3),
+    (23, "UNITED KINGDOM", 3), (24, "UNITED STATES", 1),
+]
 
 
 def epoch_days(date: datetime.date) -> int:
@@ -363,6 +387,31 @@ def generate_customer_table(rng: random.Random, row_count: int) -> pa.Table:
     )
 
 
+def generate_nation_table() -> pa.Table:
+    nationkey = [n[0] for n in NATIONS]
+    name = [n[1] for n in NATIONS]
+    regionkey = [n[2] for n in NATIONS]
+    comment = ["synthetic-tpch-nation-comment" for _ in NATIONS]
+
+    schema = pa.schema(
+        [
+            pa.field("n_nationkey", pa.int32(), False),
+            pa.field("n_name", pa.utf8(), False),
+            pa.field("n_regionkey", pa.int32(), False),
+            pa.field("n_comment", pa.utf8(), False),
+        ]
+    )
+    return pa.table(
+        {
+            "n_nationkey": nationkey,
+            "n_name": name,
+            "n_regionkey": regionkey,
+            "n_comment": comment,
+        },
+        schema=schema,
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--scale-factor", type=float, required=True)
@@ -412,6 +461,14 @@ def main() -> int:
         compression_level=compression_level, row_group_size=args.row_group_rows,
     )
     print(f"wrote {CUSTOMER_ROWS} rows to {customer_path}")
+
+    nation_table = generate_nation_table()
+    nation_path = output_dir / "nation-00000.parquet"
+    pq.write_table(
+        nation_table, nation_path, compression=compression,
+        compression_level=compression_level, row_group_size=args.row_group_rows,
+    )
+    print(f"wrote {len(NATIONS)} rows to {nation_path}")
 
     rows_per_file = total_rows // args.files
     extra = total_rows % args.files
@@ -475,6 +532,10 @@ def main() -> int:
                 "files": [str(customer_path)],
                 "rows": CUSTOMER_ROWS,
             },
+            "nation": {
+                "files": [str(nation_path)],
+                "rows": len(NATIONS),
+            },
         },
     }
     with open(output_dir / "manifest.json", "w") as manifest_file:
@@ -482,7 +543,8 @@ def main() -> int:
 
     print(f"wrote {rows_written} lineitem rows across {len(file_paths)} file(s), "
           f"{total_part_rows} part rows, {orders_written} orders rows across "
-          f"{len(orders_file_paths)} file(s), {CUSTOMER_ROWS} customer rows, to {output_dir}")
+          f"{len(orders_file_paths)} file(s), {CUSTOMER_ROWS} customer rows, "
+          f"{len(NATIONS)} nation rows, to {output_dir}")
     print(f"manifest: {output_dir / 'manifest.json'}")
     return 0
 

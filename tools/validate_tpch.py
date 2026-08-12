@@ -24,6 +24,10 @@ Usage:
     # Q3 needs two extra tables (orders and customer):
     python3 tools/validate_tpch.py --kernellake ... --data '.../lineitem-*.parquet' \
         --orders-data '.../orders-*.parquet' --customer-data '.../customer-*.parquet' --query 3
+    # Q10 needs three extra tables (orders, customer, and nation):
+    python3 tools/validate_tpch.py --kernellake ... --data '.../lineitem-*.parquet' \
+        --orders-data '.../orders-*.parquet' --customer-data '.../customer-*.parquet' \
+        --nation-data '.../nation-*.parquet' --query 10
 """
 
 import argparse
@@ -42,6 +46,7 @@ def load_query(
     part_data_glob: str | None,
     orders_data_glob: str | None,
     customer_data_glob: str | None,
+    nation_data_glob: str | None,
 ) -> str:
     path = QUERIES_DIR / f"q{query_number:02d}.sql"
     if not path.exists():
@@ -54,6 +59,8 @@ def load_query(
         raise ValueError(f"Q{query_number} needs a second table -- pass --orders-data")
     if "{customer_data}" in text and not customer_data_glob:
         raise ValueError(f"Q{query_number} needs a third table -- pass --customer-data")
+    if "{nation_data}" in text and not nation_data_glob:
+        raise ValueError(f"Q{query_number} needs a fourth table -- pass --nation-data")
     text = text.replace("{data}", data_glob)
     if part_data_glob:
         text = text.replace("{part_data}", part_data_glob)
@@ -61,6 +68,8 @@ def load_query(
         text = text.replace("{orders_data}", orders_data_glob)
     if customer_data_glob:
         text = text.replace("{customer_data}", customer_data_glob)
+    if nation_data_glob:
+        text = text.replace("{nation_data}", nation_data_glob)
     return text.strip()
 
 
@@ -71,10 +80,13 @@ def validate_one(
     part_data_glob: str | None,
     orders_data_glob: str | None,
     customer_data_glob: str | None,
+    nation_data_glob: str | None,
     backend: str | None,
 ) -> bool:
     try:
-        sql = load_query(query_number, data_glob, part_data_glob, orders_data_glob, customer_data_glob)
+        sql = load_query(
+            query_number, data_glob, part_data_glob, orders_data_glob, customer_data_glob, nation_data_glob
+        )
         print(f"--- Q{query_number}: {sql.splitlines()[0]}...")
         kernellake_rows = normalize(run_kernellake(kernellake_bin, sql, backend))
         duckdb_rows = normalize(run_duckdb(sql))
@@ -101,6 +113,9 @@ def main() -> int:
     parser.add_argument(
         "--customer-data", default=None, help="Parquet glob for the 'customer' table (Q3 needs this)"
     )
+    parser.add_argument(
+        "--nation-data", default=None, help="Parquet glob for the 'nation' table (Q10 needs this)"
+    )
     parser.add_argument("--scale-factor", type=float, default=None, help="Informational only, for the report")
     parser.add_argument("--query", required=True, help="Query number (e.g. 6) or 'all'")
     parser.add_argument("--baseline", default="duckdb", choices=["duckdb"])
@@ -125,6 +140,7 @@ def main() -> int:
             args.part_data,
             args.orders_data,
             args.customer_data,
+            args.nation_data,
             args.backend,
         ):
             failures += 1

@@ -23,6 +23,8 @@ using sql::AstCast;
 using sql::AstColumnRef;
 using sql::AstExpr;
 using sql::AstExprPtr;
+using sql::AstExtract;
+using sql::AstExtractField;
 using sql::AstIn;
 using sql::AstLike;
 using sql::AstLiteral;
@@ -248,6 +250,8 @@ bool contains_aggregate(const AstExprPtr& expr) {
             }
           }
           return node.else_branch != nullptr && contains_aggregate(node.else_branch);
+        } else if constexpr (std::is_same_v<T, AstExtract>) {
+          return contains_aggregate(node.operand);
         } else {
           return false;
         }
@@ -305,6 +309,9 @@ bool references_ungrouped_column(const ExpressionPtr& expr,
     }
     return case_expr->else_branch() != nullptr &&
            references_ungrouped_column(case_expr->else_branch(), group_by_keys, inside_aggregate);
+  }
+  if (const auto* extract = dynamic_cast<const ExtractExpression*>(expr.get())) {
+    return references_ungrouped_column(extract->operand(), group_by_keys, inside_aggregate);
   }
   return false;  // LiteralExpression: no column reference. AstIn is already
                  // expanded into Binary/Unary nodes by bind time (see
@@ -780,6 +787,29 @@ class Binder {
     ExpressionPtr operand = bind(node.operand, allow_aggregates);
     const DataType target = resolve_cast_type_name(node, operand->result_type().nullable);
     return std::make_shared<CastExpression>(std::move(operand), target);
+  }
+
+  ExpressionPtr bind_node(const AstExtract& node, bool allow_aggregates) {
+    ExpressionPtr operand = bind(node.operand, allow_aggregates);
+    const TypeId operand_id = operand->result_type().id;
+    if (operand_id != TypeId::Date32 && operand_id != TypeId::Timestamp) {
+      throw BindingError(fmt::format("EXTRACT requires a DATE or TIMESTAMP operand, got {}",
+                                     operand->result_type().to_string()));
+    }
+    DatePart part;
+    switch (node.field) {
+      case AstExtractField::Year:
+        part = DatePart::Year;
+        break;
+      case AstExtractField::Month:
+        part = DatePart::Month;
+        break;
+      case AstExtractField::Day:
+        part = DatePart::Day;
+        break;
+    }
+    const bool nullable = operand->result_type().nullable;
+    return std::make_shared<ExtractExpression>(part, std::move(operand), int64_type(nullable));
   }
 
   const Schema* input_schema_ = nullptr;  // single-table mode

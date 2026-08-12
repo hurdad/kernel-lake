@@ -144,9 +144,24 @@ struct AstCast {
   std::int64_t decimal_scale = 0;
 };
 
+// `EXTRACT(field FROM operand)`. Only YEAR/MONTH/DAY are supported --
+// KernelLake has no TIME-of-day-bearing column type in any generated
+// schema (DATE only), so HOUR/MINUTE/SECOND are rejected by the binder
+// as structurally meaningless rather than "not yet done".
+enum class AstExtractField : std::uint8_t {
+  Year,
+  Month,
+  Day,
+};
+
+struct AstExtract {
+  AstExtractField field;
+  AstExprPtr operand;
+};
+
 struct AstExpr {
   std::variant<AstColumnRef, AstStar, AstLiteral, AstBinary, AstUnary, AstBetween, AstAggregate, AstLike,
-               AstIn, AstCase, AstCast>
+               AstIn, AstCase, AstCast, AstExtract>
       node;
   std::optional<std::string> alias;
 };

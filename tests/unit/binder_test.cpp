@@ -402,6 +402,24 @@ TEST(Binder, GroupByPrefersBaseColumnOverSameNamedAlias) {
   EXPECT_EQ(column->name(), "region");
 }
 
+TEST(Binder, ExtractYearOverDateColumnMatchesExpectedGroupByKeyAndType) {
+  const auto stmt = sql::parse_sql(
+      "SELECT EXTRACT(YEAR FROM event_date) AS y, SUM(amount) AS total FROM read_parquet('/x.parquet') "
+      "GROUP BY y");
+  const BoundQuery bound = bind_query(stmt, sales_schema());
+  ASSERT_EQ(bound.group_by.size(), 1u);
+  const auto* extract = dynamic_cast<const ExtractExpression*>(bound.group_by[0].get());
+  ASSERT_NE(extract, nullptr);
+  EXPECT_EQ(extract->part(), DatePart::Year);
+  EXPECT_EQ(extract->result_type().id, TypeId::Int64);
+}
+
+TEST(Binder, ExtractOverNonDateColumnIsRejected) {
+  const auto stmt =
+      sql::parse_sql("SELECT EXTRACT(YEAR FROM amount) FROM read_parquet('/x.parquet')");
+  EXPECT_THROW((void)bind_query(stmt, sales_schema()), BindingError);
+}
+
 TEST(Binder, JoinResolvesQualifiedAndUnambiguousUnqualifiedColumns) {
   const auto stmt = sql::parse_sql(
       "SELECT o.order_id, name, amount FROM read_parquet('/o.parquet') AS o "

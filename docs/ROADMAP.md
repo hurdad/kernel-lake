@@ -2734,8 +2734,214 @@ log` is the authoritative chronology if that ordering ever matters.
   documented default); no source code changed for this entry, so no
   build/test-suite run was needed or done.
 
+- **TPC-H Q10 added** (returned-item reporting), the 5th distinct
+  join-shaped query and the first to need a table beyond `lineitem`/
+  `part`/`orders`/`customer`: a 4-way `customer`/`orders`/`lineitem`/
+  `nation` `INNER JOIN` chain, then a 7-column `GROUP BY` spanning two
+  *non-adjacent* join sources (`customer` and `nation`, with `orders`/
+  `lineitem` in between), `ORDER BY revenue DESC`, `LIMIT 20`. Chosen
+  over the other 15 not-yet-supported queries specifically because it's
+  the cheapest one reachable with zero new engine work: everything else
+  left needs a subquery, `HAVING`, an outer join, or date-part
+  extraction, all still-open gaps (see "Not yet started" below), while
+  Q10's shape -- N-way equi-join, multi-column `GROUP BY`, `ORDER BY` on
+  a `SELECT`-list alias, `LIMIT` -- is exactly what Q3 already proved
+  works on both backends.
+
+  `tools/generate_tpch.py` gained a `nation` table: fixed 25 rows
+  regardless of scale factor (matching `CUSTOMER_ROWS`'s own
+  fixed-range rationale -- `c_nationkey` is drawn from `randint(0, 24)`,
+  so every customer row needs a real nation row to join against), and the
+  *only* table this generator hardcodes real `dbgen` reference data for
+  (name and region key per nation) rather than sampling, since it's a
+  small fixed lookup table where reproducing the real values is simpler
+  than inventing synthetic ones -- same rationale already applied to
+  `MKTSEGMENTS`/`ORDER_PRIORITIES`/`SHIP_MODES`. `n_regionkey` is
+  generated even though no query needs it yet (no `region` table exists
+  to join it against), matching real `dbgen`'s schema for a table that
+  might get reused once a `region`-needing query (Q5, Q7, Q9) is added.
+  `tools/validate_tpch.py` and `kernellake benchmark tpch` both gained
+  `--nation-data` (mirroring `--customer-data`'s existing pattern) --
+  `benchmark_tpch_command.cpp`'s `strip_comments_and_substitute()`,
+  page-cache eviction file list, and JSON report all thread it through
+  the same way as the three prior tables.
+
+  Verified for real against DuckDB, both backends, SF0.01: `python3
+  tools/validate_tpch.py --query 10 --backend cpu` and `--backend gpu`
+  both PASS (20 rows, exact match) on a real GPU (`kernellake query --sql`
+  under the hood, so this predates any `benchmark_tpch_command.cpp`
+  rebuild); `--query all` (all 7 query files) still PASSES on `--backend
+  cpu` after the generator change, confirming no regression to
+  Q1/Q3/Q6/Q12/Q14/Q19; a real `cpu-dev` rebuild's full `ctest` suite
+  passes 340/340; `kernellake benchmark tpch --query 10 --nation-data ...`
+  (via a `--config` override forcing `engine.backend: cpu`, since this
+  build has no CUDA) runs end to end and returns the same 20 rows as the
+  validator. Not yet done: wiring Q10 into
+  `tools/benchmark_three_way.py`'s three-way performance comparison (see
+  "Not yet started" below, alongside the pre-existing, still-open Q14
+  entry for the same tool).
+
+- **`EXTRACT(YEAR/MONTH/DAY FROM ...)` added, on both backends, plus a
+  real CPU-backend bug found and fixed along the way.** Picked over
+  `HAVING`/outer-join/subquery support as the next blocked SQL feature to
+  implement specifically because it needed no parser/binder *structural*
+  changes (hsql, the vendored SQL grammar, already parses `EXTRACT(field
+  FROM expr)` natively via `kExprExtract`/`DatetimeField` -- only
+  `src/sql/parser.cpp`'s AST conversion needed a new case), unlike a
+  subquery or outer join, both of which need new logical/physical plan
+  node types. Scoped to `YEAR`/`MONTH`/`DAY` only (the three fields that
+  apply to a `DATE` column, which is the only date-bearing type any
+  generated table has) -- `HOUR`/`MINUTE`/`SECOND` are rejected as
+  structurally meaningless, not just unimplemented.
+
+  New `sql::AstExtract`/`kernellake::ExtractExpression` (`DatePart` enum:
+  `Year`/`Month`/`Day`) follow the exact same shape as `AstCast`/
+  `CastExpression`. Always evaluates to `BIGINT`: Arrow Compute's
+  `year()`/`month()`/`day()` kernels (the CPU backend's implementation)
+  already return `INT64` natively; the GPU backend's
+  `cudf::datetime::extract_datetime_component()` returns `INT16`, cast up
+  to `INT64` after the fact so both backends produce identical output
+  types for the same query.
+
+  GPU backend: `cudf::ast` has no datetime-extraction operator any more
+  than it has `CASE`/`LIKE`-equivalent ones, so `ExtractExpression` is
+  materialized directly (`CompiledExtract`, mirroring `CompiledLike`'s own
+  fast path exactly) in all three operators that already have this
+  pattern -- `ProjectionOperator`, `HashAggregateOperator` (both a
+  `GROUP BY` key, e.g. TPC-H Q7/Q9's `GROUP BY ..., l_year`, and a grouped
+  aggregate argument), and `ScalarAggregateOperator` -- but deliberately
+  *not* `FilterOperator`: `WHERE` support is out of scope, matching
+  `CASE`'s own pre-existing, still-open `WHERE` gap (no TPC-H query needs
+  either there). A shared `to_cudf_datetime_component(DatePart)` helper
+  lives in `cudf_adapter.hpp`/`.cpp` alongside `to_cudf_type`/
+  `literal_to_scalar`, reused by all three operators instead of
+  triplicating the enum-to-cudf mapping.
+
+  Column-index bookkeeping needed the same treatment as every other
+  composite expression type before it -- missed on the first pass and
+  caught by testing, not by inspection: `ExtractExpression` had to be
+  added to *five* separate visitor functions across three files
+  (`optimizer.cpp`'s `simplify_expression()`/`collect_columns()`/
+  `shift_columns()`, `physical_planner.cpp`'s `remap_columns()`,
+  `logical_planner.cpp`'s `rewrite_aggregate_refs()`), each walking the
+  `Expression` tree for a different purpose (constant folding, column-
+  pruning's required-columns collection, join-side predicate
+  re-localization, post-scan column-index remapping, aggregate-reference
+  rewriting). Skipping `collect_columns()` specifically was caught
+  immediately by a real end-to-end test: `l_shipdate` (referenced only
+  inside the `EXTRACT`, never bare) wasn't marked as a required column, so
+  the pruned scan silently read the wrong 2 columns and a downstream
+  `FieldRef` resolved against the wrong schema entirely
+  (`No match for FieldRef.FieldPath(10)`) -- not a crash, a wrong-schema
+  error clear enough to catch immediately, but a reminder that this
+  project's "one visitor per concern, no shared tree-walk" pattern means
+  *every* new composite `Expression` subtype must be threaded through
+  every existing visitor by hand.
+
+  **Real, pre-existing CPU-backend bug found and fixed as a direct
+  consequence, not a new regression**: `docs/ARCHITECTURE.md`'s own prior
+  text claimed the CPU backend supports `CASE` "everywhere... `GROUP BY`
+  keys...", but `acero_query_executor.cpp`'s `HashAggregateNode`
+  translation actually rejected *any* non-`ColumnExpression` `GROUP BY`
+  key outright ("GROUP BY by a computed expression is not yet supported")
+  -- true for `CASE` too, just never exercised by an existing test or
+  TPC-H query (Q12/Q14 only put `CASE` inside an *aggregate argument*,
+  never as the `GROUP BY` key itself). Surfaced immediately by
+  `EXTRACT`-as-`GROUP BY`-key on CPU (exactly Q7/Q9's shape) failing with
+  that error. Fixed by extending the *existing* `AggregateInputPlan`/
+  `resolve_aggregate_target()` machinery (already used to materialize a
+  computed *aggregate argument* via a `project` node before the aggregate)
+  to computed `GROUP BY` keys too -- with one real difference:
+  `resolve_aggregate_target()`'s throwaway synthetic projected name is
+  fine for an aggregate argument (each `Aggregate` has its own explicit
+  `output_name`, independent of its input's projected name), but Acero's
+  `AggregateNodeOptions::keys` (`std::vector<FieldRef>`) has no equivalent
+  -- whatever name a key is projected under *becomes* the final output
+  column's name. A computed key is now projected under its own logical
+  alias (`item.name`) instead, with a clear `PlanningError` on a genuine
+  name collision (only reachable via a `GROUP BY` mixing a computed key
+  with a same-bare-name plain column from a JOIN's other side) rather than
+  silently colliding.
+
+  Verified for real, both backends: `EXTRACT(YEAR FROM l_shipdate)` as a
+  `GROUP BY` key over real SF0.01 TPC-H `lineitem` data matches DuckDB
+  exactly on `--backend cpu` and `--backend gpu`; a join+multi-key-`GROUP
+  BY`+`EXTRACT` shape (`orders JOIN lineitem ... GROUP BY
+  o_orderpriority, EXTRACT(YEAR FROM o_orderdate)`) -- exactly Q7/Q9's
+  join-plus-date-bucketing shape -- matches between backends row-for-row.
+  Five new regression tests (`SqlParser.ParsesExtractYearMonthDay`,
+  `.RejectsExtractFieldOtherThanYearMonthDay`,
+  `Binder.ExtractYearOverDateColumnMatchesExpectedGroupByKeyAndType`,
+  `.ExtractOverNonDateColumnIsRejected`,
+  `QueryEngineExecuteCpuTest`/`QueryEngineExecuteTest
+  .ExtractYearAsGroupByKeyMatchesExpectedTotals` on both backends). Full
+  suites pass with zero regressions: `cpu-dev` 362/362, a real `gpu-dev`
+  rebuild's `kernellake_unit_tests` 357/357 and `kernellake_gpu_tests`
+  101/101 (real RTX 5060 Ti).
+
 ## Not yet started
 
+- **Unity Catalog support, read-only** -- Phase 5 of the lakehouse roadmap
+  (the last phase in the sequence documented above: Parquet directories
+  (done) -> Hive partitioning (done) -> Iceberg REST catalogs (done) ->
+  Delta Lake (done) -> Unity Catalog (this)). Not yet started. Scope is
+  deliberately read-only -- no writes, no catalog administration (no
+  create/alter/drop of catalogs, schemas, tables, grants) -- matching how
+  Iceberg REST catalog support also shipped read-only first. Breaks down
+  into:
+  - **Unity Catalog authentication** -- OAuth2 (or PAT) against a UC REST
+    endpoint. `IcebergRestCatalogClient` (`src/iceberg/rest_catalog_client.cpp`)
+    already has its own OAuth2 token handling for a REST catalog; a new
+    `UnityCatalogClient` should mirror that shape rather than invent a
+    second auth mechanism, though UC's own token/scope model isn't
+    identical to Iceberg's REST catalog spec and needs its own real
+    verification against a live UC endpoint, not assumed compatible.
+  - **REST client for catalog/schema/table lookup** -- resolving a
+    `catalog.schema.table` three-part name to UC's table metadata. The
+    same three-part-name shape `read_iceberg('catalog.namespace.table')`
+    already parses (`src/sql/parser.cpp`'s `read_iceberg`/`read_delta`
+    preprocessing, `docs/ARCHITECTURE.md`'s "`read_parquet(...)` adapter"
+    section), so a new `read_unity_catalog(...)` SQL-surface form can
+    likely reuse that exact preprocessing, not invent new grammar.
+  - **Mapping of UC types to Arrow types** -- UC's own (Spark/Delta-flavored)
+    type system down to KernelLake's `DataType`, the same kind of table
+    `iceberg/schema_translation.cpp` already is for Iceberg's type system,
+    not a shared implementation (UC's types don't map 1:1 to Iceberg's).
+  - **Extraction of table format and storage location** -- UC's table
+    metadata reports whether a table is `DELTA`, `PARQUET`, or (less
+    commonly) `ICEBERG`-managed, plus its underlying cloud storage path;
+    this is a dispatch point to whichever existing resolver already
+    handles that format (`DeltaSourceResolver`, a plain Parquet path, or
+    `IcebergSourceResolver`), not a new execution path of its own.
+  - **Temporary cloud-credential handling** -- UC vends short-lived,
+    per-request-scoped credentials (its "temporary table credentials" API)
+    rather than static long-lived keys. These need to flow into
+    `ObjectStoreRegistry`'s existing S3 credential provider for the
+    duration of one query and never be logged or cached past their TTL --
+    a real, security-relevant gap from the S3 credential handling
+    KernelLake already has for statically-configured keys.
+  - **S3 object access** -- using those vended credentials against the
+    existing `S3ObjectStore` (`src/storage/s3_object_store.cpp`); no new
+    storage backend, just a new credential source feeding the existing one.
+  - **Delta-log processing for Delta tables** -- once UC resolves a table
+    to its underlying Delta location, reuses the existing
+    `delta_source_resolver.cpp`/`delta_table_resolution.cpp` path
+    unchanged (already functionally complete for Phase 4, see "Delta Lake
+    support" in "Done" above).
+  - **Parquet metadata and data reading** -- reuses the existing
+    `ParquetScanOperator` (`src/execution_cpu/acero_query_executor.cpp` /
+    `src/execution_gpu/parquet_scan_operator.cpp`) and
+    `parquet_metadata.cpp` path on both backends unchanged, once resolution
+    has handed back a plain Parquet source.
+  - **Enforcement of failures from UC without bypassing catalog
+    permissions** -- a UC permission denial (or any other UC-side error,
+    e.g. an expired/revoked temporary credential) must propagate as a
+    clear, user-visible failure. No fallback path may silently retry
+    against raw cloud storage directly (bypassing UC's own access check)
+    on a UC error -- that would defeat the entire point of a governed
+    catalog, and is exactly the kind of "fail clearly rather than silently
+    reinterpret" discipline this project already applies elsewhere (e.g.
+    Iceberg/Delta resolution errors, unsupported SQL constructs).
 - **Iceberg per-row delete filtering and true schema evolution** -- both
   investigated this session (see the lakehouse roadmap's own "Whole-file
   row-level deletes" and partition-pruning entries above), and both found
@@ -2887,10 +3093,25 @@ log` is the authoritative chronology if that ordering ever matters.
   performance comparison, the same way Q19 already is (it needs the same
   `--part-data` mechanism Q19 uses, so this should be a small, mostly
   mechanical follow-up, not a new fix) -- not yet done
-- `CASE` inside `WHERE` on the GPU backend (`FilterOperator`'s own gap,
-  separate from the aggregate-argument fix above; the CPU backend already
-  supports this via its one shared expression compiler) -- not needed by
-  any TPC-H query added so far, so not yet prioritized
+- Wiring TPC-H Q10 into `tools/benchmark_three_way.py` (needs a new
+  `--nation-data` mechanism, mirroring `--orders-data`/`--customer-data`'s
+  existing pattern: `kernellake_sql()` substitution, a fourth Spark temp
+  view, cold-mode cache eviction) -- not yet done; also not yet run at any
+  scale factor beyond the SF0.01 validation in "Done" above
+- A next TPC-H query beyond Q10 -- date-part extraction (`EXTRACT(YEAR
+  FROM ...)`) is done now (see "EXTRACT(YEAR/MONTH/DAY FROM ...) added"
+  in "Done" above), but Q7/Q9 (the two canonical queries needing it) also
+  need a `supplier` table (both) and `partsupp` (Q9) that
+  `tools/generate_tpch.py` doesn't generate yet, plus Q7 self-joins
+  `nation` against two different aliases -- not yet attempted, tracked
+  separately from the EXTRACT feature itself. Every *other* still-missing
+  query needs a subquery, `HAVING`, or an outer join, none of which
+  KernelLake's SQL layer supports yet (see `docs/ARCHITECTURE.md`'s "Not
+  yet supported" list)
+- `CASE`/`EXTRACT` inside `WHERE` on the GPU backend (`FilterOperator`'s
+  own gap, separate from the aggregate-argument fix above; the CPU backend
+  already supports both via its one shared expression compiler) -- not
+  needed by any TPC-H query added so far, so not yet prioritized
 - A self-hosted GPU CI runner (would enable a `gpu-dev` build/test/
   benchmark/validate workflow to actually run in CI, rather than only
   locally) -- explicitly deferred; `hurdad/kernel-lake` is a public repo,

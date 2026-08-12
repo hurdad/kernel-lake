@@ -81,6 +81,7 @@ class HashAggregateOperator final : public PhysicalOperator {
   struct CompiledCase;         // defined below; forward-declared so CompiledExpr can hold a shared_ptr to it.
   struct CompiledDecimalCast;  // ditto.
   struct CompiledLike;         // ditto.
+  struct CompiledExtract;      // ditto.
 
   // A plain column reference (e.g. `GROUP BY region`) is copied directly
   // rather than routed through cudf::ast::compute_column: cudf's AST
@@ -114,6 +115,7 @@ class HashAggregateOperator final : public PhysicalOperator {
     std::shared_ptr<CompiledCase> case_expr;
     std::shared_ptr<CompiledDecimalCast> decimal_cast;
     std::shared_ptr<CompiledLike> like_expr;
+    std::shared_ptr<CompiledExtract> extract_expr;
   };
 
   struct CompiledCaseBranch {
@@ -136,6 +138,17 @@ class HashAggregateOperator final : public PhysicalOperator {
     CompiledExpr value;
     std::string pattern;
     bool negated;
+  };
+
+  // `EXTRACT(part FROM operand)`, reachable as a group-by key (e.g. TPC-H
+  // Q7/Q9's `GROUP BY ..., l_year`, l_year an EXTRACT alias) or a grouped
+  // aggregate argument -- cudf::ast has no datetime-extraction operator, so
+  // it's materialized directly via
+  // cudf::datetime::extract_datetime_component(), mirroring CompiledLike's
+  // own reasoning.
+  struct CompiledExtract {
+    CompiledExpr operand;
+    DatePart part;
   };
 
   // How to materialize a physical aggregate-request's value column (one
@@ -186,6 +199,9 @@ class HashAggregateOperator final : public PhysicalOperator {
   [[nodiscard]] std::unique_ptr<cudf::column> materialize_like(const CompiledLike& like_expr,
                                                                const DeviceBatch& batch,
                                                                ExecutionContext& context);
+  [[nodiscard]] std::unique_ptr<cudf::column> materialize_extract(const CompiledExtract& extract_expr,
+                                                                  const DeviceBatch& batch,
+                                                                  ExecutionContext& context);
   [[nodiscard]] std::unique_ptr<cudf::column> materialize_value_column(ValueColumnKind kind,
                                                                        const CompiledExpr& compiled,
                                                                        const DeviceBatch& batch,

@@ -419,6 +419,40 @@ TEST_F(QueryEngineExecuteCpuTest, CaseInGroupedAggregateWhereAndScalarAggregateM
   EXPECT_EQ(n_column->Value(0), 2);
 }
 
+// EXTRACT(YEAR FROM ...) as a GROUP BY key -- exactly TPC-H Q7/Q9's shape,
+// and the CPU-backend counterpart of
+// QueryEngineExecuteTest.ExtractYearAsGroupByKeyMatchesExpectedTotals
+// (tests/gpu/query_engine_execute_test.cpp), same fixture/expected values.
+// A computed GROUP BY key (EXTRACT- or CASE-derived) used to be flatly
+// rejected by acero_query_executor.cpp's HashAggregateNode translation
+// ("GROUP BY by a computed expression is not yet supported by the CPU
+// execution backend") -- fixed by projecting it under its own logical
+// name via the same AggregateInputPlan machinery aggregate arguments
+// already used, rather than resolve_aggregate_target's throwaway
+// synthetic name (which would have silently renamed this key's actual
+// output column -- see require_plain_column_index's own comment).
+TEST_F(QueryEngineExecuteCpuTest, ExtractYearAsGroupByKeyMatchesExpectedTotals) {
+  const QueryResult result = engine_.execute(
+      "SELECT EXTRACT(YEAR FROM event_date) AS y, SUM(amount) AS total FROM read_parquet('" + path_ +
+      "') GROUP BY y ORDER BY y");
+
+  ASSERT_EQ(result.rows_returned, 2);
+  ASSERT_EQ(result.batches.size(), 1u);
+  const std::shared_ptr<arrow::RecordBatch>& batch = result.batches.front();
+  const auto year_column = std::static_pointer_cast<arrow::Int64Array>(batch->GetColumnByName("y"));
+  const auto total_column = std::static_pointer_cast<arrow::DoubleArray>(batch->GetColumnByName("total"));
+  ASSERT_NE(year_column, nullptr);
+  ASSERT_NE(total_column, nullptr);
+
+  std::map<std::int64_t, double> total_by_year;
+  for (std::int64_t i = 0; i < batch->num_rows(); ++i) {
+    total_by_year[year_column->Value(i)] = total_column->Value(i);
+  }
+  ASSERT_EQ(total_by_year.size(), 2u);
+  EXPECT_DOUBLE_EQ(total_by_year.at(2025), 110.0);
+  EXPECT_DOUBLE_EQ(total_by_year.at(2026), 35.0);
+}
+
 // Regression test: the CPU execution backend used to reject every
 // HashJoinNode outright ("physical plan node 'HashJoin' is not yet
 // supported by the CPU execution backend"), even though the parser/binder

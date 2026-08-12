@@ -205,6 +205,46 @@ class CastExpression final : public Expression {
 };
 
 // ---------------------------------------------------------------------------
+// EXTRACT
+// ---------------------------------------------------------------------------
+
+// `EXTRACT(part FROM operand)`. Only Year/Month/Day exist -- see
+// sql::AstExtractField's own comment for why Hour/Minute/Second aren't
+// represented at all, not just unimplemented.
+enum class DatePart : std::uint8_t {
+  Year,
+  Month,
+  Day,
+};
+
+[[nodiscard]] std::string_view to_string(DatePart part) noexcept;
+
+// Always evaluates to INT64 (matching Arrow Compute's own year()/month()/
+// day() kernels, which this expression's CPU execution backend calls
+// directly) -- the binder requires `operand` to be DATE32 or TIMESTAMP.
+class ExtractExpression final : public Expression {
+ public:
+  ExtractExpression(DatePart part, ExpressionPtr operand, DataType result_type)
+      : part_(part), operand_(std::move(operand)), type_(result_type) {}
+
+  [[nodiscard]] DatePart part() const noexcept { return part_; }
+  [[nodiscard]] const ExpressionPtr& operand() const noexcept { return operand_; }
+  [[nodiscard]] const DataType& result_type() const override { return type_; }
+  [[nodiscard]] std::string to_string() const override {
+    return "EXTRACT(" + std::string(kernellake::to_string(part_)) + " FROM " + operand_->to_string() + ")";
+  }
+  [[nodiscard]] std::string structural_key() const override {
+    return "EXTRACT(" + std::string(kernellake::to_string(part_)) + " FROM " + operand_->structural_key() +
+           ")";
+  }
+
+ private:
+  DatePart part_;
+  ExpressionPtr operand_;
+  DataType type_;
+};
+
+// ---------------------------------------------------------------------------
 // BETWEEN
 // ---------------------------------------------------------------------------
 

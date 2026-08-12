@@ -3,6 +3,7 @@
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/copying.hpp>
+#include <cudf/datetime.hpp>
 #include <cudf/scalar/scalar_factories.hpp>
 #include <cudf/strings/contains.hpp>
 #include <cudf/strings/strings_column_view.hpp>
@@ -58,7 +59,15 @@ ProjectionOperator::CompiledValue ProjectionOperator::compile_value(const Expres
     value.like_expr = std::move(compiled_like);
     return value;
   }
-  return CompiledValue{std::nullopt, nullptr, &compiler_.compile(expr), nullptr, nullptr};
+  if (const auto* extract_expr = dynamic_cast<const ExtractExpression*>(&expr)) {
+    auto compiled_extract = std::make_shared<CompiledExtract>();
+    compiled_extract->operand = compile_value(*extract_expr->operand());
+    compiled_extract->part = extract_expr->part();
+    CompiledValue value;
+    value.extract_expr = std::move(compiled_extract);
+    return value;
+  }
+  return CompiledValue{std::nullopt, nullptr, &compiler_.compile(expr), nullptr, nullptr, nullptr};
 }
 
 ProjectionOperator::CompiledItem ProjectionOperator::compile_item(const Expression& expr) {
@@ -88,6 +97,7 @@ std::unique_ptr<cudf::column> ProjectionOperator::materialize_value(const Compil
                                                                     const cudf::table_view& batch,
                                                                     ExecutionContext& context) {
   if (value.like_expr != nullptr) return materialize_like(*value.like_expr, batch, context);
+  if (value.extract_expr != nullptr) return materialize_extract(*value.extract_expr, batch, context);
   if (value.decimal_cast != nullptr) {
     const std::unique_ptr<cudf::column> operand =
         materialize_value(value.decimal_cast->operand, batch, context);
@@ -141,6 +151,20 @@ std::unique_ptr<cudf::column> ProjectionOperator::materialize_like(const Compile
   if (!like_expr.negated) return mask;
   return cudf::unary_operation(mask->view(), cudf::unary_operator::NOT, context.stream,
                                context.memory_resource);
+}
+
+// cudf::datetime::extract_datetime_component() always returns INT16 --
+// cast up to INT64 to match ExtractExpression::result_type() (see that
+// class's own comment for why INT64, not INT16, is EXTRACT's result type
+// throughout KernelLake).
+std::unique_ptr<cudf::column> ProjectionOperator::materialize_extract(const CompiledExtract& extract_expr,
+                                                                       const cudf::table_view& batch,
+                                                                       ExecutionContext& context) {
+  const std::unique_ptr<cudf::column> operand = materialize_value(extract_expr.operand, batch, context);
+  std::unique_ptr<cudf::column> extracted = cudf::datetime::extract_datetime_component(
+      operand->view(), to_cudf_datetime_component(extract_expr.part), context.stream, context.memory_resource);
+  return cudf::cast(extracted->view(), cudf::data_type{cudf::type_id::INT64}, context.stream,
+                    context.memory_resource);
 }
 
 std::optional<DeviceBatch> ProjectionOperator::next(ExecutionContext& context) {

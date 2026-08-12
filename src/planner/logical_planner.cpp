@@ -150,6 +150,13 @@ ExpressionPtr rewrite_aggregate_refs(const ExpressionPtr& expr, std::vector<Name
     return std::make_shared<CaseExpression>(std::move(when_then), std::move(else_branch),
                                             case_expr->result_type());
   }
+  if (const auto* extract = dynamic_cast<const ExtractExpression*>(expr.get())) {
+    return std::make_shared<ExtractExpression>(
+        extract->part(),
+        rewrite_aggregate_refs(extract->operand(), aggregates, aggregate_positions, group_by,
+                               group_by_positions, group_by_count),
+        extract->result_type());
+  }
   return expr;
 }
 

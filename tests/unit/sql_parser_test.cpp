@@ -220,6 +220,21 @@ TEST(SqlParser, RejectsOffset) {
   EXPECT_THROW((void)(parse_sql("SELECT a FROM read_parquet('/x.parquet') LIMIT 10 OFFSET 5")), SqlError);
 }
 
+TEST(SqlParser, ParsesExtractYearMonthDay) {
+  AstSelectStatement stmt = parse_sql(
+      "SELECT EXTRACT(YEAR FROM d) AS y, EXTRACT(MONTH FROM d) AS m, EXTRACT(DAY FROM d) AS dd FROM "
+      "read_parquet('/x.parquet')");
+  ASSERT_EQ(stmt.select_list.size(), 3u);
+  EXPECT_EQ(std::get<AstExtract>(stmt.select_list[0]->node).field, AstExtractField::Year);
+  EXPECT_EQ(std::get<AstExtract>(stmt.select_list[1]->node).field, AstExtractField::Month);
+  EXPECT_EQ(std::get<AstExtract>(stmt.select_list[2]->node).field, AstExtractField::Day);
+  EXPECT_EQ(std::get<AstColumnRef>(std::get<AstExtract>(stmt.select_list[0]->node).operand->node).name, "d");
+}
+
+TEST(SqlParser, RejectsExtractFieldOtherThanYearMonthDay) {
+  EXPECT_THROW((void)(parse_sql("SELECT EXTRACT(HOUR FROM d) FROM read_parquet('/x.parquet')")), SqlError);
+}
+
 // Regression test: the vendored hyrise/sql-parser (bison/flex, recursive
 // descent) recurses once per nesting level with no depth limit of its own
 // -- a query with many thousands of nested parens drove it into a C-stack

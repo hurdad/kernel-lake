@@ -265,6 +265,13 @@ ExpressionPtr simplify_expression(const ExpressionPtr& expr) {
     return std::make_shared<CaseExpression>(std::move(when_then), std::move(else_branch),
                                             case_expr->result_type());
   }
+  if (const auto* extract = dynamic_cast<const ExtractExpression*>(expr.get())) {
+    ExpressionPtr operand = simplify_expression(extract->operand());
+    if (operand.get() == extract->operand().get()) {
+      return expr;
+    }
+    return std::make_shared<ExtractExpression>(extract->part(), std::move(operand), extract->result_type());
+  }
   return expr;  // ColumnExpression, LiteralExpression: nothing to simplify.
 }
 
@@ -304,6 +311,8 @@ void collect_columns(const ExpressionPtr& expr, std::unordered_set<std::size_t>&
       collect_columns(branch.result, out);
     }
     collect_columns(case_expr->else_branch(), out);
+  } else if (const auto* extract = dynamic_cast<const ExtractExpression*>(expr.get())) {
+    collect_columns(extract->operand(), out);
   }
   // LiteralExpression: nothing to collect. AstIn desugars into
   // BinaryExpression at bind time (see binder.cpp), so it needs no case
@@ -438,6 +447,10 @@ ExpressionPtr shift_columns(const ExpressionPtr& expr, std::int64_t delta) {
         case_expr->else_branch() ? shift_columns(case_expr->else_branch(), delta) : nullptr;
     return std::make_shared<CaseExpression>(std::move(when_then), std::move(else_branch),
                                             case_expr->result_type());
+  }
+  if (const auto* extract = dynamic_cast<const ExtractExpression*>(expr.get())) {
+    return std::make_shared<ExtractExpression>(extract->part(), shift_columns(extract->operand(), delta),
+                                               extract->result_type());
   }
   return expr;  // LiteralExpression: no column indices to shift.
 }

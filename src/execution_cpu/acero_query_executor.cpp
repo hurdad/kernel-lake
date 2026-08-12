@@ -473,12 +473,32 @@ arrow::acero::Declaration translate(const PhysicalPlanPtr& node, ObjectStore& st
     keys.reserve(hash_aggregate->group_by().size());
     for (const NamedExpression& item : hash_aggregate->group_by()) {
       const auto* column = dynamic_cast<const ColumnExpression*>(item.expr.get());
-      if (column == nullptr) {
-        throw PlanningError(
-            "GROUP BY by a computed expression is not yet supported by the CPU execution backend "
-            "(only a plain column reference is) -- see docs/ARCHITECTURE.md");
+      if (column != nullptr) {
+        keys.emplace_back(ensure_column_projected(plan, *column));
+        continue;
       }
-      keys.emplace_back(ensure_column_projected(plan, *column));
+      // A computed GROUP BY key (e.g. an EXTRACT- or CASE-derived alias)
+      // has no existing column to reference -- project it under its own
+      // logical name (item.name) rather than resolve_aggregate_target's
+      // throwaway synthetic name below: unlike an aggregate argument (whose
+      // projected name is a pure implementation detail, since
+      // translate_aggregate always passes its own explicit output_name),
+      // Acero's `keys` FieldRef has no separate output-name mechanism --
+      // whatever name this key is projected under becomes the actual output
+      // column name, which must match HashAggregateNode::output_schema()'s
+      // own field name (item.name) for the same reason
+      // AggregateInputPlan::claimed_names's comment already documents for
+      // plain pass-through columns.
+      if (plan.claimed_names.find(item.name) != plan.claimed_names.end()) {
+        throw PlanningError(fmt::format(
+            "GROUP BY key '{}' collides with another projected column name -- not supported by the "
+            "CPU execution backend",
+            item.name));
+      }
+      plan.claimed_names.insert(item.name);
+      plan.project_expressions.push_back(compile_expression_cpu(*item.expr));
+      plan.project_names.push_back(item.name);
+      keys.emplace_back(item.name);
     }
     std::vector<arrow::compute::Aggregate> aggregates;
     aggregates.reserve(hash_aggregate->aggregates().size());

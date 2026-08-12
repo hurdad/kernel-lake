@@ -38,6 +38,18 @@ const DataType& require_decimal_precision_scale(const DataType& type) {
 
 }  // namespace
 
+cudf::datetime::datetime_component to_cudf_datetime_component(DatePart part) {
+  switch (part) {
+    case DatePart::Year:
+      return cudf::datetime::datetime_component::YEAR;
+    case DatePart::Month:
+      return cudf::datetime::datetime_component::MONTH;
+    case DatePart::Day:
+      return cudf::datetime::datetime_component::DAY;
+  }
+  throw ExecutionError("unreachable: unknown DatePart in GPU expression compiler");
+}
+
 cudf::type_id to_cudf_type_id(TypeId id) {
   switch (id) {
     case TypeId::Boolean:

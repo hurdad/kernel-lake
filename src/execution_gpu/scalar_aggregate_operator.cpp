@@ -4,6 +4,7 @@
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/copying.hpp>
+#include <cudf/datetime.hpp>
 #include <cudf/reduction.hpp>
 #include <cudf/scalar/scalar_factories.hpp>
 #include <cudf/strings/contains.hpp>
@@ -82,6 +83,14 @@ ScalarAggregateOperator::CompiledExpr ScalarAggregateOperator::compile_expr(cons
     compiled.like_expr = std::move(compiled_like);
     return compiled;
   }
+  if (const auto* extract_expr = dynamic_cast<const ExtractExpression*>(&expr)) {
+    auto compiled_extract = std::make_shared<CompiledExtract>();
+    compiled_extract->operand = compile_expr(*extract_expr->operand());
+    compiled_extract->part = extract_expr->part();
+    CompiledExpr compiled;
+    compiled.extract_expr = std::move(compiled_extract);
+    return compiled;
+  }
   CompiledExpr compiled;
   compiled.expr = &compiler_.compile(expr);
   return compiled;
@@ -92,6 +101,7 @@ std::unique_ptr<cudf::column> ScalarAggregateOperator::materialize(const Compile
                                                                    ExecutionContext& context) {
   if (compiled.case_expr != nullptr) return materialize_case(*compiled.case_expr, batch, context);
   if (compiled.like_expr != nullptr) return materialize_like(*compiled.like_expr, batch, context);
+  if (compiled.extract_expr != nullptr) return materialize_extract(*compiled.extract_expr, batch, context);
   if (compiled.decimal_cast != nullptr) {
     const std::unique_ptr<cudf::column> operand = materialize(compiled.decimal_cast->operand, batch, context);
     return cudf::cast(operand->view(), to_cudf_type(compiled.decimal_cast->target_type), context.stream,
@@ -145,6 +155,17 @@ std::unique_ptr<cudf::column> ScalarAggregateOperator::materialize_like(const Co
   if (!like_expr.negated) return mask;
   return cudf::unary_operation(mask->view(), cudf::unary_operator::NOT, context.stream,
                                context.memory_resource);
+}
+
+// Mirrors HashAggregateOperator::materialize_extract exactly -- see that
+// function's own comment for the INT16->INT64 cast.
+std::unique_ptr<cudf::column> ScalarAggregateOperator::materialize_extract(
+    const CompiledExtract& extract_expr, const DeviceBatch& batch, ExecutionContext& context) {
+  const std::unique_ptr<cudf::column> operand = materialize(extract_expr.operand, batch, context);
+  std::unique_ptr<cudf::column> extracted = cudf::datetime::extract_datetime_component(
+      operand->view(), to_cudf_datetime_component(extract_expr.part), context.stream, context.memory_resource);
+  return cudf::cast(extracted->view(), cudf::data_type{cudf::type_id::INT64}, context.stream,
+                    context.memory_resource);
 }
 
 void ScalarAggregateOperator::open(ExecutionContext& context) {

@@ -132,23 +132,44 @@ sources within one join chain.
 - A chain of two or more tables via `INNER JOIN ... ON`, each step a single
   equality key (see "Hash joins" below for the full scope, including the
   N-way generalization)
+- `EXTRACT(field FROM expr)`, `field` one of `YEAR`/`MONTH`/`DAY` only --
+  `expr` must be `DATE`/`TIMESTAMP`. `HOUR`/`MINUTE`/`SECOND` are rejected
+  outright, not just unimplemented: no generated table has a time-of-day
+  component (every date column is `DATE`, not `DATETIME`), so those fields
+  are structurally meaningless here. Always evaluates to `BIGINT`. Both
+  backends, everywhere a `CASE` can appear except `WHERE` (`SELECT` list,
+  `GROUP BY` keys, and both grouped and scalar aggregate arguments) --
+  `cudf::ast` has no datetime-extraction operator any more than it has a
+  `CASE`/`LIKE`-equivalent one, so it's materialized the same way, via
+  `cudf::datetime::extract_datetime_component()` outside the AST tree (see
+  "LIKE/IN/CASE/CAST implementation notes" below). CPU backend via Arrow
+  Compute's `year()`/`month()`/`day()` kernels (which already return
+  `BIGINT`, unlike cudf's `INT16`, needing no extra cast on that side).
 
 Not yet supported (fails clearly rather than being silently reinterpreted):
 `DISTINCT`, `HAVING`, set operations (`UNION`/etc.), `WITH`/CTEs,
-subqueries, `OFFSET`, window functions, `CASE` in `WHERE` (GPU only --
-see above), any function other than the five aggregates above, comma-style
-joins, `LEFT`/`RIGHT`/`FULL`/`CROSS` JOIN, and multi-key or non-equality
-join conditions.
+subqueries, `OFFSET`, window functions, `CASE`/`EXTRACT` in `WHERE` (GPU
+only -- see above), any function other than the five aggregates and
+`EXTRACT` above, `EXTRACT` fields other than `YEAR`/`MONTH`/`DAY`,
+comma-style joins, `LEFT`/`RIGHT`/`FULL`/`CROSS` JOIN, and multi-key or
+non-equality join conditions.
 
 `GROUP BY <name>` resolves `<name>` against the base-table schema first,
 then falls back to matching a `SELECT`-list output alias -- this is what
-lets you `GROUP BY` a computed expression like `CASE ... AS bucket` (which
-has no column name of its own): `SELECT CASE ... AS bucket, COUNT(*) FROM
-... GROUP BY bucket` groups by the alias, not a base column named `bucket`.
-If both exist, the base column wins (standard SQL alias-shadowing
-behavior). The alias-defining `SELECT` item is exempted from the
-ungrouped-column check that normally rejects non-aggregated,
-non-grouped-by expressions in an aggregate query's `SELECT` list.
+lets you `GROUP BY` a computed expression like `CASE ... AS bucket` or
+`EXTRACT(YEAR FROM ...) AS y` (neither has a column name of its own):
+`SELECT CASE ... AS bucket, COUNT(*) FROM ... GROUP BY bucket` groups by
+the alias, not a base column named `bucket`. If both exist, the base
+column wins (standard SQL alias-shadowing behavior). The alias-defining
+`SELECT` item is exempted from the ungrouped-column check that normally
+rejects non-aggregated, non-grouped-by expressions in an aggregate
+query's `SELECT` list. On the CPU (Acero) backend, a computed `GROUP BY`
+key is projected under its own logical alias name (not a throwaway
+synthetic one) before the aggregate node, so the projected column's name
+still matches `HashAggregateNode::output_schema()`'s own field name --
+Acero's `AggregateNodeOptions::keys` has no separate output-name mechanism
+the way each `Aggregate`'s own `output_name` does, unlike an aggregate
+*argument*'s projected name, which is a pure implementation detail.
 
 `ORDER BY` executes for real via `SortOperator` (`cudf::stable_sorted_order`
 + `cudf::gather`, blocking -- it consumes the whole input before producing

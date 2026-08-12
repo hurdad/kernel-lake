@@ -94,6 +94,18 @@ std::string BinaryExpression::structural_key() const {
          right_->structural_key() + ")";
 }
 
+std::string_view to_string(DatePart part) noexcept {
+  switch (part) {
+    case DatePart::Year:
+      return "YEAR";
+    case DatePart::Month:
+      return "MONTH";
+    case DatePart::Day:
+      return "DAY";
+  }
+  return "?";
+}
+
 std::string_view to_string(UnaryOperator op) noexcept {
   switch (op) {
     case UnaryOperator::Not:

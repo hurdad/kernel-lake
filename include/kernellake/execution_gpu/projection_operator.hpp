@@ -46,6 +46,7 @@ class ProjectionOperator final : public PhysicalOperator {
   struct CompiledDecimalCast;  // defined below; forward-declared so CompiledValue can hold a shared_ptr to
                                // it.
   struct CompiledLike;         // ditto.
+  struct CompiledExtract;      // ditto.
 
   // A plain column index to copy, a plain literal to broadcast, a CAST to
   // DECIMAL to materialize directly, or a compiled AST expression to
@@ -74,6 +75,7 @@ class ProjectionOperator final : public PhysicalOperator {
     const cudf::ast::expression* expr = nullptr;
     std::shared_ptr<CompiledDecimalCast> decimal_cast;
     std::shared_ptr<CompiledLike> like_expr;
+    std::shared_ptr<CompiledExtract> extract_expr;
   };
 
   struct CompiledDecimalCast {
@@ -88,6 +90,15 @@ class ProjectionOperator final : public PhysicalOperator {
     CompiledValue value;
     std::string pattern;
     bool negated;
+  };
+
+  // `EXTRACT(part FROM operand)`: like LIKE above, cudf::ast has no
+  // datetime-component-extraction operator, so it's materialized directly
+  // via cudf::datetime::extract_datetime_component() instead of going
+  // through compute_column().
+  struct CompiledExtract {
+    CompiledValue operand;
+    DatePart part;
   };
 
   struct CompiledCaseBranch {
@@ -118,6 +129,9 @@ class ProjectionOperator final : public PhysicalOperator {
   [[nodiscard]] std::unique_ptr<cudf::column> materialize_like(const CompiledLike& like_expr,
                                                                const cudf::table_view& batch,
                                                                ExecutionContext& context);
+  [[nodiscard]] std::unique_ptr<cudf::column> materialize_extract(const CompiledExtract& extract_expr,
+                                                                  const cudf::table_view& batch,
+                                                                  ExecutionContext& context);
 
   OperatorId id_;
   std::unique_ptr<PhysicalOperator> child_;

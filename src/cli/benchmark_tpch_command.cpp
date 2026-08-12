@@ -49,16 +49,18 @@ std::string substitute_placeholder(std::string text, const std::string& placehol
   return text;
 }
 
-// `part_data`/`orders_data`/`customer_data` are only substituted (via a
-// second/third `{part_data}`/`{orders_data}`/`{customer_data}`
-// placeholder) for queries needing that extra table -- e.g. Q19's
-// `lineitem`/`part` join, Q12's `orders`/`lineitem` join, Q3's 3-way
-// `customer`/`orders`/`lineitem` join -- and are empty for every query
-// with no such placeholder to begin with.
+// `part_data`/`orders_data`/`customer_data`/`nation_data` are only
+// substituted (via a second/third/fourth `{part_data}`/`{orders_data}`/
+// `{customer_data}`/`{nation_data}` placeholder) for queries needing that
+// extra table -- e.g. Q19's `lineitem`/`part` join, Q12's `orders`/
+// `lineitem` join, Q3's 3-way `customer`/`orders`/`lineitem` join, Q10's
+// 4-way `customer`/`orders`/`lineitem`/`nation` join -- and are empty for
+// every query with no such placeholder to begin with.
 std::string strip_comments_and_substitute(const std::string& text, const std::string& data_glob,
                                           const std::string& part_data_glob,
                                           const std::string& orders_data_glob,
-                                          const std::string& customer_data_glob) {
+                                          const std::string& customer_data_glob,
+                                          const std::string& nation_data_glob) {
   static const std::regex comment_line(R"(--[^\n]*\n)");
   std::string stripped = std::regex_replace(text, comment_line, "\n");
   stripped = substitute_placeholder(std::move(stripped), "{data}", data_glob);
@@ -70,6 +72,9 @@ std::string strip_comments_and_substitute(const std::string& text, const std::st
   }
   if (!customer_data_glob.empty()) {
     stripped = substitute_placeholder(std::move(stripped), "{customer_data}", customer_data_glob);
+  }
+  if (!nation_data_glob.empty()) {
+    stripped = substitute_placeholder(std::move(stripped), "{nation_data}", nation_data_glob);
   }
   return stripped;
 }
@@ -133,6 +138,7 @@ int run_benchmark_tpch(const std::vector<std::string_view>& args, const EngineCo
   std::string part_data;
   std::string orders_data;
   std::string customer_data;
+  std::string nation_data;
   std::string query_file_override;
   std::optional<double> scale_factor;
   int query_number = -1;
@@ -150,6 +156,8 @@ int run_benchmark_tpch(const std::vector<std::string_view>& args, const EngineCo
       orders_data = args[++i];
     } else if (args[i] == "--customer-data" && i + 1 < args.size()) {
       customer_data = args[++i];
+    } else if (args[i] == "--nation-data" && i + 1 < args.size()) {
+      nation_data = args[++i];
     } else if (args[i] == "--query-file" && i + 1 < args.size()) {
       query_file_override = args[++i];
     } else if (args[i] == "--scale-factor" && i + 1 < args.size()) {
@@ -198,7 +206,7 @@ int run_benchmark_tpch(const std::vector<std::string_view>& args, const EngineCo
 
   try {
     const std::string sql = strip_comments_and_substitute(read_file_or_throw(query_file), data, part_data,
-                                                          orders_data, customer_data);
+                                                          orders_data, customer_data, nation_data);
 
     ObjectStoreRegistry store(config.storage);
     std::vector<ObjectInfo> files = discover_parquet_files(store, {data});
@@ -231,6 +239,15 @@ int run_benchmark_tpch(const std::vector<std::string_view>& args, const EngineCo
         return 1;
       }
       files.insert(files.end(), customer_files.begin(), customer_files.end());
+    }
+    if (!nation_data.empty()) {
+      const std::vector<ObjectInfo> nation_files = discover_parquet_files(store, {nation_data});
+      if (nation_files.empty()) {
+        std::fprintf(stderr, "kernellake benchmark tpch: no Parquet files matched '%s'\n",
+                     nation_data.c_str());
+        return 1;
+      }
+      files.insert(files.end(), nation_files.begin(), nation_files.end());
     }
 
     QueryEngine engine(config);
@@ -283,6 +300,9 @@ int run_benchmark_tpch(const std::vector<std::string_view>& args, const EngineCo
     }
     if (!customer_data.empty()) {
       report["customer_data"] = customer_data;
+    }
+    if (!nation_data.empty()) {
+      report["nation_data"] = nation_data;
     }
     if (scale_factor) {
       report["scale_factor"] = *scale_factor;
