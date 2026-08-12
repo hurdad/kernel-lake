@@ -10,6 +10,7 @@ add_executable(kernellake_unit_tests
   optimizer_test.cpp
   storage_test.cpp
   gcs_object_store_test.cpp
+  azure_object_store_test.cpp
   object_store_registry_test.cpp
   nvme_object_cache_test.cpp
   parquet_metadata_test.cpp

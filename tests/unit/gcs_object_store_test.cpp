@@ -1,3 +1,4 @@
+#include <arrow/filesystem/gcsfs.h>
 #include <gtest/gtest.h>
 
 #include "kernellake/common/config.hpp"
@@ -51,6 +52,16 @@ TEST(GcsObjectStore, AcceptsValidUtcAccessTokenExpiration) {
     EXPECT_EQ(std::string(e.what()).find("is not a valid ISO-8601"), std::string::npos)
         << "valid UTC timestamp should not be rejected as malformed: " << e.what();
   }
+}
+
+TEST(GcsObjectStore, VendedAccessTokenConstructorDoesNotThrow) {
+  // Mirrors the vended-credentials constructor Unity Catalog's
+  // UnityCatalogSourceResolver actually calls (a fixed 1-hour placeholder
+  // expiration, no timestamp parsing) -- like the static-config
+  // constructor above, GcsFileSystem::Make() doesn't touch the network at
+  // construction time, so this is safe to run with no real GCS endpoint.
+  const arrow::fs::GcsOptions base_options = arrow::fs::GcsOptions::Defaults();
+  EXPECT_NO_THROW((void)(GcsObjectStore(base_options, "vended-access-token")));
 }
 
 }  // namespace

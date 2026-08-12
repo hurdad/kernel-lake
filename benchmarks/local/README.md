@@ -101,6 +101,35 @@ isn't), `--no-gpu-metrics` (CPU-only stack).
   `scripts/run_e2e.py` for a real client example, or any Arrow Flight SQL
   client/driver).
 
+## Unity Catalog
+
+`docker compose up -d minio minio-init unitycatalog` also brings up a real
+`unitycatalog/unitycatalog` OSS server (`localhost:8080`) for exercising
+`read_unity_catalog(...)` against an actual Unity Catalog REST API, not
+just the fake-loopback-server unit tests. It ships a demo
+`unity`/`default` catalog/schema with a few sample tables out of the box:
+
+```bash
+curl http://localhost:8080/api/2.1/unity-catalog/tables?catalog_name=unity&schema_name=default
+```
+
+`minio-init` also populates a second bucket, `kernellake-uc-test`, with a
+committed real Parquet fixture (`fixtures/unity_catalog_test_data/`) --
+this is what `tests/unit/query_engine_unitycatalog_test.cpp`'s
+`MinioBacked`-prefixed tests read over the network to verify
+`UnityCatalogSourceResolver`'s vended-AWS-credentials path against a real
+S3-compatible backend (those tests skip themselves if this stack isn't
+up). There's deliberately no init step registering a *new* table pointing
+at this stack's own MinIO, though -- confirmed real Unity Catalog table
+creation against an `s3://` location needs its own AWS-IAM-role/STS-based
+temporary-credential vending internally, which MinIO can't satisfy
+without much deeper setup than this local stack aims for. See
+`docs/ROADMAP.md`'s Unity Catalog entry for the full writeup, including a
+real, load-bearing gap this live verification found: resolve-time
+(schema discovery, physical planning) correctly uses vended credentials,
+but actual scan *execution* still reads through `kernellake`'s own
+statically-configured `storage.s3`, not the resolver's temporary one.
+
 ## CPU-only
 
 No GPU or NVIDIA Container Toolkit needed:

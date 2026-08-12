@@ -48,7 +48,8 @@ LogicalPlanPtr QueryEngine::plan_logical(std::string_view sql,
   iceberg::IcebergSourceResolver iceberg_resolver(config_.iceberg);
   delta::DeltaSourceResolver delta_resolver(config_.delta);
   unitycatalog::UnityCatalogSourceResolver unity_catalog_resolver(config_.unity_catalog, config_.delta,
-                                                                  config_.storage.s3);
+                                                                  config_.storage.s3, config_.storage.gcs,
+                                                                  config_.storage.azure);
   CompositeSourceResolver resolver(iceberg_resolver, delta_resolver, unity_catalog_resolver);
 
   if (ast.join.has_value()) {
@@ -86,7 +87,8 @@ PhysicalPlanPtr QueryEngine::explain(std::string_view sql) const {
   iceberg::IcebergSourceResolver iceberg_resolver(config_.iceberg);
   delta::DeltaSourceResolver delta_resolver(config_.delta);
   unitycatalog::UnityCatalogSourceResolver unity_catalog_resolver(config_.unity_catalog, config_.delta,
-                                                                  config_.storage.s3);
+                                                                  config_.storage.s3, config_.storage.gcs,
+                                                                  config_.storage.azure);
   CompositeSourceResolver resolver(iceberg_resolver, delta_resolver, unity_catalog_resolver);
   return build_physical_plan(plan_logical(sql), store_, &resolver);
 }

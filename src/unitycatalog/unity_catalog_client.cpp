@@ -23,6 +23,21 @@ nlohmann::json parse_json_response(const std::string& url, const std::string& bo
   }
 }
 
+// Like `json.value(key, "")`, but also treats an explicitly-present `null`
+// as absent -- `.value()` alone only covers the key being missing
+// entirely, and throws a type_error trying to convert `null` to
+// std::string otherwise. Confirmed against a real unitycatalog/unitycatalog
+// server, not assumed: "next_page_token" (the field this matters most
+// for -- every list_*() method's pagination loop termination depends on
+// it) comes back as an explicit `null`, not an absent key, once the last
+// page is reached.
+std::string string_or_empty(const nlohmann::json& json, const char* key) {
+  if (!json.contains(key) || json.at(key).is_null()) {
+    return "";
+  }
+  return json.at(key).get<std::string>();
+}
+
 std::vector<UnityCatalogColumn> parse_columns(const nlohmann::json& table_json, const std::string& url) {
   std::vector<UnityCatalogColumn> columns;
   if (!table_json.contains("columns")) {
@@ -32,12 +47,12 @@ std::vector<UnityCatalogColumn> parse_columns(const nlohmann::json& table_json, 
     try {
       UnityCatalogColumn column;
       column.name = column_json.at("name").get<std::string>();
-      column.type_name = column_json.value("type_name", "");
+      column.type_name = string_or_empty(column_json, "type_name");
       // A struct/array/map column's "type_json" is itself a JSON-encoded
       // string in UC's response (unlike Iceberg's raw nested-object "type"
       // -- see IcebergSchemaField's own comment for that different shape),
       // so it's always already a plain string here, captured verbatim.
-      column.type_json = column_json.value("type_json", "");
+      column.type_json = string_or_empty(column_json, "type_json");
       column.nullable = column_json.value("nullable", true);
       column.position = column_json.value("position", 0);
       columns.push_back(std::move(column));
@@ -48,6 +63,23 @@ std::vector<UnityCatalogColumn> parse_columns(const nlohmann::json& table_json, 
     }
   }
   return columns;
+}
+
+// Shared by get_table() (a single TableInfo object) and list_tables() (one
+// element of a "tables" array) -- both are the exact same JSON shape.
+UnityCatalogTableInfo parse_table_info(const nlohmann::json& table_json, const std::string& url) {
+  UnityCatalogTableInfo info;
+  try {
+    info.table_id = table_json.at("table_id").get<std::string>();
+    info.table_type = table_json.at("table_type").get<std::string>();
+    info.data_source_format = string_or_empty(table_json, "data_source_format");
+    info.storage_location = table_json.at("storage_location").get<std::string>();
+  } catch (const nlohmann::json::exception& e) {
+    throw StorageError(
+        fmt::format("{}: table info from '{}' is missing a required field: {}", kErrorPrefix, url, e.what()));
+  }
+  info.columns = parse_columns(table_json, url);
+  return info;
 }
 
 }  // namespace
@@ -100,6 +132,15 @@ std::string UnityCatalogClient::bearer_token_for_request() {
   return "";
 }
 
+nlohmann::json UnityCatalogClient::authenticated_get_json(const std::string& url) {
+  const std::string bearer_token = bearer_token_for_request();
+  std::vector<std::string> headers = {"Accept: application/json"};
+  if (!bearer_token.empty()) {
+    headers.push_back(fmt::format("Authorization: Bearer {}", bearer_token));
+  }
+  return parse_json_response(url, http_request(url, headers, /*post_body=*/nullptr, kErrorPrefix));
+}
+
 UnityCatalogTableInfo UnityCatalogClient::get_table(const std::string& catalog, const std::string& schema,
                                                     const std::string& table) {
   const std::string full_name = fmt::format("{}.{}.{}", catalog, schema, table);
@@ -110,26 +151,97 @@ UnityCatalogTableInfo UnityCatalogClient::get_table(const std::string& catalog, 
   }
 
   const std::string url = fmt::format("{}/tables/{}", config_.uc_url, encoded_full_name);
-  const std::string bearer_token = bearer_token_for_request();
-  std::vector<std::string> headers = {"Accept: application/json"};
-  if (!bearer_token.empty()) {
-    headers.push_back(fmt::format("Authorization: Bearer {}", bearer_token));
-  }
-  const nlohmann::json response =
-      parse_json_response(url, http_request(url, headers, /*post_body=*/nullptr, kErrorPrefix));
+  return parse_table_info(authenticated_get_json(url), url);
+}
 
-  UnityCatalogTableInfo info;
-  try {
-    info.table_id = response.at("table_id").get<std::string>();
-    info.table_type = response.at("table_type").get<std::string>();
-    info.data_source_format = response.value("data_source_format", "");
-    info.storage_location = response.at("storage_location").get<std::string>();
-  } catch (const nlohmann::json::exception& e) {
-    throw StorageError(
-        fmt::format("{}: table info from '{}' is missing a required field: {}", kErrorPrefix, url, e.what()));
-  }
-  info.columns = parse_columns(response, url);
-  return info;
+std::vector<UnityCatalogCatalogInfo> UnityCatalogClient::list_catalogs() {
+  std::vector<UnityCatalogCatalogInfo> catalogs;
+  std::string page_token;
+  do {
+    std::string url = fmt::format("{}/catalogs", config_.uc_url);
+    if (!page_token.empty()) {
+      const CurlEasyPtr encoder = make_curl_easy();
+      url += fmt::format("?page_token={}", url_encode(encoder.get(), page_token, kErrorPrefix));
+    }
+    const nlohmann::json response = authenticated_get_json(url);
+    if (!response.contains("catalogs")) {
+      throw StorageError(fmt::format("{}: list response from '{}' is missing 'catalogs'", kErrorPrefix, url));
+    }
+    for (const nlohmann::json& catalog_json : response.at("catalogs")) {
+      try {
+        UnityCatalogCatalogInfo info;
+        info.name = catalog_json.at("name").get<std::string>();
+        info.comment = string_or_empty(catalog_json, "comment");
+        catalogs.push_back(std::move(info));
+      } catch (const nlohmann::json::exception& e) {
+        throw StorageError(fmt::format("{}: a 'catalogs' entry from '{}' is missing a required field: {}",
+                                       kErrorPrefix, url, e.what()));
+      }
+    }
+    page_token = string_or_empty(response, "next_page_token");
+  } while (!page_token.empty());
+  return catalogs;
+}
+
+std::vector<UnityCatalogSchemaInfo> UnityCatalogClient::list_schemas(const std::string& catalog) {
+  std::vector<UnityCatalogSchemaInfo> schemas;
+  std::string page_token;
+  do {
+    std::string url;
+    {
+      const CurlEasyPtr encoder = make_curl_easy();
+      url = fmt::format("{}/schemas?catalog_name={}", config_.uc_url,
+                        url_encode(encoder.get(), catalog, kErrorPrefix));
+      if (!page_token.empty()) {
+        url += fmt::format("&page_token={}", url_encode(encoder.get(), page_token, kErrorPrefix));
+      }
+    }
+    const nlohmann::json response = authenticated_get_json(url);
+    if (!response.contains("schemas")) {
+      throw StorageError(fmt::format("{}: list response from '{}' is missing 'schemas'", kErrorPrefix, url));
+    }
+    for (const nlohmann::json& schema_json : response.at("schemas")) {
+      try {
+        UnityCatalogSchemaInfo info;
+        info.name = schema_json.at("name").get<std::string>();
+        info.catalog_name = string_or_empty(schema_json, "catalog_name");
+        info.full_name = string_or_empty(schema_json, "full_name");
+        schemas.push_back(std::move(info));
+      } catch (const nlohmann::json::exception& e) {
+        throw StorageError(fmt::format("{}: a 'schemas' entry from '{}' is missing a required field: {}",
+                                       kErrorPrefix, url, e.what()));
+      }
+    }
+    page_token = string_or_empty(response, "next_page_token");
+  } while (!page_token.empty());
+  return schemas;
+}
+
+std::vector<UnityCatalogTableInfo> UnityCatalogClient::list_tables(const std::string& catalog,
+                                                                    const std::string& schema) {
+  std::vector<UnityCatalogTableInfo> tables;
+  std::string page_token;
+  do {
+    std::string url;
+    {
+      const CurlEasyPtr encoder = make_curl_easy();
+      url = fmt::format("{}/tables?catalog_name={}&schema_name={}", config_.uc_url,
+                        url_encode(encoder.get(), catalog, kErrorPrefix),
+                        url_encode(encoder.get(), schema, kErrorPrefix));
+      if (!page_token.empty()) {
+        url += fmt::format("&page_token={}", url_encode(encoder.get(), page_token, kErrorPrefix));
+      }
+    }
+    const nlohmann::json response = authenticated_get_json(url);
+    if (!response.contains("tables")) {
+      throw StorageError(fmt::format("{}: list response from '{}' is missing 'tables'", kErrorPrefix, url));
+    }
+    for (const nlohmann::json& table_json : response.at("tables")) {
+      tables.push_back(parse_table_info(table_json, url));
+    }
+    page_token = string_or_empty(response, "next_page_token");
+  } while (!page_token.empty());
+  return tables;
 }
 
 UnityCatalogTemporaryCredentials UnityCatalogClient::get_temporary_table_credentials(
@@ -146,24 +258,43 @@ UnityCatalogTemporaryCredentials UnityCatalogClient::get_temporary_table_credent
   const nlohmann::json response =
       parse_json_response(url, http_request(url, headers, &body, kErrorPrefix));
 
-  if (!response.contains("aws_temp_credentials")) {
-    throw StorageError(fmt::format(
-        "{}: temporary-table-credentials response from '{}' is missing 'aws_temp_credentials' -- only AWS "
-        "S3 vended credentials are supported (see docs/ROADMAP.md)",
-        kErrorPrefix, url));
-  }
-  const nlohmann::json& aws_json = response.at("aws_temp_credentials");
-
   UnityCatalogTemporaryCredentials credentials;
-  try {
-    credentials.access_key_id = aws_json.at("access_key_id").get<std::string>();
-    credentials.secret_access_key = aws_json.at("secret_access_key").get<std::string>();
-    credentials.session_token = aws_json.at("session_token").get<std::string>();
-  } catch (const nlohmann::json::exception& e) {
-    throw StorageError(fmt::format(
-        "{}: 'aws_temp_credentials' from '{}' is missing a required field: {}", kErrorPrefix, url, e.what()));
+  if (response.contains("aws_temp_credentials") && !response.at("aws_temp_credentials").is_null()) {
+    const nlohmann::json& aws_json = response.at("aws_temp_credentials");
+    try {
+      credentials.access_key_id = aws_json.at("access_key_id").get<std::string>();
+      credentials.secret_access_key = aws_json.at("secret_access_key").get<std::string>();
+      credentials.session_token = aws_json.at("session_token").get<std::string>();
+    } catch (const nlohmann::json::exception& e) {
+      throw StorageError(fmt::format("{}: 'aws_temp_credentials' from '{}' is missing a required field: {}",
+                                     kErrorPrefix, url, e.what()));
+    }
+    return credentials;
   }
-  return credentials;
+  if (response.contains("gcp_oauth_token") && !response.at("gcp_oauth_token").is_null()) {
+    try {
+      credentials.gcp_oauth_token = response.at("gcp_oauth_token").at("oauth_token").get<std::string>();
+    } catch (const nlohmann::json::exception& e) {
+      throw StorageError(fmt::format("{}: 'gcp_oauth_token' from '{}' is missing a required field: {}",
+                                     kErrorPrefix, url, e.what()));
+    }
+    return credentials;
+  }
+  if (response.contains("azure_user_delegation_sas") && !response.at("azure_user_delegation_sas").is_null()) {
+    try {
+      credentials.azure_sas_token =
+          response.at("azure_user_delegation_sas").at("sas_token").get<std::string>();
+    } catch (const nlohmann::json::exception& e) {
+      throw StorageError(fmt::format(
+          "{}: 'azure_user_delegation_sas' from '{}' is missing a required field: {}", kErrorPrefix, url,
+          e.what()));
+    }
+    return credentials;
+  }
+  throw StorageError(fmt::format(
+      "{}: temporary-table-credentials response from '{}' has none of 'aws_temp_credentials'/"
+      "'gcp_oauth_token'/'azure_user_delegation_sas' -- unrecognized or unsupported cloud",
+      kErrorPrefix, url));
 }
 
 }  // namespace kernellake::unitycatalog

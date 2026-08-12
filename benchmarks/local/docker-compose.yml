@@ -38,19 +38,69 @@ services:
       timeout: 5s
       retries: 10
 
-  # One-shot: creates the bucket kernellake-server/scripts read/write,
-  # then exits. `docker compose up` runs it to completion before anything
-  # depends_on: condition: service_completed_successfully waits on it.
+  # One-shot: creates the bucket kernellake-server/scripts read/write, plus
+  # a second bucket + real (committed, not generated) Parquet fixture for
+  # the Unity Catalog integration's own MinIO-backed tests
+  # (tests/unit/query_engine_unitycatalog_test.cpp's Minio*-prefixed
+  # tests) -- table_id/schema for it are wired up separately, in the
+  # `unitycatalog-init` service below, not here (this container has no
+  # Unity Catalog CLI). Then exits. `docker compose up` runs it to
+  # completion before anything depends_on:
+  # condition: service_completed_successfully waits on it.
   minio-init:
     image: minio/mc:latest
     depends_on:
       minio:
         condition: service_healthy
+    volumes:
+      - ./fixtures/unity_catalog_test_data:/fixtures/unity_catalog_test_data:ro
     entrypoint: >
       /bin/sh -c "
       mc alias set local http://minio:9000 minioadmin minioadmin &&
-      mc mb --ignore-existing local/kernellake-bench
+      mc mb --ignore-existing local/kernellake-bench &&
+      mc mb --ignore-existing local/kernellake-uc-test &&
+      mc cp /fixtures/unity_catalog_test_data/orders/data-0.parquet local/kernellake-uc-test/orders/data-0.parquet
       "
+
+  # Real unitycatalog/unitycatalog OSS server (not a stub/mock) for live,
+  # manual verification of the read_unity_catalog(...) SQL surface
+  # (src/unitycatalog/) against an actual Unity Catalog REST API -- see
+  # docs/ROADMAP.md's Unity Catalog entry for what this confirmed for
+  # real (exact response field names, a real dangling-string_view bug,
+  # storage_location's real "file://" URI form). Ships its own demo
+  # catalog/schema ("unity"/"default") with a few sample Delta/Parquet
+  # tables out of the box (`curl http://localhost:8080/api/2.1/unity-catalog/tables?catalog_name=unity&schema_name=default`
+  # lists them) -- enough to manually exercise get_table()/dispatch
+  # against real server responses via
+  # `kernellake explain --sql "SELECT * FROM read_unity_catalog('<instance>.unity.default.numbers')"`.
+  #
+  # No init step here registering a new table against this stack's own
+  # MinIO: tried it (`bin/uc table create ... --storage_location
+  # s3://...`), and confirmed it doesn't work in this environment -- Unity
+  # Catalog's own external-table creation validates/bootstraps the
+  # storage location using its *own* internal temporary-credentials
+  # vending, which (like the read-side vending kernellake's own client
+  # calls) is AWS-IAM-role/STS-based; MinIO can't honor that without much
+  # deeper setup than this local stack aims for. The Minio*-prefixed tests
+  # in tests/unit/query_engine_unitycatalog_test.cpp cover the S3-vended-
+  # credentials code path a different way instead: a controlled fixture
+  # response (not this real server) supplies the "vended" credentials
+  # (MinIO's own static ones), so kernellake's *own* S3 access is verified
+  # for real without depending on Unity Catalog's server-side S3
+  # bootstrapping working here.
+  unitycatalog:
+    image: unitycatalog/unitycatalog:latest
+    ports:
+      - "8080:8080"   # Unity Catalog REST API
+    healthcheck:
+      # No curl in this image (Alpine, JVM-only) -- bash's /dev/tcp is a
+      # builtin, same technique kernellake-server's own healthcheck below
+      # already uses for the identical reason.
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/localhost/8080"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
 
   # All-in-one Jaeger (in-memory span storage -- SPAN_STORAGE_TYPE
   # defaults to "memory", fine for a local dev/benchmark stack; traces are

@@ -38,7 +38,7 @@ CMake preset rather than `tests/unit/`).
 | `storage` | `ObjectStore`/`LocalObjectStore`/cloud backends (S3/GCS/Azure/HDFS), file discovery |
 | `iceberg` | Iceberg REST catalog client, manifest reading, partition pruning, position-delete reads, schema translation (`kernellake_iceberg`) |
 | `delta` | Delta Lake read support (`kernellake_delta`) |
-| `unitycatalog` | Unity Catalog client (auth, table lookup, temporary S3 credentials) and the resolver that dispatches a UC-managed table to `iceberg`/`delta`/plain-Parquet resolution (`kernellake_unitycatalog`) |
+| `unitycatalog` | Unity Catalog client (auth, table lookup, temporary S3/GCS/Azure credentials) and the resolver that dispatches a UC-managed table to `iceberg`/`delta`/plain-Parquet resolution (`kernellake_unitycatalog`) |
 | `io` | Parquet metadata inspection, row-group pruning, the physical planner (ties `planner` + `storage` + `io` together) |
 | `memory` | RAII CUDA device/stream wrappers, RMM memory-pool/statistics/limit configuration (`gpu-dev` preset only) |
 | `execution_gpu` | `PhysicalOperator`/`DeviceBatch`/`ExecutionContext`, the Arrow<->cudf bridge, the AST expression compiler, and every concrete GPU operator (`gpu-dev` preset only) -- renamed from `execution` |
@@ -99,15 +99,32 @@ chain. `read_unity_catalog(...)` is a name/permission/credential broker,
 not a fourth storage format of its own -- it authenticates to a configured
 Unity Catalog instance, looks up the table's actual format and storage
 location, and dispatches to whichever of the other three paths matches
-(`DELTA`/`PARQUET` via a short-lived, Unity-Catalog-vended AWS S3
-credential when the storage location is `s3://...`; `ICEBERG` via Unity
-Catalog's own Iceberg-REST-compatible endpoint, reusing the same
+(`DELTA`/`PARQUET` via a short-lived, Unity-Catalog-vended S3/GCS/Azure
+credential, dispatched by the storage location's own URI scheme
+(`s3`/`gs`,`gcs`/`abfs`,`abfss`,`az`); `ICEBERG` via Unity Catalog's own
+Iceberg-REST-compatible endpoint, reusing the same
 `IcebergRestCatalogClient` a plain `read_iceberg(...)` uses) -- see
 `kernellake::unitycatalog::UnityCatalogSourceResolver`
 (`src/unitycatalog/unity_catalog_source_resolver.cpp`) and
 `docs/ROADMAP.md`'s Unity Catalog entry for the full scope and what's
-still deferred (GCS/Azure vended credentials, catalog/schema `LIST`
-operations).
+still deferred (catalog/schema `LIST` operations have no SQL surface;
+only the AWS `aws_temp_credentials` vended-credential shape has been
+verified against a real live server, the GCS/Azure shapes are
+parsing-tested only). **A real, currently-open gap, confirmed against a
+live Unity Catalog server and a real MinIO, not just reasoned about**:
+the vended credentials are only ever used at *resolve* time (schema
+discovery, physical planning -- `TableSourceResolver::resolve()`'s own
+temporary `S3ObjectStore`/`GcsObjectStore`/`AzureObjectStore`); actual
+scan *execution* always reads through
+`QueryEngine`'s own long-lived, statically-configured `ObjectStore`
+(`store_`), which has no reference to those vended credentials at all.
+So `kernellake explain`/`explain_logical` against an S3-backed
+Unity-Catalog table works today; a real `kernellake query` fails at the
+actual data read unless the engine's own `storage.s3` config happens to
+already have independent access to that bucket. See `docs/ROADMAP.md`'s
+Unity Catalog entry for the root cause and why closing it needs a real
+seam threading "which store resolved this file" through to the scan
+operators, not a quick patch.
 
 - Column references, aliases, `*`
 - Numeric, string, boolean, date (`DATE 'YYYY-MM-DD'`), and `NULL` literals

@@ -136,6 +136,63 @@ TEST(UnityCatalogClient, GetTemporaryTableCredentialsThrowsWhenAwsCredentialsMis
   server.respond({http_ok_json(R"({"gcp_oauth_token": {"oauth_token": "x"}})")});
 
   UnityCatalogClient client(instance_config(server.base_url()));
+  const UnityCatalogTemporaryCredentials credentials =
+      client.get_temporary_table_credentials("table-uuid-1", "READ");
+  server.join();
+
+  EXPECT_TRUE(credentials.access_key_id.empty());
+  EXPECT_EQ(credentials.gcp_oauth_token, "x");
+}
+
+// The gcp_oauth_token/azure_user_delegation_sas response shapes below are
+// NOT independently verified against a real live Unity Catalog server
+// (unlike aws_temp_credentials, see UnityCatalogTemporaryCredentials's own
+// comment) -- these only lock in this client's own parsing of the
+// Databricks-SDK-conventional shape it was written against, not that a
+// real GCP/Azure-backed UC deployment actually returns exactly this.
+TEST(UnityCatalogClient, GetTemporaryTableCredentialsParsesGcpOauthToken) {
+  LoopbackHttpServer server;
+  server.respond({http_ok_json(R"({"gcp_oauth_token": {"oauth_token": "ya29.vended-gcp-token"}})")});
+
+  UnityCatalogClient client(instance_config(server.base_url()));
+  const UnityCatalogTemporaryCredentials credentials =
+      client.get_temporary_table_credentials("table-uuid-1", "READ");
+  server.join();
+
+  EXPECT_EQ(credentials.gcp_oauth_token, "ya29.vended-gcp-token");
+  EXPECT_TRUE(credentials.access_key_id.empty());
+  EXPECT_TRUE(credentials.azure_sas_token.empty());
+}
+
+TEST(UnityCatalogClient, GetTemporaryTableCredentialsParsesAzureSasToken) {
+  LoopbackHttpServer server;
+  server.respond(
+      {http_ok_json(R"({"azure_user_delegation_sas": {"sas_token": "sv=2024-01-01&sig=vended-azure-sas"}})")});
+
+  UnityCatalogClient client(instance_config(server.base_url()));
+  const UnityCatalogTemporaryCredentials credentials =
+      client.get_temporary_table_credentials("table-uuid-1", "READ");
+  server.join();
+
+  EXPECT_EQ(credentials.azure_sas_token, "sv=2024-01-01&sig=vended-azure-sas");
+  EXPECT_TRUE(credentials.access_key_id.empty());
+  EXPECT_TRUE(credentials.gcp_oauth_token.empty());
+}
+
+TEST(UnityCatalogClient, GetTemporaryTableCredentialsThrowsWhenGcpOauthTokenFieldMissing) {
+  LoopbackHttpServer server;
+  server.respond({http_ok_json(R"({"gcp_oauth_token": {}})")});
+
+  UnityCatalogClient client(instance_config(server.base_url()));
+  EXPECT_THROW((void)(client.get_temporary_table_credentials("table-uuid-1", "READ")), StorageError);
+  server.join();
+}
+
+TEST(UnityCatalogClient, GetTemporaryTableCredentialsThrowsWhenNoRecognizedCredentialsField) {
+  LoopbackHttpServer server;
+  server.respond({http_ok_json(R"({"expiration_time": 123})")});
+
+  UnityCatalogClient client(instance_config(server.base_url()));
   EXPECT_THROW((void)(client.get_temporary_table_credentials("table-uuid-1", "READ")), StorageError);
   server.join();
 }
@@ -164,6 +221,83 @@ TEST(UnityCatalogClient, ThrowsWhenStorageLocationFieldIsMissing) {
 
   UnityCatalogClient client(instance_config(server.base_url()));
   EXPECT_THROW((void)(client.get_table("main", "db", "orders")), StorageError);
+  server.join();
+}
+
+TEST(UnityCatalogClient, ListCatalogsParsesSinglePage) {
+  LoopbackHttpServer server;
+  std::vector<std::string> requests(1);
+  server.respond({http_ok_json(R"({
+    "catalogs": [
+      {"name": "unity", "comment": "Main catalog"},
+      {"name": "other", "comment": ""}
+    ],
+    "next_page_token": null
+  })")},
+                 &requests);
+
+  const std::vector<UnityCatalogCatalogInfo> catalogs = UnityCatalogClient(instance_config(server.base_url())).list_catalogs();
+  server.join();
+
+  ASSERT_EQ(catalogs.size(), 2u);
+  EXPECT_EQ(catalogs[0].name, "unity");
+  EXPECT_EQ(catalogs[0].comment, "Main catalog");
+  EXPECT_EQ(catalogs[1].name, "other");
+  EXPECT_NE(requests[0].find("GET /catalogs"), std::string::npos);
+}
+
+TEST(UnityCatalogClient, ListSchemasFollowsPaginationAcrossMultiplePages) {
+  LoopbackHttpServer server;
+  std::vector<std::string> requests(2);
+  server.respond(
+      {http_ok_json(R"({
+        "schemas": [{"name": "default", "catalog_name": "unity", "full_name": "unity.default"}],
+        "next_page_token": "default"
+      })"),
+       http_ok_json(R"({
+        "schemas": [{"name": "other_schema", "catalog_name": "unity", "full_name": "unity.other_schema"}],
+        "next_page_token": null
+      })")},
+      &requests);
+
+  const std::vector<UnityCatalogSchemaInfo> schemas = UnityCatalogClient(instance_config(server.base_url())).list_schemas("unity");
+  server.join();
+
+  ASSERT_EQ(schemas.size(), 2u);
+  EXPECT_EQ(schemas[0].name, "default");
+  EXPECT_EQ(schemas[0].full_name, "unity.default");
+  EXPECT_EQ(schemas[1].name, "other_schema");
+  EXPECT_NE(requests[0].find("GET /schemas?catalog_name=unity"), std::string::npos);
+  // Second request must echo the first response's next_page_token back as
+  // its own page_token query parameter, not just repeat the first request.
+  EXPECT_NE(requests[1].find("page_token=default"), std::string::npos);
+}
+
+TEST(UnityCatalogClient, ListTablesFollowsPaginationAndParsesEachTable) {
+  LoopbackHttpServer server;
+  server.respond({http_ok_json(fmt::format(R"({{
+                    "tables": [{}],
+                    "next_page_token": null
+                  }})",
+                                           kTableInfoJson))});
+
+  const std::vector<UnityCatalogTableInfo> tables =
+      UnityCatalogClient(instance_config(server.base_url())).list_tables("main", "db");
+  server.join();
+
+  ASSERT_EQ(tables.size(), 1u);
+  EXPECT_EQ(tables[0].table_id, "table-uuid-1");
+  EXPECT_EQ(tables[0].data_source_format, "DELTA");
+  ASSERT_EQ(tables[0].columns.size(), 2u);
+  EXPECT_EQ(tables[0].columns[0].name, "order_id");
+}
+
+TEST(UnityCatalogClient, ListTablesThrowsWhenTablesFieldMissing) {
+  LoopbackHttpServer server;
+  server.respond({http_ok_json(R"({"not_tables": []})")});
+
+  UnityCatalogClient client(instance_config(server.base_url()));
+  EXPECT_THROW((void)(client.list_tables("main", "db")), StorageError);
   server.join();
 }
 

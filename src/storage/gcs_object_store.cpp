@@ -79,18 +79,42 @@ arrow::fs::GcsOptions build_options(const GcsSection& config) {
   return options;
 }
 
-std::shared_ptr<arrow::fs::FileSystem> make_gcs_filesystem(const GcsSection& config) {
-  const arrow::Result<std::shared_ptr<arrow::fs::GcsFileSystem>> result =
-      arrow::fs::GcsFileSystem::Make(build_options(config));
+std::shared_ptr<arrow::fs::FileSystem> make_gcs_filesystem_from_options(const arrow::fs::GcsOptions& options) {
+  const arrow::Result<std::shared_ptr<arrow::fs::GcsFileSystem>> result = arrow::fs::GcsFileSystem::Make(options);
   if (!result.ok()) {
     throw StorageError(fmt::format("gcs: failed to construct filesystem: {}", result.status().ToString()));
   }
   return *result;
 }
 
+std::shared_ptr<arrow::fs::FileSystem> make_gcs_filesystem(const GcsSection& config) {
+  return make_gcs_filesystem_from_options(build_options(config));
+}
+
 }  // namespace
 
 GcsObjectStore::GcsObjectStore(const GcsSection& config) : fs_(make_gcs_filesystem(config)) {}
+
+GcsObjectStore::GcsObjectStore(const arrow::fs::GcsOptions& base_options, const std::string& access_token)
+    : fs_([&] {
+        // See this constructor's own header comment for why a fixed,
+        // generous expiration is used instead of parsing one from Unity
+        // Catalog's response.
+        const arrow::fs::TimePoint expiration = std::chrono::time_point_cast<arrow::fs::TimePoint::duration>(
+            std::chrono::system_clock::now() + std::chrono::hours(1));
+        arrow::fs::GcsOptions options = arrow::fs::GcsOptions::FromAccessToken(access_token, expiration);
+        // GcsOptions::FromAccessToken() (like every other GcsOptions
+        // credential factory -- see build_options()'s own comment) builds
+        // a fresh GcsOptions, discarding base_options' plain fields; copy
+        // them on top, same as build_options() already does for the
+        // static-config constructor.
+        options.endpoint_override = base_options.endpoint_override;
+        options.scheme = base_options.scheme;
+        options.default_bucket_location = base_options.default_bucket_location;
+        options.retry_limit_seconds = base_options.retry_limit_seconds;
+        options.project_id = base_options.project_id;
+        return make_gcs_filesystem_from_options(options);
+      }()) {}
 
 std::vector<ObjectInfo> GcsObjectStore::list(const Uri& prefix) {
   return detail::generic_fs_list(fs_, "gcs", prefix);

@@ -9,8 +9,9 @@ namespace kernellake::unitycatalog {
 namespace {
 
 UnityCatalogSourceResolver make_resolver(UnityCatalogSection instances = {}, DeltaSection delta = {},
-                                         S3Section s3 = {}) {
-  return UnityCatalogSourceResolver(std::move(instances), std::move(delta), std::move(s3));
+                                         S3Section s3 = {}, GcsSection gcs = {}, AzureSection azure = {}) {
+  return UnityCatalogSourceResolver(std::move(instances), std::move(delta), std::move(s3), std::move(gcs),
+                                    std::move(azure));
 }
 
 TEST(UnityCatalogSourceResolver, CanResolveOnlyClaimsUnityCatalogSchemeSources) {

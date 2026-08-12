@@ -3012,44 +3012,303 @@ log` is the authoritative chronology if that ordering ever matters.
   bucket (no Docker available in this session's environment) -- see "Not
   yet started" below.
 
+- **Unity Catalog: live-server and real-MinIO verification, two real bugs
+  found and fixed, one real architectural gap found and documented.**
+  Direct follow-up once Docker became available in this session's
+  environment -- closes the two live-verification gaps the entry above
+  left open, and does so for real rather than assuming the earlier
+  API research was correct.
+
+  **Real `unitycatalog/unitycatalog` OSS server** (`docker pull
+  unitycatalog/unitycatalog:latest`, `./bin/start-uc-server`, no auth
+  required by default, listens on 8080) confirmed the researched REST
+  shapes exactly: `GET /api/2.1/unity-catalog/tables/{catalog.schema.table}`
+  returns `table_id`/`table_type`/`data_source_format`/`storage_location`/
+  `columns[]` with `name`/`type_name`/`type_json`/`nullable`/`position`,
+  matching `UnityCatalogClient::get_table()`'s parsing field-for-field
+  against the server's own bundled demo tables (`unity.default.marksheet`,
+  `.numbers`, etc.) -- no client-side changes needed. One real surprise:
+  `storage_location` for every demo table came back as an explicit
+  `"file:///..."` URI, not a bare path -- `UnityCatalogSourceResolver`
+  passed this straight through to `resolve_table()`/`resolve_delta_table()`,
+  which (unlike the S3/GCS/Azure backends, which all strip their own
+  scheme prefix via `generic_fs_object_store.cpp`'s `strip_scheme()`)
+  expects a bare path with no prefix at all -- `LocalObjectStore` doesn't
+  strip one, so every real local-storage table failed with "path ...
+  is outside the configured storage root" (the raw `"file://..."` string,
+  visibly unstripped, in the error). Fixed by adding `strip_file_scheme()`
+  to the resolver (not to `LocalObjectStore` itself -- nothing else in
+  this codebase ever produces a `"file://"`-prefixed source string, so
+  teaching the whole storage layer about it would be over-scoped for a
+  gap only Unity Catalog's own responses introduce). Verified for real,
+  not just re-tested: `docker cp` a real Parquet file into the live
+  server's own data directory, `bin/uc table create --format PARQUET
+  --storage_location file:///tmp/uc_test_data` (the CLI validates
+  nothing about the path -- easier from the host side than the
+  container's own filesystem), then `kernellake query --sql "SELECT id,
+  amount FROM read_unity_catalog('live.unity.default.kernellake_test')
+  WHERE id > 2"` against the real running server returned the exact
+  correct rows/aggregate. Also confirmed the `DELTA` dispatch path
+  against the server's own real `unity.default.numbers` table (real
+  `data_source_format: DELTA`): correctly identified and rejected with
+  the intended clear `ConfigurationError` (no `delta.grpc_endpoint`
+  configured in this environment) -- proving the format-dispatch
+  *decision* is correct even though the Delta path itself needs a
+  separately-running `delta-txn-service` this session didn't set up.
+
+  **A second, more serious bug**, caught only because the `"file://"` fix
+  above didn't immediately work when first tried: `storage_scheme` was
+  declared `const std::string_view storage_scheme =
+  Uri(table.storage_location).scheme();` -- `Uri::scheme()` returns a
+  view into the `Uri` object's own owned string only when the source
+  string actually has an explicit `"scheme://"` prefix (the no-prefix
+  fallback returns a view into a `string` *literal*, always valid); the
+  `Uri(...)` temporary here is destroyed at the end of that declaration
+  statement, so `storage_scheme` was a dangling reference for any real
+  `"scheme://..."` input from that point on -- silent undefined behavior,
+  not a crash, so the `"file"`/`"s3"` comparisons downstream just
+  intermittently read garbage instead of erroring. Every existing unit
+  test used bare local paths (no `"://"` prefix), which take the
+  always-valid string-literal branch -- exactly why this was invisible
+  to `unity_catalog_source_resolver_test.cpp`/
+  `query_engine_unitycatalog_test.cpp` and only surfaced against the real
+  server's real `"file://"`-prefixed responses. Fixed by copying into an
+  owned `std::string` instead: `const std::string storage_scheme(Uri(...).scheme());`.
+  Confirmed via `git grep '\.scheme()'` that this was the only such
+  dangling-binding in the new code (the other call site,
+  `can_resolve()`'s `Uri(sources[0]).scheme() == kScheme`, compares
+  inline within the same full expression as the temporary's construction,
+  which is safe under normal C++ temporary-lifetime rules).
+
+  **Real MinIO** (`benchmarks/local/`'s existing `minio`/`minio-init`
+  services, `docker compose up -d`): uploaded a real Parquet fixture to a
+  new `kernellake-uc-test` bucket, confirmed the *resolve-time* path
+  (`explain()`/`explain_logical()`, which only fetch metadata) correctly
+  builds a working vended-credentialed `S3ObjectStore` and reads real
+  bytes over the network with MinIO's static root credentials standing in
+  for Unity-Catalog-vended ones (`S3ObjectStore`'s vended-credentials
+  constructor has no way to tell the difference either way). But a real
+  `QueryEngine::execute()` against the same table failed with a genuine
+  `ACCESS_DENIED` -- root-caused (via several isolated minimal
+  reproductions ruling out an AWS-SDK/gRPC link-graph interaction first)
+  to a real, load-bearing architectural gap: `TableSourceResolver::resolve()`
+  only affects *resolution* (file discovery, schema, physical planning) --
+  the physical plan it produces carries file *paths*, not a reference to
+  which `ObjectStore`/credentials resolved them, so actual scan
+  *execution* always reads through `QueryEngine`'s own long-lived,
+  statically-configured `store_`, never the resolver's temporary vended
+  one. Every prior resolver (Iceberg, Delta) never hit this because
+  neither ever needed credentials different from the engine's own
+  globally-configured `storage.s3` -- Unity Catalog is the first source
+  needing genuinely per-query, per-table credentials, and the existing
+  resolve-then-execute architecture has no seam for that today. Not
+  fixed this session (a real, separate, cross-cutting change -- see "Not
+  yet started" below) -- instead documented precisely, with two new
+  regression tests pinning down exactly the boundary found:
+  `MinioBackedExplainProducesPhysicalPlanWithVendedCredentials` (passes,
+  proving resolve/plan genuinely works against real MinIO) and
+  `MinioBackedExecuteFailsBecauseScanExecutionBypassesVendedCredentials`
+  (asserts the current `StorageError`, deliberately written to fail
+  loudly rather than silently once this gap is eventually closed).
+
+  One more real fix needed purely to make this testable at all: the first
+  MinIO-backed test run left the process SIGABRT'ing *after* every gtest
+  assertion had already passed, with Arrow's own runtime warning
+  ("`FinalizeS3` was not called even though S3 was initialized... This
+  could lead to a segmentation fault at exit") printed just before the
+  crash. `s3_object_store.cpp` deliberately never calls `FinalizeS3()`
+  (matching `http_client.cpp`'s identical never-call
+  `curl_global_cleanup()` reasoning -- correct for a short-lived CLI
+  process where the OS reclaims everything at exit) -- but this is the
+  first test file in the suite to ever construct a real `S3FileSystem`,
+  and a long-lived test binary running many tests in one process needs
+  the matching `FinalizeS3()` itself. Fixed with a
+  `::testing::Environment` (`S3FinalizeEnvironment`) whose `TearDown()`
+  calls `arrow::fs::FinalizeS3()` once, after every test in the binary
+  has finished -- confirmed the crash is gone (`ctest` exit code 0, not
+  just gtest's own internal pass tally) and confirmed via `git grep` that
+  no other test file constructs a real `S3FileSystem` today, so this
+  wasn't masking a second, older instance of the same gap.
+
+  **`benchmarks/local/docker-compose.yml` gained a real
+  `unitycatalog` service** (`unitycatalog/unitycatalog:latest`, port
+  8080, a `/dev/tcp` healthcheck matching `kernellake-server`'s own
+  since this image has no curl) for future live manual verification, and
+  `minio-init` now also creates the `kernellake-uc-test` bucket and
+  uploads a real, committed Parquet fixture
+  (`benchmarks/local/fixtures/unity_catalog_test_data/`) that the two
+  MinIO-backed tests above read over the network -- confirmed
+  reproducible from a genuinely clean `docker compose down -v` +
+  `up`, not just against this session's already-populated MinIO (an
+  earlier version of the upload command, `mc cp --recursive`, silently
+  nested the source directory's own name into the destination path --
+  `kernellake-uc-test/orders/orders/data-0.parquet` instead of
+  `kernellake-uc-test/orders/data-0.parquet` -- caught by exactly this
+  clean-volume re-test, fixed by copying the single file explicitly
+  instead). Deliberately no init step registering a *new* table against
+  this stack's own MinIO through the real Unity Catalog server: tried it
+  (`bin/uc table create ... --storage_location s3://...`), and it fails
+  with a real server-side `NullPointerException` -- Unity Catalog's own
+  external-table creation bootstraps/validates the storage location using
+  its *own* internal temporary-credentials vending, which (same as the
+  read-side vending `UnityCatalogClient` calls) is AWS-IAM-role/STS-based
+  and MinIO can't satisfy without much deeper setup than this local stack
+  aims for -- a second, independent confirmation of the same
+  AWS-IAM/STS-vs-MinIO limitation already noted above, this time on
+  Unity Catalog's own write path rather than kernellake's read path.
+
+  Verified for real end to end: `cpu-dev` full suite 394/394 (up from
+  392) and a real `gpu-dev` rebuild 394/394 (RTX 5060 Ti), both a clean
+  `ctest` exit (not just gtest's internal tally), zero regressions.
+
+- **`UnityCatalogClient` gained `list_catalogs()`/`list_schemas()`/
+  `list_tables()`**, closing part of the "remaining gaps" entry above (the
+  `LIST`-operations item -- catalog/schema *browsing* specifically;
+  `read_unity_catalog(...)`'s own exact-name lookup was already done).
+  Each follows Unity Catalog's cursor-style pagination (a
+  `next_page_token` in every response, echoed back as `page_token` on the
+  next request) internally, returning every page already concatenated --
+  confirmed against a real `unitycatalog/unitycatalog` server that a
+  single page tops out well under this project's own demo data size
+  (`max_results` query param confirmed to work, defaults to something
+  larger than 4 rows when omitted). `get_table()` and the new
+  `list_tables()` share one `parse_table_info()` (same JSON shape either
+  way, single object vs. one array element).
+
+  **Real bug caught by testing against the actual response shape, not
+  just plausible-looking fixture JSON**: the pagination loop's
+  `response.value("next_page_token", "")` threw
+  `json.exception.type_error.302` on every real call -- `.value()` with a
+  default only covers the *key being absent*, but a real Unity Catalog
+  server sends `"next_page_token": null` explicitly once the last page is
+  reached, not an absent key, and nlohmann::json refuses to convert
+  `null` to `std::string` even via `.value()`'s fallback path. Every new
+  unit test using canned JSON originally hit this too (until fixed) --
+  it's not a MinIO/live-server-only gap, any real call would have failed
+  immediately. Fixed with a small `string_or_empty()` helper (absent key
+  or explicit `null` both become `""`), applied to every genuinely
+  optional string field parsed here (`next_page_token`, `comment`,
+  `catalog_name`, `full_name`, `data_source_format`, `type_name`,
+  `type_json`), not just the one that happened to be caught first.
+
+  Verified for real, twice: 4 new `LoopbackHttpServer`-backed unit tests
+  (including a genuine 2-page pagination case, asserting the second
+  request's URL actually carries the first response's `page_token`, not
+  just repeating the first request), and separately a standalone program
+  linked against `kernellake_unitycatalog` calling all three methods
+  against the real live `unitycatalog/unitycatalog` server from earlier
+  in this session -- returned the real "unity" catalog, real "default"
+  schema, and all 4 real demo tables with correct `table_id`/
+  `table_type`/`data_source_format` values. `cpu-dev` 398/398, a real
+  `gpu-dev` rebuild 398/398 (RTX 5060 Ti), zero regressions.
+
+- **Unity Catalog: GCS/Azure vended-credential support** -- closes the
+  "GCS/Azure temporary credentials" gap listed below.
+  `UnityCatalogClient::get_temporary_table_credentials()` now checks
+  `aws_temp_credentials` / `gcp_oauth_token` / `azure_user_delegation_sas`
+  in that order and parses whichever the response actually carries
+  (throwing `StorageError` only if none are present), and
+  `UnityCatalogSourceResolver::resolve()` dispatches on the table's
+  `storage_location` scheme (`s3` / `gs`,`gcs` / `abfs`,`abfss`,`az` --
+  the same scheme set `ObjectStoreRegistry` itself already dispatches on)
+  to build a temporary `S3ObjectStore`/`GcsObjectStore`/`AzureObjectStore`
+  from whichever credential kind came back. New vended-credential
+  constructors added to `GcsObjectStore` (`GcsOptions::FromAccessToken()`
+  with a fixed 1-hour placeholder expiration, since UC's GCP response
+  shape wasn't independently verifiable and a vended token is only ever
+  used for one query's worth of requests, never cached past that) and
+  `AzureObjectStore` (`ConfigureSASCredential()` -- a SAS token
+  self-encodes its own expiration, no placeholder needed), both mirroring
+  `S3ObjectStore`'s existing vended constructor and sharing a
+  `make_*_filesystem_from_options()` helper with each backend's
+  static-config constructor.
+
+  **Important caveat, unlike the AWS path**: only `aws_temp_credentials`'s
+  shape (`access_key_id`/`secret_access_key`/`session_token`) was
+  confirmed against a real live Unity Catalog server this project has
+  actually run (see "Unity Catalog: live-server and real-MinIO
+  verification" above). The `gcp_oauth_token`/`azure_user_delegation_sas`
+  parsing (`{"gcp_oauth_token": {"oauth_token": "..."}}`,
+  `{"azure_user_delegation_sas": {"sas_token": "..."}}`) is based on
+  Databricks SDK naming conventions only, not independently verified --
+  no GCS/Azure-backed UC deployment or emulator was available to test
+  against, matching this project's existing, already-documented stance on
+  GCS/Azure emulator coverage for the pre-existing Iceberg/Delta code (see
+  the "Not yet started" entry below). If a real response shape turns out
+  to differ, only `UnityCatalogClient::get_temporary_table_credentials()`
+  needs to change -- the resolver dispatch and both storage-backend
+  constructors are shape-agnostic (they take a bare token string).
+
+  Tests added: `UnityCatalogClient.GetTemporaryTableCredentialsParsesGcpOauthToken`/
+  `ParsesAzureSasToken`/`ThrowsWhenGcpOauthTokenFieldMissing`/
+  `ThrowsWhenNoRecognizedCredentialsField`, plus
+  `GcsObjectStore.VendedAccessTokenConstructorDoesNotThrow` and a new
+  `tests/unit/azure_object_store_test.cpp` with
+  `AzureObjectStore.VendedSasTokenConstructorDoesNotThrow` (construction
+  alone doesn't touch the network for any of the three backends, so these
+  run with no real cloud endpoint, same reasoning the existing
+  `GcsObjectStore` construction tests already use). `cpu-dev` and a real
+  `gpu-dev-wsl2` rebuild both 404/404, zero regressions.
+
+  Not done here, deliberately out of scope for this item: threading these
+  vended stores through to actual scan *execution* (same pre-existing gap
+  the AWS/S3 path already has -- see "Scan execution doesn't use vended
+  credentials" below, unaffected by this change either way).
+
 ## Not yet started
 
 - **Unity Catalog support: remaining gaps** -- the core read path (Phase 5
   of the lakehouse roadmap) is now done, see "Unity Catalog support,
   read-only, first vertical slice" in "Done" above. What's left, not
   attempted this session:
-  - **GCS/Azure temporary credentials** -- UC's `temporary-table-credentials`
-    response also carries `gcp_oauth_token`/`azure_user_delegation_sas`
-    variants; `UnityCatalogClient::get_temporary_table_credentials()` only
-    parses `aws_temp_credentials` today and throws a clear `StorageError`
-    naming the gap if a response has neither (see that method's own
-    comment) -- this slice is AWS/S3-only throughout, matching the
-    original scoping request.
-  - **Catalog/schema `LIST` operations** -- only exact-name `GET
-    /tables/{full_name}` is implemented; no catalog or schema browsing (no
-    UC equivalent of `SHOW TABLES`), matching this project's existing
-    Iceberg/Delta scope (both are also exact-name-only, no `LIST`).
+  - ~~GCS/Azure temporary credentials~~ -- done, see "Unity Catalog:
+    GCS/Azure vended-credential support" in "Done" above.
+  - ~~Catalog/schema `LIST` operations~~ -- done, see
+    "`UnityCatalogClient` gained `list_catalogs()`/`list_schemas()`/
+    `list_tables()`" in "Done" above. Client-level only: no SQL surface
+    exposes these yet (no UC equivalent of `SHOW TABLES` reachable from
+    `kernellake query`), matching how Iceberg/Delta also have no `LIST`
+    SQL surface.
   - **Caching `UnityCatalogClient`/its OAuth2 token across queries** --
     constructed fresh per `resolve()` call today, the same deliberate MVP
     simplification `IcebergSourceResolver`'s `IcebergRestCatalogClient` and
     `DeltaSourceResolver`'s `DeltaTxnClient` already accept (see
     `docs/ROADMAP.md`'s Iceberg REST catalog entries for the same
     trade-off spelled out there).
-  - **Verification against a live Unity Catalog server** -- everything
-    below the SQL/dispatch layer was verified with a real loopback HTTP
-    server standing in for UC's REST API (real curl requests/responses,
-    real OAuth2 client-credentials flow, real JSON parsing -- see "Done"
-    above for the exact test list), not a live Databricks workspace or the
-    OSS `unitycatalog` server; the researched request/response shapes
-    (`docs.databricks.com`, `unitycatalog.io`) could still be wrong in a
-    way this test approach can't catch (a real field name mismatch, an
-    auth quirk specific to one deployment). Likewise, the AWS
-    temporary-credential path is verified by construction (compiles, the
-    right `S3ObjectStore` constructor gets called with the right
-    arguments) but not against a live bucket or MinIO -- no Docker
-    available in this session's dev environment to stand one up. Both are
-    real, not just formal, gaps -- flagged rather than silently assumed
-    correct.
+  - **Scan execution doesn't use vended credentials** -- the real gap
+    found by this session's live-MinIO verification (see "Unity Catalog:
+    live-server and real-MinIO verification..." in "Done" above): resolve
+    time (schema discovery, physical planning) correctly builds and uses
+    a temporary, vended-credentialed `S3ObjectStore`, but actual scan
+    *execution* always reads through `QueryEngine`'s own long-lived
+    `store_`, which has no idea those credentials exist. Concretely: a
+    real `read_unity_catalog(...)` query against an S3-backed table
+    currently works for `kernellake explain`/`explain_logical`, but a
+    real `kernellake query` (`QueryEngine::execute()`) fails once it
+    reaches the actual data read, unless the engine's own
+    `storage.s3.credentials_kind` happens to already have independent
+    access to that same bucket. Fixing this needs a real seam threading
+    "which credentials resolved this file" from `ResolvedTable`/the
+    physical plan through to whichever `ParquetScanOperator`/
+    `resolve_delta_table()` call actually reads bytes at execution time
+    (both CPU and GPU scan operators) -- a cross-cutting change on the
+    order of the per-row-delete-filtering entry below, not a quick patch,
+    and the reason it wasn't attempted this session. Two regression tests
+    pin down the exact current boundary:
+    `MinioBackedExplainProducesPhysicalPlanWithVendedCredentials` (passes)
+    and `MinioBackedExecuteFailsBecauseScanExecutionBypassesVendedCredentials`
+    (asserts today's `StorageError`, written to fail loudly once this is
+    fixed and needs replacing with a real-result assertion instead).
+  - Live-server/real-MinIO verification itself is now done (see "Done"
+    above) -- two real bugs found and fixed there (a `"file://"`-prefixed
+    `storage_location` from a real server, and a dangling `string_view`
+    from `Uri(...).scheme()` bound to a temporary). Not independently
+    re-verified against a live server: GCS/Azure vended credentials (now
+    implemented, see "Unity Catalog: GCS/Azure vended-credential support"
+    in "Done" above, but only parsing-level/construction-level tests
+    against canned JSON -- no real GCS/Azure-backed UC deployment or
+    emulator was available) and Unity Catalog's own `LIST`/write
+    operations (out of scope for this read-only slice).
 - **Iceberg per-row delete filtering and true schema evolution** -- both
   investigated this session (see the lakehouse roadmap's own "Whole-file
   row-level deletes" and partition-pruning entries above), and both found

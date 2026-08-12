@@ -4,6 +4,8 @@
 #include <string>
 #include <vector>
 
+#include <nlohmann/json_fwd.hpp>
+
 #include "kernellake/common/config.hpp"
 
 namespace kernellake::unitycatalog {
@@ -44,17 +46,53 @@ struct UnityCatalogTableInfo {
 };
 
 // The subset of Unity Catalog's TemporaryCredentials (POST
-// /temporary-table-credentials) this client extracts -- AWS S3 only (see
-// docs/ROADMAP.md's Unity Catalog entry for why GCS/Azure vended
-// credentials are out of scope for this slice). `expiration_time` isn't
-// captured: these credentials are used to build one S3ObjectStore for the
-// duration of a single resolve() call and never cached past it (see
-// UnityCatalogSourceResolver), so there is nothing here that would ever
-// check an expiry against.
+// /temporary-table-credentials) this client extracts. `expiration_time`
+// isn't captured for any cloud: these credentials are used to build one
+// vended-credentialed ObjectStore for the duration of a single resolve()
+// call and never cached past it (see UnityCatalogSourceResolver), so
+// there is nothing here that would ever check an expiry against.
+//
+// UC's response carries exactly one of "aws_temp_credentials"/
+// "gcp_oauth_token"/"azure_user_delegation_sas" depending on the table's
+// actual cloud, so exactly one of the three field groups below is
+// populated (the other two left default-empty) -- callers pick a
+// dispatch target by checking which group is non-empty, the same
+// resolve()-time scheme check (`s3://`/`gs://`/`abfs://`) that already
+// decides which cloud a table's storage_location is on.
+//
+// The AWS field names/shape (access_key_id/secret_access_key/
+// session_token under "aws_temp_credentials") were confirmed against a
+// real unitycatalog/unitycatalog OSS server this project actually stood
+// up (see docs/ROADMAP.md). The GCP/Azure field names below were not --
+// no live GCP/Azure Unity Catalog deployment or credential was available
+// to verify against, so `gcp_oauth_token`/`azure_user_delegation_sas`
+// (and their own inner field names, "oauth_token"/"sas_token") are based
+// on the same naming convention the AWS shape and the wider Databricks
+// SDK use, not independently confirmed -- flagged here rather than
+// silently presented with the same confidence as the AWS path.
 struct UnityCatalogTemporaryCredentials {
+  // AWS ("aws_temp_credentials") -- verified against a real server.
   std::string access_key_id;
   std::string secret_access_key;
   std::string session_token;
+  // GCP ("gcp_oauth_token") -- field name not independently verified.
+  std::string gcp_oauth_token;
+  // Azure ("azure_user_delegation_sas") -- field name not independently
+  // verified.
+  std::string azure_sas_token;
+};
+
+// One entry of GET /catalogs' "catalogs" array.
+struct UnityCatalogCatalogInfo {
+  std::string name;
+  std::string comment;
+};
+
+// One entry of GET /schemas' "schemas" array.
+struct UnityCatalogSchemaInfo {
+  std::string name;
+  std::string catalog_name;
+  std::string full_name;
 };
 
 // A client for one named Unity Catalog instance (see
@@ -86,6 +124,20 @@ class UnityCatalogClient final {
   [[nodiscard]] UnityCatalogTemporaryCredentials get_temporary_table_credentials(const std::string& table_id,
                                                                                  const std::string& operation);
 
+  // list_catalogs()/list_schemas()/list_tables() each follow Unity
+  // Catalog's own cursor-style pagination (a "next_page_token" in every
+  // response, echoed back as a "page_token" query parameter on the next
+  // request -- confirmed against a real unitycatalog/unitycatalog server,
+  // both the field names and that the token is opaque, not assumed to be
+  // parseable) internally, returning every page's results already
+  // concatenated -- a caller never sees a partial listing or has to drive
+  // the pagination loop itself. Each throws StorageError under the same
+  // conditions get_table() does.
+  [[nodiscard]] std::vector<UnityCatalogCatalogInfo> list_catalogs();
+  [[nodiscard]] std::vector<UnityCatalogSchemaInfo> list_schemas(const std::string& catalog);
+  [[nodiscard]] std::vector<UnityCatalogTableInfo> list_tables(const std::string& catalog,
+                                                                const std::string& schema);
+
   // Exposed (not just used internally by get_table()/
   // get_temporary_table_credentials() above) so UnityCatalogSourceResolver
   // can reuse the exact same token when dispatching a UC-reported Iceberg
@@ -96,6 +148,11 @@ class UnityCatalogClient final {
 
  private:
   [[nodiscard]] std::string fetch_oauth2_token();
+  // GET `url` with the current bearer token (if any) attached, parsed as
+  // JSON -- shared by get_table() and the three list_*() methods, all of
+  // which are plain authenticated GETs differing only in URL and response
+  // shape.
+  [[nodiscard]] nlohmann::json authenticated_get_json(const std::string& url);
 
   UnityCatalogInstanceSection config_;
   std::string cached_oauth2_token_;

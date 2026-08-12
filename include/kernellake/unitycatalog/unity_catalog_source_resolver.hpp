@@ -42,17 +42,23 @@ namespace kernellake::unitycatalog {
 //     plain Iceberg REST catalog does today.
 // Any other data_source_format throws StorageError naming it explicitly.
 //
-// AWS/S3 only for this slice -- GCS/Azure temporary credentials aren't
-// requested or handled (see docs/ROADMAP.md). Constructed fresh per query,
-// same deliberate MVP simplification IcebergSourceResolver/
-// DeltaSourceResolver already use.
+// S3, GCS, and Azure vended credentials are all handled (dispatched by the
+// storage_location URI's own scheme: "s3", "gs", "abfs"/"abfss"). Only the
+// AWS "aws_temp_credentials" response shape has been verified against a
+// real Unity Catalog server; the GCP/Azure field names
+// (UnityCatalogTemporaryCredentials::gcp_oauth_token/azure_sas_token) are
+// unverified, based on Databricks SDK naming conventions only -- see that
+// struct's own comment. Constructed fresh per query, same deliberate MVP
+// simplification IcebergSourceResolver/DeltaSourceResolver already use.
 class UnityCatalogSourceResolver final : public TableSourceResolver {
  public:
   UnityCatalogSourceResolver(UnityCatalogSection unity_catalog_config, DeltaSection delta_config,
-                             S3Section s3_config)
+                             S3Section s3_config, GcsSection gcs_config, AzureSection azure_config)
       : unity_catalog_config_(std::move(unity_catalog_config)),
         delta_config_(std::move(delta_config)),
-        s3_config_(std::move(s3_config)) {}
+        s3_config_(std::move(s3_config)),
+        gcs_config_(std::move(gcs_config)),
+        azure_config_(std::move(azure_config)) {}
 
   [[nodiscard]] bool can_resolve(const std::vector<std::string>& sources) const override;
   // `predicates` is currently unused: none of the three dispatch targets
@@ -67,6 +73,8 @@ class UnityCatalogSourceResolver final : public TableSourceResolver {
   UnityCatalogSection unity_catalog_config_;
   DeltaSection delta_config_;
   S3Section s3_config_;
+  GcsSection gcs_config_;
+  AzureSection azure_config_;
 };
 
 }  // namespace kernellake::unitycatalog

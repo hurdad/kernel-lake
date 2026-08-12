@@ -12,6 +12,8 @@
 #include "kernellake/delta/delta_txn_client.hpp"
 #include "kernellake/iceberg/iceberg_table_resolution.hpp"
 #include "kernellake/iceberg/rest_catalog_client.hpp"
+#include "kernellake/storage/azure_object_store.hpp"
+#include "kernellake/storage/gcs_object_store.hpp"
 #include "kernellake/storage/s3_object_store.hpp"
 #include "kernellake/unitycatalog/unity_catalog_client.hpp"
 
@@ -58,6 +60,24 @@ QualifiedName parse_qualified_name(const std::string& text) {
   return QualifiedName{parts[0], parts[1], parts[2], parts[3]};
 }
 
+// Real Unity Catalog servers commonly report a local-filesystem
+// storage_location as an explicit "file://" URI (confirmed against a
+// real unitycatalog/unitycatalog OSS server, not assumed) -- but this
+// codebase's own LocalObjectStore, unlike the S3/GCS/Azure backends
+// (which all strip their own scheme prefix via
+// generic_fs_object_store.cpp's strip_scheme()), expects a bare path with
+// no scheme prefix at all, the same convention every other
+// read_parquet(...)/read_delta(...) call in this project already
+// follows. Stripped here rather than teaching LocalObjectStore a URI form
+// nothing else in this codebase produces.
+std::string strip_file_scheme(const std::string& location) {
+  constexpr std::string_view kPrefix = "file://";
+  if (location.rfind(kPrefix, 0) == 0) {
+    return location.substr(kPrefix.size());
+  }
+  return location;
+}
+
 }  // namespace
 
 bool UnityCatalogSourceResolver::can_resolve(const std::vector<std::string>& sources) const {
@@ -97,13 +117,48 @@ ResolvedTable UnityCatalogSourceResolver::resolve(ObjectStore& store, const std:
   const bool is_delta_or_parquet =
       table.data_source_format == "DELTA" || table.data_source_format == "PARQUET" ||
       table.data_source_format.empty();
-  if (is_delta_or_parquet && Uri(table.storage_location).scheme() == "s3") {
+  // Copied into an owned std::string, not left as the Uri::scheme()
+  // string_view -- that view points into the temporary Uri object above,
+  // which is destroyed at the end of this statement, making a
+  // string_view-typed binding a real dangling-reference bug (caught by
+  // this exact real-server verification: the "file" comparison below
+  // silently read freed memory and never matched, so the "file://" prefix
+  // never got stripped).
+  const std::string storage_scheme(Uri(table.storage_location).scheme());
+  const bool is_cloud_scheme = storage_scheme == "s3" || storage_scheme == "gs" || storage_scheme == "gcs" ||
+                               storage_scheme == "abfs" || storage_scheme == "abfss" || storage_scheme == "az";
+  if (is_delta_or_parquet && is_cloud_scheme) {
+    // Same scheme-set ObjectStoreRegistry itself dispatches on
+    // (object_store_registry.cpp) -- "gs"/"gcs" both mean GCS, "abfs"/
+    // "abfss"/"az" all mean Azure.
     const UnityCatalogTemporaryCredentials credentials =
         client.get_temporary_table_credentials(table.table_id, "READ");
-    temp_store = std::make_unique<S3ObjectStore>(s3_config_.options, credentials.access_key_id,
-                                                 credentials.secret_access_key, credentials.session_token);
+    if (storage_scheme == "s3") {
+      temp_store = std::make_unique<S3ObjectStore>(s3_config_.options, credentials.access_key_id,
+                                                   credentials.secret_access_key, credentials.session_token);
+    } else if (storage_scheme == "gs" || storage_scheme == "gcs") {
+      if (credentials.gcp_oauth_token.empty()) {
+        throw StorageError(fmt::format(
+            "read_unity_catalog(...): table '{}' is GCS-backed but Unity Catalog's temporary-credentials "
+            "response carried no gcp_oauth_token",
+            source));
+      }
+      temp_store =
+          std::make_unique<GcsObjectStore>(gcs_config_.options, credentials.gcp_oauth_token);
+    } else {
+      if (credentials.azure_sas_token.empty()) {
+        throw StorageError(fmt::format(
+            "read_unity_catalog(...): table '{}' is Azure-backed but Unity Catalog's temporary-credentials "
+            "response carried no azure_sas_token",
+            source));
+      }
+      temp_store =
+          std::make_unique<AzureObjectStore>(azure_config_.options, credentials.azure_sas_token);
+    }
     data_store = temp_store.get();
   }
+  const std::string effective_location =
+      storage_scheme == "file" ? strip_file_scheme(table.storage_location) : table.storage_location;
 
   if (table.data_source_format == "DELTA") {
     if (delta_config_.grpc_endpoint.empty()) {
@@ -114,7 +169,7 @@ ResolvedTable UnityCatalogSourceResolver::resolve(ObjectStore& store, const std:
           source));
     }
     delta::DeltaTxnClient delta_client(delta_config_);
-    return delta::resolve_delta_table(*data_store, delta_client, table.storage_location);
+    return delta::resolve_delta_table(*data_store, delta_client, effective_location);
   }
 
   if (table.data_source_format == "ICEBERG") {
@@ -128,7 +183,7 @@ ResolvedTable UnityCatalogSourceResolver::resolve(ObjectStore& store, const std:
   }
 
   if (is_delta_or_parquet) {
-    return resolve_table(*data_store, {table.storage_location});
+    return resolve_table(*data_store, {effective_location});
   }
 
   throw StorageError(fmt::format(
