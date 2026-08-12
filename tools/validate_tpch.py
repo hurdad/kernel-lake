@@ -33,6 +33,17 @@ Usage:
         --orders-data '.../orders-*.parquet' --customer-data '.../customer-*.parquet' \
         --supplier-data '.../supplier-*.parquet' --nation-data '.../nation-*.parquet' \
         --region-data '.../region-*.parquet' --query 5
+    # Q7 needs four extra tables (orders, customer, supplier, and nation --
+    # nation is substituted into both of Q7's own two nation JOIN steps):
+    python3 tools/validate_tpch.py --kernellake ... --data '.../lineitem-*.parquet' \
+        --orders-data '.../orders-*.parquet' --customer-data '.../customer-*.parquet' \
+        --supplier-data '.../supplier-*.parquet' --nation-data '.../nation-*.parquet' \
+        --query 7
+    # Q9 needs five extra tables (part, supplier, partsupp, orders, and nation):
+    python3 tools/validate_tpch.py --kernellake ... --data '.../lineitem-*.parquet' \
+        --part-data '.../part-*.parquet' --supplier-data '.../supplier-*.parquet' \
+        --partsupp-data '.../partsupp-*.parquet' --orders-data '.../orders-*.parquet' \
+        --nation-data '.../nation-*.parquet' --query 9
 """
 
 import argparse
@@ -54,6 +65,7 @@ def load_query(
     nation_data_glob: str | None,
     supplier_data_glob: str | None,
     region_data_glob: str | None,
+    partsupp_data_glob: str | None,
 ) -> str:
     path = QUERIES_DIR / f"q{query_number:02d}.sql"
     if not path.exists():
@@ -72,6 +84,8 @@ def load_query(
         raise ValueError(f"Q{query_number} needs a table -- pass --supplier-data")
     if "{region_data}" in text and not region_data_glob:
         raise ValueError(f"Q{query_number} needs a table -- pass --region-data")
+    if "{partsupp_data}" in text and not partsupp_data_glob:
+        raise ValueError(f"Q{query_number} needs a table -- pass --partsupp-data")
     text = text.replace("{data}", data_glob)
     if part_data_glob:
         text = text.replace("{part_data}", part_data_glob)
@@ -85,6 +99,8 @@ def load_query(
         text = text.replace("{supplier_data}", supplier_data_glob)
     if region_data_glob:
         text = text.replace("{region_data}", region_data_glob)
+    if partsupp_data_glob:
+        text = text.replace("{partsupp_data}", partsupp_data_glob)
     return text.strip()
 
 
@@ -98,6 +114,7 @@ def validate_one(
     nation_data_glob: str | None,
     supplier_data_glob: str | None,
     region_data_glob: str | None,
+    partsupp_data_glob: str | None,
     backend: str | None,
 ) -> bool:
     try:
@@ -110,6 +127,7 @@ def validate_one(
             nation_data_glob,
             supplier_data_glob,
             region_data_glob,
+            partsupp_data_glob,
         )
         print(f"--- Q{query_number}: {sql.splitlines()[0]}...")
         kernellake_rows = normalize(run_kernellake(kernellake_bin, sql, backend))
@@ -146,6 +164,9 @@ def main() -> int:
     parser.add_argument(
         "--region-data", default=None, help="Parquet glob for the 'region' table (Q5 needs this)"
     )
+    parser.add_argument(
+        "--partsupp-data", default=None, help="Parquet glob for the 'partsupp' table (Q9 needs this)"
+    )
     parser.add_argument("--scale-factor", type=float, default=None, help="Informational only, for the report")
     parser.add_argument("--query", required=True, help="Query number (e.g. 6) or 'all'")
     parser.add_argument("--baseline", default="duckdb", choices=["duckdb"])
@@ -173,6 +194,7 @@ def main() -> int:
             args.nation_data,
             args.supplier_data,
             args.region_data,
+            args.partsupp_data,
             args.backend,
         ):
             failures += 1

@@ -3420,6 +3420,85 @@ log` is the authoritative chronology if that ordering ever matters.
   unaffected). Not yet wired into `tools/benchmark_three_way.py`'s
   PySpark/DuckDB three-way comparison (same gap Q10 already has).
 
+- **TPC-H Q7 and Q9** -- the two canonical `EXTRACT`-using queries this
+  project's own "Not yet started" entry named as the natural next step
+  once `supplier` existed (added for Q5, see above). Both, like Q5,
+  needed no new SQL engine feature -- just real, previously-untested
+  edges of the existing join/`WHERE` machinery, confirmed empirically
+  before writing the full query files rather than assumed:
+
+  - **Q7** self-joins `nation` under two different aliases (`n1`/`n2`,
+    resolving the supplier's and the customer's own nation
+    independently) -- untried before this. Confirmed directly: two
+    separate `read_parquet('{nation_data}')` sources, each its own JOIN
+    step, plan and execute correctly with no special-casing, the same
+    same-column-name-from-different-sides disambiguation
+    `JoinSelectsSameNamedColumnFromBothSidesWithoutCollision` already
+    covers for two *different* tables sharing a column name applying
+    just as well to the same table joined to itself. `{nation_data}`'s
+    placeholder appears twice in `q07.sql`'s own text (once per JOIN
+    step) and both `tools/validate_tpch.py`'s and
+    `benchmark_tpch_command.cpp`'s existing substitution logic already
+    replace every occurrence of a placeholder, not just the first, so no
+    tooling change was needed for this specifically. Q7's canonical form
+    also wraps its 6-way join in a derived table purely to compute
+    `l_year`/`volume` once before grouping -- flattens losslessly into
+    one query (no filtering happens in the derived table), the same
+    "computed `GROUP BY` key" shape other queries already use.
+
+  - **Q9** joins `partsupp` to `lineitem` on *two* columns together
+    (`ps_partkey = l_partkey AND ps_suppkey = l_suppkey` -- `partsupp`'s
+    own primary key is the pair), which no single `JOIN ... ON` step can
+    express. Split the same way Q5 already splits its own
+    `c_nationkey = s_nationkey`: one key as the `JOIN ... ON` condition,
+    the other moved into `WHERE` as an ordinary post-join filter --
+    correct because `WHERE` narrows the intermediate one-part-to-many-
+    suppliers fan-out that JOIN step alone produces back down to exactly
+    the rows a true composite-key join would, before any row is summed.
+    New `--partsupp-data` flag threaded through `validate_tpch.py`/
+    `benchmark_tpch_command.cpp`, mirroring every earlier table flag
+    exactly.
+
+    Q9 needed two real `tools/generate_tpch.py` changes, not just a new
+    table:
+    1. **A new `partsupp` table** (`generate_partsupp_table()`) -- but
+       generating it alone wasn't enough, since this generator's
+       existing `l_suppkey` (drawn independently and uniformly at
+       random) would essentially never match a real `partsupp` row for
+       its own `l_partkey`, making Q9 trivially return an empty result
+       regardless of whether the query itself was correct. Fixed by a
+       new `suppliers_for_part()` helper: every part is stocked by
+       exactly `PARTSUPP_SUPPLIERS_PER_PART` (4, real TPC-H's own fixed
+       count) suppliers, a deterministic function of `partkey` alone
+       (not `dbgen`'s own selection formula, but the same shape), and
+       both `generate_lineitem_batch()`'s `l_suppkey` draw and
+       `generate_partsupp_table()`'s own rows are built from the same
+       function -- the one foreign key in this generator that isn't
+       independently sampled, everything else still is.
+    2. **`p_name` needed real content, not a placeholder string.** Q9's
+       `WHERE p_name LIKE '%green%'` would never match this generator's
+       previous `f"synthetic-part-{k}"` p_name values, again making the
+       query trivially return nothing. Fixed by generating `p_name` from
+       a representative subset of real TPC-H `dbgen`'s own ~92-word
+       color list (`P_NAME_WORDS`, 5 words sampled without replacement
+       per part, space-joined -- matching `dbgen`'s own construction),
+       which specifically includes "green". No existing query file
+       referenced `p_name` at all, confirmed by grep before changing it,
+       so this was a safe change with no other query's results affected.
+
+  Verified for real: `tools/validate_tpch.py --query all` (now 10
+  queries: Q1/Q3/Q5/Q6/Q7/Q9/Q10/Q12/Q14/Q19) all match DuckDB on both
+  the CPU and GPU backends at SF0.01, zero regressions -- Q9 specifically
+  returned 175 real matching rows at that scale, not an empty/trivial
+  result, confirming the `p_name`/`suppliers_for_part()` fixes actually
+  worked rather than just failing to error. `kernellake benchmark tpch
+  --query 7`/`--query 9` both confirmed to run end to end. No C++
+  execution-engine code changed at all (only the Python generator and
+  the CLI benchmark tool's placeholder/file-discovery/report plumbing) --
+  `kernellake_unit_tests` 413/413 pass, unaffected. Not yet wired into
+  `tools/benchmark_three_way.py` (same gap every TPC-H query past Q3/
+  Q12/Q14/Q19 already has).
+
 ## Not yet started
 
 - **Unity Catalog support: remaining gaps** -- the core read path (Phase 5
@@ -3607,20 +3686,11 @@ log` is the authoritative chronology if that ordering ever matters.
   existing pattern: `kernellake_sql()` substitution, a fourth Spark temp
   view, cold-mode cache eviction) -- not yet done; also not yet run at any
   scale factor beyond the SF0.01 validation in "Done" above
-- Q7/Q9 -- date-part extraction (`EXTRACT(YEAR FROM ...)`) is done now
-  (see "EXTRACT(YEAR/MONTH/DAY FROM ...) added" in "Done" above), and the
-  `supplier` table gap is also closed now (added for Q5, see "TPC-H Q5"
-  in "Done" above). What's left: `partsupp` (Q9 only; still not generated
-  by `tools/generate_tpch.py`, no query needs it yet), and Q7 self-joins
-  `nation` against two different aliases (two separate
-  `read_parquet('{nation_data}')` sources with different aliases in the
-  same `JOIN` chain -- untried, but plausibly already legal the same way
-  Q5's `WHERE c_nationkey = s_nationkey` trick turned out to be for a
-  cross-join-source predicate the `JOIN...ON` chain itself couldn't
-  express). Not yet attempted, tracked separately from the EXTRACT/Q5
-  work itself. Every *other* still-missing query needs a subquery,
-  `HAVING`, or an outer join, none of which KernelLake's SQL layer
-  supports yet (see `docs/ARCHITECTURE.md`'s "Not yet supported" list)
+- ~~Q7/Q9~~ -- done, see "TPC-H Q7 and Q9" in "Done" above. Every
+  *other* still-missing query needs a subquery, `HAVING`, or an outer
+  join, none of which KernelLake's SQL layer supports yet (see
+  `docs/ARCHITECTURE.md`'s "Not yet supported" list) -- 12 of TPC-H's 22
+  queries now, down from 14
 - `CASE`/`EXTRACT` inside `WHERE` on the GPU backend (`FilterOperator`'s
   own gap, separate from the aggregate-argument fix above; the CPU backend
   already supports both via its one shared expression compiler) -- not

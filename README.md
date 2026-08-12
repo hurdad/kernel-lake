@@ -261,14 +261,16 @@ grouped aggregates (including a ~40,000-group `GROUP BY customer_id`), and
 ## TPC-H-derived benchmarking (unofficial)
 
 **Unofficial TPC-H-derived benchmark. Not a certified TPC result.** Q1,
-Q3, Q5, Q6, Q10, Q12, Q14, and Q19 are supported -- both single-table
-scans (Q1/Q6) and multi-table `INNER JOIN` chains (Q3's 3-way
-`customer`/`orders`/`lineitem` join, Q10's 4-way and Q5's 6-way joins,
-Q12/Q14/Q19's 2-way joins), on both the CPU and GPU execution backends.
-See [docs/TPCH.md](docs/TPCH.md) for the full generate -> query ->
-validate -> benchmark workflow, including `tools/generate_tpch.py` (a
-synthetic generator, not the official `dbgen`) and `kernellake benchmark
-tpch`'s cold/warm timing modes.
+Q3, Q5, Q6, Q7, Q9, Q10, Q12, Q14, and Q19 are supported -- both
+single-table scans (Q1/Q6) and multi-table `INNER JOIN` chains (Q3's
+3-way `customer`/`orders`/`lineitem` join, Q10's 4-way and Q5's/Q7's/Q9's
+6-way joins -- Q7 self-joins `nation` under two aliases, Q9 splits
+`partsupp`'s two-column join key across a `JOIN` condition and a `WHERE`
+filter, Q12/Q14/Q19's 2-way joins), on both the CPU and GPU execution
+backends. See [docs/TPCH.md](docs/TPCH.md) for the full generate ->
+query -> validate -> benchmark workflow, including `tools/generate_tpch.py`
+(a synthetic generator, not the official `dbgen`) and `kernellake
+benchmark tpch`'s cold/warm timing modes.
 
 `tools/benchmark_three_way.py` additionally cross-validates and times
 KernelLake (via a persistent `kernellake-server` over Arrow Flight SQL),
@@ -364,7 +366,7 @@ src/<module>/                  implementation, mirrors include/
 tests/unit/                    GoogleTest unit tests (CPU-only, every preset)
 tests/gpu/                     GoogleTest GPU tests (gpu-dev preset only)
 tools/                         Python tooling (DuckDB cross-validation, TPC-H generation)
-benchmarks/tpch/queries/       Version-controlled TPC-H-derived SQL (q01/q03/q05/q06/q10/q12/q14/q19.sql)
+benchmarks/tpch/queries/       Version-controlled TPC-H-derived SQL (q01/q03/q05/q06/q07/q09/q10/q12/q14/q19.sql)
 benchmarks/local/              Single-machine docker-compose stack (kernellake-server + OTel
                                 Collector + Prometheus + Grafana + Jaeger + MinIO), no cloud needed
 benchmarks/aws/                Real Terraform-provisioned AWS benchmark harness (KernelLake vs.

@@ -50,21 +50,26 @@ std::string substitute_placeholder(std::string text, const std::string& placehol
 }
 
 // `part_data`/`orders_data`/`customer_data`/`nation_data`/`supplier_data`/
-// `region_data` are only substituted (via their own `{part_data}`/
-// `{orders_data}`/`{customer_data}`/`{nation_data}`/`{supplier_data}`/
-// `{region_data}` placeholder) for queries needing that extra table --
-// e.g. Q19's `lineitem`/`part` join, Q12's `orders`/`lineitem` join, Q3's
-// 3-way `customer`/`orders`/`lineitem` join, Q10's 4-way `customer`/
-// `orders`/`lineitem`/`nation` join, Q5's 6-way `customer`/`orders`/
-// `lineitem`/`supplier`/`nation`/`region` join -- and are empty for every
-// query with no such placeholder to begin with.
+// `region_data`/`partsupp_data` are only substituted (via their own
+// `{part_data}`/`{orders_data}`/`{customer_data}`/`{nation_data}`/
+// `{supplier_data}`/`{region_data}`/`{partsupp_data}` placeholder) for
+// queries needing that extra table -- e.g. Q19's `lineitem`/`part` join,
+// Q12's `orders`/`lineitem` join, Q3's 3-way `customer`/`orders`/
+// `lineitem` join, Q10's 4-way `customer`/`orders`/`lineitem`/`nation`
+// join, Q5's 6-way `customer`/`orders`/`lineitem`/`supplier`/`nation`/
+// `region` join, Q9's 6-way `part`/`supplier`/`lineitem`/`partsupp`/
+// `orders`/`nation` join -- and are empty for every query with no such
+// placeholder to begin with. `{nation_data}` is substituted into every
+// occurrence of the placeholder, which for Q7 (its own two nation JOIN
+// steps, one per alias) means both get the same real table.
 std::string strip_comments_and_substitute(const std::string& text, const std::string& data_glob,
                                           const std::string& part_data_glob,
                                           const std::string& orders_data_glob,
                                           const std::string& customer_data_glob,
                                           const std::string& nation_data_glob,
                                           const std::string& supplier_data_glob,
-                                          const std::string& region_data_glob) {
+                                          const std::string& region_data_glob,
+                                          const std::string& partsupp_data_glob) {
   static const std::regex comment_line(R"(--[^\n]*\n)");
   std::string stripped = std::regex_replace(text, comment_line, "\n");
   stripped = substitute_placeholder(std::move(stripped), "{data}", data_glob);
@@ -85,6 +90,9 @@ std::string strip_comments_and_substitute(const std::string& text, const std::st
   }
   if (!region_data_glob.empty()) {
     stripped = substitute_placeholder(std::move(stripped), "{region_data}", region_data_glob);
+  }
+  if (!partsupp_data_glob.empty()) {
+    stripped = substitute_placeholder(std::move(stripped), "{partsupp_data}", partsupp_data_glob);
   }
   return stripped;
 }
@@ -151,6 +159,7 @@ int run_benchmark_tpch(const std::vector<std::string_view>& args, const EngineCo
   std::string nation_data;
   std::string supplier_data;
   std::string region_data;
+  std::string partsupp_data;
   std::string query_file_override;
   std::optional<double> scale_factor;
   int query_number = -1;
@@ -174,6 +183,8 @@ int run_benchmark_tpch(const std::vector<std::string_view>& args, const EngineCo
       supplier_data = args[++i];
     } else if (args[i] == "--region-data" && i + 1 < args.size()) {
       region_data = args[++i];
+    } else if (args[i] == "--partsupp-data" && i + 1 < args.size()) {
+      partsupp_data = args[++i];
     } else if (args[i] == "--query-file" && i + 1 < args.size()) {
       query_file_override = args[++i];
     } else if (args[i] == "--scale-factor" && i + 1 < args.size()) {
@@ -223,7 +234,7 @@ int run_benchmark_tpch(const std::vector<std::string_view>& args, const EngineCo
   try {
     const std::string sql = strip_comments_and_substitute(read_file_or_throw(query_file), data, part_data,
                                                           orders_data, customer_data, nation_data,
-                                                          supplier_data, region_data);
+                                                          supplier_data, region_data, partsupp_data);
 
     ObjectStoreRegistry store(config.storage);
     std::vector<ObjectInfo> files = discover_parquet_files(store, {data});
@@ -283,6 +294,15 @@ int run_benchmark_tpch(const std::vector<std::string_view>& args, const EngineCo
         return 1;
       }
       files.insert(files.end(), region_files.begin(), region_files.end());
+    }
+    if (!partsupp_data.empty()) {
+      const std::vector<ObjectInfo> partsupp_files = discover_parquet_files(store, {partsupp_data});
+      if (partsupp_files.empty()) {
+        std::fprintf(stderr, "kernellake benchmark tpch: no Parquet files matched '%s'\n",
+                     partsupp_data.c_str());
+        return 1;
+      }
+      files.insert(files.end(), partsupp_files.begin(), partsupp_files.end());
     }
 
     QueryEngine engine(config);
@@ -344,6 +364,9 @@ int run_benchmark_tpch(const std::vector<std::string_view>& args, const EngineCo
     }
     if (!region_data.empty()) {
       report["region_data"] = region_data;
+    }
+    if (!partsupp_data.empty()) {
+      report["partsupp_data"] = partsupp_data;
     }
     if (scale_factor) {
       report["scale_factor"] = *scale_factor;

@@ -17,11 +17,22 @@ ratio), **Q3** (a three-table `customer`/`orders`/`lineitem`
 `INNER JOIN` chain, a multi-key `ORDER BY` plus `LIMIT` after the join),
 **Q10** (a four-table `customer`/`orders`/`lineitem`/`nation`
 `INNER JOIN` chain, a 7-column `GROUP BY` spanning two non-adjacent join
-sources, `ORDER BY` plus `LIMIT`), and **Q5** (a six-table `customer`/
+sources, `ORDER BY` plus `LIMIT`), **Q5** (a six-table `customer`/
 `orders`/`lineitem`/`supplier`/`nation`/`region` `INNER JOIN` chain, plus
 a `WHERE`-clause equality spanning two non-adjacent join sources --
 `c_nationkey = s_nationkey` -- that can't be expressed as part of a
-single-key `JOIN ... ON` step). KernelLake supports a chain of two or
+single-key `JOIN ... ON` step), **Q7** (a six-table `supplier`/
+`lineitem`/`orders`/`customer`/`nation`/`nation` `INNER JOIN` chain --
+`nation` joined *twice*, once per alias, to resolve both the supplier's
+and the customer's own nation independently -- `OR` of `AND`s in `WHERE`,
+`BETWEEN`, and a flattened-out-of-a-derived-table `EXTRACT`-as-`GROUP
+BY`-key), and **Q9** (a six-table `part`/`supplier`/`lineitem`/
+`partsupp`/`orders`/`nation` `INNER JOIN` chain, `LIKE`, and a genuinely
+two-column join condition -- `partsupp` to `lineitem` on *both*
+`ps_partkey = l_partkey` and `ps_suppkey = l_suppkey` together -- split
+across a `JOIN ... ON` key and a `WHERE`-clause filter the same way Q5's
+own cross-join-source predicate already is, since KernelLake has no
+multi-key `JOIN ... ON` support). KernelLake supports a chain of two or
 more tables via `INNER JOIN ... ON`, each step a single equality key, on
 both the CPU and GPU execution backends (see `docs/ARCHITECTURE.md`'s
 "Hash joins" section, including its N-way-join generalization, and its
@@ -41,14 +52,25 @@ up-to-date list of what's next.
 ## 1. Generate data
 
 `tools/generate_tpch.py` is a **synthetic** generator, not the official
-TPC-H `dbgen` tool -- it produces `lineitem`, `part`, `orders`, `customer`,
-`nation`, `region`, and `supplier` tables with TPC-H's column names and
-roughly TPC-H-shaped value distributions (`nation`/`region` are the
-exception: they're small enough that the script hardcodes real `dbgen`
-reference data instead of sampling -- see the script's docstring for the
-full list of deviations, including DOUBLE instead of DECIMAL, since
-KernelLake's GPU execution layer doesn't support Decimal yet). It
+TPC-H `dbgen` tool -- it produces `lineitem`, `part`, `partsupp`,
+`orders`, `customer`, `nation`, `region`, and `supplier` tables with
+TPC-H's column names and roughly TPC-H-shaped value distributions
+(`nation`/`region` are the exception: they're small enough that the
+script hardcodes real `dbgen` reference data instead of sampling; `part`'s
+own `p_name` uses a representative subset of real `dbgen`'s color-word
+list rather than a purely synthetic string, specifically so Q9's `p_name
+LIKE '%green%'` filter matches real rows -- see the script's docstring
+for the full list of deviations, including DOUBLE instead of DECIMAL,
+since KernelLake's GPU execution layer doesn't support Decimal yet). It
 requires the `pyarrow` Python package.
+
+`l_suppkey` is the one foreign key in this generator that is **not**
+drawn independently at random: every part is stocked by exactly 4
+suppliers (`PARTSUPP_SUPPLIERS_PER_PART`, matching real TPC-H's own fixed
+count), and `generate_lineitem_batch()`'s own `l_suppkey` draw picks from
+that same part's 4 suppliers -- otherwise Q9's join of `lineitem` to
+`partsupp` on both `ps_partkey`/`ps_suppkey` together would essentially
+never find a matching row. See `suppliers_for_part()`'s own doc comment.
 
 ```bash
 python3 tools/generate_tpch.py \
@@ -56,11 +78,12 @@ python3 tools/generate_tpch.py \
   --format parquet --compression zstd --row-group-rows 1000000
 ```
 
-Writes `lineitem-*.parquet`, `part-00000.parquet`, `orders-00000.parquet`,
-`customer-00000.parquet`, `nation-00000.parquet`, `region-00000.parquet`,
-`supplier-00000.parquet`, plus a `manifest.json` recording the generation
-parameters. Real TPC-H SF1 has ~6,000,000 `lineitem` rows, 200,000 `part`
-rows, ~1,500,000 `orders` rows, and 150,000 `customer` rows; this
+Writes `lineitem-*.parquet`, `part-00000.parquet`, `partsupp-00000.parquet`,
+`orders-00000.parquet`, `customer-00000.parquet`, `nation-00000.parquet`,
+`region-00000.parquet`, `supplier-00000.parquet`, plus a `manifest.json`
+recording the generation parameters. Real TPC-H SF1 has ~6,000,000
+`lineitem` rows, 200,000 `part` rows, ~1,500,000 `orders` rows, and
+150,000 `customer` rows; this
 generator targets the same `lineitem`/`part`/`orders` row counts at the
 same scale factor (`lineitem` split across `--files` Parquet files;
 `part`/`orders` always a single file each -- `orders` gets exactly one
@@ -73,14 +96,17 @@ real `dbgen` reference data -- names and region keys -- rather than
 sampled values), each a single file. `supplier` is a fixed 10,000 rows
 regardless of scale factor (matching this generator's own fixed
 `l_suppkey` range, see the script's docstring), also a single file.
+`partsupp` scales directly with `part` (exactly 4 rows per part, real
+TPC-H's own fixed `PARTSUPP_SUPPLIERS_PER_PART` -- 800,000 rows at SF1),
+also a single file.
 
 ## 2. Query
 
 The queries live in version-controlled files, `benchmarks/tpch/queries/
-q01.sql`, `q03.sql`, `q05.sql`, `q06.sql`, `q10.sql`, `q12.sql`, `q14.sql`,
-`q19.sql`, each with a header comment documenting its specific deviations
-from canonical TPC-H syntax (`FROM lineitem` -> `FROM
-read_parquet('{data}')`, no `INTERVAL` arithmetic). Q1/Q6 need only
+q01.sql`, `q03.sql`, `q05.sql`, `q06.sql`, `q07.sql`, `q09.sql`, `q10.sql`,
+`q12.sql`, `q14.sql`, `q19.sql`, each with a header comment documenting
+its specific deviations from canonical TPC-H syntax (`FROM lineitem` ->
+`FROM read_parquet('{data}')`, no `INTERVAL` arithmetic). Q1/Q6 need only
 `{data}` substituted with your `lineitem` glob; Q19/Q14 also need
 `{part_data}` substituted with your `part` glob; Q12 also needs
 `{orders_data}` substituted with your `orders` glob; Q3 needs both
@@ -89,11 +115,18 @@ read_parquet('{data}')`, no `INTERVAL` arithmetic). Q1/Q6 need only
 `{nation_data}` substituted with your `orders`, `customer`, and `nation`
 globs; Q5 needs `{orders_data}`, `{customer_data}`, `{supplier_data}`,
 `{nation_data}`, and `{region_data}` substituted with your `orders`,
-`customer`, `supplier`, `nation`, and `region` globs. `{data}` must always
-be a `lineitem`-specific glob (e.g. `lineitem-*.parquet`), not a bare
-`*.parquet` -- `generate_tpch.py` writes every table into the same output
-directory, so a bare glob would pull in all of them at once and fail with
-a schema mismatch:
+`customer`, `supplier`, `nation`, and `region` globs; Q7 needs
+`{orders_data}`, `{customer_data}`, `{supplier_data}`, and `{nation_data}`
+substituted with your `orders`, `customer`, `supplier`, and `nation` globs
+(`{nation_data}` appears *twice* in Q7's own text -- once per alias --
+and both get the same substitution); Q9 needs `{part_data}`,
+`{supplier_data}`, `{partsupp_data}`, `{orders_data}`, and
+`{nation_data}` substituted with your `part`, `supplier`, `partsupp`,
+`orders`, and `nation` globs. `{data}` must always be a `lineitem`-specific
+glob (e.g. `lineitem-*.parquet`), not a bare `*.parquet` --
+`generate_tpch.py` writes every table into the same output directory, so
+a bare glob would pull in all of them at once and fail with a schema
+mismatch:
 
 ```bash
 sql=$(grep -v '^--' benchmarks/tpch/queries/q06.sql | tr '\n' ' ' | \
@@ -136,6 +169,23 @@ sql=$(grep -v '^--' benchmarks/tpch/queries/q05.sql | tr '\n' ' ' | \
        s|{nation_data}|/tmp/kernellake-tpch-sf1/nation-*.parquet|; \
        s|{region_data}|/tmp/kernellake-tpch-sf1/region-*.parquet|")
 ./build/gpu-dev/src/cli/kernellake query --sql "$sql" --stats
+
+sql=$(grep -v '^--' benchmarks/tpch/queries/q07.sql | tr '\n' ' ' | \
+  sed "s|{data}|/tmp/kernellake-tpch-sf1/lineitem-*.parquet|; \
+       s|{orders_data}|/tmp/kernellake-tpch-sf1/orders-*.parquet|; \
+       s|{customer_data}|/tmp/kernellake-tpch-sf1/customer-*.parquet|; \
+       s|{supplier_data}|/tmp/kernellake-tpch-sf1/supplier-*.parquet|; \
+       s|{nation_data}|/tmp/kernellake-tpch-sf1/nation-*.parquet|")
+./build/gpu-dev/src/cli/kernellake query --sql "$sql" --stats
+
+sql=$(grep -v '^--' benchmarks/tpch/queries/q09.sql | tr '\n' ' ' | \
+  sed "s|{data}|/tmp/kernellake-tpch-sf1/lineitem-*.parquet|; \
+       s|{part_data}|/tmp/kernellake-tpch-sf1/part-*.parquet|; \
+       s|{supplier_data}|/tmp/kernellake-tpch-sf1/supplier-*.parquet|; \
+       s|{partsupp_data}|/tmp/kernellake-tpch-sf1/partsupp-*.parquet|; \
+       s|{orders_data}|/tmp/kernellake-tpch-sf1/orders-*.parquet|; \
+       s|{nation_data}|/tmp/kernellake-tpch-sf1/nation-*.parquet|")
+./build/gpu-dev/src/cli/kernellake query --sql "$sql" --stats
 ```
 
 ## 3. Validate against DuckDB
@@ -158,8 +208,11 @@ python3 tools/validate_tpch.py \
 # Q19/Q14 need --part-data, Q12 needs --orders-data, Q3 needs both
 # --orders-data and --customer-data, Q10 needs --orders-data,
 # --customer-data, and --nation-data, Q5 needs --orders-data,
-# --customer-data, --supplier-data, --nation-data, and --region-data
-# (none covered by --query all, which only passes --data):
+# --customer-data, --supplier-data, --nation-data, and --region-data,
+# Q7 needs --orders-data, --customer-data, --supplier-data, and
+# --nation-data, Q9 needs --part-data, --supplier-data,
+# --partsupp-data, --orders-data, and --nation-data (none covered by
+# --query all, which only passes --data):
 python3 tools/validate_tpch.py \
   --kernellake build/gpu-dev/src/cli/kernellake \
   --data '/tmp/kernellake-tpch-sf1/lineitem-*.parquet' \
@@ -197,26 +250,48 @@ python3 tools/validate_tpch.py \
   --nation-data '/tmp/kernellake-tpch-sf1/nation-*.parquet' \
   --region-data '/tmp/kernellake-tpch-sf1/region-*.parquet' \
   --scale-factor 1 --query 5
+python3 tools/validate_tpch.py \
+  --kernellake build/gpu-dev/src/cli/kernellake \
+  --data '/tmp/kernellake-tpch-sf1/lineitem-*.parquet' \
+  --orders-data '/tmp/kernellake-tpch-sf1/orders-*.parquet' \
+  --customer-data '/tmp/kernellake-tpch-sf1/customer-*.parquet' \
+  --supplier-data '/tmp/kernellake-tpch-sf1/supplier-*.parquet' \
+  --nation-data '/tmp/kernellake-tpch-sf1/nation-*.parquet' \
+  --scale-factor 1 --query 7
+python3 tools/validate_tpch.py \
+  --kernellake build/gpu-dev/src/cli/kernellake \
+  --data '/tmp/kernellake-tpch-sf1/lineitem-*.parquet' \
+  --part-data '/tmp/kernellake-tpch-sf1/part-*.parquet' \
+  --supplier-data '/tmp/kernellake-tpch-sf1/supplier-*.parquet' \
+  --partsupp-data '/tmp/kernellake-tpch-sf1/partsupp-*.parquet' \
+  --orders-data '/tmp/kernellake-tpch-sf1/orders-*.parquet' \
+  --nation-data '/tmp/kernellake-tpch-sf1/nation-*.parquet' \
+  --scale-factor 1 --query 9
 ```
 
 This has been run at SF0.01, SF0.1, and SF1 (60,000, 600,000, and
 6,000,000 generated rows) -- Q1 and Q6 matched DuckDB exactly at every
 scale, including the full SF1 run (~105 MiB single Parquet file, zstd
-compression, 1,000,000-row row groups). Q19, Q12, Q14, Q3, Q10, and Q5
-have each been verified at SF0.01 on both the CPU and GPU backends, exact
-match against DuckDB (Q3 including its 3-way join, `ORDER BY revenue
-DESC, o_orderdate` multi-key sort, and `LIMIT 10`; Q10 including its
-4-way join, 7-column `GROUP BY` spanning two non-adjacent join sources,
-and `LIMIT 20`; Q5 including its 6-way join and the `c_nationkey =
-s_nationkey` `WHERE`-clause predicate spanning two non-adjacent join
-sources) -- Q19/Q12/Q14/Q3 also cross-validated against PySpark and
-DuckDB via `tools/benchmark_three_way.py` (KernelLake via a persistent
+compression, 1,000,000-row row groups). Q19, Q12, Q14, Q3, Q10, Q5, Q7,
+and Q9 have each been verified at SF0.01 on both the CPU and GPU
+backends, exact match against DuckDB (Q3 including its 3-way join,
+`ORDER BY revenue DESC, o_orderdate` multi-key sort, and `LIMIT 10`; Q10
+including its 4-way join, 7-column `GROUP BY` spanning two non-adjacent
+join sources, and `LIMIT 20`; Q5 including its 6-way join and the
+`c_nationkey = s_nationkey` `WHERE`-clause predicate spanning two
+non-adjacent join sources; Q7 including its 6-way join with `nation`
+joined twice under different aliases; Q9 including its 6-way join and
+the `ps_suppkey = l_suppkey` `WHERE`-clause half of `partsupp`'s
+otherwise-inexpressible two-column join condition -- 175 real matching
+rows at SF0.01, not an empty/trivial result) -- Q19/Q12/Q14/Q3 also
+cross-validated against PySpark and DuckDB via
+`tools/benchmark_three_way.py` (KernelLake via a persistent
 `kernellake-server` over Arrow Flight SQL, PySpark, and DuckDB all agree
 on every query, real GPU hardware, SF0.01/SF1/SF10 -- see
 `docs/ROADMAP.md` for the full crossover numbers and a
-`--cost-per-hour`-based cost-per-TB comparison); Q10/Q5 have not been
-wired into `benchmark_three_way.py` yet (see `docs/ROADMAP.md`'s "Not yet
-started").
+`--cost-per-hour`-based cost-per-TB comparison); Q10/Q5/Q7/Q9 have not
+been wired into `benchmark_three_way.py` yet (see `docs/ROADMAP.md`'s
+"Not yet started").
 
 ## 4. Benchmark
 
@@ -224,10 +299,12 @@ started").
 measured iterations, reporting each iteration plus median/mean/min/max/
 standard deviation as JSON. Pass `--part-data` for Q19/Q14, `--orders-data`
 for Q12, `--orders-data` and `--customer-data` for Q3, `--orders-data`,
-`--customer-data`, and `--nation-data` for Q10, or `--orders-data`,
+`--customer-data`, and `--nation-data` for Q10, `--orders-data`,
 `--customer-data`, `--supplier-data`, `--nation-data`, and `--region-data`
-for Q5 (or any combination for a future query needing those extra
-tables).
+for Q5, `--orders-data`, `--customer-data`, `--supplier-data`, and
+`--nation-data` for Q7, or `--part-data`, `--supplier-data`,
+`--partsupp-data`, `--orders-data`, and `--nation-data` for Q9 (or any
+combination for a future query needing those extra tables).
 
 ```bash
 ./build/gpu-dev/src/cli/kernellake benchmark tpch \

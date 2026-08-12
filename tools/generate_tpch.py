@@ -1,29 +1,38 @@
 #!/usr/bin/env python3
-"""Generate a synthetic, TPC-H-*derived* `lineitem`/`part`/`orders`/`customer`/`nation`/`supplier`/`region` set as Parquet.
+"""Generate a synthetic, TPC-H-*derived* `lineitem`/`part`/`partsupp`/`orders`/`customer`/`nation`/`supplier`/`region` set as Parquet.
 
 **This is not the official TPC-H `dbgen` tool and does not produce
-certified TPC-H data.** It generates seven tables (`lineitem`, `part`,
-`orders`, `customer`, `nation`, `supplier`, `region`) with TPC-H's column
+certified TPC-H data.** It generates all eight non-`lineitem` and
+`lineitem` tables TPC-H defines (`lineitem`, `part`, `partsupp`, `orders`,
+`customer`, `nation`, `supplier`, `region`) with TPC-H's column
 names/types (decimal columns as DOUBLE -- see "Deviations" below) and
 roughly TPC-H-shaped value distributions, sized approximately like real
-TPC-H at the requested scale factor. This is sufficient for the queries
+TPC-H at the requested scale factor. This is sufficient for every query
 KernelLake currently supports (Q6, Q1 -- single-table scans over
 `lineitem`; Q19/Q14 -- a two-table `lineitem`/`part` join; Q12 -- a
 two-table `orders`/`lineitem` join; Q3 -- a three-table `customer`/
 `orders`/`lineitem` join; Q10 -- a four-table `customer`/`orders`/
 `lineitem`/`nation` join; Q5 -- a six-table `customer`/`orders`/
-`lineitem`/`supplier`/`nation`/`region` join), but must never be
-described or published as an official TPC-H benchmark dataset.
+`lineitem`/`supplier`/`nation`/`region` join; Q7 -- a six-table
+`supplier`/`lineitem`/`orders`/`customer`/`nation`/`nation` join,
+`nation` joined twice under different aliases; Q9 -- a six-table
+`part`/`supplier`/`lineitem`/`partsupp`/`orders`/`nation` join), but must
+never be described or published as an official TPC-H benchmark dataset.
 
 Deviations from canonical TPC-H, documented per the spec's requirement to
 record every one:
-  - Only `lineitem`, `part`, `orders`, `customer`, `nation`, `supplier`,
-    and `region` are generated. `partsupp` is not, since no currently
-    supported TPC-H query (Q1/Q3/Q5/Q6/Q10/Q12/Q14/Q19) needs it.
-    KernelLake does support N-way hash joins now (see
-    docs/ROADMAP.md/docs/ARCHITECTURE.md's "Hash joins"), but wiring up
-    TPC-H's queries needing `partsupp` is separate, not-yet-done work,
-    not a generator limitation as such.
+  - `l_suppkey` is **not** drawn independently of `l_partkey`. Real
+    TPC-H's own `partsupp` table means every part is stocked by exactly
+    `PARTSUPP_SUPPLIERS_PER_PART` (4) suppliers, and Q9 joins `lineitem`
+    to `partsupp` on *both* `ps_partkey = l_partkey` and `ps_suppkey =
+    l_suppkey` together -- an independently-random `l_suppkey` (this
+    generator's own behavior before Q9 was added) would essentially never
+    match a real `partsupp` row for that part. `suppliers_for_part()` is
+    the deterministic (not dbgen's own selection formula, but the same
+    shape) function both `generate_lineitem_batch()`'s `l_suppkey` draw
+    and `generate_partsupp_table()`'s own rows are built from, so they
+    always agree. This is the one foreign key in this generator that
+    isn't independently sampled -- every other one still is.
   - `nation`/`region` use real TPC-H `dbgen` reference data (all 25
     nations'/5 regions' names and keys, verbatim -- unlike every other
     table's rows, which are independently sampled, not reproduced from
@@ -108,6 +117,28 @@ PART_TYPES = [
     "MEDIUM POLISHED BRASS", "PROMO BURNISHED NICKEL", "ECONOMY ANODIZED STEEL",
 ]
 
+# A representative subset of real TPC-H dbgen's own ~92-word p_name color
+# list (dbgen builds p_name as 5 of these, space-joined, drawn without
+# replacement) -- includes "green" specifically because Q9's WHERE clause
+# filters `p_name LIKE '%green%'`; a purely synthetic name (e.g.
+# "synthetic-part-{k}", this generator's own choice before Q9 was added)
+# would never match that filter at all, making Q9 trivially return zero
+# rows regardless of whether the query itself is correct.
+P_NAME_WORDS = [
+    "almond", "antique", "aquamarine", "azure", "beige", "bisque", "black",
+    "blue", "blush", "brown", "burlywood", "burnished", "chartreuse",
+    "chocolate", "coral", "cornflower", "cornsilk", "cream", "cyan", "dark",
+    "deep", "dim", "drab", "firebrick", "floral", "forest", "frosted",
+    "goldenrod", "green", "grey", "honeydew", "hot", "indian", "ivory",
+    "khaki", "lavender", "lawn", "lemon", "light", "lime", "linen",
+    "magenta", "maroon", "medium", "metallic", "midnight", "mint", "misty",
+    "moccasin", "navy", "olive", "orange", "orchid", "pale", "papaya",
+    "peach", "peru", "pink", "plum", "powder", "puff", "purple", "red",
+    "rose", "rosy", "royal", "saddle", "salmon", "sandy", "seashell",
+    "sienna", "sky", "slate", "smoke", "snow", "spring", "steel", "tan",
+    "thistle", "tomato", "turquoise", "violet", "wheat", "white", "yellow",
+]
+
 # TPC-H's own 5 o_orderpriority values, verbatim (Q12's WHERE/CASE branches
 # match these exact strings).
 ORDER_PRIORITIES = ["1-URGENT", "2-HIGH", "3-MEDIUM", "4-NOT SPECIFIED", "5-LOW"]
@@ -164,6 +195,30 @@ REGIONS = [
     (0, "AFRICA"), (1, "AMERICA"), (2, "ASIA"), (3, "EUROPE"), (4, "MIDDLE EAST"),
 ]
 
+# Real TPC-H's own fixed count: every part is stocked by exactly 4
+# suppliers (dbgen's own PS_SUPP_CNT), regardless of scale factor.
+PARTSUPP_SUPPLIERS_PER_PART = 4
+
+
+def suppliers_for_part(partkey: int, supplier_rows: int) -> list[int]:
+    """The PARTSUPP_SUPPLIERS_PER_PART supplier IDs (1-indexed) that stock
+    `partkey` -- a deterministic function of partkey alone, not dbgen's
+    own selection formula (real dbgen: ((p - 1 + i * (S / 4 + (p - 1) /
+    S)) mod S) + 1 for i in 0..3), but the same *shape*: a small, fixed,
+    reproducible set per part. This is the join key `generate_partsupp_
+    table()`'s own rows and `generate_lineitem_batch()`'s own l_suppkey
+    selection must agree on -- unlike every other foreign key in this
+    generator (drawn independently uniformly at random), l_suppkey can't
+    be independent of l_partkey here: TPC-H Q9 joins lineitem to partsupp
+    on *both* ps_partkey = l_partkey and ps_suppkey = l_suppkey together
+    (partsupp's own primary key is the pair), so an l_suppkey drawn
+    independently of l_partkey would almost never match any real partsupp
+    row for that part. `supplier_rows` (SUPPLIER_ROWS, always >> 4) makes
+    every returned ID distinct with no explicit uniqueness check needed.
+    """
+    base = ((partkey - 1) * PARTSUPP_SUPPLIERS_PER_PART) % supplier_rows
+    return [(base + i) % supplier_rows + 1 for i in range(PARTSUPP_SUPPLIERS_PER_PART)]
+
 
 def epoch_days(date: datetime.date) -> int:
     return (date - datetime.date(1970, 1, 1)).days
@@ -217,9 +272,15 @@ def generate_lineitem_batch(
             flag = "N"
         status = "O" if ship > RETURNFLAG_THRESHOLD else "F"
 
+        this_partkey = rng.randint(1, total_part_rows)
         orderkey.append(current_orderkey)
-        partkey.append(rng.randint(1, total_part_rows))
-        suppkey.append(rng.randint(1, 10_000))
+        partkey.append(this_partkey)
+        # One of this part's own PARTSUPP_SUPPLIERS_PER_PART suppliers
+        # (see suppliers_for_part()'s own comment) -- not an independent
+        # rng.randint(1, SUPPLIER_ROWS) draw, so every lineitem row's
+        # (l_partkey, l_suppkey) pair always has a real matching partsupp
+        # row (TPC-H Q9's join needs exactly this).
+        suppkey.append(rng.choice(suppliers_for_part(this_partkey, SUPPLIER_ROWS)))
         linenumber.append(line_in_order)
         quantity.append(float(qty))
         extendedprice.append(line_extended)
@@ -279,7 +340,7 @@ def generate_lineitem_batch(
 
 def generate_part_table(rng: random.Random, row_count: int) -> pa.Table:
     partkey = list(range(1, row_count + 1))
-    name = [f"synthetic-part-{k}" for k in partkey]
+    name = [" ".join(rng.sample(P_NAME_WORDS, 5)) for _ in partkey]
     mfgr = [f"Manufacturer#{(k % 5) + 1}" for k in partkey]
     brand = [rng.choice(BRANDS) for _ in partkey]
     ptype = [rng.choice(PART_TYPES) for _ in partkey]
@@ -488,6 +549,44 @@ def generate_supplier_table(rng: random.Random, row_count: int) -> pa.Table:
     )
 
 
+def generate_partsupp_table(rng: random.Random, total_part_rows: int, supplier_rows: int) -> pa.Table:
+    # Exactly PARTSUPP_SUPPLIERS_PER_PART rows per part, the same
+    # suppliers_for_part() set generate_lineitem_batch() draws l_suppkey
+    # from -- see that function's own comment for why this pairing has to
+    # be exact, not independently sampled the way every other table here
+    # is. total_part_rows * PARTSUPP_SUPPLIERS_PER_PART rows total (e.g.
+    # 800,000 at SF1's 200,000 parts), comparable in size to `customer`.
+    partkey = []
+    suppkey = []
+    for p in range(1, total_part_rows + 1):
+        for s in suppliers_for_part(p, supplier_rows):
+            partkey.append(p)
+            suppkey.append(s)
+    availqty = [rng.randint(1, 9999) for _ in partkey]
+    supplycost = [round(rng.uniform(1.00, 1000.00), 2) for _ in partkey]
+    comment = ["synthetic-tpch-partsupp-comment" for _ in partkey]
+
+    schema = pa.schema(
+        [
+            pa.field("ps_partkey", pa.int64(), False),
+            pa.field("ps_suppkey", pa.int64(), False),
+            pa.field("ps_availqty", pa.int32(), False),
+            pa.field("ps_supplycost", pa.float64(), False),
+            pa.field("ps_comment", pa.utf8(), False),
+        ]
+    )
+    return pa.table(
+        {
+            "ps_partkey": partkey,
+            "ps_suppkey": suppkey,
+            "ps_availqty": availqty,
+            "ps_supplycost": supplycost,
+            "ps_comment": comment,
+        },
+        schema=schema,
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--scale-factor", type=float, required=True)
@@ -529,6 +628,14 @@ def main() -> int:
         compression_level=compression_level, row_group_size=args.row_group_rows,
     )
     print(f"wrote {total_part_rows} rows to {part_path}")
+
+    partsupp_table = generate_partsupp_table(rng, total_part_rows, SUPPLIER_ROWS)
+    partsupp_path = output_dir / "partsupp-00000.parquet"
+    pq.write_table(
+        partsupp_table, partsupp_path, compression=compression,
+        compression_level=compression_level, row_group_size=args.row_group_rows,
+    )
+    print(f"wrote {partsupp_table.num_rows} rows to {partsupp_path}")
 
     customer_table = generate_customer_table(rng, CUSTOMER_ROWS)
     customer_path = output_dir / "customer-00000.parquet"
@@ -616,6 +723,10 @@ def main() -> int:
                 "files": [str(part_path)],
                 "rows": total_part_rows,
             },
+            "partsupp": {
+                "files": [str(partsupp_path)],
+                "rows": partsupp_table.num_rows,
+            },
             "orders": {
                 "files": orders_file_paths,
                 "rows": orders_written,
@@ -642,7 +753,8 @@ def main() -> int:
         json.dump(manifest, manifest_file, indent=2)
 
     print(f"wrote {rows_written} lineitem rows across {len(file_paths)} file(s), "
-          f"{total_part_rows} part rows, {orders_written} orders rows across "
+          f"{total_part_rows} part rows, {partsupp_table.num_rows} partsupp rows, "
+          f"{orders_written} orders rows across "
           f"{len(orders_file_paths)} file(s), {CUSTOMER_ROWS} customer rows, "
           f"{len(NATIONS)} nation rows, {len(REGIONS)} region rows, "
           f"{SUPPLIER_ROWS} supplier rows, to {output_dir}")
