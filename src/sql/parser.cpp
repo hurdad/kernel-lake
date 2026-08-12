@@ -228,6 +228,7 @@ Preprocessed preprocess_from_read_parquet(const std::string& sql) {
   static constexpr std::string_view kParquetFunctionName = "read_parquet";
   static constexpr std::string_view kIcebergFunctionName = "read_iceberg";
   static constexpr std::string_view kDeltaFunctionName = "read_delta";
+  static constexpr std::string_view kUnityCatalogFunctionName = "read_unity_catalog";
 
   std::string rewritten;
   std::vector<PlaceholderSource> sources;
@@ -236,20 +237,30 @@ Preprocessed preprocess_from_read_parquet(const std::string& sql) {
     const bool is_parquet = starts_with_ci(sql, pos, kParquetFunctionName);
     const bool is_iceberg = !is_parquet && starts_with_ci(sql, pos, kIcebergFunctionName);
     const bool is_delta = !is_parquet && !is_iceberg && starts_with_ci(sql, pos, kDeltaFunctionName);
-    if (!is_parquet && !is_iceberg && !is_delta) {
+    // Checked after kDeltaFunctionName despite "read_delta" not being a
+    // prefix of "read_unity_catalog" (unlike, say, "read_i..." shapes):
+    // kept in the same "not yet matched anything" chain as every other
+    // function name here for one consistent shape, not because ordering
+    // matters between these two specifically.
+    const bool is_unity_catalog =
+        !is_parquet && !is_iceberg && !is_delta && starts_with_ci(sql, pos, kUnityCatalogFunctionName);
+    if (!is_parquet && !is_iceberg && !is_delta && !is_unity_catalog) {
       rewritten += sql[pos];
       ++pos;
       continue;
     }
-    const std::string_view function_name =
-        is_parquet ? kParquetFunctionName : (is_iceberg ? kIcebergFunctionName : kDeltaFunctionName);
+    const std::string_view function_name = is_parquet   ? kParquetFunctionName
+                                           : is_iceberg  ? kIcebergFunctionName
+                                           : is_delta    ? kDeltaFunctionName
+                                                         : kUnityCatalogFunctionName;
     std::optional<std::pair<std::vector<std::string>, std::size_t>> parsed =
         try_parse_read_parquet_args(sql, pos + function_name.size());
-    if (!parsed || ((is_iceberg || is_delta) && parsed->first.size() != 1)) {
+    if (!parsed || ((is_iceberg || is_delta || is_unity_catalog) && parsed->first.size() != 1)) {
       // Doesn't have the shape this preprocessor understands (e.g. a
       // non-string argument, or more than one argument to
-      // read_iceberg(...)/read_delta(...)) -- leave the text untouched;
-      // hsql's own grammar will reject it with a normal parse error.
+      // read_iceberg(...)/read_delta(...)/read_unity_catalog(...)) -- leave
+      // the text untouched; hsql's own grammar will reject it with a
+      // normal parse error.
       rewritten += sql[pos];
       ++pos;
       continue;
@@ -261,6 +272,8 @@ Preprocessed preprocess_from_read_parquet(const std::string& sql) {
       paths = {"iceberg://" + parsed->first.front()};
     } else if (is_delta) {
       paths = {"delta://" + parsed->first.front()};
+    } else if (is_unity_catalog) {
+      paths = {"unitycatalog://" + parsed->first.front()};
     } else {
       paths = std::move(parsed->first);
     }
@@ -271,8 +284,9 @@ Preprocessed preprocess_from_read_parquet(const std::string& sql) {
   if (sources.empty()) {
     throw SqlError(
         "KernelLake requires at least one data source of the form "
-        "read_parquet('path' [, 'path2', ...]), read_iceberg('catalog.namespace.table'), or "
-        "read_delta('table_uri'); no such clause was found in the query");
+        "read_parquet('path' [, 'path2', ...]), read_iceberg('catalog.namespace.table'), "
+        "read_delta('table_uri'), or read_unity_catalog('instance.catalog.schema.table'); no such clause "
+        "was found in the query");
   }
   // Generous relative to any real query (TPC-H's own deepest join, Q8,
   // needs 7) -- purely a guard against a pathological number of joined
@@ -281,8 +295,8 @@ Preprocessed preprocess_from_read_parquet(const std::string& sql) {
   constexpr std::size_t kMaxJoinSources = 12;
   if (sources.size() > kMaxJoinSources) {
     throw SqlError(fmt::format(
-        "KernelLake supports at most {} read_parquet(...)/read_iceberg(...)/read_delta(...) sources in a "
-        "JOIN chain, got {}",
+        "KernelLake supports at most {} read_parquet(...)/read_iceberg(...)/read_delta(...)/"
+        "read_unity_catalog(...) sources in a JOIN chain, got {}",
         kMaxJoinSources, sources.size()));
   }
   return Preprocessed{std::move(rewritten), std::move(sources)};

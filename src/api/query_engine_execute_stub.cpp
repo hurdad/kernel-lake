@@ -17,6 +17,7 @@
 #include "kernellake/iceberg/iceberg_source_resolver.hpp"
 #include "kernellake/io/physical_planner.hpp"
 #include "kernellake/planner/physical_plan.hpp"
+#include "kernellake/unitycatalog/unity_catalog_source_resolver.hpp"
 
 #include "composite_source_resolver.hpp"
 
@@ -49,7 +50,9 @@ QueryResult QueryEngine::execute(std::string_view sql) const {
   // build_physical_plan()'s `extra_resolver` defaults to nullptr.
   iceberg::IcebergSourceResolver iceberg_resolver(config_.iceberg);
   delta::DeltaSourceResolver delta_resolver(config_.delta);
-  CompositeSourceResolver resolver(iceberg_resolver, delta_resolver);
+  unitycatalog::UnityCatalogSourceResolver unity_catalog_resolver(config_.unity_catalog, config_.delta,
+                                                                  config_.storage.s3);
+  CompositeSourceResolver resolver(iceberg_resolver, delta_resolver, unity_catalog_resolver);
   const PhysicalPlanPtr physical = build_physical_plan(logical, store_, &resolver);
 
   QueryResult result = execute_cpu(physical);

@@ -16,6 +16,8 @@ add_executable(kernellake_unit_tests
   parquet_pruning_test.cpp
   table_resolution_test.cpp
   rest_catalog_client_test.cpp
+  unity_catalog_client_test.cpp
+  unity_catalog_source_resolver_test.cpp
   manifest_reader_test.cpp
   position_delete_reader_test.cpp
   schema_translation_test.cpp
@@ -28,6 +30,7 @@ add_executable(kernellake_unit_tests
   delta_table_resolution_test.cpp
   delta_source_resolver_test.cpp
   query_engine_delta_test.cpp
+  query_engine_unitycatalog_test.cpp
   physical_planner_test.cpp
   query_engine_test.cpp
   query_engine_execute_cpu_test.cpp
@@ -47,6 +50,7 @@ target_link_libraries(kernellake_unit_tests PRIVATE
   kernellake_storage
   kernellake_io
   kernellake_iceberg
+  kernellake_unitycatalog
   kernellake_delta
   kernellake_api
   kernellake_generator

@@ -11,6 +11,7 @@
 #include "kernellake/planner/logical_planner.hpp"
 #include "kernellake/sql/parser.hpp"
 #include "kernellake/storage/nvme_cache_otel.hpp"
+#include "kernellake/unitycatalog/unity_catalog_source_resolver.hpp"
 
 #include "composite_source_resolver.hpp"
 
@@ -40,12 +41,15 @@ LogicalPlanPtr QueryEngine::plan_logical(std::string_view sql,
                                          double* metadata_inspection_seconds_out) const {
   const sql::AstSelectStatement ast = sql::parse_sql(sql);
   // Constructed fresh per call -- see IcebergSourceResolver's/
-  // DeltaSourceResolver's own comments on why neither caches its backing
-  // client across queries yet. Cheap regardless: just a copy of
-  // config_.iceberg's catalog map and config_.delta's single section.
+  // DeltaSourceResolver's/UnityCatalogSourceResolver's own comments on why
+  // none of the three caches its backing client(s) across queries yet.
+  // Cheap regardless: just copies of config_.iceberg's/config_.unity_catalog's
+  // catalog maps and config_.delta's/config_.storage.s3's single sections.
   iceberg::IcebergSourceResolver iceberg_resolver(config_.iceberg);
   delta::DeltaSourceResolver delta_resolver(config_.delta);
-  CompositeSourceResolver resolver(iceberg_resolver, delta_resolver);
+  unitycatalog::UnityCatalogSourceResolver unity_catalog_resolver(config_.unity_catalog, config_.delta,
+                                                                  config_.storage.s3);
+  CompositeSourceResolver resolver(iceberg_resolver, delta_resolver, unity_catalog_resolver);
 
   if (ast.join.has_value()) {
     std::vector<Schema> join_schemas;
@@ -81,7 +85,9 @@ LogicalPlanPtr QueryEngine::explain_logical(std::string_view sql) const {
 PhysicalPlanPtr QueryEngine::explain(std::string_view sql) const {
   iceberg::IcebergSourceResolver iceberg_resolver(config_.iceberg);
   delta::DeltaSourceResolver delta_resolver(config_.delta);
-  CompositeSourceResolver resolver(iceberg_resolver, delta_resolver);
+  unitycatalog::UnityCatalogSourceResolver unity_catalog_resolver(config_.unity_catalog, config_.delta,
+                                                                  config_.storage.s3);
+  CompositeSourceResolver resolver(iceberg_resolver, delta_resolver, unity_catalog_resolver);
   return build_physical_plan(plan_logical(sql), store_, &resolver);
 }
 

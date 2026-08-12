@@ -1,66 +1,19 @@
 #include "kernellake/iceberg/rest_catalog_client.hpp"
 
-#include <curl/curl.h>
 #include <fmt/format.h>
 #include <nlohmann/json.hpp>
 
 #include <chrono>
-#include <memory>
-#include <mutex>
 #include <utility>
 
 #include "kernellake/common/errors.hpp"
+#include "kernellake/common/http_client.hpp"
 
 namespace kernellake::iceberg {
 
 namespace {
 
-// libcurl requires exactly one curl_global_init()/curl_global_cleanup() pair
-// per process, not per handle -- std::call_once makes the first call (from
-// however many threads construct a client) do it exactly once.
-// Intentionally never cleaned up: curl_global_cleanup() would need to run
-// after every other thread has stopped using libcurl, which this class has
-// no way to know; leaving it for process-exit teardown is fine for a
-// process-lifetime global like this.
-std::once_flag curl_global_init_flag;
-void ensure_curl_global_init() {
-  std::call_once(curl_global_init_flag, [] { curl_global_init(CURL_GLOBAL_DEFAULT); });
-}
-
-struct CurlEasyDeleter {
-  void operator()(CURL* handle) const { curl_easy_cleanup(handle); }
-};
-using CurlEasyPtr = std::unique_ptr<CURL, CurlEasyDeleter>;
-
-struct CurlSlistDeleter {
-  void operator()(curl_slist* list) const { curl_slist_free_all(list); }
-};
-using CurlSlistPtr = std::unique_ptr<curl_slist, CurlSlistDeleter>;
-
-CurlEasyPtr make_curl_easy() {
-  ensure_curl_global_init();
-  CurlEasyPtr handle(curl_easy_init());
-  if (!handle) {
-    throw StorageError("iceberg rest catalog: curl_easy_init() failed");
-  }
-  return handle;
-}
-
-size_t write_to_string(char* data, size_t size, size_t nmemb, void* user_data) {
-  auto* out = static_cast<std::string*>(user_data);
-  out->append(data, size * nmemb);
-  return size * nmemb;
-}
-
-std::string url_encode(CURL* handle, const std::string& value) {
-  char* escaped = curl_easy_escape(handle, value.c_str(), static_cast<int>(value.size()));
-  if (escaped == nullptr) {
-    throw StorageError(fmt::format("iceberg rest catalog: failed to URL-encode '{}'", value));
-  }
-  std::string result(escaped);
-  curl_free(escaped);
-  return result;
-}
+constexpr const char* kErrorPrefix = "iceberg rest catalog";
 
 // Multi-level namespaces are addressed by the REST Catalog spec as their
 // parts joined with U+001F (unit separator), the whole joined string then
@@ -74,52 +27,21 @@ std::string encode_namespace(CURL* handle, const std::vector<std::string>& names
     }
     joined += namespace_parts[i];
   }
-  return url_encode(handle, joined);
+  return url_encode(handle, joined, kErrorPrefix);
 }
 
 // GET when post_body is null, POST (form-encoded) otherwise -- covers both
 // requests this client makes (table-metadata GET, oauth2 token POST).
-std::string http_request(const std::string& url, const std::string& bearer_token,
-                         const std::string* post_body) {
-  CurlEasyPtr handle = make_curl_easy();
-  std::string response_body;
-
-  curl_easy_setopt(handle.get(), CURLOPT_URL, url.c_str());
-  curl_easy_setopt(handle.get(), CURLOPT_WRITEFUNCTION, write_to_string);
-  curl_easy_setopt(handle.get(), CURLOPT_WRITEDATA, &response_body);
-  curl_easy_setopt(handle.get(), CURLOPT_FOLLOWLOCATION, 1L);
-  curl_easy_setopt(handle.get(), CURLOPT_TIMEOUT, 30L);
-  curl_easy_setopt(handle.get(), CURLOPT_CONNECTTIMEOUT, 10L);
-  // Avoid libcurl's default use of signals/alarm() for timeouts, which is
-  // not safe from a multi-threaded query engine.
-  curl_easy_setopt(handle.get(), CURLOPT_NOSIGNAL, 1L);
-
-  curl_slist* raw_headers = curl_slist_append(nullptr, "Accept: application/json");
+std::string iceberg_http_request(const std::string& url, const std::string& bearer_token,
+                                 const std::string* post_body) {
+  std::vector<std::string> headers = {"Accept: application/json"};
   if (!bearer_token.empty()) {
-    const std::string auth_header = fmt::format("Authorization: Bearer {}", bearer_token);
-    raw_headers = curl_slist_append(raw_headers, auth_header.c_str());
+    headers.push_back(fmt::format("Authorization: Bearer {}", bearer_token));
   }
   if (post_body != nullptr) {
-    raw_headers = curl_slist_append(raw_headers, "Content-Type: application/x-www-form-urlencoded");
-    curl_easy_setopt(handle.get(), CURLOPT_POSTFIELDS, post_body->c_str());
-    curl_easy_setopt(handle.get(), CURLOPT_POSTFIELDSIZE, static_cast<long>(post_body->size()));
+    headers.push_back("Content-Type: application/x-www-form-urlencoded");
   }
-  const CurlSlistPtr headers(raw_headers);
-  curl_easy_setopt(handle.get(), CURLOPT_HTTPHEADER, headers.get());
-
-  const CURLcode result = curl_easy_perform(handle.get());
-  if (result != CURLE_OK) {
-    throw StorageError(
-        fmt::format("iceberg rest catalog: request to '{}' failed: {}", url, curl_easy_strerror(result)));
-  }
-
-  long status_code = 0;
-  curl_easy_getinfo(handle.get(), CURLINFO_RESPONSE_CODE, &status_code);
-  if (status_code < 200 || status_code >= 300) {
-    throw StorageError(fmt::format("iceberg rest catalog: request to '{}' returned HTTP {}: {}", url,
-                                   status_code, response_body));
-  }
-  return response_body;
+  return http_request(url, headers, post_body, kErrorPrefix);
 }
 
 nlohmann::json parse_json_response(const std::string& url, const std::string& body) {
@@ -226,15 +148,16 @@ std::string IcebergRestCatalogClient::fetch_oauth2_token() {
   {
     const CurlEasyPtr encoder = make_curl_easy();
     body = fmt::format("grant_type=client_credentials&client_id={}&client_secret={}",
-                       url_encode(encoder.get(), config_.oauth2_client_id),
-                       url_encode(encoder.get(), config_.oauth2_client_secret));
+                       url_encode(encoder.get(), config_.oauth2_client_id, kErrorPrefix),
+                       url_encode(encoder.get(), config_.oauth2_client_secret, kErrorPrefix));
     if (!config_.oauth2_scope.empty()) {
-      body += fmt::format("&scope={}", url_encode(encoder.get(), config_.oauth2_scope));
+      body += fmt::format("&scope={}", url_encode(encoder.get(), config_.oauth2_scope, kErrorPrefix));
     }
   }
 
   const std::string url = fmt::format("{}/v1/oauth/tokens", config_.catalog_uri);
-  const nlohmann::json response = parse_json_response(url, http_request(url, /*bearer_token=*/"", &body));
+  const nlohmann::json response =
+      parse_json_response(url, iceberg_http_request(url, /*bearer_token=*/"", &body));
 
   if (!response.contains("access_token")) {
     throw StorageError(
@@ -263,7 +186,7 @@ IcebergTableMetadata IcebergRestCatalogClient::load_table_metadata(
   {
     const CurlEasyPtr encoder = make_curl_easy();
     encoded_namespace = encode_namespace(encoder.get(), namespace_parts);
-    encoded_table = url_encode(encoder.get(), table);
+    encoded_table = url_encode(encoder.get(), table, kErrorPrefix);
   }
 
   const std::string url = config_.prefix.empty()
@@ -273,7 +196,7 @@ IcebergTableMetadata IcebergRestCatalogClient::load_table_metadata(
                                             config_.prefix, encoded_namespace, encoded_table);
 
   const nlohmann::json response =
-      parse_json_response(url, http_request(url, bearer_token_for_request(), /*post_body=*/nullptr));
+      parse_json_response(url, iceberg_http_request(url, bearer_token_for_request(), /*post_body=*/nullptr));
 
   if (!response.contains("metadata")) {
     throw StorageError(

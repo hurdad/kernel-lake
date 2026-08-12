@@ -20,6 +20,7 @@ target_link_libraries(kernellake_api PUBLIC
   kernellake_storage
   kernellake_io
   kernellake_iceberg
+  kernellake_unitycatalog
   kernellake_delta
   kernellake_execution_cpu
   Arrow::arrow_static

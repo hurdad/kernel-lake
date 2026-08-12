@@ -140,6 +140,88 @@ TEST(Config, RejectsIcebergCatalogOauth2MissingClientCredentials) {
   EXPECT_THROW((void)(validate_config(config)), ConfigurationError);
 }
 
+TEST(Config, ParsesUnityCatalogInstances) {
+  const std::string yaml = R"(
+unity_catalog:
+  instances:
+    prod:
+      uc_url: https://workspace.example.com/api/2.1/unity-catalog
+      credentials_kind: bearer_token
+      bearer_token: secret-token
+    staging:
+      uc_url: https://staging.example.com/api/2.1/unity-catalog
+      oauth2_token_endpoint: https://staging.example.com/oidc/v1/token
+      credentials_kind: oauth2_client_credentials
+      oauth2_client_id: client-id
+      oauth2_client_secret: client-secret
+      oauth2_scope: all-apis
+)";
+  const EngineConfig config = parse_config(yaml);
+  ASSERT_EQ(config.unity_catalog.instances.size(), 2u);
+
+  const UnityCatalogInstanceSection& prod = config.unity_catalog.instances.at("prod");
+  EXPECT_EQ(prod.uc_url, "https://workspace.example.com/api/2.1/unity-catalog");
+  EXPECT_EQ(prod.credentials_kind, "bearer_token");
+  EXPECT_EQ(prod.bearer_token, "secret-token");
+
+  const UnityCatalogInstanceSection& staging = config.unity_catalog.instances.at("staging");
+  EXPECT_EQ(staging.oauth2_token_endpoint, "https://staging.example.com/oidc/v1/token");
+  EXPECT_EQ(staging.credentials_kind, "oauth2_client_credentials");
+  EXPECT_EQ(staging.oauth2_client_id, "client-id");
+  EXPECT_EQ(staging.oauth2_client_secret, "client-secret");
+  EXPECT_EQ(staging.oauth2_scope, "all-apis");
+
+  EXPECT_NO_THROW((void)(validate_config(config)));
+}
+
+TEST(Config, RejectsUnityCatalogInstanceMissingUrl) {
+  EngineConfig config = default_config();
+  config.unity_catalog.instances["broken"] = UnityCatalogInstanceSection{};
+  EXPECT_THROW((void)(validate_config(config)), ConfigurationError);
+}
+
+TEST(Config, RejectsUnityCatalogInstanceUnknownCredentialsKind) {
+  EngineConfig config = default_config();
+  UnityCatalogInstanceSection instance;
+  instance.uc_url = "https://workspace.example.com/api/2.1/unity-catalog";
+  instance.credentials_kind = "kerberos";
+  config.unity_catalog.instances["broken"] = instance;
+  EXPECT_THROW((void)(validate_config(config)), ConfigurationError);
+}
+
+TEST(Config, RejectsUnityCatalogInstanceBearerTokenMissingToken) {
+  EngineConfig config = default_config();
+  UnityCatalogInstanceSection instance;
+  instance.uc_url = "https://workspace.example.com/api/2.1/unity-catalog";
+  instance.credentials_kind = "bearer_token";
+  config.unity_catalog.instances["broken"] = instance;
+  EXPECT_THROW((void)(validate_config(config)), ConfigurationError);
+}
+
+TEST(Config, RejectsUnityCatalogInstanceOauth2MissingClientCredentials) {
+  EngineConfig config = default_config();
+  UnityCatalogInstanceSection instance;
+  instance.uc_url = "https://workspace.example.com/api/2.1/unity-catalog";
+  instance.oauth2_token_endpoint = "https://workspace.example.com/oidc/v1/token";
+  instance.credentials_kind = "oauth2_client_credentials";
+  instance.oauth2_client_id = "client-id";
+  // oauth2_client_secret intentionally left empty.
+  config.unity_catalog.instances["broken"] = instance;
+  EXPECT_THROW((void)(validate_config(config)), ConfigurationError);
+}
+
+TEST(Config, RejectsUnityCatalogInstanceOauth2MissingTokenEndpoint) {
+  EngineConfig config = default_config();
+  UnityCatalogInstanceSection instance;
+  instance.uc_url = "https://workspace.example.com/api/2.1/unity-catalog";
+  instance.credentials_kind = "oauth2_client_credentials";
+  instance.oauth2_client_id = "client-id";
+  instance.oauth2_client_secret = "client-secret";
+  // oauth2_token_endpoint intentionally left empty.
+  config.unity_catalog.instances["broken"] = instance;
+  EXPECT_THROW((void)(validate_config(config)), ConfigurationError);
+}
+
 TEST(Config, ParsesDeltaSection) {
   const std::string yaml = R"(
 delta:

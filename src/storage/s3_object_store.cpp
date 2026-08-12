@@ -5,6 +5,7 @@
 
 #include <cstdlib>
 #include <mutex>
+#include <utility>
 
 #include "generic_fs_object_store.hpp"
 #include "kernellake/common/errors.hpp"
@@ -21,6 +22,16 @@ void ensure_s3_initialized() {
       throw StorageError(fmt::format("s3: failed to initialize AWS SDK: {}", status.ToString()));
     }
   });
+}
+
+std::shared_ptr<arrow::fs::FileSystem> make_s3_filesystem_from_options(arrow::fs::S3Options options) {
+  ensure_s3_initialized();
+  const arrow::Result<std::shared_ptr<arrow::fs::S3FileSystem>> result =
+      arrow::fs::S3FileSystem::Make(options);
+  if (!result.ok()) {
+    throw StorageError(fmt::format("s3: failed to construct filesystem: {}", result.status().ToString()));
+  }
+  return *result;
 }
 
 std::shared_ptr<arrow::fs::FileSystem> make_s3_filesystem(const S3Section& config) {
@@ -54,17 +65,20 @@ std::shared_ptr<arrow::fs::FileSystem> make_s3_filesystem(const S3Section& confi
     options.ConfigureDefaultCredentials();
   }
 
-  const arrow::Result<std::shared_ptr<arrow::fs::S3FileSystem>> result =
-      arrow::fs::S3FileSystem::Make(options);
-  if (!result.ok()) {
-    throw StorageError(fmt::format("s3: failed to construct filesystem: {}", result.status().ToString()));
-  }
-  return *result;
+  return make_s3_filesystem_from_options(std::move(options));
 }
 
 }  // namespace
 
 S3ObjectStore::S3ObjectStore(const S3Section& config) : fs_(make_s3_filesystem(config)) {}
+
+S3ObjectStore::S3ObjectStore(const arrow::fs::S3Options& base_options, const std::string& access_key_id,
+                             const std::string& secret_access_key, const std::string& session_token)
+    : fs_([&] {
+        arrow::fs::S3Options options = base_options;
+        options.ConfigureAccessKey(access_key_id, secret_access_key, session_token);
+        return make_s3_filesystem_from_options(std::move(options));
+      }()) {}
 
 std::vector<ObjectInfo> S3ObjectStore::list(const Uri& prefix) {
   return detail::generic_fs_list(fs_, "s3", prefix);

@@ -251,6 +251,33 @@ EngineConfig parse_config(const std::string& yaml_text) {
     }
   }
 
+  // unity_catalog.instances mirrors iceberg.catalogs exactly (a map keyed
+  // by name, read_unity_catalog('instance.catalog.schema.table')'s leading
+  // component looks it up).
+  const YAML::Node uc_instances = root["unity_catalog"]["instances"];
+  if (uc_instances) {
+    for (const auto& entry : uc_instances) {
+      std::string name;
+      try {
+        name = entry.first.as<std::string>();
+      } catch (const YAML::Exception& e) {
+        throw ConfigurationError(fmt::format("invalid unity_catalog.instances entry name: {}", e.what()));
+      }
+      const YAML::Node instance_node = entry.second;
+      UnityCatalogInstanceSection instance;
+      instance.uc_url = read_or(instance_node, "uc_url", instance.uc_url);
+      instance.oauth2_token_endpoint =
+          read_or(instance_node, "oauth2_token_endpoint", instance.oauth2_token_endpoint);
+      instance.credentials_kind = read_or(instance_node, "credentials_kind", instance.credentials_kind);
+      instance.bearer_token = read_or(instance_node, "bearer_token", instance.bearer_token);
+      instance.oauth2_client_id = read_or(instance_node, "oauth2_client_id", instance.oauth2_client_id);
+      instance.oauth2_client_secret =
+          read_or(instance_node, "oauth2_client_secret", instance.oauth2_client_secret);
+      instance.oauth2_scope = read_or(instance_node, "oauth2_scope", instance.oauth2_scope);
+      config.unity_catalog.instances.emplace(std::move(name), std::move(instance));
+    }
+  }
+
   const YAML::Node delta = root["delta"];
   config.delta.grpc_endpoint = read_or(delta, "grpc_endpoint", config.delta.grpc_endpoint);
   config.delta.use_tls = read_or(delta, "use_tls", config.delta.use_tls);
@@ -479,6 +506,43 @@ void validate_config(const EngineConfig& config) {
           fmt::format("iceberg.catalogs.{}.oauth2_client_id and oauth2_client_secret must both be set when "
                       "credentials_kind is 'oauth2_client_credentials'",
                       name));
+    }
+  }
+
+  // Same three credentials_kind values as Iceberg, plus a UC-specific
+  // requirement: oauth2_token_endpoint must be set explicitly (unlike
+  // Iceberg's REST spec, Unity Catalog's token endpoint isn't a fixed path
+  // under uc_url -- see UnityCatalogInstanceSection's own comment).
+  for (const auto& [name, instance] : config.unity_catalog.instances) {
+    if (instance.uc_url.empty()) {
+      throw ConfigurationError(fmt::format("unity_catalog.instances.{}.uc_url must not be empty", name));
+    }
+    if (std::find(kIcebergCredentialsKinds.begin(), kIcebergCredentialsKinds.end(),
+                  instance.credentials_kind) == kIcebergCredentialsKinds.end()) {
+      throw ConfigurationError(fmt::format(
+          "unity_catalog.instances.{}.credentials_kind '{}' is unsupported (expected 'none', "
+          "'bearer_token', or 'oauth2_client_credentials')",
+          name, instance.credentials_kind));
+    }
+    if (instance.credentials_kind == "bearer_token" && instance.bearer_token.empty()) {
+      throw ConfigurationError(fmt::format(
+          "unity_catalog.instances.{}.bearer_token must not be empty when credentials_kind is "
+          "'bearer_token'",
+          name));
+    }
+    if (instance.credentials_kind == "oauth2_client_credentials") {
+      if (instance.oauth2_client_id.empty() || instance.oauth2_client_secret.empty()) {
+        throw ConfigurationError(fmt::format(
+            "unity_catalog.instances.{}.oauth2_client_id and oauth2_client_secret must both be set when "
+            "credentials_kind is 'oauth2_client_credentials'",
+            name));
+      }
+      if (instance.oauth2_token_endpoint.empty()) {
+        throw ConfigurationError(fmt::format(
+            "unity_catalog.instances.{}.oauth2_token_endpoint must not be empty when credentials_kind is "
+            "'oauth2_client_credentials'",
+            name));
+      }
     }
   }
 

@@ -29,7 +29,7 @@ CMake preset rather than `tests/unit/`).
 
 | Module | Contents |
 | --- | --- |
-| `common` | Error hierarchy, identifiers, config loading, logging, date parsing |
+| `common` | Error hierarchy, identifiers, config loading, logging, date parsing, shared curl HTTP-client helpers (`http_client.hpp`, used by both `iceberg` and `unitycatalog`) |
 | `types` | Internal `TypeId`/`DataType`/`Schema`, Arrow adapters |
 | `expression` | Typed expression tree (`Expression` and subclasses) |
 | `sql` | Parser-independent AST (`kernellake::sql::AstSelectStatement`) and the parser adapter around the vendored `hyrise/sql-parser` |
@@ -38,6 +38,7 @@ CMake preset rather than `tests/unit/`).
 | `storage` | `ObjectStore`/`LocalObjectStore`/cloud backends (S3/GCS/Azure/HDFS), file discovery |
 | `iceberg` | Iceberg REST catalog client, manifest reading, partition pruning, position-delete reads, schema translation (`kernellake_iceberg`) |
 | `delta` | Delta Lake read support (`kernellake_delta`) |
+| `unitycatalog` | Unity Catalog client (auth, table lookup, temporary S3 credentials) and the resolver that dispatches a UC-managed table to `iceberg`/`delta`/plain-Parquet resolution (`kernellake_unitycatalog`) |
 | `io` | Parquet metadata inspection, row-group pruning, the physical planner (ties `planner` + `storage` + `io` together) |
 | `memory` | RAII CUDA device/stream wrappers, RMM memory-pool/statistics/limit configuration (`gpu-dev` preset only) |
 | `execution_gpu` | `PhysicalOperator`/`DeviceBatch`/`ExecutionContext`, the Arrow<->cudf bridge, the AST expression compiler, and every concrete GPU operator (`gpu-dev` preset only) -- renamed from `execution` |
@@ -61,8 +62,9 @@ CMake `FetchContent` rather than hand-writing a parser. That grammar's
 `FROM` clause accepts table names, joins, and subqueries -- but has no
 table-valued-function syntax. `kernellake::sql::parse_sql()` therefore
 finds every occurrence of `read_parquet('path' [, 'path2', ...])`,
-`read_iceberg('catalog.namespace.table')`, or `read_delta('table_uri')` in
-the query text, extracts each one's path/identifier arguments, and
+`read_iceberg('catalog.namespace.table')`, `read_delta('table_uri')`, or
+`read_unity_catalog('instance.catalog.schema.table')` in the query text,
+extracts each one's path/identifier arguments, and
 substitutes a distinct placeholder identifier for each occurrence, leaving
 the surrounding syntax (`JOIN`/`ON`/aliases/commas) completely untouched --
 hsql's own grammar still parses the real table-reference/join structure
@@ -90,9 +92,22 @@ SELECT <items> FROM read_parquet(...) AS a JOIN read_parquet(...) AS b ON <a.col
   [WHERE <expr>] [GROUP BY <cols>] [ORDER BY <cols>] [LIMIT <n>]
 ```
 
-`read_parquet(...)` may be replaced by `read_iceberg('catalog.namespace.table')`
-or `read_delta('table_uri')` in either shape above, and mixed freely across
-sources within one join chain.
+`read_parquet(...)` may be replaced by `read_iceberg('catalog.namespace.table')`,
+`read_delta('table_uri')`, or `read_unity_catalog('instance.catalog.schema.table')`
+in either shape above, and mixed freely across sources within one join
+chain. `read_unity_catalog(...)` is a name/permission/credential broker,
+not a fourth storage format of its own -- it authenticates to a configured
+Unity Catalog instance, looks up the table's actual format and storage
+location, and dispatches to whichever of the other three paths matches
+(`DELTA`/`PARQUET` via a short-lived, Unity-Catalog-vended AWS S3
+credential when the storage location is `s3://...`; `ICEBERG` via Unity
+Catalog's own Iceberg-REST-compatible endpoint, reusing the same
+`IcebergRestCatalogClient` a plain `read_iceberg(...)` uses) -- see
+`kernellake::unitycatalog::UnityCatalogSourceResolver`
+(`src/unitycatalog/unity_catalog_source_resolver.cpp`) and
+`docs/ROADMAP.md`'s Unity Catalog entry for the full scope and what's
+still deferred (GCS/Azure vended credentials, catalog/schema `LIST`
+operations).
 
 - Column references, aliases, `*`
 - Numeric, string, boolean, date (`DATE 'YYYY-MM-DD'`), and `NULL` literals

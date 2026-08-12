@@ -2879,69 +2879,177 @@ log` is the authoritative chronology if that ordering ever matters.
   rebuild's `kernellake_unit_tests` 357/357 and `kernellake_gpu_tests`
   101/101 (real RTX 5060 Ti).
 
+- **Unity Catalog support, read-only, first vertical slice** -- Phase 5 of
+  the lakehouse roadmap (Parquet directories -> Hive partitioning ->
+  Iceberg REST catalogs -> Delta Lake -> Unity Catalog, all four prior
+  phases already done). Unity Catalog's real value here is as a
+  name/permission/credential *broker*, not a new table format: a
+  UC-managed table is backed by Delta, plain Parquet, or Iceberg, all
+  three of which KernelLake could already read -- so the actual new work
+  is authenticate, look up a table, read off its format/location, exchange
+  that for short-lived credentials, and dispatch to whichever existing
+  resolver matches. Confirmed via real API research
+  (`docs.databricks.com`, `unitycatalog.io`) that UC's REST surface (`GET
+  /tables/{full_name}`, `POST /temporary-table-credentials`, an OAuth2
+  client-credentials token endpoint) does **not** overlap with the Iceberg
+  REST Catalog spec `IcebergRestCatalogClient` already speaks -- different
+  endpoints, different JSON shapes -- except one real reuse point: UC
+  natively exposes an Iceberg-REST-compatible endpoint
+  (`{uc_url}/api/2.1/unity-catalog/iceberg/...`) for tables it reports as
+  Iceberg-formatted, so those dispatch straight into the *existing*
+  `IcebergRestCatalogClient`/`resolve_iceberg_table()` with a bearer
+  token, no new Iceberg-handling code at all.
+
+  Hand-written the same way `IcebergRestCatalogClient` is (curl +
+  nlohmann::json, narrow structs for only the fields actually used) --
+  considered and rejected both an OpenAPI-generated client (the UC spec's
+  `api/all.yaml` covers dozens of endpoints -- volumes, functions, models,
+  grants -- this integration doesn't touch, and codegen would mean a new
+  build-toolchain dependency for a small subset of the surface) and
+  libcurlpp (an obscure, barely-maintained wrapper adding a dependency for
+  no benefit over the RAII pattern already in place).
+
+  **New module** `kernellake_unitycatalog` (`src/unitycatalog/`,
+  mirroring `src/iceberg/`'s own structure):
+  - `UnityCatalogClient` (`unity_catalog_client.cpp`) -- OAuth2
+    client-credentials token fetch+cache (same 30s expiry margin
+    `IcebergRestCatalogClient` uses) or static bearer token;
+    `get_table(catalog, schema, table)` parsing `TableInfo` (table_id,
+    table_type, data_source_format, storage_location, columns); and
+    `get_temporary_table_credentials(table_id, operation)` parsing AWS
+    `aws_temp_credentials` (access_key_id/secret_access_key/
+    session_token) -- GCS/Azure variants not parsed, see "Not yet started"
+    below. Unlike Iceberg's REST spec (a fixed `{catalog_uri}/v1/oauth/
+    tokens` token path), Unity Catalog's OAuth2 token endpoint isn't
+    derivable from `uc_url` (Databricks: `https://<workspace>/oidc/v1/
+    token`; other deployments may differ), so it's always an explicit
+    `UnityCatalogInstanceSection::oauth2_token_endpoint` config field.
+  - `UnityCatalogSourceResolver` (`unity_catalog_source_resolver.cpp`) --
+    a `TableSourceResolver` for `read_unity_catalog('instance.catalog.
+    schema.table')` (4 parts: a local config-instance alias, then UC's own
+    fixed 3-level `catalog.schema.table`). After `get_table()`, dispatches
+    on `data_source_format`: `DELTA` -> existing `resolve_delta_table()`
+    (needs `delta.grpc_endpoint` configured, the same prerequisite plain
+    `read_delta(...)` already has); `PARQUET`/empty -> existing
+    `resolve_table()`; `ICEBERG` -> a freshly-built `IcebergCatalogSection`
+    pointed at UC's Iceberg-compatible endpoint, reusing the bearer token
+    already obtained, then existing `resolve_iceberg_table()`; anything
+    else -> a clear `StorageError` naming the unsupported format. For
+    `DELTA`/`PARQUET`, temporary AWS credentials are fetched and applied
+    *only* when `storage_location` actually starts with `s3://` -- a
+    local-filesystem location (real for a UC server's own local/dev
+    storage, and for this project's own tests) needs no credential
+    exchange, and unconditionally building an S3 filesystem for a
+    non-`s3://` location would just fail. `ICEBERG` never fetches
+    credentials at all (relies on static `storage.s3` access, same as a
+    plain Iceberg REST catalog today).
+  - Config: `UnityCatalogInstanceSection`/`UnityCatalogSection` (`config.hpp`),
+    a name-keyed map exactly like `IcebergSection::catalogs` (a deployment
+    may talk to more than one UC workspace); YAML parsing and
+    `validate_config()` mirror the existing `iceberg.catalogs` block.
+  - SQL surface: `read_unity_catalog(...)` added as a 4th recognized
+    function in `parser.cpp`'s `preprocess_from_read_parquet()`, re-encoded
+    as `"unitycatalog://..."`, the same URI-scheme dispatch idiom
+    `read_iceberg`/`read_delta` already use. `CompositeSourceResolver`
+    (`src/api/composite_source_resolver.hpp`) extended from 2 to 3
+    resolver slots; all four `QueryEngine` call sites (`query_engine.cpp`
+    x2, `query_engine_execute_gpu.cpp`, `query_engine_execute_stub.cpp`)
+    updated to construct and pass the new resolver.
+  - `S3ObjectStore` (`storage/s3_object_store.cpp`) gained a second
+    constructor taking already-obtained credentials directly
+    (`base_options`, access_key_id, secret_access_key, session_token),
+    calling the same `options.ConfigureAccessKey(...)` the existing
+    `"explicit"` env-var-based `credentials_kind` already uses -- just fed
+    vended values instead of environment variables. No new S3-related
+    config fields: `base_options` (region/endpoint/TLS/proxy) comes from
+    the resolver's own `storage.s3.options`, which an operator already
+    configures for any S3 access.
+  - Refactor, no behavior change: the curl/RAII boilerplate
+    (`CurlEasyPtr`/`CurlSlistPtr`, `ensure_curl_global_init()`,
+    `url_encode()`, a generalized `http_request()`) was extracted out of
+    `rest_catalog_client.cpp`'s anonymous namespace into a new shared
+    `include/kernellake/common/http_client.hpp`/`src/common/http_client.cpp`,
+    reused by both `IcebergRestCatalogClient` and the new
+    `UnityCatalogClient` rather than duplicated. All 18 pre-existing
+    `IcebergRestCatalogClient`/`IcebergTableMetadata` tests pass unchanged
+    after the extraction, confirmed before building anything new on top of
+    it. The test-only `LoopbackHttpServer`/`http_ok_json()`/`http_status()`
+    helpers (previously duplicated per test file, per that file's own
+    "no shared test-utility target in this project" comment) were also
+    consolidated into `tests/unit/loopback_http_server.hpp`, reused by the
+    Iceberg and new Unity Catalog client tests.
+
+  Verified for real: `UnityCatalogClient`'s own test file
+  (`unity_catalog_client_test.cpp`, 9 tests) exercises real curl requests
+  over a real loopback socket against canned-but-spec-shaped JSON
+  responses -- OAuth2 token fetch/cache/reuse (against a *separate*
+  configured token-endpoint server, proving `oauth2_token_endpoint` is
+  actually used rather than derived), `get_table()` parsing, AWS
+  temporary-credential parsing, and every error path (non-2xx, malformed
+  JSON, missing required field, connection failure). `UnityCatalogSourceResolver`'s
+  own tests (5) cover scheme-matching and qualified-name edge cases. The
+  capstone `query_engine_unitycatalog_test.cpp` (7 tests, mirroring
+  `query_engine_iceberg_test.cpp`/`query_engine_delta_test.cpp`) proves the
+  full SQL-to-result pipeline for the `PARQUET` dispatch target against
+  real local Parquet files and a fake-but-real-HTTP Unity Catalog server:
+  `explain_logical()`, `explain()` (real physical plan over real files),
+  and a real `QueryEngine::execute()` returning a correct `SUM(amount) =
+  28.0` -- plus config/unknown-instance/unsupported-format/missing-
+  Delta-endpoint error cases. One real bug caught by this last test file
+  before it passed: two tests that queued a `TableInfo` response but wrote
+  no actual Parquet data files failed with "directory contains no Parquet
+  files" -- expected, since (unlike Iceberg, whose schema comes from
+  catalog metadata) a plain Parquet source's schema is always discovered
+  by inspecting real files; fixed by writing fixture data in those tests
+  too, not by changing resolver behavior. All new/refactored code exercised
+  on both backends: a real `cpu-dev` build (392/392 `kernellake_unit_tests`,
+  up from 362) and a real `gpu-dev` rebuild (392/392, real RTX 5060 Ti),
+  zero regressions either way.
+
+  Not yet done, tracked separately: GCS/Azure temporary credentials,
+  catalog/schema `LIST` operations, client caching across queries, and
+  verification against a live Unity Catalog server or a real S3/MinIO
+  bucket (no Docker available in this session's environment) -- see "Not
+  yet started" below.
+
 ## Not yet started
 
-- **Unity Catalog support, read-only** -- Phase 5 of the lakehouse roadmap
-  (the last phase in the sequence documented above: Parquet directories
-  (done) -> Hive partitioning (done) -> Iceberg REST catalogs (done) ->
-  Delta Lake (done) -> Unity Catalog (this)). Not yet started. Scope is
-  deliberately read-only -- no writes, no catalog administration (no
-  create/alter/drop of catalogs, schemas, tables, grants) -- matching how
-  Iceberg REST catalog support also shipped read-only first. Breaks down
-  into:
-  - **Unity Catalog authentication** -- OAuth2 (or PAT) against a UC REST
-    endpoint. `IcebergRestCatalogClient` (`src/iceberg/rest_catalog_client.cpp`)
-    already has its own OAuth2 token handling for a REST catalog; a new
-    `UnityCatalogClient` should mirror that shape rather than invent a
-    second auth mechanism, though UC's own token/scope model isn't
-    identical to Iceberg's REST catalog spec and needs its own real
-    verification against a live UC endpoint, not assumed compatible.
-  - **REST client for catalog/schema/table lookup** -- resolving a
-    `catalog.schema.table` three-part name to UC's table metadata. The
-    same three-part-name shape `read_iceberg('catalog.namespace.table')`
-    already parses (`src/sql/parser.cpp`'s `read_iceberg`/`read_delta`
-    preprocessing, `docs/ARCHITECTURE.md`'s "`read_parquet(...)` adapter"
-    section), so a new `read_unity_catalog(...)` SQL-surface form can
-    likely reuse that exact preprocessing, not invent new grammar.
-  - **Mapping of UC types to Arrow types** -- UC's own (Spark/Delta-flavored)
-    type system down to KernelLake's `DataType`, the same kind of table
-    `iceberg/schema_translation.cpp` already is for Iceberg's type system,
-    not a shared implementation (UC's types don't map 1:1 to Iceberg's).
-  - **Extraction of table format and storage location** -- UC's table
-    metadata reports whether a table is `DELTA`, `PARQUET`, or (less
-    commonly) `ICEBERG`-managed, plus its underlying cloud storage path;
-    this is a dispatch point to whichever existing resolver already
-    handles that format (`DeltaSourceResolver`, a plain Parquet path, or
-    `IcebergSourceResolver`), not a new execution path of its own.
-  - **Temporary cloud-credential handling** -- UC vends short-lived,
-    per-request-scoped credentials (its "temporary table credentials" API)
-    rather than static long-lived keys. These need to flow into
-    `ObjectStoreRegistry`'s existing S3 credential provider for the
-    duration of one query and never be logged or cached past their TTL --
-    a real, security-relevant gap from the S3 credential handling
-    KernelLake already has for statically-configured keys.
-  - **S3 object access** -- using those vended credentials against the
-    existing `S3ObjectStore` (`src/storage/s3_object_store.cpp`); no new
-    storage backend, just a new credential source feeding the existing one.
-  - **Delta-log processing for Delta tables** -- once UC resolves a table
-    to its underlying Delta location, reuses the existing
-    `delta_source_resolver.cpp`/`delta_table_resolution.cpp` path
-    unchanged (already functionally complete for Phase 4, see "Delta Lake
-    support" in "Done" above).
-  - **Parquet metadata and data reading** -- reuses the existing
-    `ParquetScanOperator` (`src/execution_cpu/acero_query_executor.cpp` /
-    `src/execution_gpu/parquet_scan_operator.cpp`) and
-    `parquet_metadata.cpp` path on both backends unchanged, once resolution
-    has handed back a plain Parquet source.
-  - **Enforcement of failures from UC without bypassing catalog
-    permissions** -- a UC permission denial (or any other UC-side error,
-    e.g. an expired/revoked temporary credential) must propagate as a
-    clear, user-visible failure. No fallback path may silently retry
-    against raw cloud storage directly (bypassing UC's own access check)
-    on a UC error -- that would defeat the entire point of a governed
-    catalog, and is exactly the kind of "fail clearly rather than silently
-    reinterpret" discipline this project already applies elsewhere (e.g.
-    Iceberg/Delta resolution errors, unsupported SQL constructs).
+- **Unity Catalog support: remaining gaps** -- the core read path (Phase 5
+  of the lakehouse roadmap) is now done, see "Unity Catalog support,
+  read-only, first vertical slice" in "Done" above. What's left, not
+  attempted this session:
+  - **GCS/Azure temporary credentials** -- UC's `temporary-table-credentials`
+    response also carries `gcp_oauth_token`/`azure_user_delegation_sas`
+    variants; `UnityCatalogClient::get_temporary_table_credentials()` only
+    parses `aws_temp_credentials` today and throws a clear `StorageError`
+    naming the gap if a response has neither (see that method's own
+    comment) -- this slice is AWS/S3-only throughout, matching the
+    original scoping request.
+  - **Catalog/schema `LIST` operations** -- only exact-name `GET
+    /tables/{full_name}` is implemented; no catalog or schema browsing (no
+    UC equivalent of `SHOW TABLES`), matching this project's existing
+    Iceberg/Delta scope (both are also exact-name-only, no `LIST`).
+  - **Caching `UnityCatalogClient`/its OAuth2 token across queries** --
+    constructed fresh per `resolve()` call today, the same deliberate MVP
+    simplification `IcebergSourceResolver`'s `IcebergRestCatalogClient` and
+    `DeltaSourceResolver`'s `DeltaTxnClient` already accept (see
+    `docs/ROADMAP.md`'s Iceberg REST catalog entries for the same
+    trade-off spelled out there).
+  - **Verification against a live Unity Catalog server** -- everything
+    below the SQL/dispatch layer was verified with a real loopback HTTP
+    server standing in for UC's REST API (real curl requests/responses,
+    real OAuth2 client-credentials flow, real JSON parsing -- see "Done"
+    above for the exact test list), not a live Databricks workspace or the
+    OSS `unitycatalog` server; the researched request/response shapes
+    (`docs.databricks.com`, `unitycatalog.io`) could still be wrong in a
+    way this test approach can't catch (a real field name mismatch, an
+    auth quirk specific to one deployment). Likewise, the AWS
+    temporary-credential path is verified by construction (compiles, the
+    right `S3ObjectStore` constructor gets called with the right
+    arguments) but not against a live bucket or MinIO -- no Docker
+    available in this session's dev environment to stand one up. Both are
+    real, not just formal, gaps -- flagged rather than silently assumed
+    correct.
 - **Iceberg per-row delete filtering and true schema evolution** -- both
   investigated this session (see the lakehouse roadmap's own "Whole-file
   row-level deletes" and partition-pruning entries above), and both found

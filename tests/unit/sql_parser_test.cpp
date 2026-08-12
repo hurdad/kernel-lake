@@ -99,6 +99,26 @@ TEST(SqlParser, RejectsReadIcebergWithMultipleArguments) {
   EXPECT_THROW((void)(parse_sql("SELECT a FROM read_iceberg('prod.db.orders', 'extra')")), SqlError);
 }
 
+TEST(SqlParser, ParsesReadUnityCatalogSource) {
+  const auto stmt = parse_sql("SELECT a FROM read_unity_catalog('prod.main.db.orders') WHERE a > 0");
+  ASSERT_EQ(stmt.from.paths.size(), 1u);
+  EXPECT_EQ(stmt.from.paths[0], "unitycatalog://prod.main.db.orders");
+}
+
+TEST(SqlParser, RejectsReadUnityCatalogWithMultipleArguments) {
+  EXPECT_THROW((void)(parse_sql("SELECT a FROM read_unity_catalog('prod.main.db.orders', 'extra')")), SqlError);
+}
+
+TEST(SqlParser, ParsesJoinBetweenParquetAndUnityCatalogSources) {
+  const auto stmt = parse_sql(
+      "SELECT a.x, b.y FROM read_parquet('/x.parquet') AS a "
+      "JOIN read_unity_catalog('prod.main.db.orders') AS b ON a.order_id = b.order_id");
+  ASSERT_TRUE(stmt.join.has_value());
+  EXPECT_EQ(stmt.join->first.paths[0], "/x.parquet");
+  ASSERT_EQ(stmt.join->steps.size(), 1u);
+  EXPECT_EQ(stmt.join->steps[0].source.paths[0], "unitycatalog://prod.main.db.orders");
+}
+
 TEST(SqlParser, ParsesJoinBetweenParquetAndIcebergSources) {
   const auto stmt = parse_sql(
       "SELECT a.x, b.y FROM read_parquet('/x.parquet') AS a "

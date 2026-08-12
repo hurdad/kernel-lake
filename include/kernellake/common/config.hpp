@@ -190,6 +190,33 @@ struct IcebergSection {
   std::unordered_map<std::string, IcebergCatalogSection> catalogs;
 };
 
+// One named Unity Catalog instance (src/unitycatalog/unity_catalog_client.cpp)
+// -- a deployment may talk to more than one workspace/instance, so this is a
+// map, keyed the same way IcebergSection::catalogs is.
+// `read_unity_catalog('instance.catalog.schema.table')`'s leading component
+// looks this up; `catalog.schema.table` is then resolved against Unity
+// Catalog's own REST API. Unlike IcebergCatalogSection, the OAuth2 token
+// endpoint isn't derivable from `uc_url` (Databricks uses
+// "https://<workspace>/oidc/v1/token", a different host/path shape than the
+// UC REST API itself; other UC deployments may differ again) -- it's always
+// an explicit field, required whenever credentials_kind is
+// "oauth2_client_credentials".
+struct UnityCatalogInstanceSection {
+  std::string uc_url;               // e.g. "https://<workspace>/api/2.1/unity-catalog"
+  std::string oauth2_token_endpoint;  // required for "oauth2_client_credentials"; e.g. ".../oidc/v1/token"
+  // "none" | "bearer_token" | "oauth2_client_credentials" (mirrors
+  // IcebergCatalogSection::credentials_kind's own convention).
+  std::string credentials_kind = "none";
+  std::string bearer_token;          // for "bearer_token"
+  std::string oauth2_client_id;      // for "oauth2_client_credentials"
+  std::string oauth2_client_secret;  // for "oauth2_client_credentials"
+  std::string oauth2_scope;          // optional; for "oauth2_client_credentials"
+};
+
+struct UnityCatalogSection {
+  std::unordered_map<std::string, UnityCatalogInstanceSection> instances;
+};
+
 // Delta Lake read support (src/delta/) talks to a separate, standalone
 // delta-txn-service (a Rust gRPC service -- deliberately kept out of this
 // project's own build, see cmake/ThirdPartyDeltaTxnProto.cmake) as a
@@ -373,6 +400,7 @@ struct EngineConfig {
   MemorySection memory;
   StorageSection storage;
   IcebergSection iceberg;
+  UnityCatalogSection unity_catalog;
   DeltaSection delta;
   LoggingSection logging;
   ProfilingSection profiling;

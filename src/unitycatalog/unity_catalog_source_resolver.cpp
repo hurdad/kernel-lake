@@ -1,0 +1,140 @@
+#include "kernellake/unitycatalog/unity_catalog_source_resolver.hpp"
+
+#include <fmt/format.h>
+
+#include <algorithm>
+#include <memory>
+#include <string>
+#include <vector>
+
+#include "kernellake/common/errors.hpp"
+#include "kernellake/delta/delta_table_resolution.hpp"
+#include "kernellake/delta/delta_txn_client.hpp"
+#include "kernellake/iceberg/iceberg_table_resolution.hpp"
+#include "kernellake/iceberg/rest_catalog_client.hpp"
+#include "kernellake/storage/s3_object_store.hpp"
+#include "kernellake/unitycatalog/unity_catalog_client.hpp"
+
+namespace kernellake::unitycatalog {
+
+namespace {
+
+constexpr std::string_view kScheme = "unitycatalog";
+
+struct QualifiedName {
+  std::string instance;
+  std::string catalog;
+  std::string schema;
+  std::string table;
+};
+
+// "instance.catalog.schema.table" -> the four parts. Exactly four --
+// unlike Iceberg's own namespace (which can nest arbitrarily deep), Unity
+// Catalog's own naming is always exactly catalog.schema.table (a fixed
+// 3-level hierarchy), plus this project's own instance-alias prefix in
+// front (see UnityCatalogSourceResolver's own doc comment for why).
+QualifiedName parse_qualified_name(const std::string& text) {
+  std::vector<std::string> parts;
+  std::string current;
+  for (const char c : text) {
+    if (c == '.') {
+      parts.push_back(current);
+      current.clear();
+    } else {
+      current += c;
+    }
+  }
+  parts.push_back(current);
+
+  const bool has_empty_part =
+      std::any_of(parts.begin(), parts.end(), [](const std::string& p) { return p.empty(); });
+  if (parts.size() != 4 || has_empty_part) {
+    throw StorageError(fmt::format(
+        "read_unity_catalog(...): '{}' isn't a valid instance.catalog.schema.table reference (need exactly "
+        "4 non-empty, dot-separated parts: a configured instance name, then Unity Catalog's own "
+        "catalog.schema.table)",
+        text));
+  }
+  return QualifiedName{parts[0], parts[1], parts[2], parts[3]};
+}
+
+}  // namespace
+
+bool UnityCatalogSourceResolver::can_resolve(const std::vector<std::string>& sources) const {
+  return sources.size() == 1 && Uri(sources[0]).scheme() == kScheme;
+}
+
+ResolvedTable UnityCatalogSourceResolver::resolve(ObjectStore& store, const std::vector<std::string>& sources,
+                                                  const std::vector<PushablePredicate>& /*predicates*/) {
+  const std::string& source = sources.at(0);
+  const std::size_t scheme_end = source.find("://");
+  const QualifiedName name = parse_qualified_name(source.substr(scheme_end + 3));
+
+  const auto it = unity_catalog_config_.instances.find(name.instance);
+  if (it == unity_catalog_config_.instances.end()) {
+    throw ConfigurationError(fmt::format(
+        "read_unity_catalog(...): no unity_catalog.instances entry named '{}' is configured", name.instance));
+  }
+
+  // Constructed fresh per call rather than cached across queries -- same
+  // deliberate MVP simplification IcebergSourceResolver's own
+  // IcebergRestCatalogClient and DeltaSourceResolver's own DeltaTxnClient
+  // already use.
+  UnityCatalogClient client(it->second);
+  const UnityCatalogTableInfo table = client.get_table(name.catalog, name.schema, name.table);
+
+  // Only fetch and apply Unity Catalog's vended temporary credentials when
+  // the table's storage actually lives in S3 -- a local-filesystem storage
+  // location (real for a Unity Catalog server's own local/dev-mode
+  // storage, and for this project's own tests) needs no credential
+  // exchange at all, and building an S3ObjectStore for a non-"s3://"
+  // location would fail outright rather than do anything useful. Left as
+  // the shared `store` parameter (the caller's own ObjectStoreRegistry) in
+  // that case, exactly like a plain read_parquet(...)/read_delta(...)
+  // source already is.
+  std::unique_ptr<ObjectStore> temp_store;
+  ObjectStore* data_store = &store;
+  const bool is_delta_or_parquet =
+      table.data_source_format == "DELTA" || table.data_source_format == "PARQUET" ||
+      table.data_source_format.empty();
+  if (is_delta_or_parquet && Uri(table.storage_location).scheme() == "s3") {
+    const UnityCatalogTemporaryCredentials credentials =
+        client.get_temporary_table_credentials(table.table_id, "READ");
+    temp_store = std::make_unique<S3ObjectStore>(s3_config_.options, credentials.access_key_id,
+                                                 credentials.secret_access_key, credentials.session_token);
+    data_store = temp_store.get();
+  }
+
+  if (table.data_source_format == "DELTA") {
+    if (delta_config_.grpc_endpoint.empty()) {
+      throw ConfigurationError(fmt::format(
+          "read_unity_catalog(...): table '{}' is Delta-formatted, but no delta.grpc_endpoint is "
+          "configured (see DeltaSection in config.hpp) -- Unity Catalog only brokers the table's "
+          "identity/credentials, not the Delta log itself",
+          source));
+    }
+    delta::DeltaTxnClient delta_client(delta_config_);
+    return delta::resolve_delta_table(*data_store, delta_client, table.storage_location);
+  }
+
+  if (table.data_source_format == "ICEBERG") {
+    IcebergCatalogSection iceberg_config;
+    iceberg_config.catalog_uri = fmt::format("{}/iceberg", it->second.uc_url);
+    iceberg_config.prefix = name.catalog;
+    iceberg_config.credentials_kind = "bearer_token";
+    iceberg_config.bearer_token = client.bearer_token_for_request();
+    iceberg::IcebergRestCatalogClient iceberg_client(iceberg_config);
+    return iceberg::resolve_iceberg_table(store, iceberg_client, {name.schema}, name.table, {});
+  }
+
+  if (is_delta_or_parquet) {
+    return resolve_table(*data_store, {table.storage_location});
+  }
+
+  throw StorageError(fmt::format(
+      "read_unity_catalog(...): table '{}' has data_source_format '{}', which isn't supported yet (only "
+      "DELTA, PARQUET, and ICEBERG are) -- see docs/ROADMAP.md",
+      source, table.data_source_format));
+}
+
+}  // namespace kernellake::unitycatalog

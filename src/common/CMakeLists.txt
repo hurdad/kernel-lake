@@ -2,6 +2,7 @@ add_library(kernellake_common STATIC
   config.cpp
   logging.cpp
   date_util.cpp
+  http_client.cpp
 )
 
 target_include_directories(kernellake_common PUBLIC
@@ -29,4 +30,5 @@ target_link_libraries(kernellake_common PUBLIC
   spdlog::spdlog
   fmt::fmt
   Arrow::arrow_static
+  PkgConfig::CURL
 )
