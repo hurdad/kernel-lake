@@ -139,7 +139,10 @@ Catalog server and a real MinIO, not just reasoned about: see
   implementation notes" below
 - `IN (literal, ...)`/`NOT IN (...)` (desugared at bind time into an
   equivalent `OR`/`AND` chain of equality comparisons -- no new GPU
-  execution support needed, and no scalar-subquery form `IN (SELECT ...)`)
+  execution support needed) and `IN (SELECT ...)`/`NOT IN (SELECT ...)`,
+  a non-correlated multi-row subquery source resolved into the same
+  literal-list form before binding -- see "`IN (SELECT ...)` subqueries"
+  below
 - `CASE WHEN ... THEN ... [WHEN ...] [ELSE ...] END`, both simple
   (`CASE x WHEN ...`) and searched forms. Scope differs by backend: the CPU
   backend supports it everywhere (`WHERE`, `SELECT` list, `GROUP BY` keys,
@@ -184,9 +187,11 @@ Not yet supported (fails clearly rather than being silently reinterpreted):
 functions, `CASE`/`EXTRACT` in `WHERE` (GPU only -- see above), any
 function other than the five aggregates and `EXTRACT` above, `EXTRACT`
 fields other than `YEAR`/`MONTH`/`DAY`, comma-style joins,
-`LEFT`/`RIGHT`/`FULL`/`CROSS` JOIN, and multi-key or non-equality join
-conditions. `HAVING` and subqueries are now supported, but narrowly --
-see "`HAVING` and scalar subqueries" below.
+`LEFT`/`RIGHT`/`FULL`/`CROSS` JOIN, subqueries in `FROM` (derived
+tables), `EXISTS`/correlated subqueries, and multi-key or non-equality
+join conditions. `HAVING` and two narrow subquery forms are now
+supported -- see "`HAVING` and scalar subqueries" and "`IN (SELECT ...)`
+subqueries" below.
 
 ### `HAVING` and scalar subqueries
 
@@ -201,16 +206,17 @@ Architecturally it's just a `LogicalFilter` inserted directly on top of
 enough to filter post-aggregation output; this was previously just never
 SQL-reachable.
 
-A subquery is accepted in exactly one place: as an operand inside
-`HAVING`'s own boolean expression (e.g. `HAVING SUM(x) > (SELECT ...)`,
-TPC-H Q11's shape). It must be **non-correlated** (bound independently
-against its own `FROM`/`JOIN` schema only -- it has no access to the
-outer query's tables or aliases) and must produce **exactly one row, one
-column** (a true scalar; `DOUBLE`/`INT64` results only, the only two
-types `SUM`/`COUNT`/`MIN`/`MAX`/`AVG` can actually produce). Anywhere
-else -- `WHERE`, `SELECT`, `FROM`, `GROUP BY`, join `ON` -- a subquery is
-still rejected with a clear `BindingError`
-(`Binder::bind_node(const sql::AstSubquery&, bool)`), and `IN`/`EXISTS`/
+A subquery is accepted as an operand inside `HAVING`'s own boolean
+expression (e.g. `HAVING SUM(x) > (SELECT ...)`, TPC-H Q11's shape) or,
+separately, as the source of a `WHERE`-clause `IN (SELECT ...)` (see
+"`IN (SELECT ...)` subqueries" below). Both forms are **non-correlated**
+(bound independently against their own `FROM`/`JOIN` schema only -- no
+access to the outer query's tables or aliases). A `HAVING` subquery must
+additionally produce **exactly one row, one column** (a true scalar;
+`DOUBLE`/`INT64`/`STRING` results only). Anywhere else -- bare in `WHERE`
+(not inside `IN`), `SELECT`, `FROM`, `GROUP BY`, join `ON` -- a subquery
+is still rejected with a clear `BindingError`
+(`Binder::bind_node(const sql::AstSubquery&, bool)`), and `EXISTS`/
 correlated subqueries are not supported at all.
 
 Implementation: `sql::resolve_subqueries()` (a pure, storage-independent
@@ -219,18 +225,63 @@ outer query is ever bound -- it replaces each `AstSubquery` node inside
 `having` with a literal by calling
 `QueryEngine::evaluate_scalar_subquery()`, which runs the subquery as its
 own fully independent bind -> plan -> optimize -> physical-plan -> execute
-cycle (recursively resolving any subquery *of its own* first) and
-converts the resulting one-row, one-column Arrow scalar into an AST
-literal. This subquery execution **always uses the CPU (Acero) backend**,
-regardless of the outer query's own `--backend` -- nesting a second
-`RmmEnvironment`/GPU-execution lifecycle inside `plan_logical()` risks the
-same "two `RmmEnvironment`s racing the one process-wide current-device-
-resource slot" hazard the Concurrency notes below already warn about
-elsewhere, and a scalar subquery's result is one number, not worth that
-risk. Because the binder has no I/O capability of its own (by design --
-see `ast.hpp`'s own header comment), this resolution step could not live
-in the binder itself; it needed a layer with real query-execution access,
-which only `QueryEngine` has.
+cycle (recursively resolving any subquery *of its own* first, `having`
+and `where` both) and converts the resulting one-row, one-column Arrow
+scalar into an AST literal. This subquery execution **always uses the CPU
+(Acero) backend**, regardless of the outer query's own `--backend` --
+nesting a second `RmmEnvironment`/GPU-execution lifecycle inside
+`plan_logical()` risks the same "two `RmmEnvironment`s racing the one
+process-wide current-device-resource slot" hazard the Concurrency notes
+below already warn about elsewhere, and a scalar subquery's result is one
+value, not worth that risk. Because the binder has no I/O capability of
+its own (by design -- see `ast.hpp`'s own header comment), this
+resolution step could not live in the binder itself; it needed a layer
+with real query-execution access, which only `QueryEngine` has.
+
+### `IN (SELECT ...)` subqueries
+
+`value IN (SELECT ...)` (and `NOT IN`) is accepted in `WHERE`, with the
+subquery as the IN list's source instead of a literal list -- TPC-H
+Q18's shape (`o_orderkey IN (SELECT l_orderkey FROM lineitem GROUP BY
+l_orderkey HAVING SUM(l_quantity) > 300)`). The subquery must be
+**non-correlated** (same rule as a `HAVING` subquery) but, unlike
+`HAVING`'s exactly-one-row contract, may return **any number of rows, one
+column** (`DOUBLE`/`INT64`/`STRING`).
+
+Implementation: `AstIn` gained a `subquery` field (`std::shared_ptr<
+AstSelectStatement>`, mutually exclusive with its existing `list` field)
+populated by `convert_in()` (`parser.cpp`) when `IN`'s operand is a
+subquery rather than a literal list -- hsql already parses this shape
+(the same `select` field `kExprSelect` uses), so no grammar work was
+needed, only accepting what was previously an explicit rejection.
+`sql::resolve_in_subqueries()` (a sibling to `resolve_subqueries()`, kept
+separate rather than generalizing it, since `HAVING` must keep its
+exactly-one-row contract unchanged) walks `WHERE`, replacing each
+matched `AstIn`'s `subquery` with a literal `list` via
+`QueryEngine::evaluate_list_subquery()` -- the same generic bind -> plan
+-> optimize -> physical-plan -> execute pipeline `evaluate_scalar_subquery()`
+uses (factored into a shared `QueryEngine::run_subquery()`), just without
+the row-count assertion, looping over every row instead of extracting
+one. By the time `bind_node(const AstIn&, bool)` (`binder.cpp`) runs,
+`subquery` is always null and `list` is always populated (or the whole
+`AstIn` node was replaced by a boolean literal, see below) --
+indistinguishable from an `IN` whose source was always a literal list, so
+the binder needed no changes at all. The resulting literal list is
+desugared into an `OR`-chain of equality comparisons exactly the way a
+literal `IN (1, 2, 3)` already is (see `IN (literal, ...)` above) -- a
+deliberately narrow mechanism for a subquery expected to return a modest
+number of rows (Q18's own `SUM(l_quantity) > 300` filter is tight even at
+large scale factors), not a general-purpose semi-join; there is no size
+cap, so a subquery returning a very large number of rows would build a
+correspondingly large expression tree rather than failing loudly.
+
+An empty subquery result is handled as standard SQL semantics require --
+`x IN ()` is always false and `x NOT IN ()` is always true, regardless of
+`x` -- by replacing the whole `AstIn` node with a boolean literal
+directly (`resolve_in_subqueries()`'s own empty-list branch) rather than
+reaching `bind_node`'s pre-existing "IN requires at least one value"
+check, which is about a malformed literal list, not a legitimately empty
+subquery result.
 
 `GROUP BY <name>` resolves `<name>` against the base-table schema first,
 then falls back to matching a `SELECT`-list output alias -- this is what
@@ -364,10 +415,12 @@ For that reason `QueryEngine` also exposes a split entry point:
 `explain(sql) -> PhysicalPlanPtr` (already reentrant -- parsing, binding,
 logical planning, optimization, and Parquet metadata inspection touch no
 shared mutable state -- with one exception: if the query has a `HAVING`
-subquery, planning now really executes it, on the CPU backend, as a side
-effect of `plan_logical()`; see "`HAVING` and scalar subqueries" above.
-This is not a new risk category, though -- `explain()` already performs
-real Parquet-metadata I/O during planning regardless) followed by
+subquery or a `WHERE ... IN (SELECT ...)` subquery, planning now really
+executes it, on the CPU backend, as a side effect of `plan_logical()`;
+see "`HAVING` and scalar subqueries"/"`IN (SELECT ...)` subqueries"
+above. This is not a new risk category, though -- `explain()` already
+performs real Parquet-metadata I/O during planning regardless) followed
+by
 `execute(const PhysicalPlanPtr&, RmmEnvironment&) -> QueryResult`, which
 takes an **externally owned** `RmmEnvironment` instead of building its own.
 A long-lived caller should construct exactly one `RmmEnvironment` at

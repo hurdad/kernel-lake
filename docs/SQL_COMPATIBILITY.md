@@ -4,11 +4,11 @@ A single, scannable reference for what SQL KernelLake accepts today. This
 is a compatibility matrix, not an implementation guide -- for *why* a
 given scope boundary exists, see `docs/ARCHITECTURE.md`'s "Supported SQL
 grammar (current)" section and its sub-sections (`HAVING`/scalar
-subqueries, Hash joins, DECIMAL support, LIKE/IN/CASE/CAST implementation
-notes). For which TPC-H queries this adds up to, see `docs/TPCH.md` and
-`docs/ROADMAP.md`'s "Done"/"Not yet started" sections. Everything below
-reflects the codebase as of the TPC-H Q11 addition (11 of 22 TPC-H
-queries supported).
+subqueries, `IN (SELECT ...)` subqueries, Hash joins, DECIMAL support,
+LIKE/IN/CASE/CAST implementation notes). For which TPC-H queries this
+adds up to, see `docs/TPCH.md` and `docs/ROADMAP.md`'s "Done"/"Not yet
+started" sections. Everything below reflects the codebase as of the
+TPC-H Q18 addition (12 of 22 TPC-H queries supported).
 
 KernelLake vendors `hyrise/sql-parser` (hsql) for grammar parsing, then
 applies its own, much narrower binder/logical-planner scope on top --
@@ -42,7 +42,7 @@ rejected at parse time.
 | `SELECT` list | Yes | Columns, aliases, `*`, expressions, aggregates |
 | `FROM` | Single source only | `read_parquet`/`read_iceberg`/`read_delta`/`read_unity_catalog` |
 | `JOIN ... ON` | Yes, N-way | `INNER` only, one equality key per step -- see "Joins" below |
-| `WHERE` | Yes | See "Expressions" below for what's allowed inside it |
+| `WHERE` | Yes | See "Expressions" below; also accepts one subquery form, `IN (SELECT ...)` -- see "Subqueries" |
 | `GROUP BY` | Yes | By base column, computed expression, or `SELECT`-list alias |
 | `HAVING` | Yes, narrow | Aggregates/`GROUP BY` keys only, plus one scalar subquery form -- see "Subqueries" |
 | `ORDER BY` | Yes | Multiple keys, `ASC`/`DESC` |
@@ -82,7 +82,7 @@ rejected at parse time.
 | `IS [NOT] NULL` | Yes | Both |
 | `LIKE` / `NOT LIKE` | Yes | Both, everywhere (`WHERE`, `SELECT`, `CASE` branch, aggregate argument) |
 | `IN (literal, ...)` / `NOT IN (...)` | Yes | Desugared at bind time into an OR/AND chain of equalities; no dedicated execution support needed |
-| `IN (SELECT ...)` | No | Only a literal list is accepted |
+| `IN (SELECT ...)` / `NOT IN (SELECT ...)` | Yes, narrow | Non-correlated, any row count, one column -- resolved to a literal list (same OR/AND desugar) before binding; see "Subqueries" |
 | `EXISTS` / correlated subqueries | No | |
 | `CASE WHEN ... THEN ... [ELSE ...] END` | Yes, backend-scoped | CPU: everywhere. GPU: `SELECT` list, `GROUP BY` keys, aggregate arguments -- **not yet in `WHERE`** |
 | `CAST(expr AS type)` | Yes | `INT`/`BIGINT`/`DOUBLE`/`VARCHAR(n)`/`DECIMAL(p, s)`; numeric-to-integer casts truncate (not round -- differs from DuckDB) |
@@ -91,22 +91,30 @@ rejected at parse time.
 
 ## Subqueries
 
-Exactly one form is supported: a **non-correlated scalar subquery as an
-operand inside `HAVING`'s own boolean expression**
-(`HAVING SUM(x) > (SELECT ...)`, TPC-H Q11's shape). It must:
+Exactly two forms are supported, both **non-correlated** (bound
+independently against their own `FROM`/`JOIN` schema, with no access to
+the outer query's tables or aliases) and both executed always on the CPU
+(Acero) backend regardless of the outer query's own `--backend`, as a
+side effect of planning (including inside `explain`):
 
-- Be non-correlated -- bound independently against its own `FROM`/`JOIN`
-  schema, with no access to the outer query's tables or aliases.
-- Return exactly one row, one column (`DOUBLE`/`INT64` only, the two
-  result types `SUM`/`COUNT`/`MIN`/`MAX`/`AVG` can actually produce).
-- Execution always runs on the CPU (Acero) backend regardless of the
-  outer query's own `--backend`, as a side effect of planning (including
-  inside `explain`).
+1. **A scalar subquery as an operand inside `HAVING`'s own boolean
+   expression** (`HAVING SUM(x) > (SELECT ...)`, TPC-H Q11's shape).
+   Must return exactly one row, one column (`DOUBLE`/`INT64`/`STRING`).
+2. **`value IN (SELECT ...)` / `NOT IN (SELECT ...)` in `WHERE`**
+   (`o_orderkey IN (SELECT l_orderkey FROM ... HAVING SUM(...) > 300)`,
+   TPC-H Q18's shape). May return any number of rows, one column
+   (`DOUBLE`/`INT64`/`STRING`); resolved into a literal list -- the same
+   OR-chain desugar a literal `IN (1, 2, 3)` already gets -- before
+   binding. An empty result is standard SQL semantics, not an error:
+   `IN ()` is always false, `NOT IN ()` is always true. No size cap on
+   the returned row count -- a narrow mechanism for a subquery expected
+   to return a modest number of rows (e.g. a tight `HAVING` filter), not
+   a general-purpose semi-join.
 
-A subquery anywhere else -- `WHERE`, `SELECT`, `FROM`, `GROUP BY`, join
-`ON` -- is rejected with a clear `BindingError`. `IN (SELECT ...)`,
-`EXISTS`/`NOT EXISTS`, correlated subqueries, and any subquery returning
-more than one row or more than one column are all unsupported.
+A subquery anywhere else -- bare in `WHERE` (not inside `IN`), `SELECT`,
+`FROM`, `GROUP BY`, join `ON` -- is rejected with a clear `BindingError`.
+`EXISTS`/`NOT EXISTS`, correlated subqueries, and a `HAVING` subquery
+returning more than one row or more than one column are all unsupported.
 
 ## Data types
 
@@ -157,27 +165,26 @@ The only two known gaps, both GPU-only:
 
 - `CASE`/`EXTRACT` in `WHERE` (`FilterOperator`'s own gap; not needed by
   any TPC-H query added so far).
-- HAVING-subquery execution always uses the CPU backend regardless of
-  `--backend` (a deliberate design choice, not a capability gap -- see
-  "Subqueries" above).
+- Subquery execution (`HAVING` or `IN`) always uses the CPU backend
+  regardless of `--backend` (a deliberate design choice, not a
+  capability gap -- see "Subqueries" above).
 
 ## Not supported
 
 `DISTINCT`, set operations (`UNION`/`INTERSECT`/`EXCEPT`), `WITH`/CTEs,
 `OFFSET`, window functions, subqueries in `FROM` (derived tables),
-`IN (SELECT ...)`, `EXISTS`/correlated subqueries, `LEFT`/`RIGHT`/`FULL`/
-`CROSS` JOIN, comma-style joins, multi-key or non-equality join
-conditions, `CASE`/`EXTRACT` in `WHERE` on the GPU backend, and any
-function beyond the five aggregates and `EXTRACT`. Each fails clearly at
-parse or bind time with a specific error rather than being silently
-reinterpreted.
+`EXISTS`/correlated subqueries, `LEFT`/`RIGHT`/`FULL`/`CROSS` JOIN,
+comma-style joins, multi-key or non-equality join conditions,
+`CASE`/`EXTRACT` in `WHERE` on the GPU backend, and any function beyond
+the five aggregates and `EXTRACT`. Each fails clearly at parse or bind
+time with a specific error rather than being silently reinterpreted.
 
 ## TPC-H query coverage
 
-11 of 22 TPC-H queries: **Q1, Q3, Q5, Q6, Q7, Q9, Q10, Q11, Q12, Q14,
-Q19**. See `docs/TPCH.md` for the generate/query/validate/benchmark
+12 of 22 TPC-H queries: **Q1, Q3, Q5, Q6, Q7, Q9, Q10, Q11, Q12, Q14,
+Q18, Q19**. See `docs/TPCH.md` for the generate/query/validate/benchmark
 workflow and `docs/ROADMAP.md`'s "Done" section for what each addition
 needed. Every remaining query is blocked on a feature in the "Not
 supported" list above (most commonly an outer join, a derived table, or
-`IN`/`EXISTS`/correlated subqueries) -- none of the "cheap," no-new-SQL-
+`EXISTS`/a correlated subquery) -- none of the "cheap," no-new-SQL-
 feature queries remain.

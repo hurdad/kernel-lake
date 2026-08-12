@@ -139,20 +139,42 @@ class QueryEngine {
                                             double* metadata_inspection_seconds_out = nullptr) const;
 
   // Runs `subquery_ast` as a genuinely separate, complete query (bind,
-  // logical-plan, optimize, physical-plan, execute) and returns its single
-  // scalar result as an AstLiteral -- see docs/ARCHITECTURE.md's HAVING
-  // section for the full scope (non-correlated, single-row/single-column
-  // only) and why this always executes on the CPU (Acero) backend
-  // regardless of the outer query's own configured one. Called by
+  // logical-plan, optimize, physical-plan, execute) on the CPU (Acero)
+  // backend, always -- regardless of the outer query's own configured
+  // backend, see docs/ARCHITECTURE.md's HAVING section for why. Shared by
+  // evaluate_scalar_subquery()/evaluate_list_subquery() below; recursively
+  // resolves `subquery_ast`'s own HAVING and WHERE-IN subqueries first
+  // (via sql::resolve_subqueries()/sql::resolve_in_subqueries()), so a
+  // subquery nested inside a subquery works for free regardless of which
+  // kind of subquery it is.
+  [[nodiscard]] QueryResult run_subquery(const sql::AstSelectStatement& subquery_ast) const;
+
+  // Returns `subquery_ast`'s single scalar result as an AstLiteral -- see
+  // docs/ARCHITECTURE.md's HAVING section for the full scope
+  // (non-correlated, single-row/single-column only). Called by
   // plan_logical() (via sql::resolve_subqueries()) to resolve every
   // AstSubquery reachable from a HAVING clause before the outer query is
   // bound -- the physical plan's own HAVING filter needs a real literal
-  // threshold, not a placeholder. Recursively resolves `subquery_ast`'s
-  // own HAVING subqueries first, so a subquery nested inside a subquery
-  // works for free. Throws ExecutionError if the result isn't exactly one
-  // row and one column, or if that column's Arrow type isn't one of the
-  // few this project's aggregates can actually produce.
+  // threshold, not a placeholder. Throws ExecutionError if the result
+  // isn't exactly one row and one column, or if that column's Arrow type
+  // isn't one of the few this project's aggregates can actually produce.
   [[nodiscard]] sql::AstLiteral evaluate_scalar_subquery(const sql::AstSelectStatement& subquery_ast) const;
+
+  // Returns `subquery_ast`'s single-column result as a list of AstLiterals
+  // (possibly empty -- see sql::resolve_in_subqueries()'s own handling of
+  // that case). Called by plan_logical() (via sql::resolve_in_subqueries())
+  // to resolve every IN-subquery reachable from a WHERE clause before the
+  // outer query is bound -- TPC-H Q18's shape
+  // (`o_orderkey IN (SELECT l_orderkey FROM ... HAVING SUM(...) > 300)`).
+  // Throws ExecutionError if the result isn't exactly one column, or if
+  // that column's Arrow type isn't one this project can convert to a
+  // literal. Deliberately narrow: the returned list becomes an OR-chain of
+  // equality comparisons at bind time (the same desugar a literal IN list
+  // already gets), so this is scoped to a subquery expected to return a
+  // modest number of rows, not a general-purpose semi-join -- see
+  // sql::resolve_in_subqueries()'s own doc comment.
+  [[nodiscard]] std::vector<sql::AstLiteral> evaluate_list_subquery(
+      const sql::AstSelectStatement& subquery_ast) const;
 
   EngineConfig config_;
   // Declared after config_ (member init order follows declaration order):

@@ -118,9 +118,22 @@ struct AstLike {
 // into a chain of `=`/`<>` comparisons combined with OR/AND -- see
 // binder.cpp -- rather than needing its own Expression/GPU-operator
 // support.
+//
+// `subquery` is the alternative, mutually-exclusive-with-`list` source
+// for `value IN (SELECT ...)` (TPC-H Q18's shape) -- null unless the IN
+// operand was a subquery, in which case `list` starts empty. Exactly
+// like a HAVING scalar subquery (see `AstSubquery`), it must be
+// non-correlated and is resolved away before binding: unlike HAVING's
+// single-literal result, this is resolved into a full literal `list`
+// (kernellake::sql::resolve_in_subqueries(), run from
+// QueryEngine::plan_logical() on `WHERE`) so `bind_node(const AstIn&,
+// bool)` in binder.cpp needs no changes at all -- by the time binding
+// happens, `subquery` is always null and `list` is always populated,
+// indistinguishable from an IN whose source was always a literal list.
 struct AstIn {
   AstExprPtr value;
   std::vector<AstExprPtr> list;
+  std::shared_ptr<AstSelectStatement> subquery;
   bool negated = false;
 };
 

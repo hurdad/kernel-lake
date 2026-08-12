@@ -718,6 +718,11 @@ class Binder {
   }
 
   ExpressionPtr bind_node(const AstIn& node, bool allow_aggregates) {
+    if (node.subquery != nullptr) {
+      throw BindingError(
+          "IN (SELECT ...) is only supported as a WHERE-clause predicate over a non-correlated "
+          "subquery returning a single column (e.g. 'WHERE x IN (SELECT ...)'), not here");
+    }
     if (node.list.empty()) {
       throw BindingError("IN requires at least one value");
     }

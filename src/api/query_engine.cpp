@@ -25,6 +25,47 @@ namespace kernellake {
 QueryEngine::QueryEngine(EngineConfig config) : config_(std::move(config)), store_(config_.storage) {}
 
 namespace {
+
+// DOUBLE/INT64/STRING cover both use cases this function serves: a HAVING
+// scalar subquery's result is always DOUBLE/INT64 (SUM/AVG -> DOUBLE,
+// COUNT/CountStar -> INT64; MIN/MAX pass their argument's own type
+// through, which for every currently-generated TPC-H column is itself
+// DOUBLE or INT64) -- see docs/ARCHITECTURE.md's HAVING section. An
+// IN-subquery's result, though, is typically a plain (non-aggregated)
+// grouped/selected column, which is just as often STRING (e.g.
+// `region IN (SELECT region FROM ...)`) as numeric. Shared by
+// evaluate_scalar_subquery()/evaluate_list_subquery() below, since both
+// convert one Arrow scalar to one AstLiteral, just a different number of
+// times.
+sql::AstLiteral scalar_to_literal(const std::shared_ptr<arrow::Scalar>& scalar) {
+  if (!scalar->is_valid) {
+    return sql::AstLiteral{sql::AstLiteralKind::Null, 0, 0.0, {}, false};
+  }
+  if (scalar->type->id() == arrow::Type::DOUBLE) {
+    return sql::AstLiteral{sql::AstLiteralKind::Float,
+                           0,
+                           std::static_pointer_cast<arrow::DoubleScalar>(scalar)->value,
+                           {},
+                           false};
+  }
+  if (scalar->type->id() == arrow::Type::INT64) {
+    return sql::AstLiteral{sql::AstLiteralKind::Integer,
+                           std::static_pointer_cast<arrow::Int64Scalar>(scalar)->value,
+                           0.0,
+                           {},
+                           false};
+  }
+  if (scalar->type->id() == arrow::Type::STRING) {
+    return sql::AstLiteral{sql::AstLiteralKind::String, 0, 0.0,
+                           std::static_pointer_cast<arrow::StringScalar>(scalar)->value->ToString(), false};
+  }
+  throw ExecutionError(
+      fmt::format("a subquery returned a {} value, which isn't supported (only DOUBLE/INT64/STRING -- the "
+                  "result types SUM/COUNT/MIN/MAX/AVG can actually produce, or a plain grouped INT64/DOUBLE/"
+                  "STRING column -- are)",
+                  scalar->type->ToString()));
+}
+
 ResolvedTable inspect_source(ObjectStore& store, const std::vector<std::string>& paths,
                              TableSourceResolver* extra_resolver, double* elapsed_seconds_out) {
   const auto start = std::chrono::steady_clock::now();
@@ -42,12 +83,17 @@ ResolvedTable inspect_source(ObjectStore& store, const std::vector<std::string>&
 }
 }  // namespace
 
-sql::AstLiteral QueryEngine::evaluate_scalar_subquery(const sql::AstSelectStatement& subquery_ast) const {
+QueryResult QueryEngine::run_subquery(const sql::AstSelectStatement& subquery_ast) const {
   sql::AstSelectStatement resolved = subquery_ast;
   if (resolved.having != nullptr) {
     resolved.having = sql::resolve_subqueries(resolved.having, [this](const sql::AstSelectStatement& nested) {
       return evaluate_scalar_subquery(nested);
     });
+  }
+  if (resolved.where != nullptr) {
+    resolved.where = sql::resolve_in_subqueries(
+        resolved.where,
+        [this](const sql::AstSelectStatement& nested) { return evaluate_list_subquery(nested); });
   }
 
   // Same per-call resolver construction plan_logical()/explain() already
@@ -89,8 +135,13 @@ sql::AstLiteral QueryEngine::evaluate_scalar_subquery(const sql::AstSelectStatem
   // Always the CPU backend, regardless of config_.engine.backend -- see
   // this method's own header comment (query_engine.hpp) for why nesting a
   // second GPU/RmmEnvironment lifecycle inside plan_logical() isn't worth
-  // the risk for what's ultimately one scalar number.
-  const QueryResult result = execute_cpu(physical);
+  // the risk for what's ultimately one scalar (or one small column) of
+  // values.
+  return execute_cpu(physical);
+}
+
+sql::AstLiteral QueryEngine::evaluate_scalar_subquery(const sql::AstSelectStatement& subquery_ast) const {
+  const QueryResult result = run_subquery(subquery_ast);
 
   if (result.schema == nullptr || result.schema->num_fields() != 1) {
     throw ExecutionError(fmt::format("a HAVING subquery must return exactly one column, got {}",
@@ -114,33 +165,33 @@ sql::AstLiteral QueryEngine::evaluate_scalar_subquery(const sql::AstSelectStatem
     throw ExecutionError(fmt::format("failed to read a HAVING subquery's scalar result: {}",
                                      scalar_result.status().ToString()));
   }
-  const std::shared_ptr<arrow::Scalar>& scalar = *scalar_result;
-  if (!scalar->is_valid) {
-    return sql::AstLiteral{sql::AstLiteralKind::Null, 0, 0.0, {}, false};
+  return scalar_to_literal(*scalar_result);
+}
+
+std::vector<sql::AstLiteral> QueryEngine::evaluate_list_subquery(
+    const sql::AstSelectStatement& subquery_ast) const {
+  const QueryResult result = run_subquery(subquery_ast);
+
+  if (result.schema == nullptr || result.schema->num_fields() != 1) {
+    throw ExecutionError(fmt::format("an IN (SELECT ...) subquery must return exactly one column, got {}",
+                                     result.schema != nullptr ? result.schema->num_fields() : 0));
   }
-  // DOUBLE/INT64 are the only two Arrow types this project's own
-  // aggregates can actually produce (SUM/AVG -> DOUBLE, COUNT/CountStar
-  // -> INT64; MIN/MAX pass their argument's own type through, which for
-  // every currently-generated TPC-H column is itself DOUBLE or INT64) --
-  // see docs/ARCHITECTURE.md's HAVING section.
-  if (scalar->type->id() == arrow::Type::DOUBLE) {
-    return sql::AstLiteral{sql::AstLiteralKind::Float,
-                           0,
-                           std::static_pointer_cast<arrow::DoubleScalar>(scalar)->value,
-                           {},
-                           false};
+  std::vector<sql::AstLiteral> literals;
+  for (const std::shared_ptr<arrow::RecordBatch>& batch : result.batches) {
+    const std::shared_ptr<arrow::Array>& column = batch->column(0);
+    literals.reserve(literals.size() + static_cast<std::size_t>(batch->num_rows()));
+    for (std::int64_t row = 0; row < batch->num_rows(); ++row) {
+      const arrow::Result<std::shared_ptr<arrow::Scalar>> scalar_result = column->GetScalar(row);
+      if (!scalar_result.ok()) {
+        throw ExecutionError(fmt::format("failed to read an IN (SELECT ...) subquery's result: {}",
+                                         scalar_result.status().ToString()));
+      }
+      literals.push_back(scalar_to_literal(*scalar_result));
+    }
   }
-  if (scalar->type->id() == arrow::Type::INT64) {
-    return sql::AstLiteral{sql::AstLiteralKind::Integer,
-                           std::static_pointer_cast<arrow::Int64Scalar>(scalar)->value,
-                           0.0,
-                           {},
-                           false};
-  }
-  throw ExecutionError(fmt::format(
-      "a HAVING subquery returned a {} value, which isn't supported (only DOUBLE/INT64 -- the result "
-      "types SUM/COUNT/MIN/MAX/AVG can actually produce here -- are)",
-      scalar->type->ToString()));
+  // An empty result is legitimate (`x IN ()` is always false) -- handled
+  // by sql::resolve_in_subqueries() itself, not an error here.
+  return literals;
 }
 
 LogicalPlanPtr QueryEngine::plan_logical(std::string_view sql,
@@ -155,6 +206,17 @@ LogicalPlanPtr QueryEngine::plan_logical(std::string_view sql,
     // AstSubquery&, bool) instead, which rejects it with a clear error.
     ast.having = sql::resolve_subqueries(
         ast.having, [this](const sql::AstSelectStatement& sub) { return evaluate_scalar_subquery(sub); });
+  }
+  if (ast.where != nullptr) {
+    // Same rationale as the HAVING resolution above, run separately since
+    // an IN-subquery can legitimately return many rows (unlike HAVING's
+    // exactly-one-row/one-column contract) -- see
+    // sql::resolve_in_subqueries()'s own doc comment. Any AstIn surviving
+    // this with `subquery` still set (i.e. one that wasn't inside WHERE)
+    // reaches Binder::bind_node(const AstIn&, bool) instead, which rejects
+    // it with a clear error.
+    ast.where = sql::resolve_in_subqueries(
+        ast.where, [this](const sql::AstSelectStatement& sub) { return evaluate_list_subquery(sub); });
   }
   // Constructed fresh per call -- see IcebergSourceResolver's/
   // DeltaSourceResolver's/UnityCatalogSourceResolver's own comments on why

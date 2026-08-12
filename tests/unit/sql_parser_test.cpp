@@ -432,5 +432,47 @@ TEST(SqlParser, RejectsSubqueryOutsideHaving) {
   EXPECT_TRUE(std::holds_alternative<AstSubquery>(comparison->right->node));
 }
 
+// `x IN (SELECT ...)` -- TPC-H Q18's shape. Parses into an AstIn with
+// `subquery` set to the fully-converted nested statement and `list` left
+// empty (mutually exclusive; see ast.hpp's own comment on AstIn).
+TEST(SqlParser, ParsesInWithSubquery) {
+  const auto stmt = parse_sql(
+      "SELECT a FROM read_parquet('/x.parquet') WHERE a IN "
+      "(SELECT b FROM read_parquet('/y.parquet') GROUP BY b HAVING SUM(b) > 300)");
+  ASSERT_NE(stmt.where, nullptr);
+  const auto* in = std::get_if<AstIn>(&stmt.where->node);
+  ASSERT_NE(in, nullptr);
+  EXPECT_FALSE(in->negated);
+  EXPECT_TRUE(in->list.empty());
+  ASSERT_NE(in->subquery, nullptr);
+  ASSERT_EQ(in->subquery->from.paths.size(), 1u);
+  EXPECT_EQ(in->subquery->from.paths[0], "/y.parquet");
+  ASSERT_NE(in->subquery->having, nullptr);
+}
+
+TEST(SqlParser, ParsesNotInWithSubquery) {
+  const auto stmt = parse_sql(
+      "SELECT a FROM read_parquet('/x.parquet') WHERE a NOT IN "
+      "(SELECT b FROM read_parquet('/y.parquet'))");
+  ASSERT_NE(stmt.where, nullptr);
+  const auto* in = std::get_if<AstIn>(&stmt.where->node);
+  ASSERT_NE(in, nullptr);
+  EXPECT_TRUE(in->negated);
+  EXPECT_TRUE(in->list.empty());
+  ASSERT_NE(in->subquery, nullptr);
+}
+
+// Regression guard: a plain literal IN list must keep `subquery == nullptr`
+// -- the new field must not accidentally get populated for the
+// already-working literal-list path.
+TEST(SqlParser, InWithLiteralListHasNoSubquery) {
+  const auto stmt = parse_sql("SELECT a FROM read_parquet('/x.parquet') WHERE a IN (1, 2, 3)");
+  ASSERT_NE(stmt.where, nullptr);
+  const auto* in = std::get_if<AstIn>(&stmt.where->node);
+  ASSERT_NE(in, nullptr);
+  EXPECT_EQ(in->list.size(), 3u);
+  EXPECT_EQ(in->subquery, nullptr);
+}
+
 }  // namespace
 }  // namespace kernellake::sql

@@ -3581,6 +3581,85 @@ log` is the authoritative chronology if that ordering ever matters.
   `kernellake_gpu_tests` 101/101 pass, both zero regressions, confirmed
   on a real `gpu-dev-wsl2` rebuild against real GPU hardware.
 
+- **TPC-H Q18** -- a non-correlated, multi-row `IN (SELECT ...)`
+  subquery in `WHERE`, generalizing the `HAVING`-scalar-subquery
+  machinery Q11 shipped rather than inventing a new mechanism. Scoping
+  history worth recording: the next query was first picked as "LEFT
+  OUTER JOIN, to unlock Q13" -- research (two parallel `Explore` agents)
+  found Q13's canonical form actually needs *three* separate new
+  features together (`LEFT OUTER JOIN` itself, an extra `AND`'d
+  predicate inside `JOIN ... ON` that can't legally move to `WHERE` for
+  an outer join, and a derived-table/subquery-in-`FROM` so a
+  first-level aggregate's own output can be re-grouped by a second
+  query stage) -- a multi-day, ~3x-Q11-scope feature, not a contained
+  follow-up. Presented back and re-scoped to Q18 instead (deferred, not
+  abandoned -- see "Not yet started" below).
+
+  Design: `AstIn` (`ast.hpp`) gained a `subquery` field, mutually
+  exclusive with its existing literal `list` -- populated by
+  `convert_in()` (`parser.cpp`) when hsql's own `IN` operator carries a
+  `select` subquery instead of an `exprList` (hsql already parses this;
+  the prior code explicitly rejected it with
+  `unsupported("IN with a subquery ...")`, the one line removed to
+  unlock this). A new `sql::resolve_in_subqueries()` (a sibling to
+  `resolve_subqueries()`, not a generalization of it -- `HAVING` must
+  keep its exactly-one-row contract unchanged) walks `WHERE`, replacing
+  a matched `AstIn`'s `subquery` with a literal `list` via a new
+  `QueryEngine::evaluate_list_subquery()` (sharing a factored-out
+  `QueryEngine::run_subquery()` with `evaluate_scalar_subquery()` for
+  the generic bind -> plan -> optimize -> physical-plan -> execute
+  pipeline, differing only in the row-count assertion and how many
+  Arrow scalars get converted to `AstLiteral`s). By the time
+  `bind_node(const AstIn&, bool)` (`binder.cpp`) runs, `subquery` is
+  always null and `list` is always populated -- **no binder changes at
+  all**, confirmed directly rather than assumed. The resolved list
+  desugars into the same `OR`-chain of equality comparisons a literal
+  `IN (1, 2, 3)` already gets.
+
+  One real design decision made along the way: an empty subquery result
+  (`x IN ()`) is standard-SQL always-false (`NOT IN ()` always-true),
+  not an error -- `resolve_in_subqueries()` replaces the whole `AstIn`
+  node with a boolean literal directly in that case, rather than
+  reaching `bind_node`'s pre-existing "IN requires at least one value"
+  check (which is about a malformed literal list, not a legitimately
+  empty subquery result, and would have produced a confusing error for
+  a correct, unremarkable query). Also found and fixed while writing
+  end-to-end tests: `scalar_to_literal()` (shared by both subquery
+  kinds) only handled `DOUBLE`/`INT64`, inherited unchanged from
+  `HAVING`'s aggregate-only scope -- correct for `HAVING` (an aggregate
+  result), but wrong for `IN`, whose source is typically a plain
+  grouped/selected column just as often `STRING` (e.g.
+  `region IN (SELECT region FROM ...)`) as numeric. Added `STRING`
+  support; a real test using a string column caught this before it
+  shipped, not a hypothetical gap.
+
+  User confirmed no size cap is needed on the resolved list for now
+  (matches Q11's own precedent of no artificial limits) -- Q18's real
+  `SUM(l_quantity) > 300` filter stays tight even at large scale
+  factors, and the mechanism is already documented as narrow, not
+  general-purpose.
+
+  Verified for real: `tools/validate_tpch.py --query 18` exact match
+  against DuckDB on both the CPU and GPU backends at SF0.01 (1 row --
+  the threshold is genuinely tight at this scale, confirmed correct via
+  a direct DuckDB cross-check of the exact same query outside the
+  validation tool too), and `--query all` (now 12 queries:
+  Q1/Q3/Q5/Q6/Q7/Q9/Q10/Q11/Q12/Q14/Q18/Q19) all still match with zero
+  regressions on both backends. Manually smoke-tested the empty-result
+  (`IN ()`/`NOT IN ()`) and non-correlation-enforcement edge cases via
+  `kernellake query` directly before writing them up as unit tests. 10
+  new unit tests added (`sql_parser_test.cpp`: `IN (SELECT ...)`/
+  `NOT IN (SELECT ...)` parsing, plus a regression guard that a literal
+  IN list still leaves `subquery` null; `binder_test.cpp`: rejects an
+  IN-subquery that reached binding unresolved;
+  `query_engine_execute_cpu_test.cpp`: real IN-subquery filtering,
+  AND'd with another `WHERE` conjunct, empty-result true/false
+  semantics, working alongside a real `JOIN`, and a multi-column
+  subquery `ExecutionError`) -- `kernellake_unit_tests` 438/438 pass (up
+  from 428) and `kernellake_gpu_tests` 101/101 pass, both zero
+  regressions, confirmed on a real `gpu-dev-wsl2` rebuild against real
+  GPU hardware.
+
 ## Not yet started
 
 - **Unity Catalog support: remaining gaps** -- the core read path (Phase 5
@@ -3772,12 +3851,81 @@ log` is the authoritative chronology if that ordering ever matters.
 - ~~Q11~~ -- done, see "TPC-H Q11" in "Done" above. `HAVING` and a
   narrow non-correlated scalar subquery are now supported (see
   `docs/ARCHITECTURE.md`'s "`HAVING` and scalar subqueries" section for
-  the exact scope). Every *other* still-missing query needs an outer
-  join, `DISTINCT`, set operations, `WITH`/CTEs, window functions, `IN`/
-  `EXISTS`, a correlated subquery, or a multi-row/multi-column subquery
-  -- none of which KernelLake's SQL layer supports yet (see
-  `docs/ARCHITECTURE.md`'s "Not yet supported" list) -- 11 of TPC-H's 22
-  queries now, down from 12
+  the exact scope).
+- ~~Q18~~ -- done, see "TPC-H Q18" in "Done" above. A narrow
+  non-correlated multi-row `IN (SELECT ...)` subquery in `WHERE` is now
+  also supported (see `docs/ARCHITECTURE.md`'s "`IN (SELECT ...)`
+  subqueries" section). Every *other* still-missing query needs an
+  outer join, `DISTINCT`, set operations, `WITH`/CTEs, window functions,
+  `EXISTS`, a correlated subquery, or a derived table (subquery in
+  `FROM`) -- none of which KernelLake's SQL layer supports yet (see
+  `docs/ARCHITECTURE.md`'s "Not yet supported" list) -- 12 of TPC-H's 22
+  queries now, down from 11
+- **LEFT OUTER JOIN (Q13's own blocker, plus two more features Q13
+  needs on top of it)** -- deferred, not abandoned, after research (two
+  parallel `Explore` agents) found Q13's canonical form needs three
+  separate new features together, not just outer join alone:
+  1. **`LEFT OUTER JOIN` itself.** hsql already parses it
+     (`hsql::JoinType::kJoinLeft`, both `LEFT JOIN` and `LEFT OUTER
+     JOIN` -- `OUTER` is a grammatical no-op); the rejection is one
+     `if (join->type != hsql::kJoinInner)` in `flatten_join_chain()`
+     (`parser.cpp`). `LogicalJoin`/`HashJoinNode` would need a join-type
+     field threaded through (currently absent, `explain_attributes()`
+     hardcodes the string `"INNER"`), and the joined schema's nullable
+     side needs its `DataType.nullable` widened to `true` (currently a
+     plain field concatenation with no adjustment). Acero already
+     supports `arrow::acero::JoinType::LEFT_OUTER` via the *same*
+     `HashJoinNodeOptions` constructor already used for `INNER` -- the
+     easy part. `cudf::hash_join` already exposes `left_join()` with an
+     identical signature to the `inner_join()` the GPU
+     `HashJoinOperator` calls today; the real GPU-side work is
+     switching the right-side gather's out-of-bounds policy from
+     `DONT_CHECK` to `NULLIFY` (so an unmatched left row's right-side
+     columns come back genuinely null, not garbage) and removing the
+     empty-build-side fast-path short-circuit (which today assumes an
+     empty build side can never produce a row -- true for `INNER`,
+     false for `LEFT OUTER`, where every left row must still be
+     emitted). Two real correctness hazards found during research, not
+     yet fixed (nothing to fix until `LEFT JOIN` itself exists): the
+     physical planner's size-aware build-side swap
+     (`physical_planner.cpp`) is only safe because `INNER JOIN` is
+     symmetric -- swapping sides for a `LEFT JOIN` would silently
+     change which side keeps its unmatched rows; and the optimizer's
+     `push_predicate_through_join()` (`optimizer.cpp`) is only
+     unconditionally valid today because there's no null-extension
+     semantics to worry about -- pushing a predicate on the nullable
+     side of a future `LEFT JOIN` down below it would change results.
+  2. **An extra `AND`'d predicate inside `JOIN ... ON`**, not just a
+     single equality key. Q13's own `o_comment NOT LIKE
+     '%special%requests%'` is part of the `ON` clause, not `WHERE` --
+     and, unlike Q5's/Q9's own composite-join-key predicates (which
+     could safely move to `WHERE` since they're on `INNER JOIN`s),
+     moving it to `WHERE` for a `LEFT JOIN` would silently drop
+     unmatched/`NULL` customer rows, defeating the whole point of the
+     outer join. `extract_join_step_keys()` (`binder.cpp`) only ever
+     extracts a single equality key per step today; this needs real
+     new capability, not another WHERE-vs-ON placement trick.
+  3. **A derived table (subquery in `FROM`)**, the largest of the
+     three. Q13's own second-level `GROUP BY c_count` groups over the
+     *output* of a first-level per-customer aggregate
+     (`count(o_orderkey) as c_count`) -- confirmed structurally that
+     this can't be flattened into one flat query the way Q7's/Q9's own
+     derived tables were (those added no filtering of their own, purely
+     naming a computed `GROUP BY` key; Q13's is a genuine two-stage
+     aggregation pipeline). `AstSelectStatement::from` has no
+     derived-table variant at all today (`FROM (SELECT ...)` hits the
+     same `unsupported("joins and subqueries ...")` rejection any other
+     subquery in `FROM` gets, and `WITH` is rejected separately,
+     unconditionally, at the top of `convert_select_statement()`) --
+     `build_logical_plan()` only ever constructs one `LogicalAggregate`
+     per statement, and there's no dormant/partial CTE mechanism to
+     build on.
+
+  If resumed: implement `LEFT OUTER JOIN` as its own standalone,
+  tested engine feature first (real, contained value on its own,
+  the two correctness hazards above are worth fixing regardless of
+  Q13), then revisit whether Q13's other two blockers are worth a
+  second, separate project.
 - `CASE`/`EXTRACT` inside `WHERE` on the GPU backend (`FilterOperator`'s
   own gap, separate from the aggregate-argument fix above; the CPU backend
   already supports both via its one shared expression compiler) -- not

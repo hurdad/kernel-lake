@@ -729,5 +729,89 @@ TEST_F(QueryEngineExecuteCpuTest, HavingSubqueryCannotReferenceOuterQueryColumns
                BindingError);
 }
 
+// TPC-H Q18's own shape: `x IN (SELECT ...)` in WHERE, resolved into a
+// literal list (an OR-chain of equalities) before binding. Only region B
+// has a row with amount > 50 (100.0), so the subquery resolves to {"B"}
+// and the outer query returns exactly the 3 region-B rows.
+TEST_F(QueryEngineExecuteCpuTest, InSubqueryFiltersToMatchingRows) {
+  const QueryResult result = engine_.execute("SELECT region FROM read_parquet('" + path_ +
+                                             "') WHERE region IN (SELECT region FROM read_parquet('" + path_ +
+                                             "') WHERE amount > 50)");
+  EXPECT_EQ(result.rows_returned, 3);
+  const auto region_column =
+      std::static_pointer_cast<arrow::StringArray>(result.batches.front()->GetColumnByName("region"));
+  ASSERT_NE(region_column, nullptr);
+  for (std::int64_t i = 0; i < region_column->length(); ++i) {
+    EXPECT_EQ(region_column->GetString(i), "B");
+  }
+}
+
+// The IN-subquery is one conjunct in a larger AND-chain alongside a real
+// predicate on the outer table -- exactly Q18's own WHERE shape
+// (`o_orderkey IN (...) AND c_custkey = o_custkey AND ...`). Region B's
+// rows are 100.0/7.0/3.0; ANDing `amount > 5` narrows to just 100.0/7.0.
+TEST_F(QueryEngineExecuteCpuTest, InSubqueryAndedWithOtherWhereConjunctsMatchesExpectedRows) {
+  const QueryResult result = engine_.execute("SELECT amount FROM read_parquet('" + path_ +
+                                             "') WHERE region IN (SELECT region FROM read_parquet('" + path_ +
+                                             "') WHERE amount > 50) AND amount > 5");
+  EXPECT_EQ(result.rows_returned, 2);
+  const auto amount_column =
+      std::static_pointer_cast<arrow::DoubleArray>(result.batches.front()->GetColumnByName("amount"));
+  ASSERT_NE(amount_column, nullptr);
+  std::vector<double> amounts;
+  for (std::int64_t i = 0; i < amount_column->length(); ++i) {
+    amounts.push_back(amount_column->Value(i));
+  }
+  std::sort(amounts.begin(), amounts.end());
+  EXPECT_DOUBLE_EQ(amounts[0], 7.0);
+  EXPECT_DOUBLE_EQ(amounts[1], 100.0);
+}
+
+// `x IN (SELECT ... /* zero rows */)` is always false -- standard SQL
+// semantics for an empty set, handled by sql::resolve_in_subqueries()
+// itself (not an error) -- see that function's own doc comment.
+TEST_F(QueryEngineExecuteCpuTest, InSubqueryWithEmptyResultMatchesNoRows) {
+  const QueryResult result = engine_.execute("SELECT region FROM read_parquet('" + path_ +
+                                             "') WHERE region IN (SELECT region FROM read_parquet('" + path_ +
+                                             "') WHERE amount > 1000)");
+  EXPECT_EQ(result.rows_returned, 0);
+}
+
+// `x NOT IN (SELECT ... /* zero rows */)` is always true, the mirror image
+// of the empty-IN case above.
+TEST_F(QueryEngineExecuteCpuTest, NotInSubqueryWithEmptyResultMatchesAllRows) {
+  const QueryResult result = engine_.execute("SELECT COUNT(*) AS n FROM read_parquet('" + path_ +
+                                             "') WHERE region NOT IN (SELECT region FROM read_parquet('" +
+                                             path_ + "') WHERE amount > 1000)");
+  const auto n_column =
+      std::static_pointer_cast<arrow::Int64Array>(result.batches.front()->GetColumnByName("n"));
+  ASSERT_NE(n_column, nullptr);
+  EXPECT_EQ(n_column->Value(0), 6);
+}
+
+// Real end-to-end coverage of the exact Q18 shape: an IN-subquery in
+// WHERE alongside a real JOIN, not just a single-table query.
+TEST_F(QueryEngineExecuteCpuTest, InSubqueryWorksAlongsideARealJoin) {
+  const QueryResult result = engine_.execute("SELECT r.region_name, s.amount FROM read_parquet('" + path_ +
+                                             "') AS s JOIN read_parquet('" + regions_path_ +
+                                             "') AS r ON s.region = r.region WHERE s.region IN "
+                                             "(SELECT region FROM read_parquet('" +
+                                             path_ + "') WHERE amount > 50)");
+  EXPECT_EQ(result.rows_returned, 3);
+  const auto name_column =
+      std::static_pointer_cast<arrow::StringArray>(result.batches.front()->GetColumnByName("region_name"));
+  ASSERT_NE(name_column, nullptr);
+  for (std::int64_t i = 0; i < name_column->length(); ++i) {
+    EXPECT_EQ(name_column->GetString(i), "Beta");
+  }
+}
+
+TEST_F(QueryEngineExecuteCpuTest, InSubqueryReturningMultipleColumnsThrowsExecutionError) {
+  EXPECT_THROW((void)(engine_.execute("SELECT region FROM read_parquet('" + path_ +
+                                      "') WHERE region IN (SELECT region, amount FROM read_parquet('" +
+                                      path_ + "'))")),
+               ExecutionError);
+}
+
 }  // namespace
 }  // namespace kernellake

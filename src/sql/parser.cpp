@@ -342,6 +342,7 @@ std::optional<std::string> alias_of(const hsql::Expr& e) {
 }
 
 AstExprPtr convert_expr(const hsql::Expr* e, ConversionState& state);
+AstSelectStatement convert_select_statement(const hsql::SelectStatement* stmt, ConversionState& state);
 
 AstBinaryOp to_binary_op(hsql::OperatorType op) {
   switch (op) {
@@ -375,14 +376,18 @@ AstBinaryOp to_binary_op(hsql::OperatorType op) {
 }
 
 AstIn convert_in(const hsql::Expr* e, ConversionState& state) {
-  if (e->select != nullptr) {
-    unsupported("IN with a subquery (only a literal list is supported)");
-  }
-  if (e->expr == nullptr || e->exprList == nullptr) {
+  if (e->expr == nullptr) {
     unsupported("malformed IN expression");
   }
   AstIn in;
   in.value = convert_expr(e->expr, state);
+  if (e->select != nullptr) {
+    in.subquery = std::make_shared<AstSelectStatement>(convert_select_statement(e->select, state));
+    return in;
+  }
+  if (e->exprList == nullptr) {
+    unsupported("malformed IN expression");
+  }
   in.list.reserve(e->exprList->size());
   for (const hsql::Expr* item : *e->exprList) {
     in.list.push_back(convert_expr(item, state));
@@ -550,8 +555,6 @@ std::string to_cast_type_name(hsql::DataType type) {
   }
   unsupported("CAST to an unrecognized type");
 }
-
-AstSelectStatement convert_select_statement(const hsql::SelectStatement* stmt, ConversionState& state);
 
 AstExprPtr convert_expr(const hsql::Expr* e, ConversionState& state) {
   if (e == nullptr) {

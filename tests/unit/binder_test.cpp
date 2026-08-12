@@ -635,5 +635,17 @@ TEST(Binder, RejectsSubqueryOutsideHaving) {
   EXPECT_THROW((void)bind_query(stmt, Schema({Field{"a", int64_type(false)}})), BindingError);
 }
 
+TEST(Binder, RejectsUnresolvedInSubquery) {
+  // sql::resolve_in_subqueries() (QueryEngine::plan_logical()) is what
+  // actually resolves an IN-subquery's AstIn::subquery field into a real
+  // literal list before binding -- bind_query() alone (as called directly
+  // here, bypassing QueryEngine) never runs that resolution, so this must
+  // reach bind_node(const AstIn&, bool)'s own dedicated rejection rather
+  // than being silently misinterpreted as an empty IN list.
+  const auto stmt = sql::parse_sql(
+      "SELECT a FROM read_parquet('/x.parquet') WHERE a IN (SELECT a FROM read_parquet('/x.parquet'))");
+  EXPECT_THROW((void)bind_query(stmt, Schema({Field{"a", int64_type(false)}})), BindingError);
+}
+
 }  // namespace
 }  // namespace kernellake
