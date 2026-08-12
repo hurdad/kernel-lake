@@ -84,7 +84,9 @@ and two of the first file's three row groups couldn't contain any
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full pipeline, the
 GPU operator set, the CPU execution backend (Apache Arrow Acero), and the
-CPU/GPU build split. `kernellake query` runs on the GPU by default when
+CPU/GPU build split, or [docs/SQL_COMPATIBILITY.md](docs/SQL_COMPATIBILITY.md)
+for a single scannable reference of exactly what SQL is (and isn't)
+supported today. `kernellake query` runs on the GPU by default when
 built with CUDA (`--backend gpu`, the default) and throws a clear
 `ExecutionError` for that backend on a CPU-only build -- it never silently
 substitutes a CPU implementation without being asked. Pass `--backend cpu`
