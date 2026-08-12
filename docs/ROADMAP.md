@@ -3607,16 +3607,20 @@ log` is the authoritative chronology if that ordering ever matters.
   existing pattern: `kernellake_sql()` substitution, a fourth Spark temp
   view, cold-mode cache eviction) -- not yet done; also not yet run at any
   scale factor beyond the SF0.01 validation in "Done" above
-- A next TPC-H query beyond Q10 -- date-part extraction (`EXTRACT(YEAR
-  FROM ...)`) is done now (see "EXTRACT(YEAR/MONTH/DAY FROM ...) added"
-  in "Done" above), but Q7/Q9 (the two canonical queries needing it) also
-  need a `supplier` table (both) and `partsupp` (Q9) that
-  `tools/generate_tpch.py` doesn't generate yet, plus Q7 self-joins
-  `nation` against two different aliases -- not yet attempted, tracked
-  separately from the EXTRACT feature itself. Every *other* still-missing
-  query needs a subquery, `HAVING`, or an outer join, none of which
-  KernelLake's SQL layer supports yet (see `docs/ARCHITECTURE.md`'s "Not
-  yet supported" list)
+- Q7/Q9 -- date-part extraction (`EXTRACT(YEAR FROM ...)`) is done now
+  (see "EXTRACT(YEAR/MONTH/DAY FROM ...) added" in "Done" above), and the
+  `supplier` table gap is also closed now (added for Q5, see "TPC-H Q5"
+  in "Done" above). What's left: `partsupp` (Q9 only; still not generated
+  by `tools/generate_tpch.py`, no query needs it yet), and Q7 self-joins
+  `nation` against two different aliases (two separate
+  `read_parquet('{nation_data}')` sources with different aliases in the
+  same `JOIN` chain -- untried, but plausibly already legal the same way
+  Q5's `WHERE c_nationkey = s_nationkey` trick turned out to be for a
+  cross-join-source predicate the `JOIN...ON` chain itself couldn't
+  express). Not yet attempted, tracked separately from the EXTRACT/Q5
+  work itself. Every *other* still-missing query needs a subquery,
+  `HAVING`, or an outer join, none of which KernelLake's SQL layer
+  supports yet (see `docs/ARCHITECTURE.md`'s "Not yet supported" list)
 - `CASE`/`EXTRACT` inside `WHERE` on the GPU backend (`FilterOperator`'s
   own gap, separate from the aggregate-argument fix above; the CPU backend
   already supports both via its one shared expression compiler) -- not
@@ -3639,15 +3643,24 @@ log` is the authoritative chronology if that ordering ever matters.
   (libcudf/RMM), not available in this environment; every other
   CPU/server/otel-buildable file is now covered (see "Done" above)
 - CPU execution backend's Parquet scan is single-threaded, unlike Acero
-  itself. `acero_query_executor.cpp`'s `read_scan_table()` (every
-  `ParquetScanNode` is translated to a `"table_source"` Declaration fed by
-  this function, not Acero's own dataset-aware `"scan"` node) reads each
-  fragment with `parquet::arrow::FileReader::Make()` (no `use_threads` set,
-  defaults off) in a plain sequential loop across files, entirely before
-  Acero's own multi-threaded `ExecPlan` (`DeclarationToTable()`'s default
-  `ExecContext`, backed by `arrow::internal::GetCpuThreadPool()`) ever
-  starts -- so the scan itself, likely the dominant cost for a
-  near-unfiltered query like Q1, never uses more than one core. Noticed
+  itself. `acero_query_executor.cpp`'s `make_streaming_scan_reader()`
+  (every `ParquetScanNode` is translated to a `"record_batch_reader_source"`
+  Declaration fed by this function, not Acero's own dataset-aware `"scan"`
+  node -- this replaced an earlier `read_scan_table()`/`"table_source"`
+  design that fully materialized every fragment up front, fixed
+  separately, see "Done" above) still opens and reads each fragment with
+  `parquet::arrow::FileReader::Make()` (no `use_threads` set, defaults
+  off) strictly one at a time -- a single `ScanIterationState::mutex`
+  serializes `next_fragment_index` advancement across the whole scan, and
+  Acero's iterator callback only asks for the next batch once the
+  previous one is produced -- entirely independent of Acero's own
+  multi-threaded `ExecPlan` (`DeclarationToTable()`'s default
+  `ExecContext`, backed by `arrow::internal::GetCpuThreadPool()`), which
+  only parallelizes the operators *above* this reader. So the scan
+  itself, likely the dominant cost for a near-unfiltered query like Q1,
+  still never uses more than one core -- the streaming-reader fix changed
+  memory footprint, not scan parallelism, and this gap is unrelated to
+  and unaffected by that fix. Noticed
   investigating why KernelLake-CPU's SF100 Q1 (42.05s median) is
   disproportionately slower than both KernelLake-GPU (10.27s) and
   PySpark's `local[*]` (9.02s, which explicitly parallelizes the scan
@@ -3656,8 +3669,9 @@ log` is the authoritative chronology if that ordering ever matters.
   concurrently (e.g. one thread per file, matching this project's own
   20-core dev hardware) or switch to Acero's native `"scan"`
   (`arrow::acero::ScanNodeOptions` over an `arrow::dataset::Dataset`)
-  instead of pre-materializing a `table_source`, which would also pick up
-  Acero's own fragment-level parallelism for free.
+  instead of this project's own hand-rolled `record_batch_reader_source`
+  reader, which would also pick up Acero's own fragment-level parallelism
+  for free.
 - GPU `HashJoinOperator` still has no bounded-memory/streaming design --
   unlike `ParquetScanOperator`'s pass-based reading or
   `HashAggregateOperator`'s `max_distinct_keys` batching, `open()`

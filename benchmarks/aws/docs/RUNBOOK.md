@@ -39,10 +39,11 @@ milestone has actually run.
   ```
 - **No manual Docker build/push needed**: `kernellake_docker_image` defaults
   to `ghcr.io/hurdad/kernel-lake-gpu:latest`, which this repo's own CI
-  (`.github/workflows/docker-publish.yml`) already builds and pushes on
-  every push to `main` (confirmed via a real successful run). Only build
-  and push your own image (and override `kernellake_docker_image`) if
-  you're testing local changes not yet on `main`:
+  (the `docker-publish` job in `.github/workflows/ci.yml`) already builds
+  and pushes on every push to `main` (confirmed via a real successful
+  run). Only build and push your own image (and override
+  `kernellake_docker_image`) if you're testing local changes not yet on
+  `main`:
   ```bash
   cd ../../.. # repo root
   docker build -t <your-registry>/kernellake:runtime-gpu -f docker/Dockerfile --target runtime-gpu .

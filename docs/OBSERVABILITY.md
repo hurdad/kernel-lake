@@ -14,10 +14,11 @@ split the way it is, the real bugs found implementing it), see
 document is the operator-facing reference, that one is the implementation
 writeup.
 
-**Scope, as shipped**: one span per whole query, one histogram metric, and
-every existing `spdlog` log line bridged into OTel's Logs signal. There are
-no per-operator spans (no "this is the Parquet scan step, this is the hash
-join step" breakdown) -- see "Not yet done" below.
+**Scope, as shipped**: one span per whole query with a real per-operator
+child-span tree beneath it on the GPU execution path (see §2.1.1), plus
+two GPU-client spans in the Delta transaction-service client, one
+histogram metric, GPU-memory and NVMe-cache metrics, and every existing
+`spdlog` log line bridged into OTel's Logs signal.
 
 ## 1. Enabling it
 
@@ -88,6 +89,39 @@ as the status description -- no `QueryResult` fields, since there isn't one
 to read from. A span that's neither `finish()`ed nor `finish_error()`d
 (shouldn't happen in practice, but the destructor is a safety net) ends
 unfinished with status `Unset`.
+
+### 2.1.1 Traces: per-operator spans (GPU execution path)
+
+Every node the GPU operator tree builds (`operator_builder.cpp`'s
+`build_operator_tree()`) is wrapped in `InstrumentedOperator`, which gives
+each wrapped operator its own child span named for `PhysicalOperator::name()`
+(e.g. `"ParquetScan"`, `"HashJoin"`, `"HashAggregate"`) -- so a real trace
+tool (Jaeger) shows a span tree shaped like the physical plan itself, not
+one flat whole-query span. Each span's lifetime is `open()` through
+`close()`; parenting is threaded explicitly through
+`ExecutionContext::current_span` (not OTel's thread-local "current span"
+mechanism, which the whole-query span above still uses) specifically so
+a join's two children -- opened one after another by the same parent
+`open()` call -- both parent correctly under the join, not under each
+other. On close, an operator whose `resource_seconds()` reports a value
+(currently only `ParquetScanOperator`, whose real decode cost is
+deliberately overlapped with, not included in, its own `next()` calls'
+wall-clock time -- see §2.1's `kernellake.parquet_decoding_seconds` note)
+gets a `kernellake.operator.resource_seconds` numeric attribute recording
+that cost. A `next()` call that throws finishes the span with
+`finish_error()` the same way the whole-query span does.
+
+This is a GPU-execution-path feature only (`src/execution_gpu/
+operator_builder.cpp`) -- the CPU/Acero execution backend has no
+per-operator span instrumentation of its own; a CPU-backend query's trace
+is still just the single whole-query span from §2.1.
+
+Separately, `src/delta/delta_txn_client.cpp` creates two more client
+spans of its own, unrelated to query execution -- `delta_txn.GetTable`
+and `delta_txn.ListActiveFiles` -- each injecting its own W3C
+trace-context into the outbound gRPC call's metadata (`ClientSpan::inject()`)
+so the receiving Delta transaction service can link its own spans as
+children, completing the trace across the process boundary.
 
 ### 2.2 Metrics: one histogram
 
@@ -373,9 +407,8 @@ deployment today. Only takes effect if the deployed image was built with
 
 ## 7. Not yet done
 
-- **Per-operator spans.** Today's tracing is whole-query only -- there's
-  no span for "this is the Parquet scan," "this is the hash join," etc.
-  Explicitly deferred, not attempted, per `docs/ROADMAP.md`.
+- **No per-operator spans on the CPU/Acero execution backend.** See
+  §2.1.1 -- this exists for the GPU execution path only.
 - **No metric beyond query duration, GPU memory (2.2.1), and the NVMe
   cache (2.2.2).** No per-query-type counters, no gauge for in-flight
   queries, no queue-depth metric.

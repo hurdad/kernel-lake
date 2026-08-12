@@ -344,8 +344,18 @@ into a `MetricsRegistry` keyed by `PhysicalOperator::name()` -- no
 individual operator implements its own timing. Recorded totals are
 *inclusive* of children (a parent's `next()` call naturally invokes its
 already-separately-instrumented child's `next()` internally), so only a
-leaf operator's (e.g. `ParquetScanOperator`'s) total is true self time;
-`QueryResult::parquet_decoding_seconds` uses exactly that leaf total.
+leaf operator's (e.g. `ParquetScanOperator`'s) total is true self time.
+`QueryResult::parquet_decoding_seconds` does **not** use that plain
+`next()`-call self time, though: since `ParquetScanOperator`'s decode/
+compute overlap (see that operator's own class comment) moves most of its
+real decode cost onto a background thread *between* `next()` calls, the
+plain self-time under-reports it for the common (non-partitioned) scan
+path. `InstrumentedOperator` separately records the operator's own
+`resource_seconds()` -- real cumulative time inside every
+`reader_->read_chunk()` call, regardless of which thread/path made it --
+under a derived `"{node_name()}.resource_seconds"` metrics key, and
+`query_engine_execute_gpu.cpp` reads `parquet_decoding_seconds` from that
+key instead.
 `QueryResult::gpu_execution_seconds`/`device_to_host_seconds` are measured
 independently as plain wrapping timers around the operator-tree pull loop
 and each `to_arrow_record_batch()` call, respectively, rather than via the
@@ -398,12 +408,17 @@ Two correctness details worth knowing if you touch these operators:
   query like `SELECT SUM(amount) ...` (where an earlier column got pruned
   away) would index past the end of the batch the scan operator actually
   produces.
-- `cudf::groupby`'s COUNT aggregations always produce `INT32` regardless of
-  requested type, but KernelLake's binder declares `COUNT`/`COUNT(*)` as
-  `INT64`; `HashAggregateOperator` casts those result columns after
-  `finalize()` so the output `DeviceBatch`'s actual column types match its
-  declared schema. `ScalarAggregateOperator` doesn't need this -- `cudf::reduce`
-  honors the requested output type for `COUNT`.
+- **`HashAggregateOperator` never uses `cudf::groupby`'s native COUNT/MEAN
+  aggregations.** `COUNT`/`COUNT(*)`/`AVG` are instead computed as a `SUM`
+  over a synthesized `INT64` "ones"/value column -- cudf's own COUNT and
+  MEAN groupby aggregations both accumulate through a 32-bit
+  `cudf::size_type` internally and silently wrap around once a single
+  group's row count exceeds `INT32_MAX`, confirmed by a real SF1000
+  TPC-H Q1 run (see `docs/ROADMAP.md`). `SUM`/`MIN`/`MAX` are the only
+  aggregate kinds that still go through cudf's native groupby
+  aggregations directly. `ScalarAggregateOperator` doesn't have this
+  problem -- `cudf::reduce` honors the requested output type for `COUNT`
+  and has no such internal accumulator-width limit.
 - **`LogicalProjection`/`LogicalSort` conversion must not always remap
   against the scan.** Most physical nodes (`Filter`, `Aggregate`) sit at a
   fixed structural position, always directly above the scan, so their
@@ -415,11 +430,13 @@ Two correctness details worth knowing if you touch these operators:
   one-for-one, and remapping them against the scan fails outright, since
   an aggregate alias like `total` was never a real scanned column).
   `physical_planner.cpp`'s `convert()` discriminates by checking whether
-  the node's child is specifically `LogicalFilter`/`LogicalScan` (a
-  positive match on the case that needs remapping) rather than checking
-  "child is not `LogicalAggregate`" -- the latter looked equivalent but
-  isn't: the optimizer's redundant-projection-removal rule can delete an
-  aggregate query's reprojection when the SELECT list already matches the
+  the node's child is specifically `LogicalFilter`/`LogicalScan`/
+  `LogicalJoin` (a positive match on the case that needs remapping,
+  looking through any interposed `LogicalSort`/`LogicalLimit` first --
+  see `references_scan_schema()`) rather than checking "child is not
+  `LogicalAggregate`" -- the latter looked equivalent but isn't: the
+  optimizer's redundant-projection-removal rule can delete an aggregate
+  query's reprojection when the SELECT list already matches the
   aggregate's natural column order, which made an earlier, negative-check
   version of this discriminator (checking only for `LogicalProjection`)
   wrongly treat a `Sort` sitting directly on `LogicalAggregate` as if it
@@ -1226,9 +1243,15 @@ the gRPC boundary as a raw C++ exception -- verified with a real ADBC
 Python client seeing a clean `INVALID_ARGUMENT` for bad SQL rather than a
 dropped connection.
 
-Respects `engine.backend: gpu|cpu` (new `ServerSection` in `EngineConfig`
-adds `server.host`/`server.port`) exactly like the CLI's `query --backend`
-flag -- not hardcoded to GPU. For `backend: gpu`, a long-lived server can't
+Respects `engine.backend: gpu|cpu` (a `ServerSection` in `EngineConfig`
+carries `server.host`/`server.port`, a `max_pending_results` cap on
+buffered-not-yet-fetched results, inbound TLS for the Flight SQL listener
+itself -- `use_tls`/`tls_cert_path`/`tls_key_path`, plus mTLS via
+`require_client_cert`/`tls_client_ca_cert_path` -- and static bearer-token
+auth via `auth_enabled`/`auth_token`, checked by a `ServerMiddleware`
+against every call's `Authorization: Bearer <token>` header) exactly like
+the CLI's `query --backend` flag -- not hardcoded to GPU. For `backend:
+gpu`, a long-lived server can't
 use `QueryEngine::execute(sql)`'s one-shot convenience overload (it builds
 and tears down its own `RmmEnvironment` per call -- a real
 use-after-free race under concurrent gRPC handler threads, per the
@@ -1496,7 +1519,14 @@ thin surface (`backend: cpu|gpu` mirroring `engine.backend`, `service.port`
 matching `ServerSection`'s own `31337` default, `observability.*` mirroring
 the top-level `ObservabilitySection` fields -- per-signal processor/batch/
 sampler tuning stays at kernellake's own compiled-in defaults, not yet
-exposed through Helm values). `templates/configmap.yaml` renders a real
+exposed through Helm values). `server.tls.*` mirrors `ServerSection`'s
+inbound-TLS fields (`enabled`/`requireClientCert`) but never puts cert/key
+material in `values.yaml` or the rendered ConfigMap directly -- instead it
+points at a Secret the operator creates themselves (cert-manager,
+`kubectl create secret tls`, External Secrets, etc.:
+`secretName`/`secretCertKey`/`secretKeyKey` for the server's own cert+key,
+`clientCaSecretName`/`clientCaSecretKey` for the mTLS client CA), which
+`templates/deployment.yaml` mounts read-only. `templates/configmap.yaml` renders a real
 `kernellake.yaml` from those values; `templates/deployment.yaml` overrides
 `command` to run `kernellake-server --config /etc/kernellake/kernellake.yaml`,
 uses `tcpSocket` readiness/liveness probes (Flight SQL is a gRPC protocol
@@ -1878,12 +1908,20 @@ chunks via the same `RandomAccessObject::as_arrow_file()->ReadAt()` path
 `ObjectStoreDatasource` already uses, so no new remote-read code path was
 introduced), then `std::filesystem::rename()`s it into place -- atomic on
 POSIX for a same-directory rename, so a concurrent reader can never
-observe a partially-written cache entry. Per-cache-key `std::mutex`
+observe a partially-written cache entry. Per-cache-key `std::recursive_mutex`
 locking (`key_locks_`, grown but never pruned -- acceptable for the
 working-set sizes this targets) serializes population of the *same*
 object across threads without blocking unrelated cache misses, verified
 by `NvmeObjectCacheTest.ConcurrentPopulateOfSameKeyFetchesBackendExactlyOnce`
 (8 threads racing on one URI, backend `open()` call count asserted == 1).
+`recursive_mutex`, not a plain `mutex`: `evict_if_over_budget()` (run
+inline after a `populate()` that pushed the cache over its byte budget)
+`try_lock()`s each eviction candidate's own key lock before removing it --
+including, when the entry that just ran over budget is itself a
+candidate, the very key `get_or_populate()` is already holding this lock
+for, further up the same thread's call stack. `try_lock()` on a plain
+`mutex` already held by the current thread reports "busy" and would
+wrongly skip evicting that entry.
 
 Reading a cache hit is delegated to a `LocalObjectStore` instance rooted
 at the cache directory, reusing its existing `arrow::io::ReadableFile`

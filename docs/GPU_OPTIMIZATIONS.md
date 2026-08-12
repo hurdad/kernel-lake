@@ -681,6 +681,17 @@ routes through the real VPC Gateway Endpoint (`aws_vpc_endpoint.s3`, prefix
 list `pl-63a5400a`), not the public internet path, so this isn't measuring
 an accidentally-suboptimal network route.
 
+These numbers measure `device_read_async` in isolation, against a cold
+object store with nothing sitting in front of it. An NVMe-backed local
+object cache (`src/storage/nvme_object_cache.cpp`, see
+`docs/ARCHITECTURE.md`'s "NVMe cache tier" section) was added the day
+after this fix and now sits in front of this same read path whenever
+`storage.cache.enabled` is set -- a *repeat* real-S3 scan in the current
+codebase would also hit that cache layer, not just this fix's concurrent-
+copy path, and hasn't been re-measured with the cache enabled to see how
+the two interact. The numbers above remain accurate as a measurement of
+this specific fix on a cold/uncached path.
+
 ## Fixed: sequential per-file metadata inspection (SF100 latency reversal)
 
 Found investigating a real, full reversal in the SF10-vs-SF100 AWS
@@ -723,6 +734,19 @@ and each future targets a different, independent file. Futures are
 collected in original order (not as they complete) since callers below
 (Hive partition-segment extraction, schema validation) assume
 `metadata[i]` corresponds to `files[i]`.
+
+**Hardened later** (a separate fix, not part of this SF100 investigation):
+the original version above launched one giant `std::async`-per-file burst
+for the whole table at once, which was fine for SF100's 120-file
+`lineitem` table but would spawn thousands of OS threads at once for a
+table accumulated over time with many more, smaller files -- a real
+`RLIMIT_NPROC` exhaustion / thundering-herd risk against one object-store
+prefix. `resolve_table()` now processes files in fixed-size batches of
+`kMaxConcurrentFileInspections = 64` (a network-round-trip-bound
+workload, not CPU-bound, so this is deliberately higher than a typical
+core-count-based cap), each batch fully awaited before the next batch's
+`std::async` calls are made -- see that constant's own comment in
+`src/io/table_resolution.cpp`.
 
 **Validated for real, on the same EC2 kernellake host against the same
 SF100 data:**

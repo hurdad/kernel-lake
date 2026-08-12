@@ -10,13 +10,13 @@
 # Usage (from this directory):
 #   docker compose up -d --build
 #   ./scripts/generate_and_upload_data.sh          # once, or after `docker compose down -v`
-#   ./scripts/run_e2e.sh                            # smoke test + TPC-H benchmark + metrics check
+#   ./scripts/run_e2e.py                            # smoke test + TPC-H benchmark + metrics check
 #   docker compose down [-v]                        # -v also drops the MinIO/Grafana/Prometheus volumes
 #
 # GPU is required by default (kernellake-server builds the `runtime-gpu`
 # Dockerfile target and requests `--gpus all`). For a GPU-less machine, set
 # KERNELLAKE_TARGET=runtime-cpu and drop/comment the `deploy.resources`
-# block below, and pass --backend cpu explicitly in scripts/run_e2e.sh's
+# block below, and pass --backend cpu explicitly in scripts/run_e2e.py's
 # own query calls (kernellake-server itself will otherwise still try to
 # construct a GpuExecutionCoordinator -- see config/kernellake.yaml's own
 # comment on engine.backend).
@@ -42,11 +42,14 @@ services:
   # a second bucket + real (committed, not generated) Parquet fixture for
   # the Unity Catalog integration's own MinIO-backed tests
   # (tests/unit/query_engine_unitycatalog_test.cpp's Minio*-prefixed
-  # tests) -- table_id/schema for it are wired up separately, in the
-  # `unitycatalog-init` service below, not here (this container has no
-  # Unity Catalog CLI). Then exits. `docker compose up` runs it to
-  # completion before anything depends_on:
-  # condition: service_completed_successfully waits on it.
+  # tests, which supply the table's own table_id/schema directly as canned
+  # LoopbackHttpServer responses, not via a real Unity Catalog server --
+  # see this file's own `unitycatalog` service below for why there's no
+  # `unitycatalog-init` service registering this table for real: Unity
+  # Catalog's own external-table write path needs real AWS IAM/STS
+  # internally too, which MinIO can't satisfy). Then exits. `docker
+  # compose up` runs it to completion before anything
+  # depends_on: condition: service_completed_successfully waits on it.
   minio-init:
     image: minio/mc:latest
     depends_on:
