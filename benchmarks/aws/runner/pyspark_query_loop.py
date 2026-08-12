@@ -217,6 +217,7 @@ def main() -> int:
     register_spark_views(spark, args.s3_bucket, args.scale_factor, args.compression, args.compression_level)
 
     results = []
+    run_start_unix = time.time()
     for query_number in queries:
         entry: dict = {"query": query_number, "modes": {}}
         for mode in modes:
@@ -250,6 +251,8 @@ def main() -> int:
         "scale_factor": args.scale_factor,
         "compression": args.compression,
         "compression_level": args.compression_level,
+        "run_start_unix": run_start_unix,
+        "run_end_unix": time.time(),
         "queries": results,
     }
     Path(args.output).write_text(json.dumps(output, indent=2))

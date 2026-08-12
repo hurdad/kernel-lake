@@ -182,6 +182,7 @@ def main() -> int:
 
     con = new_duckdb_connection(args.region)
     results = []
+    run_start_unix = time.time()
     for query_number in queries:
         globs = build_globs(args.s3_bucket, args.scale_factor, query_number, args.compression, args.compression_level)
         entry: dict = {"query": query_number, "modes": {}}
@@ -206,6 +207,8 @@ def main() -> int:
         "scale_factor": args.scale_factor,
         "compression": args.compression,
         "compression_level": args.compression_level,
+        "run_start_unix": run_start_unix,
+        "run_end_unix": time.time(),
         "queries": results,
     }
     Path(args.output).write_text(json.dumps(output, indent=2))

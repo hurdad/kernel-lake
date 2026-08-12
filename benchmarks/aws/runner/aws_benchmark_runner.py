@@ -665,6 +665,7 @@ def main() -> int:
         s3fs_for_bytes = pafs.S3FileSystem()
 
     results = []
+    run_start_unix = time.time()
     for query_number in queries:
         def table_ref(table: str) -> str:
             if args.table_format == "iceberg":
@@ -725,6 +726,8 @@ def main() -> int:
         "compression_level": args.compression_level,
         "table_format": args.table_format,
         "s3_bucket": args.s3_bucket,
+        "run_start_unix": run_start_unix,
+        "run_end_unix": time.time(),
         "queries": results,
         "unsupported_queries": UNSUPPORTED_QUERIES,
         "cold_warm_definition": (
