@@ -574,5 +574,66 @@ TEST(Binder, ThreeWayJoinRejectsAmbiguousUnqualifiedColumnFromNonAdjacentSources
       BindingError);
 }
 
+TEST(Binder, HavingReferencingAggregateBinds) {
+  const auto stmt = sql::parse_sql(
+      "SELECT region, SUM(amount) AS total FROM read_parquet('/x.parquet') "
+      "GROUP BY region HAVING SUM(amount) > 100");
+  const BoundQuery bound = bind_query(stmt, sales_schema());
+  ASSERT_NE(bound.having, nullptr);
+  EXPECT_EQ(bound.having->result_type().id, TypeId::Boolean);
+  const auto* comparison = dynamic_cast<const BinaryExpression*>(bound.having.get());
+  ASSERT_NE(comparison, nullptr);
+  EXPECT_EQ(comparison->op(), BinaryOperator::Greater);
+  // HAVING's own SUM(amount) is structurally identical to the SELECT
+  // list's own -- register_aggregate()'s dedup (logical_planner.cpp,
+  // exercised indirectly here via the *bound* tree both reference) means
+  // this doesn't need its own separate LogicalAggregate slot; verified
+  // properly end to end in logical_plan_test.cpp, since bind_query() alone
+  // doesn't build the LogicalAggregate.
+  const auto* left = dynamic_cast<const AggregateExpression*>(comparison->left().get());
+  ASSERT_NE(left, nullptr);
+  EXPECT_EQ(left->function(), AggregateFunction::Sum);
+}
+
+TEST(Binder, HavingWithoutAggregateOrGroupByIsRejected) {
+  // hsql's own grammar only reaches HAVING through `GROUP BY ... HAVING
+  // ...` (opt_group's own production), so a real `parse_sql()` call can
+  // never actually produce an AstSelectStatement with `having != nullptr`
+  // and `group_by.empty()`/no aggregate at the same time -- this
+  // specific rejection in bind_query_common() is a defensive fallback,
+  // not reachable through the public parsing API today. Construct the
+  // AST by hand to exercise it directly anyway, in case that constraint
+  // ever changes.
+  auto stmt = sql::parse_sql("SELECT region FROM read_parquet('/x.parquet')");
+  stmt.having = sql::parse_sql("SELECT region FROM read_parquet('/x.parquet') WHERE region = 'A'").where;
+  EXPECT_THROW((void)bind_query(stmt, sales_schema()), BindingError);
+}
+
+TEST(Binder, HavingReferencingUngroupedColumnIsRejected) {
+  // "amount" is neither a GROUP BY key nor wrapped in an aggregate here --
+  // the same rule an ungrouped SELECT-list column already gets.
+  const auto stmt = sql::parse_sql(
+      "SELECT region, SUM(amount) AS total FROM read_parquet('/x.parquet') "
+      "GROUP BY region HAVING amount > 100");
+  EXPECT_THROW((void)bind_query(stmt, sales_schema()), BindingError);
+}
+
+TEST(Binder, HavingMustBeBoolean) {
+  const auto stmt = sql::parse_sql(
+      "SELECT region, SUM(amount) AS total FROM read_parquet('/x.parquet') GROUP BY region HAVING "
+      "SUM(amount)");
+  EXPECT_THROW((void)bind_query(stmt, sales_schema()), BindingError);
+}
+
+TEST(Binder, RejectsSubqueryOutsideHaving) {
+  // resolve_subqueries() (QueryEngine::plan_logical()) only ever walks
+  // AstSelectStatement::having -- a subquery anywhere else (WHERE here)
+  // reaches the binder unresolved, which must reject it clearly rather
+  // than crash or misinterpret it.
+  const auto stmt = sql::parse_sql(
+      "SELECT a FROM read_parquet('/x.parquet') WHERE a > (SELECT SUM(a) FROM read_parquet('/x.parquet'))");
+  EXPECT_THROW((void)bind_query(stmt, Schema({Field{"a", int64_type(false)}})), BindingError);
+}
+
 }  // namespace
 }  // namespace kernellake

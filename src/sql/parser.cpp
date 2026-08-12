@@ -101,6 +101,24 @@ struct Preprocessed {
   std::vector<PlaceholderSource> sources;  // in order of appearance
 };
 
+// Threaded through every conversion function (instead of a plain
+// `const Preprocessed&`) once a query can contain more than one SELECT
+// statement (a HAVING subquery, see AstSubquery) -- `preprocessed.sources`
+// is one flat, occurrence-ordered list spanning the *entire* raw SQL text
+// (outer query and any nested subquery alike; preprocess_from_read_parquet()
+// scans linearly with no awareness of parens/nesting, so each occurrence
+// anywhere in the text -- including inside a `(SELECT ...)` -- gets its own
+// globally unique placeholder). `consumed` tracks, by index into that same
+// list, which source has been claimed by some statement's own FROM/JOIN
+// clause so far across the whole parse -- see find_and_consume_source().
+// Replaces the older, simpler "preprocessed.sources.size() must exactly
+// equal this one statement's own source count" checks, which assumed
+// there was only ever one statement to begin with.
+struct ConversionState {
+  const Preprocessed& preprocessed;
+  std::vector<bool>& consumed;
+};
+
 std::size_t skip_whitespace(std::string_view sql, std::size_t pos) {
   while (pos < sql.size() && std::isspace(static_cast<unsigned char>(sql[pos]))) {
     ++pos;
@@ -307,7 +325,7 @@ Preprocessed preprocess_from_read_parquet(const std::string& sql) {
 }
 
 AstExprPtr wrap(std::variant<AstColumnRef, AstStar, AstLiteral, AstBinary, AstUnary, AstBetween, AstAggregate,
-                             AstLike, AstIn, AstCase, AstCast, AstExtract>
+                             AstLike, AstIn, AstCase, AstCast, AstExtract, AstSubquery>
                     node,
                 std::optional<std::string> alias = std::nullopt) {
   auto expr = std::make_shared<AstExpr>();
@@ -323,7 +341,7 @@ std::optional<std::string> alias_of(const hsql::Expr& e) {
   return std::string(e.alias);
 }
 
-AstExprPtr convert_expr(const hsql::Expr* e);
+AstExprPtr convert_expr(const hsql::Expr* e, ConversionState& state);
 
 AstBinaryOp to_binary_op(hsql::OperatorType op) {
   switch (op) {
@@ -356,7 +374,7 @@ AstBinaryOp to_binary_op(hsql::OperatorType op) {
   }
 }
 
-AstIn convert_in(const hsql::Expr* e) {
+AstIn convert_in(const hsql::Expr* e, ConversionState& state) {
   if (e->select != nullptr) {
     unsupported("IN with a subquery (only a literal list is supported)");
   }
@@ -364,15 +382,15 @@ AstIn convert_in(const hsql::Expr* e) {
     unsupported("malformed IN expression");
   }
   AstIn in;
-  in.value = convert_expr(e->expr);
+  in.value = convert_expr(e->expr, state);
   in.list.reserve(e->exprList->size());
   for (const hsql::Expr* item : *e->exprList) {
-    in.list.push_back(convert_expr(item));
+    in.list.push_back(convert_expr(item, state));
   }
   return in;
 }
 
-AstCase convert_case(const hsql::Expr* e) {
+AstCase convert_case(const hsql::Expr* e, ConversionState& state) {
   if (e->exprList == nullptr || e->exprList->empty()) {
     unsupported("CASE with no WHEN branches");
   }
@@ -383,76 +401,77 @@ AstCase convert_case(const hsql::Expr* e) {
         element->expr2 == nullptr) {
       unsupported("malformed CASE WHEN branch");
     }
-    AstExprPtr when = convert_expr(element->expr);
+    AstExprPtr when = convert_expr(element->expr, state);
     // Simple CASE ("CASE x WHEN v THEN ... END") compares each WHEN value
     // against the CASE operand; searched CASE ("CASE WHEN cond THEN ...
     // END", e->expr == nullptr) uses each WHEN as a boolean condition
     // directly. Desugar the simple form into the searched form here so
     // the binder/executor only ever need to handle one shape.
-    AstExprPtr condition = e->expr != nullptr
-                               ? wrap(AstBinary{AstBinaryOp::Eq, convert_expr(e->expr), std::move(when)})
-                               : std::move(when);
-    result.when_then.emplace_back(std::move(condition), convert_expr(element->expr2));
+    AstExprPtr condition =
+        e->expr != nullptr ? wrap(AstBinary{AstBinaryOp::Eq, convert_expr(e->expr, state), std::move(when)})
+                           : std::move(when);
+    result.when_then.emplace_back(std::move(condition), convert_expr(element->expr2, state));
   }
   if (e->expr2 != nullptr) {
-    result.else_branch = convert_expr(e->expr2);
+    result.else_branch = convert_expr(e->expr2, state);
   }
   return result;
 }
 
-AstExprPtr convert_operator(const hsql::Expr* e) {
+AstExprPtr convert_operator(const hsql::Expr* e, ConversionState& state) {
   switch (e->opType) {
     case hsql::kOpBetween: {
       if (e->exprList == nullptr || e->exprList->size() != 2 || e->expr == nullptr) {
         unsupported("malformed BETWEEN expression");
       }
-      AstBetween between{convert_expr(e->expr), convert_expr((*e->exprList)[0]),
-                         convert_expr((*e->exprList)[1])};
+      AstBetween between{convert_expr(e->expr, state), convert_expr((*e->exprList)[0], state),
+                         convert_expr((*e->exprList)[1], state)};
       return wrap(std::move(between), alias_of(*e));
     }
     case hsql::kOpUnaryMinus:
-      return wrap(AstUnary{AstUnaryOp::Negate, convert_expr(e->expr)}, alias_of(*e));
+      return wrap(AstUnary{AstUnaryOp::Negate, convert_expr(e->expr, state)}, alias_of(*e));
     case hsql::kOpIsNull:
-      return wrap(AstUnary{AstUnaryOp::IsNull, convert_expr(e->expr)}, alias_of(*e));
+      return wrap(AstUnary{AstUnaryOp::IsNull, convert_expr(e->expr, state)}, alias_of(*e));
     case hsql::kOpNot: {
       // hsql represents "x IS NOT NULL" as NOT(IS NULL(x)) and "x NOT IN
       // (...)" as NOT(IN(x, ...)); recover the cleaner negated node
       // instead of double-negating.
       if (e->expr != nullptr && e->expr->type == hsql::kExprOperator && e->expr->opType == hsql::kOpIsNull) {
-        return wrap(AstUnary{AstUnaryOp::IsNotNull, convert_expr(e->expr->expr)}, alias_of(*e));
+        return wrap(AstUnary{AstUnaryOp::IsNotNull, convert_expr(e->expr->expr, state)}, alias_of(*e));
       }
       if (e->expr != nullptr && e->expr->type == hsql::kExprOperator && e->expr->opType == hsql::kOpIn) {
-        AstIn in = convert_in(e->expr);
+        AstIn in = convert_in(e->expr, state);
         in.negated = true;
         return wrap(std::move(in), alias_of(*e));
       }
-      return wrap(AstUnary{AstUnaryOp::Not, convert_expr(e->expr)}, alias_of(*e));
+      return wrap(AstUnary{AstUnaryOp::Not, convert_expr(e->expr, state)}, alias_of(*e));
     }
     case hsql::kOpLike:
     case hsql::kOpNotLike: {
       if (e->expr == nullptr || e->expr2 == nullptr) {
         unsupported("malformed LIKE expression");
       }
-      return wrap(AstLike{convert_expr(e->expr), convert_expr(e->expr2), e->opType == hsql::kOpNotLike},
-                  alias_of(*e));
+      return wrap(
+          AstLike{convert_expr(e->expr, state), convert_expr(e->expr2, state), e->opType == hsql::kOpNotLike},
+          alias_of(*e));
     }
     case hsql::kOpILike:
       unsupported("ILIKE (case-insensitive LIKE) -- use LIKE");
     case hsql::kOpIn:
-      return wrap(convert_in(e), alias_of(*e));
+      return wrap(convert_in(e, state), alias_of(*e));
     case hsql::kOpCase:
-      return wrap(convert_case(e), alias_of(*e));
+      return wrap(convert_case(e, state), alias_of(*e));
     default:
       break;
   }
   if (e->expr == nullptr || e->expr2 == nullptr) {
     unsupported("binary operator with missing operand");
   }
-  return wrap(AstBinary{to_binary_op(e->opType), convert_expr(e->expr), convert_expr(e->expr2)},
+  return wrap(AstBinary{to_binary_op(e->opType), convert_expr(e->expr, state), convert_expr(e->expr2, state)},
               alias_of(*e));
 }
 
-AstExprPtr convert_function(const hsql::Expr* e) {
+AstExprPtr convert_function(const hsql::Expr* e, ConversionState& state) {
   if (e->distinct) {
     unsupported("DISTINCT inside an aggregate function");
   }
@@ -475,7 +494,7 @@ AstExprPtr convert_function(const hsql::Expr* e) {
     if (e->exprList == nullptr || e->exprList->size() != 1) {
       unsupported("COUNT with != 1 argument");
     }
-    return wrap(AstAggregate{AstAggregateFunc::Count, convert_expr((*e->exprList)[0])}, alias_of(*e));
+    return wrap(AstAggregate{AstAggregateFunc::Count, convert_expr((*e->exprList)[0], state)}, alias_of(*e));
   }
 
   static const std::vector<std::pair<std::string, AstAggregateFunc>> kAggregates = {
@@ -491,7 +510,7 @@ AstExprPtr convert_function(const hsql::Expr* e) {
     if (e->exprList == nullptr || e->exprList->size() != 1) {
       unsupported(fn_name + " with != 1 argument");
     }
-    return wrap(AstAggregate{fn, convert_expr((*e->exprList)[0])}, alias_of(*e));
+    return wrap(AstAggregate{fn, convert_expr((*e->exprList)[0], state)}, alias_of(*e));
   }
 
   unsupported("function '" + name + "' (only SUM/COUNT/MIN/MAX/AVG are supported)");
@@ -532,7 +551,9 @@ std::string to_cast_type_name(hsql::DataType type) {
   unsupported("CAST to an unrecognized type");
 }
 
-AstExprPtr convert_expr(const hsql::Expr* e) {
+AstSelectStatement convert_select_statement(const hsql::SelectStatement* stmt, ConversionState& state);
+
+AstExprPtr convert_expr(const hsql::Expr* e, ConversionState& state) {
   if (e == nullptr) {
     unsupported("null expression");
   }
@@ -566,14 +587,14 @@ AstExprPtr convert_expr(const hsql::Expr* e) {
       return wrap(AstLiteral{AstLiteralKind::Date, days, 0.0, {}, false}, alias_of(*e));
     }
     case hsql::kExprOperator:
-      return convert_operator(e);
+      return convert_operator(e, state);
     case hsql::kExprFunctionRef:
-      return convert_function(e);
+      return convert_function(e, state);
     case hsql::kExprCast: {
       if (e->expr == nullptr) {
         unsupported("malformed CAST expression");
       }
-      return wrap(AstCast{convert_expr(e->expr), to_cast_type_name(e->columnType.data_type),
+      return wrap(AstCast{convert_expr(e->expr, state), to_cast_type_name(e->columnType.data_type),
                           e->columnType.precision, e->columnType.scale},
                   alias_of(*e));
     }
@@ -601,18 +622,58 @@ AstExprPtr convert_expr(const hsql::Expr* e) {
               "EXTRACT field (only YEAR/MONTH/DAY are supported -- no generated table has a "
               "time-of-day component)");
       }
-      return wrap(AstExtract{field, convert_expr(e->expr)}, alias_of(*e));
+      return wrap(AstExtract{field, convert_expr(e->expr, state)}, alias_of(*e));
+    }
+    case hsql::kExprSelect: {
+      // `(SELECT ...)` used as a value expression -- only meaningful as an
+      // operand inside HAVING (see AstSubquery's own comment); legal
+      // anywhere hsql's grammar allows a value expression, purely so this
+      // parses instead of erroring, but resolve_subqueries() only ever
+      // looks for/resolves one inside AstSelectStatement::having --
+      // anywhere else, it survives unresolved all the way to the binder,
+      // which rejects it with a clear, specific error (see
+      // Binder::bind_node(const AstSubquery&, bool)) rather than this
+      // layer guessing where it's "supposed" to be disallowed.
+      if (e->select == nullptr) {
+        unsupported("malformed subquery expression");
+      }
+      auto statement = std::make_shared<AstSelectStatement>(convert_select_statement(e->select, state));
+      return wrap(AstSubquery{std::move(statement)}, alias_of(*e));
     }
     default:
-      unsupported(
-          "expression type not in the supported grammar (subqueries and arrays are not yet supported)");
+      unsupported("expression type not in the supported grammar (arrays are not yet supported)");
   }
+}
+
+// Finds the source (by placeholder identifier) a FROM/JOIN clause
+// referenced, and marks it consumed -- see ConversionState's own comment
+// for why this replaces the older "preprocessed.sources.size() must
+// exactly match this one statement" checks. Throws if `placeholder` isn't
+// found at all, or (defensively; shouldn't happen given every occurrence
+// gets its own globally unique placeholder -- see
+// preprocess_from_read_parquet()) was already consumed by an earlier
+// FROM/JOIN clause somewhere in this same parse.
+const PlaceholderSource& find_and_consume_source(const std::string& placeholder, ConversionState& state) {
+  for (std::size_t i = 0; i < state.preprocessed.sources.size(); ++i) {
+    if (state.preprocessed.sources[i].placeholder != placeholder) {
+      continue;
+    }
+    if (state.consumed[i]) {
+      unsupported(
+          "internal error: a read_parquet(...)/read_iceberg(...)/read_delta(...) source was referenced by "
+          "more than one FROM/JOIN clause");
+    }
+    state.consumed[i] = true;
+    return state.preprocessed.sources[i];
+  }
+  unsupported(
+      "FROM/JOIN source does not reference a read_parquet(...)/read_iceberg(...)/read_delta(...) call");
 }
 
 // Resolves one JOIN side's TableRef (a leaf, never itself a nested JOIN --
 // see flatten_join_chain()'s own comment) to its read_parquet(...) paths
 // and required alias.
-AstParquetSource convert_join_source(const hsql::TableRef* ref, const Preprocessed& preprocessed) {
+AstParquetSource convert_join_source(const hsql::TableRef* ref, ConversionState& state) {
   if (ref == nullptr || ref->type != hsql::kTableName || ref->name == nullptr) {
     unsupported(
         "JOIN sides must each be a single read_parquet(...)/read_iceberg(...)/read_delta(...) source, not a "
@@ -622,12 +683,8 @@ AstParquetSource convert_join_source(const hsql::TableRef* ref, const Preprocess
   if (ref->alias == nullptr || ref->alias->name == nullptr) {
     unsupported("both sides of a JOIN must be aliased, e.g. read_parquet('a.parquet') AS a");
   }
-  for (const PlaceholderSource& source : preprocessed.sources) {
-    if (source.placeholder == ref->name) {
-      return AstParquetSource{source.paths, std::string(ref->alias->name)};
-    }
-  }
-  unsupported("JOIN source does not reference a read_parquet(...)/read_iceberg(...)/read_delta(...) call");
+  const PlaceholderSource& source = find_and_consume_source(ref->name, state);
+  return AstParquetSource{source.paths, std::string(ref->alias->name)};
 }
 
 // hsql parses a multi-way JOIN left-associatively: `A JOIN B ON c1 JOIN C
@@ -641,7 +698,7 @@ AstParquetSource convert_join_source(const hsql::TableRef* ref, const Preprocess
 // subquery on either side, a non-INNER join type) fails clearly via
 // convert_join_source()/the checks below, at whichever level of the chain
 // it appears.
-AstJoinClause flatten_join_chain(const hsql::TableRef* table_ref, const Preprocessed& preprocessed) {
+AstJoinClause flatten_join_chain(const hsql::TableRef* table_ref, ConversionState& state) {
   if (table_ref == nullptr || table_ref->type != hsql::kTableJoin || table_ref->join == nullptr) {
     unsupported("malformed JOIN");
   }
@@ -658,13 +715,88 @@ AstJoinClause flatten_join_chain(const hsql::TableRef* table_ref, const Preproce
 
   AstJoinClause clause;
   if (join->left->type == hsql::kTableJoin) {
-    clause = flatten_join_chain(join->left, preprocessed);
+    clause = flatten_join_chain(join->left, state);
   } else {
-    clause.first = convert_join_source(join->left, preprocessed);
+    clause.first = convert_join_source(join->left, state);
   }
   clause.steps.push_back(
-      AstJoinStep{convert_join_source(join->right, preprocessed), convert_expr(join->condition)});
+      AstJoinStep{convert_join_source(join->right, state), convert_expr(join->condition, state)});
   return clause;
+}
+
+// The body of what used to be all of parse_sql() -- factored out so it can
+// be called recursively for a HAVING subquery's own nested
+// hsql::SelectStatement (see convert_expr()'s kExprSelect case), not just
+// the top-level statement. `state` is shared across every recursive call
+// within one parse_sql() invocation (one Preprocessed/consumed pair for
+// the whole raw SQL text, outer query and every nested subquery alike).
+AstSelectStatement convert_select_statement(const hsql::SelectStatement* stmt, ConversionState& state) {
+  if (stmt->selectDistinct) {
+    unsupported("SELECT DISTINCT");
+  }
+  if (stmt->setOperations != nullptr && !stmt->setOperations->empty()) {
+    unsupported("UNION/INTERSECT/EXCEPT");
+  }
+  if (stmt->withDescriptions != nullptr && !stmt->withDescriptions->empty()) {
+    unsupported("WITH (common table expressions)");
+  }
+
+  AstSelectStatement out;
+
+  if (stmt->fromTable != nullptr && stmt->fromTable->type == hsql::kTableName &&
+      stmt->fromTable->name != nullptr) {
+    const PlaceholderSource& source = find_and_consume_source(stmt->fromTable->name, state);
+    out.from.paths = source.paths;
+    if (stmt->fromTable->alias != nullptr && stmt->fromTable->alias->name != nullptr) {
+      out.from.alias = std::string(stmt->fromTable->alias->name);
+    }
+  } else if (stmt->fromTable != nullptr && stmt->fromTable->type == hsql::kTableJoin) {
+    out.join = flatten_join_chain(stmt->fromTable, state);
+  } else {
+    unsupported(
+        "joins and subqueries (only a single FROM read_parquet(...)/read_iceberg(...)/read_delta(...) "
+        "source, or a "
+        "two-table JOIN, is supported)");
+  }
+
+  if (stmt->selectList == nullptr || stmt->selectList->empty()) {
+    throw SqlError("SELECT list must not be empty");
+  }
+  for (const hsql::Expr* item : *stmt->selectList) {
+    out.select_list.push_back(convert_expr(item, state));
+  }
+
+  if (stmt->whereClause != nullptr) {
+    out.where = convert_expr(stmt->whereClause, state);
+  }
+
+  if (stmt->groupBy != nullptr && stmt->groupBy->columns != nullptr) {
+    for (const hsql::Expr* column : *stmt->groupBy->columns) {
+      out.group_by.push_back(convert_expr(column, state));
+    }
+  }
+  if (stmt->groupBy != nullptr && stmt->groupBy->having != nullptr) {
+    out.having = convert_expr(stmt->groupBy->having, state);
+  }
+
+  if (stmt->order != nullptr) {
+    for (const hsql::OrderDescription* order : *stmt->order) {
+      out.order_by.push_back(
+          AstOrderByItem{convert_expr(order->expr, state), order->type == hsql::kOrderAsc});
+    }
+  }
+
+  if (stmt->limit != nullptr) {
+    if (stmt->limit->offset != nullptr) {
+      unsupported("OFFSET");
+    }
+    if (stmt->limit->limit == nullptr || stmt->limit->limit->type != hsql::kExprLiteralInt) {
+      unsupported("non-literal LIMIT");
+    }
+    out.limit = stmt->limit->limit->ival;
+  }
+
+  return out;
 }
 
 }  // namespace
@@ -694,83 +826,22 @@ AstSelectStatement parse_sql(std::string_view sql_view) {
   // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
   const auto* stmt = static_cast<const hsql::SelectStatement*>(raw_stmt);
 
-  if (stmt->selectDistinct) {
-    unsupported("SELECT DISTINCT");
-  }
-  if (stmt->setOperations != nullptr && !stmt->setOperations->empty()) {
-    unsupported("UNION/INTERSECT/EXCEPT");
-  }
-  if (stmt->withDescriptions != nullptr && !stmt->withDescriptions->empty()) {
-    unsupported("WITH (common table expressions)");
-  }
-  if (stmt->groupBy != nullptr && stmt->groupBy->having != nullptr) {
-    unsupported("HAVING");
-  }
-  AstSelectStatement out;
+  std::vector<bool> consumed(preprocessed.sources.size(), false);
+  ConversionState state{preprocessed, consumed};
+  AstSelectStatement out = convert_select_statement(stmt, state);
 
-  if (stmt->fromTable != nullptr && stmt->fromTable->type == hsql::kTableName &&
-      stmt->fromTable->name != nullptr) {
-    if (preprocessed.sources.size() != 1 || stmt->fromTable->name != preprocessed.sources[0].placeholder) {
+  // Every read_parquet(...)/read_iceberg(...)/read_delta(...) occurrence
+  // anywhere in the raw SQL text (outer query or nested HAVING subquery
+  // alike) must have been claimed by exactly one FROM/JOIN clause
+  // somewhere in the parse -- catches a source that appears in the query
+  // text but outside any FROM/JOIN shape this parser understands (this
+  // project has no other place a source could legitimately appear).
+  for (std::size_t i = 0; i < preprocessed.sources.size(); ++i) {
+    if (!consumed[i]) {
       unsupported(
-          "joins and subqueries (only a single FROM read_parquet(...)/read_iceberg(...)/read_delta(...) "
-          "source, or a "
-          "two-table JOIN, is supported)");
+          "a read_parquet(...)/read_iceberg(...)/read_delta(...) source appears in the query but is not "
+          "referenced by any recognized FROM/JOIN clause");
     }
-    out.from.paths = preprocessed.sources[0].paths;
-    if (stmt->fromTable->alias != nullptr && stmt->fromTable->alias->name != nullptr) {
-      out.from.alias = std::string(stmt->fromTable->alias->name);
-    }
-  } else if (stmt->fromTable != nullptr && stmt->fromTable->type == hsql::kTableJoin) {
-    AstJoinClause clause = flatten_join_chain(stmt->fromTable, preprocessed);
-    // clause.steps.size() + 1 (the "first" source) must equal every
-    // read_parquet(...) call actually found in the query text -- catches a
-    // read_parquet(...) source that appears in the FROM clause but outside
-    // the JOIN chain the parser understood (this project has no other FROM
-    // shape a source could legitimately appear in).
-    if (preprocessed.sources.size() != clause.steps.size() + 1) {
-      unsupported(
-          "a JOIN requires exactly one read_parquet(...)/read_iceberg(...)/read_delta(...) source per table "
-          "in the chain");
-    }
-    out.join = std::move(clause);
-  } else {
-    unsupported(
-        "joins and subqueries (only a single FROM read_parquet(...)/read_iceberg(...)/read_delta(...) "
-        "source, or a "
-        "two-table JOIN, is supported)");
-  }
-
-  if (stmt->selectList == nullptr || stmt->selectList->empty()) {
-    throw SqlError("SELECT list must not be empty");
-  }
-  for (const hsql::Expr* item : *stmt->selectList) {
-    out.select_list.push_back(convert_expr(item));
-  }
-
-  if (stmt->whereClause != nullptr) {
-    out.where = convert_expr(stmt->whereClause);
-  }
-
-  if (stmt->groupBy != nullptr && stmt->groupBy->columns != nullptr) {
-    for (const hsql::Expr* column : *stmt->groupBy->columns) {
-      out.group_by.push_back(convert_expr(column));
-    }
-  }
-
-  if (stmt->order != nullptr) {
-    for (const hsql::OrderDescription* order : *stmt->order) {
-      out.order_by.push_back(AstOrderByItem{convert_expr(order->expr), order->type == hsql::kOrderAsc});
-    }
-  }
-
-  if (stmt->limit != nullptr) {
-    if (stmt->limit->offset != nullptr) {
-      unsupported("OFFSET");
-    }
-    if (stmt->limit->limit == nullptr || stmt->limit->limit->type != hsql::kExprLiteralInt) {
-      unsupported("non-literal LIMIT");
-    }
-    out.limit = stmt->limit->limit->ival;
   }
 
   return out;

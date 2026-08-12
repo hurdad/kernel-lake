@@ -591,5 +591,143 @@ TEST_F(QueryEngineExecuteCpuTest, RejectsGroupByOnOneJoinSideWithSameNamedUngrou
                BindingError);
 }
 
+// Regression test for physical_planner.cpp's references_scan_schema():
+// it used to treat *any* LogicalFilter as scan-schema-referencing
+// unconditionally, which was safe before HAVING existed but breaks once
+// the optimizer's redundant-projection-removal elides the aggregate
+// path's final re-projection (exactly what happens here, since the
+// SELECT list already matches the aggregate's own output order) --
+// leaving LogicalSort sitting directly on the HAVING LogicalFilter, whose
+// ColumnExpression indices describe the *aggregate's* output schema, not
+// the scan's. The real symptom was an Acero execution-time error ("No
+// match for FieldRef.FieldPath(2)"), only reachable via this exact
+// combination: a JOIN (so the final projection can become a genuine
+// identity projection over the combined schema), GROUP BY + HAVING (a
+// LogicalFilter directly on a LogicalAggregate), and ORDER BY (a
+// LogicalSort that ends up directly on that filter once the redundant
+// projection is elided).
+TEST_F(QueryEngineExecuteCpuTest, JoinGroupByHavingOrderByDoesNotMisremapSortKeyIndices) {
+  const QueryResult result = engine_.execute(
+      "SELECT r.region_name, SUM(s.amount) AS total FROM read_parquet('" + path_ +
+      "') AS s JOIN read_parquet('" + regions_path_ +
+      "') AS r ON s.region = r.region GROUP BY r.region_name HAVING SUM(s.amount) > 50 ORDER BY total DESC");
+
+  ASSERT_EQ(result.rows_returned, 1);
+  const std::shared_ptr<arrow::RecordBatch>& batch = result.batches.front();
+  const auto name_column =
+      std::static_pointer_cast<arrow::StringArray>(batch->GetColumnByName("region_name"));
+  const auto total_column = std::static_pointer_cast<arrow::DoubleArray>(batch->GetColumnByName("total"));
+  ASSERT_NE(name_column, nullptr);
+  ASSERT_NE(total_column, nullptr);
+  EXPECT_EQ(name_column->GetString(0), "Beta");
+  EXPECT_DOUBLE_EQ(total_column->Value(0), 110.0);
+}
+
+// TPC-H Q11's own shape, end to end: a literal HAVING threshold filters
+// out groups below it. region A totals 35.0, region B totals 110.0 --
+// only B survives a > 50 threshold.
+TEST_F(QueryEngineExecuteCpuTest, HavingWithLiteralThresholdFiltersGroups) {
+  const QueryResult result = engine_.execute("SELECT region, SUM(amount) AS total FROM read_parquet('" +
+                                             path_ + "') GROUP BY region HAVING SUM(amount) > 50");
+
+  ASSERT_EQ(result.rows_returned, 1);
+  const std::shared_ptr<arrow::RecordBatch>& batch = result.batches.front();
+  const auto region_column = std::static_pointer_cast<arrow::StringArray>(batch->GetColumnByName("region"));
+  const auto total_column = std::static_pointer_cast<arrow::DoubleArray>(batch->GetColumnByName("total"));
+  ASSERT_NE(region_column, nullptr);
+  ASSERT_NE(total_column, nullptr);
+  EXPECT_EQ(region_column->GetString(0), "B");
+  EXPECT_DOUBLE_EQ(total_column->Value(0), 110.0);
+}
+
+// QueryEngine::evaluate_scalar_subquery(): a real non-correlated scalar
+// subquery computes the HAVING threshold instead of a literal -- exactly
+// TPC-H Q11's own `SUM(...) * 0.0001` shape. 145.0 (grand total) * 0.3 =
+// 43.5, so region A (35.0) is excluded and region B (110.0) survives, the
+// same split as the literal-threshold test above but driven by a nested
+// bind->plan->execute cycle instead of a constant.
+TEST_F(QueryEngineExecuteCpuTest, HavingWithScalarSubqueryThresholdFiltersGroups) {
+  const QueryResult result = engine_.execute(
+      "SELECT region, SUM(amount) AS total FROM read_parquet('" + path_ +
+      "') GROUP BY region HAVING SUM(amount) > (SELECT SUM(amount) * 0.3 FROM read_parquet('" + path_ +
+      "'))");
+
+  ASSERT_EQ(result.rows_returned, 1);
+  const std::shared_ptr<arrow::RecordBatch>& batch = result.batches.front();
+  const auto region_column = std::static_pointer_cast<arrow::StringArray>(batch->GetColumnByName("region"));
+  const auto total_column = std::static_pointer_cast<arrow::DoubleArray>(batch->GetColumnByName("total"));
+  ASSERT_NE(region_column, nullptr);
+  ASSERT_NE(total_column, nullptr);
+  EXPECT_EQ(region_column->GetString(0), "B");
+  EXPECT_DOUBLE_EQ(total_column->Value(0), 110.0);
+}
+
+// A HAVING subquery's own subquery: subquery1 (a grouped aggregate that
+// itself has a HAVING referencing subquery2) must resolve subquery2
+// first, collapse to a genuine single row (region A, 35.0 -- the only
+// region whose total is below subquery2's 72.5 threshold), and only then
+// hand that one value up to the outer HAVING as its own threshold.
+// Regression coverage for evaluate_scalar_subquery()'s own recursive
+// resolved.having != nullptr branch, which a flat single-level subquery
+// test can't exercise.
+TEST_F(QueryEngineExecuteCpuTest, NestedHavingSubqueryResolvesInnerSubqueryFirst) {
+  const QueryResult result = engine_.execute(
+      "SELECT region, SUM(amount) AS total FROM read_parquet('" + path_ +
+      "') GROUP BY region HAVING SUM(amount) > "
+      "(SELECT SUM(amount) AS x FROM read_parquet('" +
+      path_ + "') GROUP BY region HAVING SUM(amount) < (SELECT SUM(amount) * 0.5 FROM read_parquet('" +
+      path_ + "')))");
+
+  ASSERT_EQ(result.rows_returned, 1);
+  const std::shared_ptr<arrow::RecordBatch>& batch = result.batches.front();
+  const auto region_column = std::static_pointer_cast<arrow::StringArray>(batch->GetColumnByName("region"));
+  const auto total_column = std::static_pointer_cast<arrow::DoubleArray>(batch->GetColumnByName("total"));
+  ASSERT_NE(region_column, nullptr);
+  ASSERT_NE(total_column, nullptr);
+  EXPECT_EQ(region_column->GetString(0), "B");
+  EXPECT_DOUBLE_EQ(total_column->Value(0), 110.0);
+}
+
+TEST_F(QueryEngineExecuteCpuTest, HavingSubqueryReturningZeroRowsThrowsExecutionError) {
+  EXPECT_THROW((void)(engine_.execute("SELECT region, SUM(amount) AS total FROM read_parquet('" + path_ +
+                                      "') GROUP BY region HAVING SUM(amount) > "
+                                      "(SELECT amount FROM read_parquet('" +
+                                      path_ + "') WHERE region = 'nonexistent')")),
+               ExecutionError);
+}
+
+TEST_F(QueryEngineExecuteCpuTest, HavingSubqueryReturningMultipleRowsThrowsExecutionError) {
+  EXPECT_THROW((void)(engine_.execute("SELECT region, SUM(amount) AS total FROM read_parquet('" + path_ +
+                                      "') GROUP BY region HAVING SUM(amount) > "
+                                      "(SELECT amount FROM read_parquet('" +
+                                      path_ + "'))")),
+               ExecutionError);
+}
+
+TEST_F(QueryEngineExecuteCpuTest, HavingSubqueryReturningMultipleColumnsThrowsExecutionError) {
+  // region = 'A' AND amount = 10 matches exactly one row (10.0, "A") --
+  // isolates the column-count check from the row-count check, since this
+  // subquery genuinely returns one row, just with two columns.
+  EXPECT_THROW((void)(engine_.execute("SELECT region, SUM(amount) AS total FROM read_parquet('" + path_ +
+                                      "') GROUP BY region HAVING SUM(amount) > "
+                                      "(SELECT region, amount FROM read_parquet('" +
+                                      path_ + "') WHERE region = 'A' AND amount = 10)")),
+               ExecutionError);
+}
+
+// The subquery is bound independently against its own FROM clause's
+// schema only -- it has no access to the outer query's tables/aliases, so
+// referencing a column that exists on the outer query but not on the
+// subquery's own source must fail exactly like any other unknown-column
+// reference, not silently resolve against the outer scope (there is no
+// correlated-subquery support to accidentally provide that).
+TEST_F(QueryEngineExecuteCpuTest, HavingSubqueryCannotReferenceOuterQueryColumns) {
+  EXPECT_THROW((void)(engine_.execute("SELECT region, SUM(amount) AS total FROM read_parquet('" + path_ +
+                                      "') GROUP BY region HAVING SUM(amount) > "
+                                      "(SELECT COUNT(*) FROM read_parquet('" +
+                                      regions_path_ + "') WHERE amount > 5)")),
+               BindingError);
+}
+
 }  // namespace
 }  // namespace kernellake

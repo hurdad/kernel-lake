@@ -219,7 +219,37 @@ LogicalPlanPtr finish_logical_plan(LogicalPlanPtr plan, const BoundQuery& query)
                                                        group_by_positions, group_by.size()));
     }
 
+    // HAVING's own aggregate references must be rewritten here too, in
+    // this same pre-LogicalAggregate phase, not after -- a HAVING clause
+    // referencing an aggregate not already in the SELECT list (legal SQL,
+    // just not this project's own tests today) needs register_aggregate()
+    // to grow `aggregates` before LogicalAggregate is constructed just
+    // below; rewriting afterward would silently miss it (LogicalAggregate
+    // would already have been built from the smaller, stale list).
+    // register_aggregate()'s own structural_key() dedup means a HAVING
+    // expression identical to one already in the SELECT list (the common
+    // case, e.g. TPC-H Q11's `HAVING SUM(x) > ...` repeating the SELECT
+    // list's own `SUM(x) AS value`) reuses that same slot rather than
+    // adding a second one.
+    ExpressionPtr rewritten_having;
+    if (query.having != nullptr) {
+      rewritten_having = rewrite_aggregate_refs(query.having, aggregates, aggregate_positions, group_by,
+                                                group_by_positions, group_by.size());
+    }
+
     plan = std::make_shared<LogicalAggregate>(plan, std::move(group_by), std::move(aggregates));
+
+    if (rewritten_having != nullptr) {
+      // Filters the aggregate's own output rows (one per group) before
+      // the re-projection below -- see docs/ARCHITECTURE.md's HAVING
+      // section. This LogicalFilter's predicate indexes into
+      // LogicalAggregate's output schema, not any scan's -- see
+      // optimizer.cpp's annotate_scan() and physical_planner.cpp's
+      // convert() LogicalFilter cases, both of which special-case a
+      // LogicalFilter sitting directly on a LogicalAggregate for exactly
+      // this reason.
+      plan = std::make_shared<LogicalFilter>(plan, rewritten_having);
+    }
 
     // Re-project to the exact column order/names the query requested: the
     // LogicalAggregate above always emits [group_by..., aggregates...]

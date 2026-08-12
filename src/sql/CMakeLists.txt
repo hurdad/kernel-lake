@@ -2,6 +2,7 @@ include(ThirdPartySqlParser)
 
 add_library(kernellake_sql STATIC
   parser.cpp
+  subquery_resolver.cpp
 )
 
 target_include_directories(kernellake_sql PUBLIC

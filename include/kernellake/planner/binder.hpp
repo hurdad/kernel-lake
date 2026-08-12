@@ -55,6 +55,12 @@ struct BoundQuery {
   std::optional<BoundJoin> join;          // JOIN chain case (see bind_query's join overload)
   ExpressionPtr where;                    // null if no WHERE clause
   std::vector<ExpressionPtr> group_by;
+  // `HAVING <bool expr>` -- null if no HAVING clause. Only ever set when
+  // `is_aggregate_query` is true (see bind_query_common()); may reference
+  // aggregates (unlike `where` above, which never may) via the same
+  // ColumnExpression-into-aggregate-output mechanism SELECT-list items
+  // use -- see rewrite_aggregate_refs() (logical_planner.cpp).
+  ExpressionPtr having;
   std::vector<BoundOrderByItem> order_by;
   std::optional<std::int64_t> limit;
   bool is_aggregate_query = false;

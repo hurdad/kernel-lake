@@ -180,12 +180,57 @@ Catalog server and a real MinIO, not just reasoned about: see
   `BIGINT`, unlike cudf's `INT16`, needing no extra cast on that side).
 
 Not yet supported (fails clearly rather than being silently reinterpreted):
-`DISTINCT`, `HAVING`, set operations (`UNION`/etc.), `WITH`/CTEs,
-subqueries, `OFFSET`, window functions, `CASE`/`EXTRACT` in `WHERE` (GPU
-only -- see above), any function other than the five aggregates and
-`EXTRACT` above, `EXTRACT` fields other than `YEAR`/`MONTH`/`DAY`,
-comma-style joins, `LEFT`/`RIGHT`/`FULL`/`CROSS` JOIN, and multi-key or
-non-equality join conditions.
+`DISTINCT`, set operations (`UNION`/etc.), `WITH`/CTEs, `OFFSET`, window
+functions, `CASE`/`EXTRACT` in `WHERE` (GPU only -- see above), any
+function other than the five aggregates and `EXTRACT` above, `EXTRACT`
+fields other than `YEAR`/`MONTH`/`DAY`, comma-style joins,
+`LEFT`/`RIGHT`/`FULL`/`CROSS` JOIN, and multi-key or non-equality join
+conditions. `HAVING` and subqueries are now supported, but narrowly --
+see "`HAVING` and scalar subqueries" below.
+
+### `HAVING` and scalar subqueries
+
+`HAVING <bool expr>` is accepted on any aggregate query (`GROUP BY` or a
+bare aggregate `SELECT` list), following the same binding rules the
+`SELECT` list's own aggregate expressions already follow: any combination
+of aggregates and `GROUP BY` keys, rejected otherwise via
+`references_ungrouped_column()` (the same check `SELECT` items get).
+Architecturally it's just a `LogicalFilter` inserted directly on top of
+`LogicalAggregate`, between the aggregate and its re-projection --
+`FilterNode`/`FilterOperator` on both backends were already fully generic
+enough to filter post-aggregation output; this was previously just never
+SQL-reachable.
+
+A subquery is accepted in exactly one place: as an operand inside
+`HAVING`'s own boolean expression (e.g. `HAVING SUM(x) > (SELECT ...)`,
+TPC-H Q11's shape). It must be **non-correlated** (bound independently
+against its own `FROM`/`JOIN` schema only -- it has no access to the
+outer query's tables or aliases) and must produce **exactly one row, one
+column** (a true scalar; `DOUBLE`/`INT64` results only, the only two
+types `SUM`/`COUNT`/`MIN`/`MAX`/`AVG` can actually produce). Anywhere
+else -- `WHERE`, `SELECT`, `FROM`, `GROUP BY`, join `ON` -- a subquery is
+still rejected with a clear `BindingError`
+(`Binder::bind_node(const sql::AstSubquery&, bool)`), and `IN`/`EXISTS`/
+correlated subqueries are not supported at all.
+
+Implementation: `sql::resolve_subqueries()` (a pure, storage-independent
+AST tree walker) runs once, in `QueryEngine::plan_logical()`, before the
+outer query is ever bound -- it replaces each `AstSubquery` node inside
+`having` with a literal by calling
+`QueryEngine::evaluate_scalar_subquery()`, which runs the subquery as its
+own fully independent bind -> plan -> optimize -> physical-plan -> execute
+cycle (recursively resolving any subquery *of its own* first) and
+converts the resulting one-row, one-column Arrow scalar into an AST
+literal. This subquery execution **always uses the CPU (Acero) backend**,
+regardless of the outer query's own `--backend` -- nesting a second
+`RmmEnvironment`/GPU-execution lifecycle inside `plan_logical()` risks the
+same "two `RmmEnvironment`s racing the one process-wide current-device-
+resource slot" hazard the Concurrency notes below already warn about
+elsewhere, and a scalar subquery's result is one number, not worth that
+risk. Because the binder has no I/O capability of its own (by design --
+see `ast.hpp`'s own header comment), this resolution step could not live
+in the binder itself; it needed a layer with real query-execution access,
+which only `QueryEngine` has.
 
 `GROUP BY <name>` resolves `<name>` against the base-table schema first,
 then falls back to matching a `SELECT`-list output alias -- this is what
@@ -318,7 +363,11 @@ entire RMM pool per request is wasteful even single-threaded.
 For that reason `QueryEngine` also exposes a split entry point:
 `explain(sql) -> PhysicalPlanPtr` (already reentrant -- parsing, binding,
 logical planning, optimization, and Parquet metadata inspection touch no
-shared mutable state) followed by
+shared mutable state -- with one exception: if the query has a `HAVING`
+subquery, planning now really executes it, on the CPU backend, as a side
+effect of `plan_logical()`; see "`HAVING` and scalar subqueries" above.
+This is not a new risk category, though -- `explain()` already performs
+real Parquet-metadata I/O during planning regardless) followed by
 `execute(const PhysicalPlanPtr&, RmmEnvironment&) -> QueryResult`, which
 takes an **externally owned** `RmmEnvironment` instead of building its own.
 A long-lived caller should construct exactly one `RmmEnvironment` at

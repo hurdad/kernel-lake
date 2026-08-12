@@ -30,6 +30,7 @@ using sql::AstLike;
 using sql::AstLiteral;
 using sql::AstLiteralKind;
 using sql::AstStar;
+using sql::AstSubquery;
 using sql::AstUnary;
 using sql::AstUnaryOp;
 
@@ -811,6 +812,20 @@ class Binder {
     return std::make_shared<ExtractExpression>(part, std::move(operand), int64_type(nullable));
   }
 
+  // Reached only if an `AstSubquery` survives all the way to binding --
+  // i.e. it appeared somewhere QueryEngine::plan_logical()'s
+  // sql::resolve_subqueries() pass never looks (that pass only ever
+  // walks AstSelectStatement::having), or that pass's own walk somehow
+  // missed one. Either way, the only place a subquery is actually
+  // supported is inside HAVING (see docs/ARCHITECTURE.md), so this is
+  // always a real error, never reached for a query that binds
+  // successfully.
+  [[noreturn]] ExpressionPtr bind_node(const AstSubquery&, bool) {
+    throw BindingError(
+        "subqueries are only supported as an operand inside a HAVING clause (e.g. "
+        "'HAVING SUM(x) > (SELECT ...)'), not here");
+  }
+
   const Schema* input_schema_ = nullptr;  // single-table mode
   // JOIN mode: one (alias, schema) pair per FROM-clause source, in
   // left-to-right order -- empty (and input_schema_ non-null) in
@@ -946,6 +961,31 @@ BoundQuery bind_query_common(const sql::AstSelectStatement& stmt, Binder& binder
             "aggregate function");
       }
     }
+  }
+
+  if (stmt.having != nullptr) {
+    if (!is_aggregate_query) {
+      throw BindingError("HAVING requires GROUP BY or an aggregate function in the SELECT list");
+    }
+    // allow_aggregates=true (unlike WHERE just above): HAVING is exactly
+    // the one clause that's *supposed* to reference aggregates -- that's
+    // the whole point of it existing separately from WHERE, which runs
+    // before aggregation even happens.
+    ExpressionPtr having = binder.bind(stmt.having, /*allow_aggregates=*/true);
+    if (having->result_type().id != TypeId::Boolean) {
+      throw BindingError(fmt::format("HAVING clause must be a boolean expression, got {}",
+                                     having->result_type().to_string()));
+    }
+    // Same rule the SELECT list already gets just above: any bare column
+    // reference in HAVING must be a GROUP BY key or wrapped in an
+    // aggregate -- HAVING runs over post-aggregation groups, so an
+    // ungrouped column has no single value to compare against.
+    if (references_ungrouped_column(having, group_by_keys, /*inside_aggregate=*/false)) {
+      throw BindingError(
+          "column referenced in HAVING must appear in GROUP BY or be used inside an aggregate "
+          "function");
+    }
+    result.having = std::move(having);
   }
 
   for (const sql::AstOrderByItem& item : stmt.order_by) {

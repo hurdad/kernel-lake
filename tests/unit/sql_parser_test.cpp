@@ -350,5 +350,87 @@ TEST(SqlParser, ReadParquetPathArgumentPreservesEscapedQuoteVerbatim) {
   EXPECT_EQ(stmt.from.paths[0], R"(/data/a\'b.parquet)");
 }
 
+TEST(SqlParser, ParsesHavingClause) {
+  const auto stmt = parse_sql(
+      "SELECT region, SUM(amount) AS total FROM read_parquet('/x.parquet') "
+      "GROUP BY region HAVING SUM(amount) > 100");
+  ASSERT_NE(stmt.having, nullptr);
+  const auto* comparison = std::get_if<AstBinary>(&stmt.having->node);
+  ASSERT_NE(comparison, nullptr);
+  EXPECT_EQ(comparison->op, AstBinaryOp::Gt);
+  ASSERT_TRUE(std::holds_alternative<AstAggregate>(comparison->left->node));
+  EXPECT_EQ(std::get<AstAggregate>(comparison->left->node).function, AstAggregateFunc::Sum);
+}
+
+TEST(SqlParser, HavingIsNullWhenAbsent) {
+  const auto stmt = parse_sql("SELECT region FROM read_parquet('/x.parquet') GROUP BY region");
+  EXPECT_EQ(stmt.having, nullptr);
+}
+
+// `(SELECT ...)` as HAVING's comparison operand -- parses into an
+// AstSubquery wrapping a fully-converted nested AstSelectStatement (its
+// own FROM/WHERE/aggregate, entirely independent of the outer query's).
+TEST(SqlParser, ParsesHavingWithScalarSubquery) {
+  const auto stmt = parse_sql(
+      "SELECT region, SUM(amount) AS total FROM read_parquet('/x.parquet') "
+      "GROUP BY region HAVING SUM(amount) > (SELECT SUM(amount) * 0.1 FROM read_parquet('/x.parquet'))");
+  ASSERT_NE(stmt.having, nullptr);
+  const auto* comparison = std::get_if<AstBinary>(&stmt.having->node);
+  ASSERT_NE(comparison, nullptr);
+  const auto* subquery = std::get_if<AstSubquery>(&comparison->right->node);
+  ASSERT_NE(subquery, nullptr);
+  ASSERT_NE(subquery->statement, nullptr);
+  ASSERT_EQ(subquery->statement->from.paths.size(), 1u);
+  EXPECT_EQ(subquery->statement->from.paths[0], "/x.parquet");
+  ASSERT_EQ(subquery->statement->select_list.size(), 1u);
+  EXPECT_EQ(subquery->statement->having, nullptr);
+}
+
+// Regression test for the source-consumption redesign this feature needed:
+// preprocess_from_read_parquet() produces one flat, occurrence-ordered
+// placeholder list spanning the *entire* raw SQL text, so a subquery with
+// its own JOIN chain (repeating the same table twice, matching TPC-H
+// Q11's/Q7's own real shape) must not trip the old per-statement
+// "preprocessed.sources.size() must exactly match this one statement"
+// checks -- each of the outer/subquery JOIN chains must independently
+// resolve their own sources by placeholder identity instead.
+TEST(SqlParser, SubqueryWithItsOwnJoinChainParsesCorrectly) {
+  const auto stmt = parse_sql(
+      "SELECT k, SUM(v) AS total FROM read_parquet('/k.parquet') AS a "
+      "JOIN read_parquet('/v.parquet') AS b ON a.id = b.id "
+      "GROUP BY k HAVING SUM(v) > (SELECT SUM(v) * 0.1 FROM read_parquet('/k2.parquet') AS a "
+      "JOIN read_parquet('/v2.parquet') AS b ON a.id = b.id)");
+  ASSERT_TRUE(stmt.join.has_value());
+  EXPECT_EQ(stmt.join->first.paths, std::vector<std::string>{"/k.parquet"});
+  EXPECT_EQ(stmt.join->steps[0].source.paths, std::vector<std::string>{"/v.parquet"});
+
+  ASSERT_NE(stmt.having, nullptr);
+  const auto* comparison = std::get_if<AstBinary>(&stmt.having->node);
+  ASSERT_NE(comparison, nullptr);
+  const auto* subquery = std::get_if<AstSubquery>(&comparison->right->node);
+  ASSERT_NE(subquery, nullptr);
+  ASSERT_TRUE(subquery->statement->join.has_value());
+  EXPECT_EQ(subquery->statement->join->first.paths, std::vector<std::string>{"/k2.parquet"});
+  EXPECT_EQ(subquery->statement->join->steps[0].source.paths, std::vector<std::string>{"/v2.parquet"});
+}
+
+TEST(SqlParser, RejectsSubqueryOutsideHaving) {
+  // convert_expr() happily builds an AstSubquery node wherever hsql's own
+  // grammar allows a value expression -- WHERE included -- but nothing
+  // downstream ever resolves one there (resolve_subqueries() only ever
+  // walks AstSelectStatement::having), so it's the *binder*, not the
+  // parser, that's expected to reject this -- see binder_test.cpp's
+  // RejectsSubqueryOutsideHaving for that half. This parser-level test
+  // only confirms parsing itself succeeds (produces a real AstSubquery
+  // node), matching the doc comment on AstSubquery/convert_expr's own
+  // kExprSelect case.
+  const auto stmt = parse_sql(
+      "SELECT a FROM read_parquet('/x.parquet') WHERE a > (SELECT SUM(a) FROM read_parquet('/x.parquet'))");
+  ASSERT_NE(stmt.where, nullptr);
+  const auto* comparison = std::get_if<AstBinary>(&stmt.where->node);
+  ASSERT_NE(comparison, nullptr);
+  EXPECT_TRUE(std::holds_alternative<AstSubquery>(comparison->right->node));
+}
+
 }  // namespace
 }  // namespace kernellake::sql

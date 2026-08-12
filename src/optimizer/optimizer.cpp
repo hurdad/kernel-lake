@@ -663,8 +663,22 @@ LogicalPlanPtr rewrite_plan(const LogicalPlanPtr& node) {
 void annotate_scan(const LogicalPlanPtr& node, std::unordered_set<std::size_t>& required_columns,
                    std::vector<PushablePredicate>& pushable_predicates) {
   if (const auto* filter = dynamic_cast<const LogicalFilter*>(node.get())) {
-    collect_columns(filter->predicate(), required_columns);
-    collect_pushable_predicates(filter->predicate(), pushable_predicates);
+    // A HAVING filter sitting directly on a LogicalAggregate (see
+    // logical_planner.cpp's finish_logical_plan()) is the one LogicalFilter
+    // shape whose predicate's ColumnExpression indices describe the
+    // *aggregate's* output schema, not the scan's -- same reasoning the
+    // LogicalProjection branch below already applies via its own
+    // reads_aggregate_output check. Neither collecting its columns into
+    // required_columns (which would misindex into the scan's own pruned
+    // column list) nor treating it as a pushable file-level predicate (it
+    // can't be -- it runs after aggregation, over rows that don't exist
+    // yet at scan time) is correct here.
+    const bool filters_aggregate_output =
+        dynamic_cast<const LogicalAggregate*>(filter->child().get()) != nullptr;
+    if (!filters_aggregate_output) {
+      collect_columns(filter->predicate(), required_columns);
+      collect_pushable_predicates(filter->predicate(), pushable_predicates);
+    }
     annotate_scan(filter->child(), required_columns, pushable_predicates);
   } else if (const auto* sort = dynamic_cast<const LogicalSort*>(node.get())) {
     for (const LogicalSort::Key& key : sort->keys()) {

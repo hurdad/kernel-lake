@@ -21,6 +21,7 @@ namespace kernellake::sql {
 
 struct AstExpr;
 using AstExprPtr = std::shared_ptr<AstExpr>;
+struct AstSelectStatement;
 
 // `table` is the optional qualifier on a qualified column reference (e.g.
 // `a` in `a.key`) -- only meaningful for a two-table JOIN query, where it
@@ -159,9 +160,25 @@ struct AstExtract {
   AstExprPtr operand;
 };
 
+// `(SELECT ...)` used as a value expression -- only ever legal today as an
+// operand inside a `HAVING` clause's boolean expression (see
+// kernellake::sql::resolve_subqueries()/QueryEngine::evaluate_scalar_subquery(),
+// which replace every such node with a real AstLiteral -- the result of
+// actually running the nested query -- before the outer query is ever
+// bound). A binder that encounters one directly (i.e. one that survived
+// resolution, because it appeared somewhere other than HAVING) rejects it
+// with a clear error -- see Binder::bind_node(const AstSubquery&, bool).
+// `statement` is a `shared_ptr`, not embedded by value, since
+// `AstSelectStatement` is only forward-declared here (it embeds
+// `AstExprPtr`s of its own, which would make a by-value cycle back to this
+// type an incomplete-type error).
+struct AstSubquery {
+  std::shared_ptr<AstSelectStatement> statement;
+};
+
 struct AstExpr {
   std::variant<AstColumnRef, AstStar, AstLiteral, AstBinary, AstUnary, AstBetween, AstAggregate, AstLike,
-               AstIn, AstCase, AstCast, AstExtract>
+               AstIn, AstCase, AstCast, AstExtract, AstSubquery>
       node;
   std::optional<std::string> alias;
 };
@@ -209,6 +226,11 @@ struct AstSelectStatement {
   std::optional<AstJoinClause> join;  // FROM ... JOIN ... ON ... [JOIN ... ON ...]
   AstExprPtr where;                   // null if no WHERE clause
   std::vector<AstExprPtr> group_by;
+  // `HAVING <bool expr>` -- null if no HAVING clause. Only legal on a
+  // GROUP BY/aggregate query (see binder.cpp); may itself contain an
+  // AstSubquery node (see that type's own comment) by the time parse_sql()
+  // returns, always resolved to a plain AstLiteral before binding.
+  AstExprPtr having;
   std::vector<AstOrderByItem> order_by;
   std::optional<std::int64_t> limit;
 };

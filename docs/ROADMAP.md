@@ -3499,6 +3499,88 @@ log` is the authoritative chronology if that ordering ever matters.
   `tools/benchmark_three_way.py` (same gap every TPC-H query past Q3/
   Q12/Q14/Q19 already has).
 
+- **TPC-H Q11** -- `GROUP BY`'s `HAVING` clause and a non-correlated
+  scalar subquery, both genuinely implemented for the first time (unlike
+  Q5/Q7/Q9, which needed no new SQL engine feature). Scoped narrowly to
+  exactly what Q11 needs: `HAVING <bool expr>` on any aggregate query,
+  same binding rules the `SELECT` list's own aggregate expressions
+  already follow; a subquery only as an operand inside `HAVING`'s own
+  boolean expression, non-correlated, exactly one row/one column. See
+  `docs/ARCHITECTURE.md`'s "`HAVING` and scalar subqueries" section for
+  the full scope and every layer touched (AST, parser, a new
+  `sql::resolve_subqueries()` tree walker, binder, logical planner,
+  optimizer, physical planner, and a new `QueryEngine::
+  evaluate_scalar_subquery()` orchestration layer that runs the subquery
+  as its own independent bind -> plan -> execute cycle, always on the CPU
+  backend regardless of the outer query's own `--backend`, to avoid
+  nesting a second `RmmEnvironment`/GPU lifecycle inside `plan_logical()`).
+
+  Confirmed via hsql (the vendored grammar) already parsing both
+  `HAVING` (`hsql::GroupByDescription::having`) and a subquery as a value
+  expression (`hsql::Expr::type == kExprSelect`) before writing any code
+  -- KernelLake's own conversion layer was what rejected both, not hsql.
+
+  The parser's own source-consumption validation (confirming every
+  `read_parquet(...)` call in the raw SQL text got matched to a real
+  `FROM`/`JOIN` clause) had to be redesigned: it used to assume exactly
+  one statement's worth of sources existed per query, which breaks once
+  a `HAVING` subquery has its own, separately-scoped `read_parquet(...)`
+  calls sharing the same flat, occurrence-ordered placeholder list. Fixed
+  by tracking per-source consumption across the whole parse (not
+  per-statement) and checking full coverage once at the very end.
+
+  Found and fixed one real, subtle bug during verification: `physical_
+  planner.cpp`'s `references_scan_schema()` (used by `LogicalSort`'s own
+  physical-conversion case to decide whether its key indices need
+  remapping against the scan) treated *any* `LogicalFilter` as scan-
+  schema-referencing unconditionally -- safe before `HAVING` existed, but
+  wrong once the optimizer's redundant-projection-removal elides the
+  aggregate path's final re-projection for a JOIN-based query, leaving
+  `LogicalSort` sitting directly on the `HAVING` `LogicalFilter` (whose
+  `ColumnExpression` indices describe the aggregate's *output* schema,
+  not the scan's). Symptom was an Acero execution-time error ("No match
+  for FieldRef.FieldPath(2)"), only reachable via the exact combination
+  `JOIN` + `GROUP BY` + `HAVING` + `ORDER BY` -- found by bisecting which
+  of those four was actually required (removing any one made it pass),
+  then confirmed the real cause via a standalone C++ program calling this
+  project's own Arrow library directly to empirically verify Acero's
+  hashaggregate output field order (keys first, then aggregates --
+  ruling out an ordering-mismatch theory before finding the real one).
+  Fixed by having `references_scan_schema()` return `false` when a
+  `LogicalFilter`'s own child is a `LogicalAggregate`. Covered by a
+  dedicated regression test (`QueryEngineExecuteCpuTest.
+  JoinGroupByHavingOrderByDoesNotMisremapSortKeyIndices`) reproducing the
+  exact shape end to end.
+
+  Also caught before it shipped: an early draft of `q11.sql` mapped
+  `{data}` to `partsupp` (Q11 doesn't reference `lineitem` at all), which
+  worked standalone but broke `tools/validate_tpch.py --query all` (which
+  always substitutes `{data}` with a `lineitem` glob uniformly across
+  every query). Fixed by using the already-existing `{partsupp_data}`
+  placeholder (added for Q9) instead, leaving `{data}`/`--data` simply
+  required-but-unreferenced for this one query -- caught by running the
+  full `--query all` regression pass rather than declaring victory after
+  `--query 11` alone.
+
+  Verified for real: `tools/validate_tpch.py --query 11` exact match
+  against DuckDB on both the CPU and GPU backends at SF0.01 (266 real
+  matching rows, not an empty/trivial result -- DuckDB needed no code
+  changes, it already supports `HAVING`/subqueries natively), and
+  `--query all` (now 11 queries: Q1/Q3/Q5/Q6/Q7/Q9/Q10/Q11/Q12/Q14/Q19)
+  all still match with zero regressions on both backends. 18 new unit
+  tests added (`sql_parser_test.cpp`: `HAVING`/subquery parsing including
+  a subquery with its own independent `JOIN` chain; `binder_test.cpp`:
+  `HAVING` binding, ungrouped-column-in-`HAVING` rejection, `HAVING`-
+  without-aggregate rejection, boolean-type check, subquery-outside-
+  `HAVING` rejection; `query_engine_execute_cpu_test.cpp`: literal and
+  subquery `HAVING` thresholds, the `JOIN`+`HAVING`+`ORDER BY` regression
+  above, nested subquery-in-subquery resolution, and `ExecutionError`/
+  `BindingError` coverage for a subquery returning zero rows, multiple
+  rows, multiple columns, or referencing a column outside its own scope)
+  -- `kernellake_unit_tests` 428/428 pass (up from 413) and
+  `kernellake_gpu_tests` 101/101 pass, both zero regressions, confirmed
+  on a real `gpu-dev-wsl2` rebuild against real GPU hardware.
+
 ## Not yet started
 
 - **Unity Catalog support: remaining gaps** -- the core read path (Phase 5
@@ -3686,11 +3768,16 @@ log` is the authoritative chronology if that ordering ever matters.
   existing pattern: `kernellake_sql()` substitution, a fourth Spark temp
   view, cold-mode cache eviction) -- not yet done; also not yet run at any
   scale factor beyond the SF0.01 validation in "Done" above
-- ~~Q7/Q9~~ -- done, see "TPC-H Q7 and Q9" in "Done" above. Every
-  *other* still-missing query needs a subquery, `HAVING`, or an outer
-  join, none of which KernelLake's SQL layer supports yet (see
-  `docs/ARCHITECTURE.md`'s "Not yet supported" list) -- 12 of TPC-H's 22
-  queries now, down from 14
+- ~~Q7/Q9~~ -- done, see "TPC-H Q7 and Q9" in "Done" above.
+- ~~Q11~~ -- done, see "TPC-H Q11" in "Done" above. `HAVING` and a
+  narrow non-correlated scalar subquery are now supported (see
+  `docs/ARCHITECTURE.md`'s "`HAVING` and scalar subqueries" section for
+  the exact scope). Every *other* still-missing query needs an outer
+  join, `DISTINCT`, set operations, `WITH`/CTEs, window functions, `IN`/
+  `EXISTS`, a correlated subquery, or a multi-row/multi-column subquery
+  -- none of which KernelLake's SQL layer supports yet (see
+  `docs/ARCHITECTURE.md`'s "Not yet supported" list) -- 11 of TPC-H's 22
+  queries now, down from 12
 - `CASE`/`EXTRACT` inside `WHERE` on the GPU backend (`FilterOperator`'s
   own gap, separate from the aggregate-argument fix above; the CPU backend
   already supports both via its one shared expression compiler) -- not

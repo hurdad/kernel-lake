@@ -9,6 +9,7 @@
 #include "kernellake/common/config.hpp"
 #include "kernellake/planner/logical_plan.hpp"
 #include "kernellake/planner/physical_plan.hpp"
+#include "kernellake/sql/ast.hpp"
 #include "kernellake/storage/object_store_registry.hpp"
 #include "kernellake/types/schema.hpp"
 #include "kernellake/unitycatalog/unity_catalog_token_cache.hpp"
@@ -136,6 +137,22 @@ class QueryEngine {
   // return a QueryResult to put it in.
   [[nodiscard]] LogicalPlanPtr plan_logical(std::string_view sql,
                                             double* metadata_inspection_seconds_out = nullptr) const;
+
+  // Runs `subquery_ast` as a genuinely separate, complete query (bind,
+  // logical-plan, optimize, physical-plan, execute) and returns its single
+  // scalar result as an AstLiteral -- see docs/ARCHITECTURE.md's HAVING
+  // section for the full scope (non-correlated, single-row/single-column
+  // only) and why this always executes on the CPU (Acero) backend
+  // regardless of the outer query's own configured one. Called by
+  // plan_logical() (via sql::resolve_subqueries()) to resolve every
+  // AstSubquery reachable from a HAVING clause before the outer query is
+  // bound -- the physical plan's own HAVING filter needs a real literal
+  // threshold, not a placeholder. Recursively resolves `subquery_ast`'s
+  // own HAVING subqueries first, so a subquery nested inside a subquery
+  // works for free. Throws ExecutionError if the result isn't exactly one
+  // row and one column, or if that column's Arrow type isn't one of the
+  // few this project's aggregates can actually produce.
+  [[nodiscard]] sql::AstLiteral evaluate_scalar_subquery(const sql::AstSelectStatement& subquery_ast) const;
 
   EngineConfig config_;
   // Declared after config_ (member init order follows declaration order):

@@ -222,6 +222,18 @@ std::optional<ScanBoundary> find_scan_boundary(const PhysicalPlanNode& node) {
 // narrowed (non-*, non-aggregate) SELECT combined with ORDER BY and/or
 // LIMIT. See PhysicalPlannerTest.SurvivingPlainProjectionRemapsThroughAn
 // InterposedSort/...InterposedLimit.
+//
+// A `LogicalFilter` is *not* always a positive match: a HAVING filter (see
+// logical_planner.cpp's finish_logical_plan()) is also a LogicalFilter, but
+// sits directly on a LogicalAggregate and its ColumnExpressions reference
+// *that* node's output schema, not the scan's -- the same distinction this
+// function already draws for LogicalScan vs. everything else. Real bug
+// this exact gap caused: `GROUP BY ... HAVING ... ORDER BY ...`, once the
+// optimizer's redundant-projection-removal rule elides the aggregate
+// path's re-projection (leaving LogicalSort sitting directly on the HAVING
+// LogicalFilter), wrongly remapped the Sort's already-correctly-indexed
+// keys as if they were scan indices -- an out-of-range FieldRef at
+// execution time on any query combining a JOIN with GROUP BY/HAVING.
 bool references_scan_schema(const LogicalPlanNode* node) {
   while (true) {
     if (const auto* sort = dynamic_cast<const LogicalSort*>(node)) {
@@ -232,8 +244,10 @@ bool references_scan_schema(const LogicalPlanNode* node) {
       node = limit->child().get();
       continue;
     }
-    return dynamic_cast<const LogicalFilter*>(node) != nullptr ||
-           dynamic_cast<const LogicalScan*>(node) != nullptr ||
+    if (const auto* filter = dynamic_cast<const LogicalFilter*>(node)) {
+      return dynamic_cast<const LogicalAggregate*>(filter->child().get()) == nullptr;
+    }
+    return dynamic_cast<const LogicalScan*>(node) != nullptr ||
            dynamic_cast<const LogicalJoin*>(node) != nullptr;
   }
 }
@@ -422,7 +436,20 @@ PhysicalPlanPtr convert(const LogicalPlanPtr& node, ObjectStore& store, TableSou
   }
   if (const auto* filter = dynamic_cast<const LogicalFilter*>(node.get())) {
     PhysicalPlanPtr child = convert(filter->child(), store, extra_resolver);
-    const std::optional<ScanBoundary> boundary = find_scan_boundary(*child);
+    // A HAVING filter sits directly on LogicalAggregate (see
+    // logical_planner.cpp's finish_logical_plan()) -- its predicate
+    // already references *that* node's own output schema one-for-one, the
+    // same "already correctly indexed, no remap needed" situation the
+    // LogicalProjection case below documents for its own aggregate-
+    // reprojection shape. Only remap when this filter's own predicate
+    // actually references scan schema (a WHERE filter, sitting on
+    // Scan/Filter/Join, possibly through an interposed Sort/Limit) --
+    // reusing the exact same references_scan_schema() discriminator the
+    // Projection/Sort cases below already rely on for the identical
+    // problem.
+    const bool predicate_references_scan_schema = references_scan_schema(filter->child().get());
+    const std::optional<ScanBoundary> boundary =
+        predicate_references_scan_schema ? find_scan_boundary(*child) : std::nullopt;
     ExpressionPtr predicate = boundary ? remap_columns(filter->predicate(), *boundary) : filter->predicate();
     return std::make_shared<FilterNode>(std::move(child), std::move(predicate));
   }

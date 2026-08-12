@@ -261,13 +261,17 @@ grouped aggregates (including a ~40,000-group `GROUP BY customer_id`), and
 ## TPC-H-derived benchmarking (unofficial)
 
 **Unofficial TPC-H-derived benchmark. Not a certified TPC result.** Q1,
-Q3, Q5, Q6, Q7, Q9, Q10, Q12, Q14, and Q19 are supported -- both
-single-table scans (Q1/Q6) and multi-table `INNER JOIN` chains (Q3's
-3-way `customer`/`orders`/`lineitem` join, Q10's 4-way and Q5's/Q7's/Q9's
-6-way joins -- Q7 self-joins `nation` under two aliases, Q9 splits
-`partsupp`'s two-column join key across a `JOIN` condition and a `WHERE`
-filter, Q12/Q14/Q19's 2-way joins), on both the CPU and GPU execution
-backends. See [docs/TPCH.md](docs/TPCH.md) for the full generate ->
+Q3, Q5, Q6, Q7, Q9, Q10, Q11, Q12, Q14, and Q19 are supported (11 of 22) --
+both single-table scans (Q1/Q6) and multi-table `INNER JOIN` chains (Q3's
+and Q11's 3-way joins, Q10's 4-way join, and Q5's/Q7's/Q9's 6-way joins --
+Q7 self-joins `nation` under two aliases, Q9
+splits `partsupp`'s two-column join key across a `JOIN` condition and a
+`WHERE` filter, Q12/Q14/Q19's 2-way joins), on both the CPU and GPU
+execution backends. Q11 is also the first query needing `GROUP BY`'s
+`HAVING` clause or a subquery (a non-correlated scalar one computing
+`HAVING`'s own threshold), both now genuinely supported in a narrow scope
+-- see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)'s "`HAVING` and scalar
+subqueries" section. See [docs/TPCH.md](docs/TPCH.md) for the full generate ->
 query -> validate -> benchmark workflow, including `tools/generate_tpch.py`
 (a synthetic generator, not the official `dbgen`) and `kernellake
 benchmark tpch`'s cold/warm timing modes.
