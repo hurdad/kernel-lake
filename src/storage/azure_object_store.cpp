@@ -10,7 +10,8 @@ namespace kernellake {
 
 namespace {
 
-std::shared_ptr<arrow::fs::FileSystem> make_azure_filesystem_from_options(const arrow::fs::AzureOptions& options) {
+std::shared_ptr<arrow::fs::FileSystem> make_azure_filesystem_from_options(
+    const arrow::fs::AzureOptions& options) {
   const arrow::Result<std::shared_ptr<arrow::fs::AzureFileSystem>> result =
       arrow::fs::AzureFileSystem::Make(options);
   if (!result.ok()) {
