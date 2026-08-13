@@ -414,6 +414,64 @@ TEST(SqlParser, SubqueryWithItsOwnJoinChainParsesCorrectly) {
   EXPECT_EQ(subquery->statement->join->steps[0].source.paths, std::vector<std::string>{"/v2.parquet"});
 }
 
+// Both sql::resolve_subqueries() and the binder walk an AstExpr tree
+// recursively -- a subquery sitting directly as HAVING's own comparison
+// operand (ParsesHavingWithScalarSubquery above) doesn't exercise that
+// recursion at all. Nesting one inside a BETWEEN bound instead does.
+TEST(SqlParser, ParsesHavingWithScalarSubqueryNestedInsideBetween) {
+  const auto stmt = parse_sql(
+      "SELECT region, SUM(amount) AS total FROM read_parquet('/x.parquet') "
+      "GROUP BY region HAVING SUM(amount) BETWEEN (SELECT SUM(amount) * 0.3 FROM read_parquet('/x.parquet')) "
+      "AND 200");
+  ASSERT_NE(stmt.having, nullptr);
+  const auto* between = std::get_if<AstBetween>(&stmt.having->node);
+  ASSERT_NE(between, nullptr);
+  const auto* subquery = std::get_if<AstSubquery>(&between->lower->node);
+  ASSERT_NE(subquery, nullptr);
+  ASSERT_NE(subquery->statement, nullptr);
+  ASSERT_EQ(subquery->statement->from.paths.size(), 1u);
+  EXPECT_EQ(subquery->statement->from.paths[0], "/x.parquet");
+}
+
+// Same as above, but nested inside a CASE branch's result instead of a
+// BETWEEN bound.
+TEST(SqlParser, ParsesHavingWithScalarSubqueryNestedInsideCase) {
+  const auto stmt = parse_sql(
+      "SELECT region, SUM(amount) AS total FROM read_parquet('/x.parquet') "
+      "GROUP BY region HAVING SUM(amount) > CASE WHEN SUM(amount) > 0 THEN "
+      "(SELECT SUM(amount) * 0.3 FROM read_parquet('/x.parquet')) ELSE 0 END");
+  ASSERT_NE(stmt.having, nullptr);
+  const auto* comparison = std::get_if<AstBinary>(&stmt.having->node);
+  ASSERT_NE(comparison, nullptr);
+  const auto* case_expr = std::get_if<AstCase>(&comparison->right->node);
+  ASSERT_NE(case_expr, nullptr);
+  ASSERT_EQ(case_expr->when_then.size(), 1u);
+  const auto* subquery = std::get_if<AstSubquery>(&case_expr->when_then[0].second->node);
+  ASSERT_NE(subquery, nullptr);
+  ASSERT_NE(subquery->statement, nullptr);
+  ASSERT_EQ(subquery->statement->from.paths.size(), 1u);
+  EXPECT_EQ(subquery->statement->from.paths[0], "/x.parquet");
+}
+
+// Regression guard: an ordinary literal IN list inside HAVING must keep
+// `subquery == nullptr` and its `list` populated -- same invariant
+// InWithLiteralListHasNoSubquery already pins down for WHERE, but HAVING is
+// a separate code path (resolve_subqueries() walks it, resolve_in_subqueries()
+// never does) that could plausibly mishandle it differently.
+TEST(SqlParser, ParsesHavingWithLiteralInListNotMistakenForSubquery) {
+  const auto stmt = parse_sql(
+      "SELECT region, SUM(amount) AS total FROM read_parquet('/x.parquet') "
+      "GROUP BY region HAVING SUM(amount) > 10 AND region IN ('A', 'B')");
+  ASSERT_NE(stmt.having, nullptr);
+  const auto* conjunction = std::get_if<AstBinary>(&stmt.having->node);
+  ASSERT_NE(conjunction, nullptr);
+  EXPECT_EQ(conjunction->op, AstBinaryOp::And);
+  const auto* in = std::get_if<AstIn>(&conjunction->right->node);
+  ASSERT_NE(in, nullptr);
+  EXPECT_EQ(in->subquery, nullptr);
+  EXPECT_EQ(in->list.size(), 2u);
+}
+
 TEST(SqlParser, RejectsSubqueryOutsideHaving) {
   // convert_expr() happily builds an AstSubquery node wherever hsql's own
   // grammar allows a value expression -- WHERE included -- but nothing

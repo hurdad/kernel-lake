@@ -60,5 +60,68 @@ TEST(Expression, CastExpressionToString) {
   EXPECT_EQ(cast.to_string(), "CAST(id AS INT64)");
 }
 
+TEST(Expression, BinaryExpressionStructuralKeyMatchesForStructurallyIdenticalExpressions) {
+  auto left_a = std::make_shared<ColumnExpression>("amount", 0, float64_type());
+  auto right_a = std::make_shared<LiteralExpression>(LiteralExpression::make_float64(1.0));
+  BinaryExpression first(BinaryOperator::Greater, left_a, right_a, boolean_type(false));
+
+  auto left_b = std::make_shared<ColumnExpression>("amount", 0, float64_type());
+  auto right_b = std::make_shared<LiteralExpression>(LiteralExpression::make_float64(1.0));
+  BinaryExpression second(BinaryOperator::Greater, left_b, right_b, boolean_type(false));
+
+  EXPECT_EQ(first.structural_key(), second.structural_key());
+}
+
+// structural_key() is the mechanism that lets the binder/logical planner
+// distinguish `a.x` from `b.x` after a JOIN (e.g. GROUP BY key matching,
+// aggregate-slot dedup): to_string() alone collapses both to the identical
+// bare name "x", but structural_key() additionally encodes the resolved
+// column_index(), which differs between the two sides. Direct coverage --
+// previously only exercised indirectly through the binder/optimizer.
+TEST(Expression, BinaryExpressionStructuralKeyDiffersForColumnsWithSameNameDifferentIndex) {
+  auto left_side = std::make_shared<ColumnExpression>("x", 0, float64_type());
+  auto right_side = std::make_shared<ColumnExpression>("x", 5, float64_type());
+  auto literal = std::make_shared<LiteralExpression>(LiteralExpression::make_float64(1.0));
+
+  BinaryExpression left_comparison(BinaryOperator::Greater, left_side, literal, boolean_type(false));
+  BinaryExpression right_comparison(BinaryOperator::Greater, right_side, literal, boolean_type(false));
+
+  EXPECT_NE(left_comparison.structural_key(), right_comparison.structural_key());
+  EXPECT_EQ(left_comparison.to_string(), right_comparison.to_string());
+}
+
+TEST(Expression, UnaryExpressionStructuralKeyDiffersForColumnsWithSameNameDifferentIndex) {
+  auto left_side = std::make_shared<ColumnExpression>("flag", 0, boolean_type());
+  auto right_side = std::make_shared<ColumnExpression>("flag", 3, boolean_type());
+  UnaryExpression left_is_null(UnaryOperator::IsNull, left_side, boolean_type(false));
+  UnaryExpression right_is_null(UnaryOperator::IsNull, right_side, boolean_type(false));
+
+  EXPECT_NE(left_is_null.structural_key(), right_is_null.structural_key());
+  EXPECT_EQ(left_is_null.to_string(), right_is_null.to_string());
+}
+
+TEST(Expression, AggregateExpressionStructuralKeyDiffersForColumnsWithSameNameDifferentIndex) {
+  auto left_amount = std::make_shared<ColumnExpression>("amount", 0, float64_type());
+  auto right_amount = std::make_shared<ColumnExpression>("amount", 4, float64_type());
+  AggregateExpression left_sum(AggregateFunction::Sum, left_amount, float64_type());
+  AggregateExpression right_sum(AggregateFunction::Sum, right_amount, float64_type());
+
+  EXPECT_NE(left_sum.structural_key(), right_sum.structural_key());
+  EXPECT_EQ(left_sum.to_string(), right_sum.to_string());
+}
+
+TEST(Expression, IsLogicalIdentifiesAndOr) {
+  EXPECT_TRUE(is_logical(BinaryOperator::And));
+  EXPECT_TRUE(is_logical(BinaryOperator::Or));
+  EXPECT_FALSE(is_logical(BinaryOperator::Add));
+  EXPECT_FALSE(is_logical(BinaryOperator::Greater));
+}
+
+TEST(Expression, DatePartToString) {
+  EXPECT_EQ(to_string(DatePart::Year), "YEAR");
+  EXPECT_EQ(to_string(DatePart::Month), "MONTH");
+  EXPECT_EQ(to_string(DatePart::Day), "DAY");
+}
+
 }  // namespace
 }  // namespace kernellake

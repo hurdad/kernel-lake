@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <limits>
 
 #include "kernellake/optimizer/optimizer.hpp"
 #include "kernellake/planner/logical_planner.hpp"
@@ -136,6 +137,209 @@ TEST(Optimizer, DoesNotFoldOverflowingInt64Arithmetic) {
   EXPECT_EQ(real_filter->predicate()->to_string(), "(a > (9223372036854775807 + 1))");
 }
 
+// Only Add is exercised above (ConstantFoldsArithmetic/
+// ConstantFoldsLargeInt64ArithmeticExactly/DoesNotFoldOverflowingInt64Arithmetic)
+// -- Subtract/Multiply/Divide share the same fold_arithmetic_int64() switch
+// but had no test of their own.
+TEST(Optimizer, ConstantFoldsSubtractMultiplyDivide) {
+  auto subtract_plan =
+      plan_for("SELECT a FROM read_parquet('/x.parquet') WHERE a > 10 - 3", two_column_schema());
+  subtract_plan = optimize(std::move(subtract_plan));
+  const auto* subtract_projection = dynamic_cast<const LogicalProjection*>(subtract_plan.get());
+  ASSERT_NE(subtract_projection, nullptr);
+  const auto* subtract_filter = dynamic_cast<const LogicalFilter*>(subtract_projection->children()[0].get());
+  ASSERT_NE(subtract_filter, nullptr);
+  EXPECT_EQ(subtract_filter->predicate()->to_string(), "(a > 7)");
+
+  auto multiply_plan =
+      plan_for("SELECT a FROM read_parquet('/x.parquet') WHERE a > 3 * 4", two_column_schema());
+  multiply_plan = optimize(std::move(multiply_plan));
+  const auto* multiply_projection = dynamic_cast<const LogicalProjection*>(multiply_plan.get());
+  ASSERT_NE(multiply_projection, nullptr);
+  const auto* multiply_filter = dynamic_cast<const LogicalFilter*>(multiply_projection->children()[0].get());
+  ASSERT_NE(multiply_filter, nullptr);
+  EXPECT_EQ(multiply_filter->predicate()->to_string(), "(a > 12)");
+
+  auto divide_plan =
+      plan_for("SELECT a FROM read_parquet('/x.parquet') WHERE a > 20 / 4", two_column_schema());
+  divide_plan = optimize(std::move(divide_plan));
+  const auto* divide_projection = dynamic_cast<const LogicalProjection*>(divide_plan.get());
+  ASSERT_NE(divide_projection, nullptr);
+  const auto* divide_filter = dynamic_cast<const LogicalFilter*>(divide_projection->children()[0].get());
+  ASSERT_NE(divide_filter, nullptr);
+  EXPECT_EQ(divide_filter->predicate()->to_string(), "(a > 5)");
+}
+
+TEST(Optimizer, DoesNotFoldDivisionByZero) {
+  auto plan = plan_for("SELECT a FROM read_parquet('/x.parquet') WHERE a > 20 / 0", two_column_schema());
+  plan = optimize(std::move(plan));
+
+  const auto* projection = dynamic_cast<const LogicalProjection*>(plan.get());
+  ASSERT_NE(projection, nullptr);
+  const auto* filter = dynamic_cast<const LogicalFilter*>(projection->children()[0].get());
+  ASSERT_NE(filter, nullptr);
+  EXPECT_EQ(filter->predicate()->to_string(), "(a > (20 / 0))");
+}
+
+// INT64_MIN / -1 overflows int64 (its magnitude exceeds INT64_MAX) and is
+// undefined behavior for the raw '/' operator -- fold_arithmetic_int64()
+// has a dedicated guard for exactly this case, same as divide-by-zero.
+// Built directly (bypassing SQL text) since INT64_MIN has no representable
+// positive counterpart to negate through the parser's own literal grammar.
+TEST(Optimizer, DoesNotFoldInt64MinDividedByNegativeOne) {
+  Schema schema({Field{"a", int64_type(false)}});
+  auto scan = std::make_shared<LogicalScan>(std::vector<std::string>{"/x.parquet"}, schema);
+  auto min_literal = std::make_shared<LiteralExpression>(
+      LiteralExpression::make_int64(std::numeric_limits<std::int64_t>::min()));
+  auto minus_one = std::make_shared<LiteralExpression>(LiteralExpression::make_int64(-1));
+  auto divide =
+      std::make_shared<BinaryExpression>(BinaryOperator::Divide, min_literal, minus_one, int64_type(false));
+  auto filter = std::make_shared<LogicalFilter>(scan, divide);
+
+  LogicalPlanPtr optimized = optimize(filter);
+  const auto* result_filter = dynamic_cast<const LogicalFilter*>(optimized.get());
+  ASSERT_NE(result_filter, nullptr);
+  const auto* result_binary = dynamic_cast<const BinaryExpression*>(result_filter->predicate().get());
+  ASSERT_NE(result_binary, nullptr);
+  EXPECT_EQ(result_binary->op(), BinaryOperator::Divide);
+}
+
+// Only Greater is exercised elsewhere (e.g. ConstantFoldsArithmetic) --
+// nested inside CASE branches (whose own folding is already proven by
+// ConstantFoldsInsideCaseBranches below) so the folded boolean literal is
+// directly observable without a further AND/OR/removal pass collapsing it
+// away, the way it would if used as a bare WHERE predicate.
+TEST(Optimizer, ConstantFoldsRemainingComparisonOperators) {
+  auto plan = plan_for(
+      "SELECT CASE WHEN 1 = 1 THEN 1 WHEN 2 <> 2 THEN 2 WHEN 1 < 2 THEN 3 WHEN 2 <= 2 THEN 4 "
+      "WHEN 3 >= 4 THEN 5 ELSE 6 END AS bucket FROM read_parquet('/x.parquet')",
+      two_column_schema());
+  plan = optimize(std::move(plan));
+
+  const auto* projection = dynamic_cast<const LogicalProjection*>(plan.get());
+  ASSERT_NE(projection, nullptr);
+  ASSERT_EQ(projection->items().size(), 1u);
+  EXPECT_EQ(projection->items()[0].expr->to_string(),
+            "CASE WHEN TRUE THEN 1 WHEN FALSE THEN 2 WHEN TRUE THEN 3 WHEN TRUE THEN 4 WHEN FALSE THEN 5 "
+            "ELSE 6 END");
+}
+
+TEST(Optimizer, FoldsNotOfLiteralAndEliminatesDoubleNegation) {
+  auto plan =
+      plan_for("SELECT a FROM read_parquet('/x.parquet') WHERE NOT (1 = 2) AND a > 0", two_column_schema());
+  plan = optimize(std::move(plan));
+  const auto* projection = dynamic_cast<const LogicalProjection*>(plan.get());
+  ASSERT_NE(projection, nullptr);
+  const auto* filter = dynamic_cast<const LogicalFilter*>(projection->children()[0].get());
+  ASSERT_NE(filter, nullptr);
+  EXPECT_EQ(filter->predicate()->to_string(), "(a > 0)");
+
+  // NOT (NOT (a > 0)) simplifies straight to (a > 0), without ever passing
+  // through a boolean literal along the way -- built directly since there's
+  // no SQL syntax for a bare double-NOT of a non-literal expression that
+  // survives binding unchanged.
+  Schema schema({Field{"a", int64_type(false)}});
+  auto scan = std::make_shared<LogicalScan>(std::vector<std::string>{"/x.parquet"}, schema);
+  auto a_col = std::make_shared<ColumnExpression>("a", 0, int64_type(false));
+  auto zero = std::make_shared<LiteralExpression>(LiteralExpression::make_int64(0));
+  auto comparison =
+      std::make_shared<BinaryExpression>(BinaryOperator::Greater, a_col, zero, boolean_type(false));
+  auto inner_not = std::make_shared<UnaryExpression>(UnaryOperator::Not, comparison, boolean_type(false));
+  auto outer_not = std::make_shared<UnaryExpression>(UnaryOperator::Not, inner_not, boolean_type(false));
+  auto double_negation_filter = std::make_shared<LogicalFilter>(scan, outer_not);
+
+  LogicalPlanPtr optimized = optimize(double_negation_filter);
+  const auto* result_filter = dynamic_cast<const LogicalFilter*>(optimized.get());
+  ASSERT_NE(result_filter, nullptr);
+  EXPECT_EQ(result_filter->predicate()->to_string(), "(a > 0)");
+}
+
+TEST(Optimizer, AndShortCircuitsOnLiteralBooleanOperand) {
+  auto true_left =
+      plan_for("SELECT a FROM read_parquet('/x.parquet') WHERE (1 = 1) AND a > 0", two_column_schema());
+  true_left = optimize(std::move(true_left));
+  const auto* true_left_projection = dynamic_cast<const LogicalProjection*>(true_left.get());
+  ASSERT_NE(true_left_projection, nullptr);
+  const auto* true_left_filter =
+      dynamic_cast<const LogicalFilter*>(true_left_projection->children()[0].get());
+  ASSERT_NE(true_left_filter, nullptr);
+  EXPECT_EQ(true_left_filter->predicate()->to_string(), "(a > 0)");
+
+  auto true_right =
+      plan_for("SELECT a FROM read_parquet('/x.parquet') WHERE a > 0 AND (1 = 1)", two_column_schema());
+  true_right = optimize(std::move(true_right));
+  const auto* true_right_projection = dynamic_cast<const LogicalProjection*>(true_right.get());
+  ASSERT_NE(true_right_projection, nullptr);
+  const auto* true_right_filter =
+      dynamic_cast<const LogicalFilter*>(true_right_projection->children()[0].get());
+  ASSERT_NE(true_right_filter, nullptr);
+  EXPECT_EQ(true_right_filter->predicate()->to_string(), "(a > 0)");
+
+  // AND with a literal FALSE operand collapses to FALSE outright, discarding
+  // the other operand entirely -- surfaces as the always-false/zero-rows
+  // annotation, same as AnnotatesAlwaysFalseFilterWithZeroRows above.
+  auto false_left =
+      plan_for("SELECT a FROM read_parquet('/x.parquet') WHERE (1 = 2) AND a > 0", two_column_schema());
+  false_left = optimize(std::move(false_left));
+  const auto* false_left_projection = dynamic_cast<const LogicalProjection*>(false_left.get());
+  ASSERT_NE(false_left_projection, nullptr);
+  const auto* false_left_filter =
+      dynamic_cast<const LogicalFilter*>(false_left_projection->children()[0].get());
+  ASSERT_NE(false_left_filter, nullptr);
+  ASSERT_TRUE(false_left_filter->estimated_rows.has_value());
+  EXPECT_EQ(*false_left_filter->estimated_rows, 0u);
+
+  auto false_right =
+      plan_for("SELECT a FROM read_parquet('/x.parquet') WHERE a > 0 AND (1 = 2)", two_column_schema());
+  false_right = optimize(std::move(false_right));
+  const auto* false_right_projection = dynamic_cast<const LogicalProjection*>(false_right.get());
+  ASSERT_NE(false_right_projection, nullptr);
+  const auto* false_right_filter =
+      dynamic_cast<const LogicalFilter*>(false_right_projection->children()[0].get());
+  ASSERT_NE(false_right_filter, nullptr);
+  ASSERT_TRUE(false_right_filter->estimated_rows.has_value());
+  EXPECT_EQ(*false_right_filter->estimated_rows, 0u);
+}
+
+TEST(Optimizer, OrShortCircuitsOnLiteralBooleanOperand) {
+  // OR with a literal TRUE operand collapses to TRUE outright -- the filter
+  // is removed entirely, same as RemovesFilterThatFoldsToTrue above.
+  auto true_left =
+      plan_for("SELECT a FROM read_parquet('/x.parquet') WHERE (1 = 1) OR a > 0", two_column_schema());
+  true_left = optimize(std::move(true_left));
+  const auto* true_left_projection = dynamic_cast<const LogicalProjection*>(true_left.get());
+  ASSERT_NE(true_left_projection, nullptr);
+  EXPECT_NE(dynamic_cast<const LogicalScan*>(true_left_projection->children()[0].get()), nullptr);
+
+  auto true_right =
+      plan_for("SELECT a FROM read_parquet('/x.parquet') WHERE a > 0 OR (1 = 1)", two_column_schema());
+  true_right = optimize(std::move(true_right));
+  const auto* true_right_projection = dynamic_cast<const LogicalProjection*>(true_right.get());
+  ASSERT_NE(true_right_projection, nullptr);
+  EXPECT_NE(dynamic_cast<const LogicalScan*>(true_right_projection->children()[0].get()), nullptr);
+
+  // OR with a literal FALSE operand collapses to the other operand.
+  auto false_left =
+      plan_for("SELECT a FROM read_parquet('/x.parquet') WHERE (1 = 2) OR a > 0", two_column_schema());
+  false_left = optimize(std::move(false_left));
+  const auto* false_left_projection = dynamic_cast<const LogicalProjection*>(false_left.get());
+  ASSERT_NE(false_left_projection, nullptr);
+  const auto* false_left_filter =
+      dynamic_cast<const LogicalFilter*>(false_left_projection->children()[0].get());
+  ASSERT_NE(false_left_filter, nullptr);
+  EXPECT_EQ(false_left_filter->predicate()->to_string(), "(a > 0)");
+
+  auto false_right =
+      plan_for("SELECT a FROM read_parquet('/x.parquet') WHERE a > 0 OR (1 = 2)", two_column_schema());
+  false_right = optimize(std::move(false_right));
+  const auto* false_right_projection = dynamic_cast<const LogicalProjection*>(false_right.get());
+  ASSERT_NE(false_right_projection, nullptr);
+  const auto* false_right_filter =
+      dynamic_cast<const LogicalFilter*>(false_right_projection->children()[0].get());
+  ASSERT_NE(false_right_filter, nullptr);
+  EXPECT_EQ(false_right_filter->predicate()->to_string(), "(a > 0)");
+}
+
 // Regression test: constant folding used to skip CASE branches entirely
 // (simplify_expression had no case for CaseExpression, falling through to
 // its default "nothing to simplify" branch) -- a foldable THEN/ELSE
@@ -150,6 +354,78 @@ TEST(Optimizer, ConstantFoldsInsideCaseBranches) {
   ASSERT_NE(projection, nullptr);
   ASSERT_EQ(projection->items().size(), 1u);
   EXPECT_EQ(projection->items()[0].expr->to_string(), "CASE WHEN (a > 1) THEN 3 ELSE 7 END");
+}
+
+// simplify_expression() has a dedicated case for CastExpression (recurses
+// into its operand), CaseExpression (tested just above), AggregateExpression,
+// LikeExpression and ExtractExpression -- only CaseExpression had a test.
+TEST(Optimizer, ConstantFoldsInsideCastOperand) {
+  auto plan =
+      plan_for("SELECT CAST(1 + 2 AS BIGINT) AS x FROM read_parquet('/x.parquet')", two_column_schema());
+  plan = optimize(std::move(plan));
+
+  const auto* projection = dynamic_cast<const LogicalProjection*>(plan.get());
+  ASSERT_NE(projection, nullptr);
+  ASSERT_EQ(projection->items().size(), 1u);
+  const auto* cast = dynamic_cast<const CastExpression*>(projection->items()[0].expr.get());
+  ASSERT_NE(cast, nullptr);
+  const auto* literal = dynamic_cast<const LiteralExpression*>(cast->operand().get());
+  ASSERT_NE(literal, nullptr);
+  ASSERT_TRUE(std::holds_alternative<std::int64_t>(literal->value()));
+  EXPECT_EQ(std::get<std::int64_t>(literal->value()), 3);
+}
+
+TEST(Optimizer, ConstantFoldsInsideAggregateArgument) {
+  auto plan =
+      plan_for("SELECT SUM(amount * (1 + 2)) AS total FROM read_parquet('/x.parquet')", sales_schema());
+  plan = optimize(std::move(plan));
+
+  const auto* projection = dynamic_cast<const LogicalProjection*>(plan.get());
+  ASSERT_NE(projection, nullptr);
+  const auto* aggregate = dynamic_cast<const LogicalAggregate*>(projection->children()[0].get());
+  ASSERT_NE(aggregate, nullptr);
+  ASSERT_EQ(aggregate->aggregates().size(), 1u);
+  const auto* sum = dynamic_cast<const AggregateExpression*>(aggregate->aggregates()[0].expr.get());
+  ASSERT_NE(sum, nullptr);
+  const auto* product = dynamic_cast<const BinaryExpression*>(sum->argument().get());
+  ASSERT_NE(product, nullptr);
+  // amount * (1 + 2): the int64 literal side gets implicitly CAST to
+  // FLOAT64 to match `amount` (see binder.cpp's cast_if_needed) -- the
+  // folded literal ends up underneath that CAST, not as the CAST's sibling
+  // directly.
+  const auto* cast = dynamic_cast<const CastExpression*>(product->right().get());
+  ASSERT_NE(cast, nullptr);
+  const auto* literal = dynamic_cast<const LiteralExpression*>(cast->operand().get());
+  ASSERT_NE(literal, nullptr);
+  ASSERT_TRUE(std::holds_alternative<std::int64_t>(literal->value()));
+  EXPECT_EQ(std::get<std::int64_t>(literal->value()), 3);
+}
+
+TEST(Optimizer, ConstantFoldsInsideLikeValueOperand) {
+  auto plan = plan_for(
+      "SELECT (CASE WHEN 1 = 1 THEN region ELSE 'X' END) LIKE 'A%' AS matches FROM "
+      "read_parquet('/x.parquet')",
+      sales_schema());
+  plan = optimize(std::move(plan));
+
+  const auto* projection = dynamic_cast<const LogicalProjection*>(plan.get());
+  ASSERT_NE(projection, nullptr);
+  ASSERT_EQ(projection->items().size(), 1u);
+  EXPECT_EQ(projection->items()[0].expr->to_string(), "CASE WHEN TRUE THEN region ELSE 'X' END LIKE 'A%'");
+}
+
+TEST(Optimizer, ConstantFoldsInsideExtractOperand) {
+  auto plan = plan_for(
+      "SELECT EXTRACT(YEAR FROM CASE WHEN 1 = 1 THEN event_date ELSE event_date END) AS y "
+      "FROM read_parquet('/x.parquet')",
+      sales_schema());
+  plan = optimize(std::move(plan));
+
+  const auto* projection = dynamic_cast<const LogicalProjection*>(plan.get());
+  ASSERT_NE(projection, nullptr);
+  ASSERT_EQ(projection->items().size(), 1u);
+  EXPECT_EQ(projection->items()[0].expr->to_string(),
+            "EXTRACT(YEAR FROM CASE WHEN TRUE THEN event_date ELSE event_date END)");
 }
 
 TEST(Optimizer, RemovesFilterThatFoldsToTrue) {
@@ -443,6 +719,42 @@ TEST(Optimizer, DoesNotPushCrossSidePredicateThroughJoin) {
   const auto* filter = dynamic_cast<const LogicalFilter*>(projection->children()[0].get());
   ASSERT_NE(filter, nullptr);
   EXPECT_NE(dynamic_cast<const LogicalJoin*>(filter->children()[0].get()), nullptr);
+}
+
+// annotate_scan()'s LogicalFilter branch special-cases a filter sitting
+// directly on a LogicalAggregate (a HAVING filter): its predicate's
+// ColumnExpression indices describe the aggregate's own output schema
+// ([region, total] here), not the scan's -- neither collecting its columns
+// into the scan's required_columns (which would misindex, e.g. treating
+// scan index 1 as "the HAVING threshold column") nor treating it as a
+// pushable file-level predicate (it runs after aggregation, over rows that
+// don't exist at scan time) is correct. No optimizer test used HAVING at
+// all before this.
+TEST(Optimizer, HavingFilterOnAggregateDoesNotPolluteScanColumnsOrPushablePredicates) {
+  auto plan = plan_for(
+      "SELECT region, SUM(amount) AS total FROM read_parquet('/x.parquet') "
+      "GROUP BY region HAVING SUM(amount) > 50",
+      sales_schema());
+  plan = optimize(std::move(plan));
+
+  const auto* projection = dynamic_cast<const LogicalProjection*>(plan.get());
+  ASSERT_NE(projection, nullptr);
+  const auto* filter = dynamic_cast<const LogicalFilter*>(projection->children()[0].get());
+  ASSERT_NE(filter, nullptr);
+  const auto* aggregate = dynamic_cast<const LogicalAggregate*>(filter->children()[0].get());
+  ASSERT_NE(aggregate, nullptr);
+
+  const LogicalScan* scan = find_scan(plan);
+  ASSERT_NE(scan, nullptr);
+  // region (GROUP BY key) + amount (SUM's argument) -- not "total" (the
+  // aggregate's own output name) and not misindexed against the HAVING
+  // predicate's aggregate-output column position.
+  ASSERT_EQ(scan->required_columns().size(), 2u);
+  for (const char* expected : {"region", "amount"}) {
+    EXPECT_NE(std::find(scan->required_columns().begin(), scan->required_columns().end(), expected),
+              scan->required_columns().end());
+  }
+  EXPECT_TRUE(scan->pushable_predicates().empty());
 }
 
 }  // namespace
