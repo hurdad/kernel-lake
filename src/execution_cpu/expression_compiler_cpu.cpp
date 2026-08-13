@@ -73,7 +73,13 @@ arrow::Datum literal_to_arrow_datum(const LiteralExpression& literal) {
     case TypeId::Decimal:
       throw ExecutionError("DECIMAL literals are not yet supported by the CPU execution backend");
   }
-  throw ExecutionError("unreachable: unknown KernelLake TypeId in CPU expression compiler");
+  // to_arrow_type() (arrow_adapter.cpp) already rejects an invalid TypeId
+  // before literal_to_arrow_datum() ever reaches this switch, so this is
+  // truly dead code, not a coverage gap -- see
+  // LiteralToArrowDatum.UnknownTypeIdFailsInToArrowTypeBeforeReachingThisFunctionsOwnSwitch
+  // in expression_compiler_cpu_test.cpp.
+  throw ExecutionError(
+      "unreachable: unknown KernelLake TypeId in CPU expression compiler");  // GCOVR_EXCL_LINE
 }
 
 namespace {

@@ -239,7 +239,12 @@ jobs:
         # Restricted to src/ and include/ -- vendored third-party code
         # (build/cpu-coverage/_deps) and the tests themselves are never
         # part of the numerator or denominator; a test file covering
-        # itself would be a meaningless metric.
+        # itself would be a meaningless metric. --exclude '_deps/' keeps
+        # gcovr from even walking/gcov-parsing vendored hsql's own
+        # coverage data (it's compiled with --coverage too, since the
+        # cpu-coverage preset's flags apply project-wide) only to discard
+        # it via --filter afterward -- --filter alone controls what's in
+        # the *report*, not what gcovr spends time parsing to get there.
         #
         # --gcov-ignore-parse-errors=negative_hits.warn_once_per_file:
         # gcc's own gcov occasionally emits a negative branch-hit count on
@@ -254,6 +259,7 @@ jobs:
           gcovr --root . \
             --filter 'src/' --filter 'include/' \
             --exclude '.*_test\.cpp' \
+            --exclude '.*/_deps/.*' \
             --gcov-ignore-parse-errors=negative_hits.warn_once_per_file \
             --xml-pretty -o coverage.xml \
             --print-summary \

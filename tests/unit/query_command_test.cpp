@@ -6,16 +6,14 @@
 // benchmark_tpch_command_test.cpp alongside it).
 #include <gtest/gtest.h>
 
-#include <arrow/api.h>
-#include <arrow/io/file.h>
-#include <parquet/arrow/writer.h>
-
 #include <filesystem>
 #include <fstream>
 #include <sstream>
 
 #include "kernellake/cli/commands.hpp"
 #include "kernellake/common/config.hpp"
+
+#include "cli_command_test_support.hpp"
 
 namespace kernellake::cli {
 namespace {
@@ -31,19 +29,7 @@ class QueryCommandTest : public ::testing::Test {
     fs::create_directories(dir_);
     path_ = (dir_ / "sales.parquet").string();
     output_path_ = (dir_ / "out").string();
-
-    arrow::Int64Builder id_builder;
-    for (std::int64_t i = 0; i < 3; ++i) {
-      ASSERT_TRUE(id_builder.Append(i).ok());
-    }
-    std::shared_ptr<arrow::Array> id_array;
-    ASSERT_TRUE(id_builder.Finish(&id_array).ok());
-    const auto schema = arrow::schema({arrow::field("id", arrow::int64(), false)});
-    const auto table = arrow::Table::Make(schema, {id_array});
-    auto sink = arrow::io::FileOutputStream::Open(path_).ValueOrDie();
-    const arrow::Status status =
-        parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), sink, /*chunk_size=*/3);
-    ASSERT_TRUE(status.ok()) << status.ToString();
+    write_id_column_parquet(path_);
   }
 
   void TearDown() override { fs::remove_all(dir_); }
@@ -59,13 +45,6 @@ class QueryCommandTest : public ::testing::Test {
   std::string path_;
   std::string output_path_;
   EngineConfig config_ = cpu_backend_config();
-
- private:
-  [[nodiscard]] static EngineConfig cpu_backend_config() {
-    EngineConfig config = default_config();
-    config.engine.backend = "cpu";
-    return config;
-  }
 };
 
 TEST_F(QueryCommandTest, RejectsSqlAndFileTogetherAsMutuallyExclusive) {
