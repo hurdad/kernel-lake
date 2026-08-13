@@ -2,7 +2,9 @@
 
 #include <algorithm>
 #include <limits>
+#include <tuple>
 
+#include "kernellake/common/errors.hpp"
 #include "kernellake/optimizer/optimizer.hpp"
 #include "kernellake/planner/logical_planner.hpp"
 #include "kernellake/sql/parser.hpp"
@@ -730,6 +732,193 @@ TEST(Optimizer, DoesNotPushCrossSidePredicateThroughJoin) {
 // pushable file-level predicate (it runs after aggregation, over rows that
 // don't exist at scan time) is correct. No optimizer test used HAVING at
 // all before this.
+// literal_as_double()/fold_arithmetic()/fold_numeric_comparison()
+// (optimizer.cpp) are the double-literal folding counterparts of
+// fold_arithmetic_int64()/fold_integer_comparison() -- simplify_expression()
+// only reaches them when at least one operand's LiteralStorage isn't
+// int64, a shape no prior optimizer test used (every existing folding test
+// above uses pure int64 literals). Built directly (bypassing SQL/the
+// binder) so a raw int64-storage-under-a-double-typed-literal mix --
+// literal_as_double()'s own int64 branch, only reachable this way, real
+// make_*() factories always pair storage/type correctly -- is exercised
+// alongside the double-storage branch in the same expression tree.
+TEST(Optimizer, ConstantFoldsMixedIntAndDoubleArithmetic) {
+  Schema schema({Field{"a", int64_type(false)}});
+  auto scan = std::make_shared<LogicalScan>(std::vector<std::string>{"/x.parquet"}, schema);
+  auto int_literal =
+      std::make_shared<LiteralExpression>(LiteralExpression(std::int64_t{2}, float64_type(false)));
+  auto double_literal = std::make_shared<LiteralExpression>(LiteralExpression::make_float64(2.5));
+  auto sum = std::make_shared<BinaryExpression>(BinaryOperator::Add, int_literal, double_literal,
+                                                float64_type(false));
+  auto filter = std::make_shared<LogicalFilter>(scan, sum);
+
+  LogicalPlanPtr optimized = optimize(filter);
+  const auto* result_filter = dynamic_cast<const LogicalFilter*>(optimized.get());
+  ASSERT_NE(result_filter, nullptr);
+  const auto* literal = dynamic_cast<const LiteralExpression*>(result_filter->predicate().get());
+  ASSERT_NE(literal, nullptr);
+  ASSERT_TRUE(std::holds_alternative<double>(literal->value()));
+  EXPECT_DOUBLE_EQ(std::get<double>(literal->value()), 4.5);
+}
+
+TEST(Optimizer, ConstantFoldsEveryDoubleArithmeticOperator) {
+  Schema schema({Field{"a", int64_type(false)}});
+  auto scan = std::make_shared<LogicalScan>(std::vector<std::string>{"/x.parquet"}, schema);
+  const std::vector<std::tuple<BinaryOperator, double, double, double>> cases = {
+      {BinaryOperator::Add, 1.5, 2.5, 4.0},
+      {BinaryOperator::Subtract, 5.5, 2.5, 3.0},
+      {BinaryOperator::Multiply, 2.5, 4.0, 10.0},
+      {BinaryOperator::Divide, 9.0, 2.0, 4.5},
+  };
+  for (const auto& [op, left, right, expected] : cases) {
+    auto left_literal = std::make_shared<LiteralExpression>(LiteralExpression::make_float64(left));
+    auto right_literal = std::make_shared<LiteralExpression>(LiteralExpression::make_float64(right));
+    auto binary = std::make_shared<BinaryExpression>(op, left_literal, right_literal, float64_type(false));
+    auto filter = std::make_shared<LogicalFilter>(scan, binary);
+
+    LogicalPlanPtr optimized = optimize(filter);
+    const auto* result_filter = dynamic_cast<const LogicalFilter*>(optimized.get());
+    ASSERT_NE(result_filter, nullptr);
+    const auto* literal = dynamic_cast<const LiteralExpression*>(result_filter->predicate().get());
+    ASSERT_NE(literal, nullptr) << "op index " << static_cast<int>(op);
+    ASSERT_TRUE(std::holds_alternative<double>(literal->value()));
+    EXPECT_DOUBLE_EQ(std::get<double>(literal->value()), expected) << "op index " << static_cast<int>(op);
+  }
+}
+
+TEST(Optimizer, DoesNotFoldDoubleDivisionByZero) {
+  Schema schema({Field{"a", int64_type(false)}});
+  auto scan = std::make_shared<LogicalScan>(std::vector<std::string>{"/x.parquet"}, schema);
+  auto left_literal = std::make_shared<LiteralExpression>(LiteralExpression::make_float64(1.0));
+  auto right_literal = std::make_shared<LiteralExpression>(LiteralExpression::make_float64(0.0));
+  auto divide = std::make_shared<BinaryExpression>(BinaryOperator::Divide, left_literal, right_literal,
+                                                   float64_type(false));
+  auto filter = std::make_shared<LogicalFilter>(scan, divide);
+
+  LogicalPlanPtr optimized = optimize(filter);
+  const auto* result_filter = dynamic_cast<const LogicalFilter*>(optimized.get());
+  ASSERT_NE(result_filter, nullptr);
+  // Left unfolded (a BinaryExpression, not collapsed to a literal).
+  EXPECT_NE(dynamic_cast<const BinaryExpression*>(result_filter->predicate().get()), nullptr);
+}
+
+// Uses a LogicalProjection item, not a LogicalFilter predicate: a filter
+// whose predicate folds to literal TRUE is removed entirely by rewrite_plan
+// (see RemovesFilterThatFoldsToTrue), which would make a folded-true case
+// here indistinguishable from "didn't fold at all" -- a projection item
+// has no such special-casing, so the folded literal is always directly
+// observable regardless of which way it folds.
+TEST(Optimizer, ConstantFoldsEveryDoubleComparisonOperator) {
+  Schema schema({Field{"a", int64_type(false)}});
+  auto scan = std::make_shared<LogicalScan>(std::vector<std::string>{"/x.parquet"}, schema);
+  const std::vector<std::tuple<BinaryOperator, double, double, bool>> cases = {
+      {BinaryOperator::Equal, 1.5, 1.5, true},   {BinaryOperator::NotEqual, 1.5, 2.5, true},
+      {BinaryOperator::Less, 1.5, 2.5, true},    {BinaryOperator::LessEqual, 2.5, 2.5, true},
+      {BinaryOperator::Greater, 2.5, 1.5, true}, {BinaryOperator::GreaterEqual, 2.5, 2.5, true},
+  };
+  for (const auto& [op, left, right, expected] : cases) {
+    auto left_literal = std::make_shared<LiteralExpression>(LiteralExpression::make_float64(left));
+    auto right_literal = std::make_shared<LiteralExpression>(LiteralExpression::make_float64(right));
+    auto binary = std::make_shared<BinaryExpression>(op, left_literal, right_literal, boolean_type(false));
+    auto projection =
+        std::make_shared<LogicalProjection>(scan, std::vector<NamedExpression>{{binary, "result"}});
+
+    LogicalPlanPtr optimized = optimize(projection);
+    const auto* result_projection = dynamic_cast<const LogicalProjection*>(optimized.get());
+    ASSERT_NE(result_projection, nullptr);
+    const auto* literal = dynamic_cast<const LiteralExpression*>(result_projection->items()[0].expr.get());
+    ASSERT_NE(literal, nullptr) << "op index " << static_cast<int>(op);
+    ASSERT_TRUE(std::holds_alternative<bool>(literal->value()));
+    EXPECT_EQ(std::get<bool>(literal->value()), expected) << "op index " << static_cast<int>(op);
+  }
+}
+
+// fold_integer_comparison()'s Greater case specifically -- the existing
+// ConstantFoldsRemainingComparisonOperators test covers Equal/NotEqual/
+// Less/LessEqual/GreaterEqual but never bare '>' with int64 literals.
+TEST(Optimizer, ConstantFoldsIntegerGreaterComparison) {
+  auto plan = plan_for("SELECT a FROM read_parquet('/x.parquet') WHERE a > 0 AND 3 > 2", two_column_schema());
+  plan = optimize(std::move(plan));
+
+  const auto* projection = dynamic_cast<const LogicalProjection*>(plan.get());
+  ASSERT_NE(projection, nullptr);
+  const auto* filter = dynamic_cast<const LogicalFilter*>(projection->children()[0].get());
+  ASSERT_NE(filter, nullptr);
+  // "3 > 2" folds to TRUE, short-circuiting the AND down to just "a > 0".
+  EXPECT_EQ(filter->predicate()->to_string(), "(a > 0)");
+}
+
+// simplify_expression()'s UnaryExpression branch rebuilds a new
+// UnaryExpression when its operand changed but didn't collapse away (not a
+// literal, not a double-negation) -- FoldsNotOfLiteralAndEliminatesDoubleNegation
+// above only ever exercises the two collapsing cases, never this
+// rebuild-and-keep path.
+TEST(Optimizer, SimplifiesUnaryOperandWithoutCollapsingTheUnaryItself) {
+  auto plan = plan_for("SELECT a FROM read_parquet('/x.parquet') WHERE NOT (a > 1 + 2)", two_column_schema());
+  plan = optimize(std::move(plan));
+
+  const auto* projection = dynamic_cast<const LogicalProjection*>(plan.get());
+  ASSERT_NE(projection, nullptr);
+  const auto* filter = dynamic_cast<const LogicalFilter*>(projection->children()[0].get());
+  ASSERT_NE(filter, nullptr);
+  EXPECT_EQ(filter->predicate()->to_string(), "NOT ((a > 3))");
+}
+
+// push_predicate_through_join()'s remaining_conjuncts-non-empty-AFTER-some-
+// conjuncts-were-pushed path (optimizer.cpp's own `return
+// std::make_shared<LogicalFilter>(std::move(new_join), ...)` line) needs a
+// WHERE clause mixing at least one single-sided (pushable) conjunct with at
+// least one cross-side (unpushable) conjunct -- DoesNotPushCrossSidePredicateThroughJoin
+// above uses a cross-side-only predicate, which returns nullptr before ever
+// reaching this line (see that function's own early-return when neither
+// side got anything pushed).
+TEST(Optimizer, PushesSingleSidedConjunctAndKeepsCrossSideConjunctAboveJoin) {
+  auto plan = plan_for_join(
+      "SELECT o_orderkey FROM read_parquet('/o.parquet') AS o "
+      "JOIN read_parquet('/c.parquet') AS c ON o.o_custkey = c.c_custkey "
+      "WHERE c_mktsegment = 'BUILDING' AND o_orderkey > c_custkey",
+      std::vector<Schema>{orders_schema(), customer_schema()});
+  plan = optimize(std::move(plan));
+
+  const auto* projection = dynamic_cast<const LogicalProjection*>(plan.get());
+  ASSERT_NE(projection, nullptr);
+  // The cross-side conjunct keeps a Filter sitting directly on the join.
+  const auto* filter = dynamic_cast<const LogicalFilter*>(projection->children()[0].get());
+  ASSERT_NE(filter, nullptr);
+  EXPECT_NE(dynamic_cast<const LogicalJoin*>(filter->children()[0].get()), nullptr);
+  EXPECT_EQ(filter->predicate()->to_string(), "(o_orderkey > c_custkey)");
+
+  // The single-sided conjunct still got pushed all the way to customer's scan.
+  const LogicalScan* customer_scan = find_scan_with_column(plan, "c_mktsegment");
+  ASSERT_NE(customer_scan, nullptr);
+  ASSERT_EQ(customer_scan->pushable_predicates().size(), 1u);
+  EXPECT_EQ(customer_scan->pushable_predicates()[0].column_name, "c_mktsegment");
+}
+
+// rewrite_plan()'s final `throw PlanningError(...)` guards against a
+// LogicalPlanNode subtype it doesn't recognize -- unreachable through any
+// of the seven real subtypes (all handled), only reachable via a custom one
+// built just for this test, the same technique
+// expression_compiler_cpu_test.cpp's UnrecognizedExpressionTypeThrows uses
+// for compile_expression_cpu()'s own equivalent guard.
+namespace {
+class UnknownLogicalPlanNode final : public LogicalPlanNode {
+ public:
+  explicit UnknownLogicalPlanNode(Schema schema) : schema_(std::move(schema)) {}
+  [[nodiscard]] const Schema& output_schema() const override { return schema_; }
+  [[nodiscard]] std::string_view node_name() const noexcept override { return "UnknownLogicalPlanNode"; }
+  [[nodiscard]] std::vector<LogicalPlanPtr> children() const override { return {}; }
+
+ private:
+  Schema schema_;
+};
+}  // namespace
+
+TEST(Optimizer, RejectsUnrecognizedLogicalPlanNodeType) {
+  auto unknown = std::make_shared<UnknownLogicalPlanNode>(two_column_schema());
+  EXPECT_THROW((void)optimize(unknown), PlanningError);
+}
+
 TEST(Optimizer, HavingFilterOnAggregateDoesNotPolluteScanColumnsOrPushablePredicates) {
   auto plan = plan_for(
       "SELECT region, SUM(amount) AS total FROM read_parquet('/x.parquet') "
