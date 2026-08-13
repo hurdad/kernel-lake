@@ -154,6 +154,80 @@ TEST(UnityCatalogClient, TwoClientsSharingATokenCacheOnlyFetchTheTokenOnce) {
   EXPECT_NE(table_requests[1].find("Authorization: Bearer shared-token"), std::string::npos);
 }
 
+// Proves fetch_oauth2_token()'s own local cached_oauth2_token_/
+// oauth2_token_expiry_unix_seconds_ fast path (no shared UnityCatalogTokenCache
+// involved at all here) actually skips the real token-endpoint round trip
+// on a second call from the *same* client instance -- distinct from
+// TwoClientsSharingATokenCacheOnlyFetchTheTokenOnce above, which covers the
+// *shared*-cache path across two separate client instances. The token
+// server is only handed one canned response, so a second real fetch would
+// find nothing listening and fail/hang instead of silently passing.
+TEST(UnityCatalogClient, GetTableTwiceOnTheSameClientOnlyFetchesTheTokenOnce) {
+  LoopbackHttpServer token_server;
+  LoopbackHttpServer table_server;
+  std::vector<std::string> token_requests(1);
+  std::vector<std::string> table_requests(2);
+  const std::string token_response = R"({"access_token": "cached-token", "expires_in": 3600})";
+  token_server.respond({http_ok_json(token_response)}, &token_requests);
+  table_server.respond({http_ok_json(kTableInfoJson), http_ok_json(kTableInfoJson)}, &table_requests);
+
+  UnityCatalogInstanceSection config = instance_config(table_server.base_url());
+  config.oauth2_token_endpoint = token_server.base_url() + "/oidc/v1/token";
+  config.credentials_kind = "oauth2_client_credentials";
+  config.oauth2_client_id = "my-client";
+  config.oauth2_client_secret = "my-secret";
+
+  UnityCatalogClient client(config);  // no shared token_cache -- this instance's own local fast path
+  (void)client.get_table("main", "db", "orders");
+  (void)client.get_table("main", "db", "orders");
+
+  token_server.join();
+  table_server.join();
+
+  EXPECT_NE(token_requests[0].find("POST /oidc/v1/token"), std::string::npos);
+  EXPECT_NE(table_requests[0].find("Authorization: Bearer cached-token"), std::string::npos);
+  EXPECT_NE(table_requests[1].find("Authorization: Bearer cached-token"), std::string::npos);
+}
+
+// Proves fetch_oauth2_token() actually checks a shared cache entry's expiry
+// (via UnityCatalogTokenCache::try_get(), which compares against the
+// caller-supplied `now`) rather than treating any present entry as
+// reusable: pre-seeding the shared cache with an already-expired entry for
+// this instance's uc_url, deterministically, with no need to wait on real
+// wall-clock time (UnityCatalogClient has no injectable clock -- this
+// drives the same expiry check through the cache's own already-parameterized
+// interface instead). A stale entry must still trigger a real
+// token-endpoint request and the freshly-fetched token must be what's
+// actually used.
+TEST(UnityCatalogClient, RefetchesTokenWhenSharedCacheEntryHasExpired) {
+  LoopbackHttpServer token_server;
+  LoopbackHttpServer table_server;
+  std::vector<std::string> token_requests(1);
+  std::vector<std::string> table_requests(1);
+  const std::string token_response = R"({"access_token": "refreshed-token", "expires_in": 3600})";
+  token_server.respond({http_ok_json(token_response)}, &token_requests);
+  table_server.respond({http_ok_json(kTableInfoJson)}, &table_requests);
+
+  UnityCatalogInstanceSection config = instance_config(table_server.base_url());
+  config.oauth2_token_endpoint = token_server.base_url() + "/oidc/v1/token";
+  config.credentials_kind = "oauth2_client_credentials";
+  config.oauth2_client_id = "my-client";
+  config.oauth2_client_secret = "my-secret";
+
+  UnityCatalogTokenCache shared_cache;
+  shared_cache.store(config.uc_url, "stale-token", /*expiry_unix_seconds=*/1.0);
+
+  UnityCatalogClient client(config, &shared_cache);
+  const UnityCatalogTableInfo info = client.get_table("main", "db", "orders");
+
+  token_server.join();
+  table_server.join();
+
+  EXPECT_EQ(info.data_source_format, "DELTA");
+  EXPECT_NE(token_requests[0].find("POST /oidc/v1/token"), std::string::npos);
+  EXPECT_NE(table_requests[0].find("Authorization: Bearer refreshed-token"), std::string::npos);
+}
+
 // The default (nullptr token_cache) behavior is unchanged: two separate
 // clients with no shared cache each fetch their own token, so the token
 // server needs two canned responses, not one.
@@ -263,6 +337,17 @@ TEST(UnityCatalogClient, GetTemporaryTableCredentialsThrowsWhenGcpOauthTokenFiel
   server.join();
 }
 
+// Mirrors GetTemporaryTableCredentialsThrowsWhenGcpOauthTokenFieldMissing
+// exactly, for the azure_user_delegation_sas sibling shape.
+TEST(UnityCatalogClient, GetTemporaryTableCredentialsThrowsWhenAzureSasTokenFieldMissing) {
+  LoopbackHttpServer server;
+  server.respond({http_ok_json(R"({"azure_user_delegation_sas": {}})")});
+
+  UnityCatalogClient client(instance_config(server.base_url()));
+  EXPECT_THROW((void)(client.get_temporary_table_credentials("table-uuid-1", "READ")), StorageError);
+  server.join();
+}
+
 TEST(UnityCatalogClient, GetTemporaryTableCredentialsThrowsWhenNoRecognizedCredentialsField) {
   LoopbackHttpServer server;
   server.respond({http_ok_json(R"({"expiration_time": 123})")});
@@ -293,6 +378,21 @@ TEST(UnityCatalogClient, ThrowsOnMalformedJsonResponse) {
 TEST(UnityCatalogClient, ThrowsWhenStorageLocationFieldIsMissing) {
   LoopbackHttpServer server;
   server.respond({http_ok_json(R"({"table_id": "t1", "table_type": "EXTERNAL"})")});
+
+  UnityCatalogClient client(instance_config(server.base_url()));
+  EXPECT_THROW((void)(client.get_table("main", "db", "orders")), StorageError);
+  server.join();
+}
+
+TEST(UnityCatalogClient, GetTableThrowsWhenAColumnEntryIsMissingName) {
+  LoopbackHttpServer server;
+  server.respond({http_ok_json(R"({
+    "table_id": "t1",
+    "table_type": "EXTERNAL",
+    "data_source_format": "DELTA",
+    "storage_location": "s3://warehouse/db/orders",
+    "columns": [{"type_name": "LONG", "nullable": false, "position": 0}]
+  })")});
 
   UnityCatalogClient client(instance_config(server.base_url()));
   EXPECT_THROW((void)(client.get_table("main", "db", "orders")), StorageError);

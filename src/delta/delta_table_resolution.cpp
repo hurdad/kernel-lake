@@ -49,10 +49,24 @@ LiteralStorage parse_delta_partition_value(const std::string& value, const DataT
     case TypeId::Int64:
     case TypeId::UInt32:
     case TypeId::UInt64:
-      return static_cast<std::int64_t>(std::stoll(value));
+      try {
+        return static_cast<std::int64_t>(std::stoll(value));
+      } catch (const std::exception& e) {
+        throw StorageError(fmt::format(
+            "delta table resolution: data file '{}' has partition value '{}' for integer column '{}' that "
+            "isn't a valid integer: {}",
+            file_path, value, column_name, e.what()));
+      }
     case TypeId::Float32:
     case TypeId::Float64:
-      return std::stod(value);
+      try {
+        return std::stod(value);
+      } catch (const std::exception& e) {
+        throw StorageError(fmt::format(
+            "delta table resolution: data file '{}' has partition value '{}' for floating-point column '{}' "
+            "that isn't a valid number: {}",
+            file_path, value, column_name, e.what()));
+      }
     case TypeId::Date32:
       return static_cast<std::int64_t>(parse_iso_date(value));
     case TypeId::String:
