@@ -1,5 +1,8 @@
 #include <gtest/gtest.h>
 
+#include <filesystem>
+#include <fstream>
+
 #include "kernellake/common/config.hpp"
 #include "kernellake/common/errors.hpp"
 
@@ -331,6 +334,315 @@ TEST(Config, RejectsServerAuthEnabledWithoutToken) {
 
 TEST(Config, LoadConfigFileRejectsMissingPath) {
   EXPECT_THROW((void)(load_config_file("/nonexistent/kernellake.yaml")), ConfigurationError);
+}
+
+// load_config_file()'s success path (reading a real file off disk and
+// delegating to parse_config()) was never exercised -- only the missing-path
+// rejection above was.
+TEST(Config, LoadConfigFileReadsRealFile) {
+  const std::filesystem::path path = std::filesystem::temp_directory_path() / "kernellake_config_test.yaml";
+  {
+    std::ofstream out(path);
+    out << "engine:\n  device_id: 3\n";
+  }
+  const EngineConfig config = load_config_file(path.string());
+  std::filesystem::remove(path);
+  EXPECT_EQ(config.engine.device_id, 3);
+}
+
+// read_string_map() (storage.hdfs.connection_config.extra_conf) had no
+// coverage at all, success or failure.
+TEST(Config, ParsesHdfsExtraConf) {
+  const std::string yaml = R"(
+storage:
+  hdfs:
+    connection_config:
+      host: namenode
+      extra_conf:
+        dfs.client.use.datanode.hostname: "true"
+)";
+  const EngineConfig config = parse_config(yaml);
+  EXPECT_EQ(config.storage.hdfs.options.connection_config.host, "namenode");
+  ASSERT_EQ(config.storage.hdfs.options.connection_config.extra_conf.size(), 1u);
+  EXPECT_EQ(config.storage.hdfs.options.connection_config.extra_conf.at("dfs.client.use.datanode.hostname"),
+            "true");
+}
+
+TEST(Config, RejectsMalformedHdfsExtraConfEntry) {
+  // A nested sequence as a map value can't convert via .as<std::string>().
+  const std::string yaml = R"(
+storage:
+  hdfs:
+    connection_config:
+      extra_conf:
+        bad_key: [not, a, scalar]
+)";
+  EXPECT_THROW((void)(parse_config(yaml)), ConfigurationError);
+}
+
+// storage.gcs.options.retry_limit_seconds/project_id are std::optional<>,
+// read via their own explicit-presence-check branch in parse_config()
+// rather than read_or<T>() -- neither the success nor failure path of
+// either had coverage.
+TEST(Config, ParsesGcsRetryLimitSecondsAndProjectId) {
+  const std::string yaml = R"(
+storage:
+  gcs:
+    retry_limit_seconds: 30.5
+    project_id: my-project
+)";
+  const EngineConfig config = parse_config(yaml);
+  ASSERT_TRUE(config.storage.gcs.options.retry_limit_seconds.has_value());
+  EXPECT_DOUBLE_EQ(*config.storage.gcs.options.retry_limit_seconds, 30.5);
+  ASSERT_TRUE(config.storage.gcs.options.project_id.has_value());
+  EXPECT_EQ(*config.storage.gcs.options.project_id, "my-project");
+}
+
+TEST(Config, RejectsMalformedGcsRetryLimitSeconds) {
+  const std::string yaml = "storage:\n  gcs:\n    retry_limit_seconds: [not, a, number]\n";
+  EXPECT_THROW((void)(parse_config(yaml)), ConfigurationError);
+}
+
+TEST(Config, RejectsMalformedGcsProjectId) {
+  const std::string yaml = "storage:\n  gcs:\n    project_id: [not, a, scalar]\n";
+  EXPECT_THROW((void)(parse_config(yaml)), ConfigurationError);
+}
+
+// A few representative read_or<T>() malformed-value cases across distinct
+// instantiated types (int, bool, uint16_t port) -- read_or<T> is
+// instantiated separately per T, and most of its many instantiations
+// (one per distinct config field type) previously had neither their
+// success nor failure path exercised by any parse_config() test.
+TEST(Config, RejectsMalformedEngineDeviceId) {
+  EXPECT_THROW((void)(parse_config("engine:\n  device_id: not-a-number\n")), ConfigurationError);
+}
+
+TEST(Config, RejectsMalformedMemoryUseAsyncAllocator) {
+  EXPECT_THROW((void)(parse_config("memory:\n  use_async_allocator: not-a-bool\n")), ConfigurationError);
+}
+
+TEST(Config, RejectsMalformedServerPort) {
+  EXPECT_THROW((void)(parse_config("server:\n  port: not-a-port\n")), ConfigurationError);
+}
+
+TEST(Config, RejectsNegativeEngineDeviceId) {
+  EngineConfig config = default_config();
+  config.engine.device_id = -1;
+  EXPECT_THROW((void)(validate_config(config)), ConfigurationError);
+}
+
+TEST(Config, RejectsZeroResultBatchRows) {
+  EngineConfig config = default_config();
+  config.engine.result_batch_rows = 0;
+  EXPECT_THROW((void)(validate_config(config)), ConfigurationError);
+}
+
+TEST(Config, RejectsUnsupportedBackend) {
+  EngineConfig config = default_config();
+  config.engine.backend = "tpu";
+  EXPECT_THROW((void)(validate_config(config)), ConfigurationError);
+}
+
+TEST(Config, RejectsZeroMemoryPoolInitialBytes) {
+  EngineConfig config = default_config();
+  config.memory.pool_initial_bytes = 0;
+  EXPECT_THROW((void)(validate_config(config)), ConfigurationError);
+}
+
+TEST(Config, RejectsS3UnknownCredentialsKind) {
+  EngineConfig config = default_config();
+  config.storage.s3.credentials_kind = "kerberos";
+  EXPECT_THROW((void)(validate_config(config)), ConfigurationError);
+}
+
+TEST(Config, RejectsS3RoleCredentialsMissingRoleArn) {
+  EngineConfig config = default_config();
+  config.storage.s3.credentials_kind = "role";
+  // options.role_arn left empty.
+  EXPECT_THROW((void)(validate_config(config)), ConfigurationError);
+}
+
+TEST(Config, RejectsS3InvalidScheme) {
+  EngineConfig config = default_config();
+  config.storage.s3.options.scheme = "ftp";
+  EXPECT_THROW((void)(validate_config(config)), ConfigurationError);
+}
+
+TEST(Config, RejectsGcsUnknownCredentialsKind) {
+  EngineConfig config = default_config();
+  config.storage.gcs.credentials_kind = "kerberos";
+  EXPECT_THROW((void)(validate_config(config)), ConfigurationError);
+}
+
+TEST(Config, RejectsGcsAccessTokenCredentialsMissingToken) {
+  EngineConfig config = default_config();
+  config.storage.gcs.credentials_kind = "access_token";
+  // access_token left empty.
+  EXPECT_THROW((void)(validate_config(config)), ConfigurationError);
+}
+
+TEST(Config, RejectsGcsServiceAccountJsonCredentialsMissingJson) {
+  EngineConfig config = default_config();
+  config.storage.gcs.credentials_kind = "service_account_json";
+  // json_credentials left empty.
+  EXPECT_THROW((void)(validate_config(config)), ConfigurationError);
+}
+
+TEST(Config, RejectsGcsInvalidScheme) {
+  EngineConfig config = default_config();
+  config.storage.gcs.options.scheme = "ftp";
+  EXPECT_THROW((void)(validate_config(config)), ConfigurationError);
+}
+
+TEST(Config, RejectsAzureUnknownCredentialsKind) {
+  EngineConfig config = default_config();
+  config.storage.azure.credentials_kind = "kerberos";
+  EXPECT_THROW((void)(validate_config(config)), ConfigurationError);
+}
+
+TEST(Config, RejectsAzureStorageSharedKeyCredentialsMissingKey) {
+  EngineConfig config = default_config();
+  config.storage.azure.credentials_kind = "storage_shared_key";
+  // storage_shared_key left empty.
+  EXPECT_THROW((void)(validate_config(config)), ConfigurationError);
+}
+
+TEST(Config, RejectsAzureSasTokenCredentialsMissingToken) {
+  EngineConfig config = default_config();
+  config.storage.azure.credentials_kind = "sas_token";
+  // sas_token left empty.
+  EXPECT_THROW((void)(validate_config(config)), ConfigurationError);
+}
+
+TEST(Config, RejectsAzureClientSecretCredentialsMissingFields) {
+  EngineConfig config = default_config();
+  config.storage.azure.credentials_kind = "client_secret";
+  // tenant_id/client_id/client_secret all left empty.
+  EXPECT_THROW((void)(validate_config(config)), ConfigurationError);
+}
+
+TEST(Config, RejectsAzureInvalidBlobStorageScheme) {
+  EngineConfig config = default_config();
+  config.storage.azure.options.blob_storage_scheme = "ftp";
+  EXPECT_THROW((void)(validate_config(config)), ConfigurationError);
+}
+
+TEST(Config, RejectsAzureInvalidDfsStorageScheme) {
+  EngineConfig config = default_config();
+  config.storage.azure.options.dfs_storage_scheme = "ftp";
+  EXPECT_THROW((void)(validate_config(config)), ConfigurationError);
+}
+
+TEST(Config, RejectsCacheEnabledWithoutDirectory) {
+  EngineConfig config = default_config();
+  config.storage.cache.enabled = true;
+  // directory left empty.
+  EXPECT_THROW((void)(validate_config(config)), ConfigurationError);
+}
+
+TEST(Config, RejectsBenchmarkNonPositiveDefaultIterations) {
+  EngineConfig config = default_config();
+  config.benchmark.default_iterations = 0;
+  EXPECT_THROW((void)(validate_config(config)), ConfigurationError);
+}
+
+TEST(Config, RejectsBenchmarkNegativeWarmupIterations) {
+  EngineConfig config = default_config();
+  config.benchmark.warmup_iterations = -1;
+  EXPECT_THROW((void)(validate_config(config)), ConfigurationError);
+}
+
+TEST(Config, RejectsServerZeroPort) {
+  EngineConfig config = default_config();
+  config.server.port = 0;
+  EXPECT_THROW((void)(validate_config(config)), ConfigurationError);
+}
+
+TEST(Config, RejectsServerZeroMaxPendingResults) {
+  EngineConfig config = default_config();
+  config.server.max_pending_results = 0;
+  EXPECT_THROW((void)(validate_config(config)), ConfigurationError);
+}
+
+TEST(Config, RejectsObservabilityInvalidOtlpProtocol) {
+  EngineConfig config = default_config();
+  config.observability.otlp_protocol = "carrier-pigeon";
+  EXPECT_THROW((void)(validate_config(config)), ConfigurationError);
+}
+
+TEST(Config, RejectsObservabilityEnabledWithoutEndpoint) {
+  EngineConfig config = default_config();
+  config.observability.enabled = true;
+  config.observability.otlp_endpoint.clear();  // non-empty by default.
+  EXPECT_THROW((void)(validate_config(config)), ConfigurationError);
+}
+
+TEST(Config, RejectsObservabilityEmptyServiceName) {
+  EngineConfig config = default_config();
+  config.observability.service_name.clear();
+  EXPECT_THROW((void)(validate_config(config)), ConfigurationError);
+}
+
+TEST(Config, RejectsObservabilityTracingInvalidSampler) {
+  EngineConfig config = default_config();
+  config.observability.tracing.sampler = "coinflip";
+  EXPECT_THROW((void)(validate_config(config)), ConfigurationError);
+}
+
+TEST(Config, RejectsObservabilityMetricsZeroExportIntervalMs) {
+  EngineConfig config = default_config();
+  config.observability.metrics.export_interval_ms = 0;
+  EXPECT_THROW((void)(validate_config(config)), ConfigurationError);
+}
+
+TEST(Config, RejectsObservabilityMetricsZeroExportTimeoutMs) {
+  EngineConfig config = default_config();
+  config.observability.metrics.export_timeout_ms = 0;
+  EXPECT_THROW((void)(validate_config(config)), ConfigurationError);
+}
+
+// validate_batch_export_config() (shared by observability.tracing.batch and
+// observability.logs.batch) had none of its five error branches covered --
+// exercised once via tracing.batch, representative of both callers since
+// they share the exact same validation function.
+TEST(Config, RejectsTracingBatchInvalidProcessor) {
+  EngineConfig config = default_config();
+  config.observability.tracing.processor = "carrier-pigeon";
+  EXPECT_THROW((void)(validate_config(config)), ConfigurationError);
+}
+
+TEST(Config, RejectsTracingBatchZeroMaxQueueSize) {
+  EngineConfig config = default_config();
+  config.observability.tracing.batch.max_queue_size = 0;
+  EXPECT_THROW((void)(validate_config(config)), ConfigurationError);
+}
+
+TEST(Config, RejectsTracingBatchZeroMaxExportBatchSize) {
+  EngineConfig config = default_config();
+  config.observability.tracing.batch.max_export_batch_size = 0;
+  EXPECT_THROW((void)(validate_config(config)), ConfigurationError);
+}
+
+TEST(Config, RejectsTracingBatchExportSizeExceedingQueueSize) {
+  EngineConfig config = default_config();
+  config.observability.tracing.batch.max_queue_size = 10;
+  config.observability.tracing.batch.max_export_batch_size = 20;
+  EXPECT_THROW((void)(validate_config(config)), ConfigurationError);
+}
+
+TEST(Config, RejectsTracingBatchZeroScheduleDelayMs) {
+  EngineConfig config = default_config();
+  config.observability.tracing.batch.schedule_delay_ms = 0;
+  EXPECT_THROW((void)(validate_config(config)), ConfigurationError);
+}
+
+// logs.batch shares validate_batch_export_config() with tracing.batch
+// above -- one test confirms the *logs* call site itself is reached (not
+// just tracing's), rather than re-covering every branch a second time.
+TEST(Config, RejectsLogsBatchInvalidProcessor) {
+  EngineConfig config = default_config();
+  config.observability.logs.processor = "carrier-pigeon";
+  EXPECT_THROW((void)(validate_config(config)), ConfigurationError);
 }
 
 }  // namespace
