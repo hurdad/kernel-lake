@@ -640,6 +640,26 @@ TEST_F(QueryEngineExecuteCpuTest, HavingWithLiteralThresholdFiltersGroups) {
   EXPECT_DOUBLE_EQ(total_column->Value(0), 110.0);
 }
 
+// Regression test: finish_logical_plan() rewrites HAVING's own aggregate
+// references (register_aggregate()) in the same pre-LogicalAggregate phase
+// as the SELECT list, specifically so a HAVING aggregate that never appears
+// in the SELECT list itself still grows LogicalAggregate's own `aggregates`
+// list before it's constructed -- otherwise LogicalAggregate would already
+// be built from a stale, smaller list by the time HAVING tried to rewrite
+// its own reference. Same split as HavingWithLiteralThresholdFiltersGroups
+// (region A totals 35.0, region B totals 110.0), but `total` is never
+// selected here.
+TEST_F(QueryEngineExecuteCpuTest, HavingReferencesAggregateNotInSelectListFiltersGroupsCorrectly) {
+  const QueryResult result = engine_.execute("SELECT region FROM read_parquet('" + path_ +
+                                             "') GROUP BY region HAVING SUM(amount) > 50");
+
+  ASSERT_EQ(result.rows_returned, 1);
+  const std::shared_ptr<arrow::RecordBatch>& batch = result.batches.front();
+  const auto region_column = std::static_pointer_cast<arrow::StringArray>(batch->GetColumnByName("region"));
+  ASSERT_NE(region_column, nullptr);
+  EXPECT_EQ(region_column->GetString(0), "B");
+}
+
 // QueryEngine::evaluate_scalar_subquery(): a real non-correlated scalar
 // subquery computes the HAVING threshold instead of a literal -- exactly
 // TPC-H Q11's own `SUM(...) * 0.0001` shape. 145.0 (grand total) * 0.3 =
@@ -651,6 +671,49 @@ TEST_F(QueryEngineExecuteCpuTest, HavingWithScalarSubqueryThresholdFiltersGroups
       "SELECT region, SUM(amount) AS total FROM read_parquet('" + path_ +
       "') GROUP BY region HAVING SUM(amount) > (SELECT SUM(amount) * 0.3 FROM read_parquet('" + path_ +
       "'))");
+
+  ASSERT_EQ(result.rows_returned, 1);
+  const std::shared_ptr<arrow::RecordBatch>& batch = result.batches.front();
+  const auto region_column = std::static_pointer_cast<arrow::StringArray>(batch->GetColumnByName("region"));
+  const auto total_column = std::static_pointer_cast<arrow::DoubleArray>(batch->GetColumnByName("total"));
+  ASSERT_NE(region_column, nullptr);
+  ASSERT_NE(total_column, nullptr);
+  EXPECT_EQ(region_column->GetString(0), "B");
+  EXPECT_DOUBLE_EQ(total_column->Value(0), 110.0);
+}
+
+// sql::resolve_subqueries() recurses through an AstBetween's lower/upper
+// bounds -- a subquery sitting directly as HAVING's own comparison operand
+// (the test above) never exercises that recursion. Same threshold/split as
+// HavingWithScalarSubqueryThresholdFiltersGroups (43.5, excluding region A's
+// 35.0 and including region B's 110.0), just reached through a BETWEEN
+// instead of a bare comparison.
+TEST_F(QueryEngineExecuteCpuTest, HavingSubqueryNestedInsideBetweenFiltersGroups) {
+  const QueryResult result =
+      engine_.execute("SELECT region, SUM(amount) AS total FROM read_parquet('" + path_ +
+                      "') GROUP BY region HAVING SUM(amount) BETWEEN "
+                      "(SELECT SUM(amount) * 0.3 FROM read_parquet('" +
+                      path_ + "')) AND 200");
+
+  ASSERT_EQ(result.rows_returned, 1);
+  const std::shared_ptr<arrow::RecordBatch>& batch = result.batches.front();
+  const auto region_column = std::static_pointer_cast<arrow::StringArray>(batch->GetColumnByName("region"));
+  const auto total_column = std::static_pointer_cast<arrow::DoubleArray>(batch->GetColumnByName("total"));
+  ASSERT_NE(region_column, nullptr);
+  ASSERT_NE(total_column, nullptr);
+  EXPECT_EQ(region_column->GetString(0), "B");
+  EXPECT_DOUBLE_EQ(total_column->Value(0), 110.0);
+}
+
+// Same recursion check, but for an AstCase branch instead of an AstBetween
+// bound -- resolve_subqueries() walks both when_then results and the else
+// branch.
+TEST_F(QueryEngineExecuteCpuTest, HavingSubqueryNestedInsideCaseFiltersGroups) {
+  const QueryResult result =
+      engine_.execute("SELECT region, SUM(amount) AS total FROM read_parquet('" + path_ +
+                      "') GROUP BY region HAVING SUM(amount) > CASE WHEN SUM(amount) > 0 THEN "
+                      "(SELECT SUM(amount) * 0.3 FROM read_parquet('" +
+                      path_ + "')) ELSE 0 END");
 
   ASSERT_EQ(result.rows_returned, 1);
   const std::shared_ptr<arrow::RecordBatch>& batch = result.batches.front();

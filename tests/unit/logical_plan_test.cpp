@@ -36,6 +36,16 @@ Schema table_c_schema() {
   return Schema({Field{"c_val", string_type(false)}, Field{"b_key", int64_type(false)}});
 }
 
+// Two schemas sharing a bare column name ("amount") -- for a JOIN test
+// where SUM(a.amount) and SUM(b.amount) must land in two distinct
+// LogicalAggregate slots, not be deduplicated by a naive bare-name check.
+Schema amount_schema_a() {
+  return Schema({Field{"join_key", int64_type(false)}, Field{"amount", float64_type(false)}});
+}
+Schema amount_schema_b() {
+  return Schema({Field{"join_key", int64_type(false)}, Field{"amount", float64_type(false)}});
+}
+
 TEST(LogicalPlanner, BuildsGeneralMvpQueryShape) {
   const auto stmt = sql::parse_sql(
       "SELECT region, SUM(amount) AS total_amount, COUNT(*) AS order_count "
@@ -193,6 +203,113 @@ TEST(LogicalPlanner, AggregateArithmeticCombiningTwoAggregatesBuildsBothSlots) {
   // neither is the SELECT item itself, both had to be found by recursing
   // into the multiplication/division tree.
   ASSERT_EQ(aggregate->aggregates().size(), 2u);
+}
+
+// register_aggregate() dedups by structural_key(): the same aggregate
+// expression referenced twice in the SELECT list (here, under two different
+// aliases) must only occupy one LogicalAggregate slot, keeping the *first*
+// name it was registered under.
+TEST(LogicalPlanner, DuplicateAggregateCallsShareOneAggregateSlot) {
+  const auto stmt =
+      sql::parse_sql("SELECT SUM(amount) AS a, SUM(amount) AS b FROM read_parquet('/x.parquet')");
+  const Schema schema = sales_schema();
+  const BoundQuery bound = bind_query(stmt, schema);
+  const LogicalPlanPtr plan = build_logical_plan(bound, schema);
+
+  const auto* projection = dynamic_cast<const LogicalProjection*>(plan.get());
+  ASSERT_NE(projection, nullptr);
+  const auto* aggregate = dynamic_cast<const LogicalAggregate*>(projection->children()[0].get());
+  ASSERT_NE(aggregate, nullptr);
+  ASSERT_EQ(aggregate->aggregates().size(), 1u);
+  EXPECT_EQ(aggregate->aggregates()[0].name, "a");
+
+  ASSERT_EQ(projection->items().size(), 2u);
+  const auto* a_col = dynamic_cast<const ColumnExpression*>(projection->items()[0].expr.get());
+  const auto* b_col = dynamic_cast<const ColumnExpression*>(projection->items()[1].expr.get());
+  ASSERT_NE(a_col, nullptr);
+  ASSERT_NE(b_col, nullptr);
+  EXPECT_EQ(a_col->column_index(), b_col->column_index());
+}
+
+// The dedup above is keyed by structural_key(), not a bare column name --
+// SUM(a.amount) and SUM(b.amount) reference "amount" on opposite JOIN
+// sides (different column_index()) and must get two distinct slots.
+TEST(LogicalPlanner, AggregatesOverSameNamedColumnsFromDifferentJoinSidesGetDistinctSlots) {
+  const auto stmt = sql::parse_sql(
+      "SELECT SUM(a.amount) + SUM(b.amount) AS total FROM read_parquet('/a.parquet') AS a "
+      "JOIN read_parquet('/b.parquet') AS b ON a.join_key = b.join_key");
+  const std::vector<Schema> schemas = {amount_schema_a(), amount_schema_b()};
+  const BoundQuery bound = bind_query(stmt, schemas);
+  const LogicalPlanPtr plan = build_logical_plan(bound, schemas);
+
+  const auto* projection = dynamic_cast<const LogicalProjection*>(plan.get());
+  ASSERT_NE(projection, nullptr);
+  const auto* aggregate = dynamic_cast<const LogicalAggregate*>(projection->children()[0].get());
+  ASSERT_NE(aggregate, nullptr);
+  EXPECT_EQ(aggregate->aggregates().size(), 2u);
+}
+
+// rewrite_aggregate_refs() recursing into an aggregate wrapped in a
+// BinaryExpression is already covered by
+// AggregateArithmeticCombiningTwoAggregatesBuildsBothSlots above; these
+// three cover the remaining wrapper kinds it also has a dedicated case
+// for -- only CASE-wrapping had test coverage before.
+TEST(LogicalPlanner, RewriteAggregateRefsHandlesAggregateWrappedInBetween) {
+  const auto stmt = sql::parse_sql(
+      "SELECT SUM(l_extendedprice) BETWEEN 1 AND SUM(l_discount) AS in_range "
+      "FROM read_parquet('/x.parquet')");
+  const Schema schema = lineitem_schema();
+  const BoundQuery bound = bind_query(stmt, schema);
+  const LogicalPlanPtr plan = build_logical_plan(bound, schema);
+
+  const auto* projection = dynamic_cast<const LogicalProjection*>(plan.get());
+  ASSERT_NE(projection, nullptr);
+  ASSERT_EQ(projection->items().size(), 1u);
+  const auto* between = dynamic_cast<const BetweenExpression*>(projection->items()[0].expr.get());
+  ASSERT_NE(between, nullptr);
+  EXPECT_NE(dynamic_cast<const ColumnExpression*>(between->value().get()), nullptr);
+  EXPECT_NE(dynamic_cast<const ColumnExpression*>(between->upper().get()), nullptr);
+
+  const auto* aggregate = dynamic_cast<const LogicalAggregate*>(projection->children()[0].get());
+  ASSERT_NE(aggregate, nullptr);
+  ASSERT_EQ(aggregate->aggregates().size(), 2u);
+}
+
+TEST(LogicalPlanner, RewriteAggregateRefsHandlesAggregateWrappedInLike) {
+  const auto stmt = sql::parse_sql("SELECT MIN(region) LIKE 'A%' AS has_a FROM read_parquet('/x.parquet')");
+  const Schema schema = sales_schema();
+  const BoundQuery bound = bind_query(stmt, schema);
+  const LogicalPlanPtr plan = build_logical_plan(bound, schema);
+
+  const auto* projection = dynamic_cast<const LogicalProjection*>(plan.get());
+  ASSERT_NE(projection, nullptr);
+  ASSERT_EQ(projection->items().size(), 1u);
+  const auto* like = dynamic_cast<const LikeExpression*>(projection->items()[0].expr.get());
+  ASSERT_NE(like, nullptr);
+  EXPECT_NE(dynamic_cast<const ColumnExpression*>(like->value().get()), nullptr);
+
+  const auto* aggregate = dynamic_cast<const LogicalAggregate*>(projection->children()[0].get());
+  ASSERT_NE(aggregate, nullptr);
+  ASSERT_EQ(aggregate->aggregates().size(), 1u);
+}
+
+TEST(LogicalPlanner, RewriteAggregateRefsHandlesAggregateWrappedInExtract) {
+  const auto stmt =
+      sql::parse_sql("SELECT EXTRACT(YEAR FROM MIN(event_date)) AS min_year FROM read_parquet('/x.parquet')");
+  const Schema schema = sales_schema();
+  const BoundQuery bound = bind_query(stmt, schema);
+  const LogicalPlanPtr plan = build_logical_plan(bound, schema);
+
+  const auto* projection = dynamic_cast<const LogicalProjection*>(plan.get());
+  ASSERT_NE(projection, nullptr);
+  ASSERT_EQ(projection->items().size(), 1u);
+  const auto* extract = dynamic_cast<const ExtractExpression*>(projection->items()[0].expr.get());
+  ASSERT_NE(extract, nullptr);
+  EXPECT_NE(dynamic_cast<const ColumnExpression*>(extract->operand().get()), nullptr);
+
+  const auto* aggregate = dynamic_cast<const LogicalAggregate*>(projection->children()[0].get());
+  ASSERT_NE(aggregate, nullptr);
+  ASSERT_EQ(aggregate->aggregates().size(), 1u);
 }
 
 TEST(LogicalPlanner, AggregateOrderByReferencesSelectListOutputName) {

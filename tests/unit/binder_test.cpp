@@ -31,6 +31,16 @@ Schema orders_schema() {
   });
 }
 
+// customer_id is INT32 here (vs. orders_schema()'s INT64) -- for a JOIN
+// test that needs two numerically-compatible-but-different-width key
+// columns, distinct from customers_schema()'s exact-type-match column.
+Schema narrow_customers_schema() {
+  return Schema({
+      Field{"customer_id", int32_type(false)},
+      Field{"name", string_type(false)},
+  });
+}
+
 Schema customers_schema() {
   return Schema({
       Field{"customer_id", int64_type(false)},
@@ -137,6 +147,11 @@ TEST(Binder, RejectsDuplicateOutputNames) {
 
 TEST(Binder, RejectsAggregateInWhere) {
   const auto stmt = sql::parse_sql("SELECT region FROM read_parquet('/x.parquet') WHERE SUM(amount) > 0");
+  EXPECT_THROW((void)(bind_query(stmt, sales_schema())), BindingError);
+}
+
+TEST(Binder, RejectsNestedAggregateFunctions) {
+  const auto stmt = sql::parse_sql("SELECT SUM(SUM(amount)) FROM read_parquet('/x.parquet')");
   EXPECT_THROW((void)(bind_query(stmt, sales_schema())), BindingError);
 }
 
@@ -645,6 +660,83 @@ TEST(Binder, RejectsUnresolvedInSubquery) {
   const auto stmt = sql::parse_sql(
       "SELECT a FROM read_parquet('/x.parquet') WHERE a IN (SELECT a FROM read_parquet('/x.parquet'))");
   EXPECT_THROW((void)bind_query(stmt, Schema({Field{"a", int64_type(false)}})), BindingError);
+}
+
+TEST(Binder, QualifiedColumnRefInSingleTableModeIsRejected) {
+  // input_schema_ != nullptr (single-table/non-JOIN mode) -- a qualified
+  // reference like `a.region` has no side to disambiguate here, unlike JOIN
+  // mode where it picks a source.
+  const auto stmt = sql::parse_sql("SELECT a.region FROM read_parquet('/x.parquet')");
+  EXPECT_THROW((void)(bind_query(stmt, sales_schema())), BindingError);
+}
+
+TEST(Binder, JoinRejectsKeysOfDifferentNumericWidthRequiringAnImplicitCast) {
+  // Unlike JoinRejectsMismatchedKeyTypes above (STRING vs. INT64, which
+  // fails earlier in combine_binary()'s "incompatible comparison" check),
+  // INT32 and INT64 are numerically compatible -- combine_binary() promotes
+  // and wraps the INT32 side in an implicit CastExpression, so the ON
+  // condition is no longer a bare `<column> = <column>` by the time it
+  // reaches extract_join_step_keys(), which is what this test actually
+  // exercises.
+  const auto stmt = sql::parse_sql(
+      "SELECT o.order_id FROM read_parquet('/o.parquet') AS o "
+      "JOIN read_parquet('/c.parquet') AS c ON o.customer_id = c.customer_id");
+  EXPECT_THROW((void)(bind_query(stmt, std::vector<Schema>{orders_schema(), narrow_customers_schema()})),
+               BindingError);
+}
+
+TEST(Binder, SumAndAvgOnNonNumericColumnAreRejected) {
+  const auto sum_stmt = sql::parse_sql("SELECT SUM(region) FROM read_parquet('/x.parquet')");
+  EXPECT_THROW((void)(bind_query(sum_stmt, sales_schema())), BindingError);
+
+  const auto avg_stmt = sql::parse_sql("SELECT AVG(region) FROM read_parquet('/x.parquet')");
+  EXPECT_THROW((void)(bind_query(avg_stmt, sales_schema())), BindingError);
+}
+
+TEST(Binder, LikeWithNonLiteralPatternIsRejected) {
+  const auto stmt = sql::parse_sql("SELECT region FROM read_parquet('/x.parquet') WHERE region LIKE region");
+  EXPECT_THROW((void)(bind_query(stmt, sales_schema())), BindingError);
+}
+
+TEST(Binder, ArithmeticOnNonNumericOperandsIsRejected) {
+  const auto stmt = sql::parse_sql("SELECT region + amount FROM read_parquet('/x.parquet')");
+  EXPECT_THROW((void)(bind_query(stmt, sales_schema())), BindingError);
+}
+
+TEST(Binder, AndOrWithNonBooleanOperandIsRejected) {
+  const auto stmt =
+      sql::parse_sql("SELECT region FROM read_parquet('/x.parquet') WHERE amount AND region = 'A'");
+  EXPECT_THROW((void)(bind_query(stmt, sales_schema())), BindingError);
+}
+
+TEST(Binder, NotWithNonBooleanOperandIsRejected) {
+  const auto stmt = sql::parse_sql("SELECT region FROM read_parquet('/x.parquet') WHERE NOT amount");
+  EXPECT_THROW((void)(bind_query(stmt, sales_schema())), BindingError);
+}
+
+TEST(Binder, BetweenBoundTypeMismatchedWithValueTypeIsRejected) {
+  const auto stmt =
+      sql::parse_sql("SELECT region FROM read_parquet('/x.parquet') WHERE region BETWEEN 1 AND 10");
+  EXPECT_THROW((void)(bind_query(stmt, sales_schema())), BindingError);
+}
+
+TEST(Binder, GroupByNonColumnRefExpressionIsRejected) {
+  const auto stmt = sql::parse_sql("SELECT amount FROM read_parquet('/x.parquet') GROUP BY amount + 1");
+  EXPECT_THROW((void)(bind_query(stmt, sales_schema())), BindingError);
+}
+
+TEST(Binder, AggregateOrderByOnNonColumnRefExpressionIsRejected) {
+  const auto stmt = sql::parse_sql(
+      "SELECT region, SUM(amount) AS total FROM read_parquet('/x.parquet') GROUP BY region "
+      "ORDER BY total + 1");
+  EXPECT_THROW((void)(bind_query(stmt, sales_schema())), BindingError);
+}
+
+TEST(Binder, AggregateOrderByOnUnknownOutputNameIsRejected) {
+  const auto stmt = sql::parse_sql(
+      "SELECT region, SUM(amount) AS total FROM read_parquet('/x.parquet') GROUP BY region "
+      "ORDER BY nonexistent");
+  EXPECT_THROW((void)(bind_query(stmt, sales_schema())), BindingError);
 }
 
 }  // namespace
