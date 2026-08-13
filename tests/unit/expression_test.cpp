@@ -54,6 +54,77 @@ TEST(Expression, UnaryIsNullToString) {
   EXPECT_EQ(is_null.to_string(), "discount IS NULL");
 }
 
+// UnaryExpression::to_string()'s own switch has a case per UnaryOperator --
+// UnaryIsNullToString above only ever exercised IsNull.
+TEST(Expression, UnaryExpressionToStringCoversEveryOperator) {
+  auto column = std::make_shared<ColumnExpression>("flag", 0, boolean_type());
+  EXPECT_EQ(UnaryExpression(UnaryOperator::Not, column, boolean_type(false)).to_string(), "NOT (flag)");
+  EXPECT_EQ(UnaryExpression(UnaryOperator::Negate, column, boolean_type(false)).to_string(), "-flag");
+  EXPECT_EQ(UnaryExpression(UnaryOperator::IsNotNull, column, boolean_type(false)).to_string(),
+            "flag IS NOT NULL");
+}
+
+TEST(Expression, UnaryExpressionStructuralKeyCoversEveryOperator) {
+  // ColumnExpression::structural_key() encodes "#<column_index>", not the
+  // bare name -- see structural_key()'s own class-level doc comment.
+  auto column = std::make_shared<ColumnExpression>("flag", 0, boolean_type());
+  EXPECT_EQ(UnaryExpression(UnaryOperator::Not, column, boolean_type(false)).structural_key(), "NOT (#0)");
+  EXPECT_EQ(UnaryExpression(UnaryOperator::Negate, column, boolean_type(false)).structural_key(), "-#0");
+  EXPECT_EQ(UnaryExpression(UnaryOperator::IsNotNull, column, boolean_type(false)).structural_key(),
+            "#0 IS NOT NULL");
+}
+
+// The standalone free kernellake::to_string(UnaryOperator) (expression.cpp) is
+// distinct from UnaryExpression::to_string()'s own switch above -- neither
+// exercises the other -- and was never called directly by any prior test.
+TEST(Expression, FreeToStringCoversEveryUnaryOperator) {
+  EXPECT_EQ(to_string(UnaryOperator::Not), "NOT");
+  EXPECT_EQ(to_string(UnaryOperator::Negate), "-");
+  EXPECT_EQ(to_string(UnaryOperator::IsNull), "IS NULL");
+  EXPECT_EQ(to_string(UnaryOperator::IsNotNull), "IS NOT NULL");
+}
+
+TEST(Expression, FreeToStringCoversEveryBinaryOperator) {
+  EXPECT_EQ(to_string(BinaryOperator::Add), "+");
+  EXPECT_EQ(to_string(BinaryOperator::Subtract), "-");
+  EXPECT_EQ(to_string(BinaryOperator::Multiply), "*");
+  EXPECT_EQ(to_string(BinaryOperator::Divide), "/");
+  EXPECT_EQ(to_string(BinaryOperator::Equal), "=");
+  EXPECT_EQ(to_string(BinaryOperator::NotEqual), "!=");
+  EXPECT_EQ(to_string(BinaryOperator::Less), "<");
+  EXPECT_EQ(to_string(BinaryOperator::LessEqual), "<=");
+  EXPECT_EQ(to_string(BinaryOperator::Greater), ">");
+  EXPECT_EQ(to_string(BinaryOperator::GreaterEqual), ">=");
+  EXPECT_EQ(to_string(BinaryOperator::And), "AND");
+  EXPECT_EQ(to_string(BinaryOperator::Or), "OR");
+}
+
+TEST(Expression, FreeToStringCoversEveryAggregateFunction) {
+  EXPECT_EQ(to_string(AggregateFunction::Sum), "SUM");
+  EXPECT_EQ(to_string(AggregateFunction::Count), "COUNT");
+  EXPECT_EQ(to_string(AggregateFunction::CountStar), "COUNT");
+  EXPECT_EQ(to_string(AggregateFunction::Min), "MIN");
+  EXPECT_EQ(to_string(AggregateFunction::Max), "MAX");
+  EXPECT_EQ(to_string(AggregateFunction::Avg), "AVG");
+}
+
+// Every to_string(<enum>) overload in expression.cpp falls through an
+// otherwise-exhaustive switch to a defensive `return "?";` for a value with
+// no matching case -- only reachable via an out-of-range static_cast, never
+// through the real enum, but exercised here to confirm the fallback itself
+// actually returns "?" rather than being genuinely dead code.
+TEST(Expression, UnknownEnumeratorsFallBackToQuestionMark) {
+  EXPECT_EQ(to_string(static_cast<BinaryOperator>(255)), "?");
+  EXPECT_EQ(to_string(static_cast<UnaryOperator>(255)), "?");
+  EXPECT_EQ(to_string(static_cast<DatePart>(255)), "?");
+  EXPECT_EQ(to_string(static_cast<AggregateFunction>(255)), "?");
+
+  auto column = std::make_shared<ColumnExpression>("flag", 0, boolean_type());
+  const UnaryExpression unknown_unary(static_cast<UnaryOperator>(255), column, boolean_type(false));
+  EXPECT_EQ(unknown_unary.to_string(), "?");
+  EXPECT_EQ(unknown_unary.structural_key(), "?");
+}
+
 TEST(Expression, CastExpressionToString) {
   auto column = std::make_shared<ColumnExpression>("id", 0, int32_type());
   CastExpression cast(column, int64_type());

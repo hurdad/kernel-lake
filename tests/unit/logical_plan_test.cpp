@@ -379,6 +379,97 @@ TEST(LogicalPlanner, ExplainTextContainsExpectedNodesAndAttributes) {
   EXPECT_NE(text.find("/data/sales/*.parquet"), std::string::npos);
 }
 
+// LogicalScan::explain_attributes()'s required_columns/partition_columns/
+// pushable_predicates blocks are all conditional on non-default state that
+// ExplainTextContainsExpectedNodesAndAttributes above never sets -- these
+// construct a LogicalScan directly (no full parse/bind needed, all three
+// are plain public setters/constructor args) to exercise each.
+TEST(LogicalScanExplainAttributes, OmitsRequiredColumnsWhenUnnarrowed) {
+  auto scan = std::make_shared<LogicalScan>(std::vector<std::string>{"/x.parquet"}, sales_schema());
+  const auto attrs = scan->explain_attributes();
+  for (const auto& [key, value] : attrs) {
+    EXPECT_NE(key, "required_columns");
+  }
+}
+
+TEST(LogicalScanExplainAttributes, IncludesRequiredColumnsWhenNarrowedByProjectionPushdown) {
+  auto scan = std::make_shared<LogicalScan>(std::vector<std::string>{"/x.parquet"}, sales_schema());
+  scan->set_required_columns({"region"});
+  const auto attrs = scan->explain_attributes();
+  bool found = false;
+  for (const auto& [key, value] : attrs) {
+    if (key == "required_columns") {
+      found = true;
+      EXPECT_EQ(value, "[region]");
+    }
+  }
+  EXPECT_TRUE(found);
+}
+
+TEST(LogicalScanExplainAttributes, IncludesPartitionColumnsWhenPresent) {
+  auto scan = std::make_shared<LogicalScan>(std::vector<std::string>{"/x.parquet"}, sales_schema(),
+                                            std::vector<PartitionColumn>{{"region", string_type(false)}});
+  const auto attrs = scan->explain_attributes();
+  bool found = false;
+  for (const auto& [key, value] : attrs) {
+    if (key == "partition_columns") {
+      found = true;
+      EXPECT_EQ(value, "[region]");
+    }
+  }
+  EXPECT_TRUE(found);
+}
+
+TEST(LogicalScanExplainAttributes, IncludesPushablePredicatesWhenPresent) {
+  auto scan = std::make_shared<LogicalScan>(std::vector<std::string>{"/x.parquet"}, sales_schema());
+  auto literal = std::make_shared<LiteralExpression>(LiteralExpression::make_string("US"));
+  scan->set_pushable_predicates({PushablePredicate{"region", BinaryOperator::Equal, literal}});
+  const auto attrs = scan->explain_attributes();
+  bool found = false;
+  for (const auto& [key, value] : attrs) {
+    if (key == "pushable_predicates") {
+      found = true;
+      EXPECT_EQ(value, "[region = 'US']");
+    }
+  }
+  EXPECT_TRUE(found);
+}
+
+// LogicalSort::explain_attributes() was never called by any prior test --
+// AggregateOrderByReferencesSelectListOutputName/
+// NonAggregateOrderByPlacedBeforeProjection above assert on LogicalSort's
+// structure, not its explain output.
+TEST(LogicalPlanner, ExplainTextIncludesSortKeysWithDirection) {
+  const auto stmt = sql::parse_sql(
+      "SELECT region, amount FROM read_parquet('/x.parquet') ORDER BY amount DESC, region ASC");
+  const Schema schema = sales_schema();
+  const BoundQuery bound = bind_query(stmt, schema);
+  const LogicalPlanPtr plan = build_logical_plan(bound, schema);
+
+  const std::string text = explain_text(*plan);
+  EXPECT_NE(text.find("LogicalSort"), std::string::npos);
+  EXPECT_NE(text.find("keys: [amount DESC, region ASC]"), std::string::npos);
+}
+
+// estimated_rows (LogicalPlanNode's own optional field, filled in by
+// Parquet metadata inspection -- see LogicalPlanNode's class comment) is
+// null by default on every plan node built above; explain_text_recursive()/
+// explain_json_recursive()'s own "estimated_rows" lines are only reached
+// when something has actually set it.
+TEST(LogicalPlanner, ExplainTextIncludesEstimatedRowsWhenSet) {
+  auto scan = std::make_shared<LogicalScan>(std::vector<std::string>{"/x.parquet"}, sales_schema());
+  scan->estimated_rows = 42;
+  const std::string text = explain_text(*scan);
+  EXPECT_NE(text.find("estimated_rows: 42"), std::string::npos);
+}
+
+TEST(LogicalPlanner, ExplainJsonIncludesEstimatedRowsWhenSet) {
+  auto scan = std::make_shared<LogicalScan>(std::vector<std::string>{"/x.parquet"}, sales_schema());
+  scan->estimated_rows = 42;
+  const std::string json_text = explain_json(*scan);
+  EXPECT_NE(json_text.find("\"estimated_rows\": 42"), std::string::npos);
+}
+
 TEST(LogicalPlanner, ExplainJsonIsValidAndContainsNodeNames) {
   const auto stmt = sql::parse_sql("SELECT region FROM read_parquet('/data/sales/*.parquet')");
   const Schema schema = sales_schema();
