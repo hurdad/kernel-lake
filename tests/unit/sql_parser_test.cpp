@@ -350,6 +350,31 @@ TEST(SqlParser, ReadParquetPathArgumentPreservesEscapedQuoteVerbatim) {
   EXPECT_EQ(stmt.from.paths[0], R"(/data/a\'b.parquet)");
 }
 
+// try_parse_quoted_string()/try_parse_read_parquet_args() (parser.cpp) are
+// the hand-rolled, non-recursive replacement for a former std::regex
+// pattern that could be crashed via C-stack overflow on attacker-
+// controlled input (see that function's own comment) -- each of their
+// nullopt-returning shapes below had no test of its own; when unrecognized,
+// the preprocessor leaves the text untouched and either hsql's own grammar
+// or the "no data source" check ends up rejecting it, so all four still
+// surface as SqlError, just via a different path than a clean, purpose-
+// built error message.
+TEST(SqlParser, RejectsReadParquetWithNonStringArgument) {
+  EXPECT_THROW((void)(parse_sql("SELECT a FROM read_parquet(123)")), SqlError);
+}
+
+TEST(SqlParser, RejectsReadParquetWithUnclosedStringArgument) {
+  EXPECT_THROW((void)(parse_sql("SELECT a FROM read_parquet('unclosed")), SqlError);
+}
+
+TEST(SqlParser, RejectsReadParquetMissingOpeningParen) {
+  EXPECT_THROW((void)(parse_sql("SELECT a FROM read_parquet 'x.parquet'")), SqlError);
+}
+
+TEST(SqlParser, RejectsReadParquetMissingClosingParen) {
+  EXPECT_THROW((void)(parse_sql("SELECT a FROM read_parquet('x.parquet'")), SqlError);
+}
+
 TEST(SqlParser, ParsesHavingClause) {
   const auto stmt = parse_sql(
       "SELECT region, SUM(amount) AS total FROM read_parquet('/x.parquet') "
