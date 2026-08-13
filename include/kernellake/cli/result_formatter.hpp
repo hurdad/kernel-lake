@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <optional>
 #include <string>
 
@@ -7,7 +8,11 @@
 
 namespace kernellake::cli {
 
-enum class ResultFormat {
+// This header only became clang-tidy-visible once it moved from src/cli/
+// (outside .clang-tidy's HeaderFilterRegex) to include/kernellake/cli/
+// (inside it) for testability -- see src/cli/CMakeLists.txt's own comment
+// on the kernellake_cli split. std::uint8_t is plenty for four enumerators.
+enum class ResultFormat : std::uint8_t {
   Table,  // Aligned terminal table.
   Csv,
   JsonLines,

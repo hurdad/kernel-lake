@@ -144,5 +144,47 @@ TEST_F(SampleDataGeneratorTest, RejectsInvalidOptions) {
   EXPECT_THROW((void)(generate_sample_data(options)), ConfigurationError);
 }
 
+TEST_F(SampleDataGeneratorTest, RejectsEmptyOutputDir) {
+  SampleDataGeneratorOptions options;
+  options.output_dir = "";
+  EXPECT_THROW((void)(generate_sample_data(options)), ConfigurationError);
+}
+
+TEST_F(SampleDataGeneratorTest, RejectsNonPositiveRowGroupRows) {
+  SampleDataGeneratorOptions options;
+  options.output_dir = dir_.string();
+  options.rows = 10;
+  options.row_group_rows = 0;
+  EXPECT_THROW((void)(generate_sample_data(options)), ConfigurationError);
+}
+
+TEST_F(SampleDataGeneratorTest, RejectsNonPositiveCardinalities) {
+  SampleDataGeneratorOptions region_options;
+  region_options.output_dir = dir_.string();
+  region_options.rows = 10;
+  region_options.region_cardinality = 0;
+  EXPECT_THROW((void)(generate_sample_data(region_options)), ConfigurationError);
+
+  SampleDataGeneratorOptions category_options;
+  category_options.output_dir = dir_.string();
+  category_options.rows = 10;
+  category_options.category_cardinality = 0;
+  EXPECT_THROW((void)(generate_sample_data(category_options)), ConfigurationError);
+
+  SampleDataGeneratorOptions customer_options;
+  customer_options.output_dir = dir_.string();
+  customer_options.rows = 10;
+  customer_options.customer_cardinality = -1;
+  EXPECT_THROW((void)(generate_sample_data(customer_options)), ConfigurationError);
+}
+
+TEST_F(SampleDataGeneratorTest, RejectsNegativeSkew) {
+  SampleDataGeneratorOptions options;
+  options.output_dir = dir_.string();
+  options.rows = 10;
+  options.skew = -0.1;
+  EXPECT_THROW((void)(generate_sample_data(options)), ConfigurationError);
+}
+
 }  // namespace
 }  // namespace kernellake

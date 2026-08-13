@@ -1,4 +1,4 @@
-#include "commands.hpp"
+#include "kernellake/cli/commands.hpp"
 
 #include <fmt/format.h>
 
@@ -9,7 +9,7 @@
 #include "kernellake/api/query_engine.hpp"
 #include "kernellake/common/errors.hpp"
 #include "kernellake/observability/query_tracing.hpp"
-#include "result_formatter.hpp"
+#include "kernellake/cli/result_formatter.hpp"
 
 namespace kernellake::cli {
 
