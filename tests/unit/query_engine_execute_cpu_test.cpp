@@ -13,7 +13,9 @@
 
 #include <algorithm>
 #include <filesystem>
+#include <fstream>
 #include <map>
+#include <tuple>
 
 #include "kernellake/api/query_engine.hpp"
 #include "kernellake/common/errors.hpp"
@@ -811,6 +813,165 @@ TEST_F(QueryEngineExecuteCpuTest, InSubqueryReturningMultipleColumnsThrowsExecut
                                       "') WHERE region IN (SELECT region, amount FROM read_parquet('" +
                                       path_ + "'))")),
                ExecutionError);
+}
+
+// Regression coverage: MIN/MAX/AVG only ever exercised SUM/COUNT on this
+// backend before this test -- a real gap, since translate_aggregate()'s
+// Min/Max/Avg branches (acero_query_executor.cpp) are separate Arrow
+// Compute function names ("min"/"max"/"mean", "hash_min"/"hash_max"/
+// "hash_mean"), not parameter variations of SUM's own path.
+TEST_F(QueryEngineExecuteCpuTest, GroupedMinMaxAvgMatchExpectedValues) {
+  const QueryResult result = engine_.execute(
+      "SELECT region, MIN(amount) AS lo, MAX(amount) AS hi, AVG(amount) AS avg "
+      "FROM read_parquet('" +
+      path_ + "') GROUP BY region");
+  ASSERT_EQ(result.rows_returned, 2);
+  const std::shared_ptr<arrow::RecordBatch>& batch = result.batches.front();
+  const auto region_column = std::static_pointer_cast<arrow::StringArray>(batch->GetColumnByName("region"));
+  const auto lo_column = std::static_pointer_cast<arrow::DoubleArray>(batch->GetColumnByName("lo"));
+  const auto hi_column = std::static_pointer_cast<arrow::DoubleArray>(batch->GetColumnByName("hi"));
+  const auto avg_column = std::static_pointer_cast<arrow::DoubleArray>(batch->GetColumnByName("avg"));
+  ASSERT_NE(region_column, nullptr);
+  ASSERT_NE(lo_column, nullptr);
+  ASSERT_NE(hi_column, nullptr);
+  ASSERT_NE(avg_column, nullptr);
+
+  std::map<std::string, std::tuple<double, double, double>> by_region;
+  for (std::int64_t i = 0; i < batch->num_rows(); ++i) {
+    by_region[region_column->GetString(i)] = {lo_column->Value(i), hi_column->Value(i), avg_column->Value(i)};
+  }
+  ASSERT_EQ(by_region.size(), 2u);
+  EXPECT_DOUBLE_EQ(std::get<0>(by_region.at("A")), 5.0);
+  EXPECT_DOUBLE_EQ(std::get<1>(by_region.at("A")), 20.0);
+  EXPECT_DOUBLE_EQ(std::get<2>(by_region.at("A")), 35.0 / 3.0);
+  EXPECT_DOUBLE_EQ(std::get<0>(by_region.at("B")), 3.0);
+  EXPECT_DOUBLE_EQ(std::get<1>(by_region.at("B")), 100.0);
+  EXPECT_DOUBLE_EQ(std::get<2>(by_region.at("B")), 110.0 / 3.0);
+}
+
+TEST_F(QueryEngineExecuteCpuTest, ScalarMinMaxAvgMatchExpectedValues) {
+  const QueryResult result = engine_.execute(
+      "SELECT MIN(amount) AS lo, MAX(amount) AS hi, AVG(amount) AS avg FROM read_parquet('" + path_ + "')");
+  ASSERT_EQ(result.rows_returned, 1);
+  const std::shared_ptr<arrow::RecordBatch>& batch = result.batches.front();
+  const auto lo_column = std::static_pointer_cast<arrow::DoubleArray>(batch->GetColumnByName("lo"));
+  const auto hi_column = std::static_pointer_cast<arrow::DoubleArray>(batch->GetColumnByName("hi"));
+  const auto avg_column = std::static_pointer_cast<arrow::DoubleArray>(batch->GetColumnByName("avg"));
+  ASSERT_NE(lo_column, nullptr);
+  ASSERT_NE(hi_column, nullptr);
+  ASSERT_NE(avg_column, nullptr);
+  EXPECT_DOUBLE_EQ(lo_column->Value(0), 3.0);
+  EXPECT_DOUBLE_EQ(hi_column->Value(0), 100.0);
+  EXPECT_DOUBLE_EQ(avg_column->Value(0), 145.0 / 6.0);
+}
+
+// Regression coverage: CAST(...) was essentially 0%-covered on this backend
+// end to end before this test -- every amount in the fixture is already a
+// whole number, so truncate-vs-round ambiguity (this project's CAST
+// truncates; see docs/ARCHITECTURE.md for why this differs from DuckDB's
+// rounding) doesn't affect this result. Mirrors
+// QueryEngineExecuteTest.CastConvertsAmountToInteger (tests/gpu/
+// query_engine_execute_test.cpp), the GPU-backend counterpart.
+TEST_F(QueryEngineExecuteCpuTest, CastConvertsAmountToInteger) {
+  const QueryResult result = engine_.execute(
+      "SELECT CAST(amount AS BIGINT) AS amount_int FROM read_parquet('" + path_ + "') WHERE region = 'B'");
+  ASSERT_EQ(result.batches.size(), 1u);
+  const auto column =
+      std::static_pointer_cast<arrow::Int64Array>(result.batches.front()->GetColumnByName("amount_int"));
+  ASSERT_NE(column, nullptr);
+  std::vector<std::int64_t> values;
+  for (std::int64_t i = 0; i < result.batches.front()->num_rows(); ++i) values.push_back(column->Value(i));
+  std::sort(values.begin(), values.end());
+  EXPECT_EQ(values, (std::vector<std::int64_t>{3, 7, 100}));
+}
+
+// Regression coverage: BETWEEN and the unary operators (NOT/Negate/IsNull/
+// IsNotNull) were only ever referenced in parser/binder/optimizer unit
+// tests, never actually executed end to end on this backend.
+TEST_F(QueryEngineExecuteCpuTest, BetweenAndUnaryOperatorsMatchExpectedRows) {
+  const QueryResult between_result =
+      engine_.execute("SELECT amount FROM read_parquet('" + path_ + "') WHERE amount BETWEEN 5 AND 20");
+  EXPECT_EQ(between_result.rows_returned, 4);  // 10.0, 20.0, 5.0, 7.0
+
+  const QueryResult not_result =
+      engine_.execute("SELECT amount FROM read_parquet('" + path_ + "') WHERE NOT (region = 'A')");
+  EXPECT_EQ(not_result.rows_returned, 3);  // all 3 region B rows
+
+  const QueryResult negate_result =
+      engine_.execute("SELECT amount FROM read_parquet('" + path_ + "') WHERE -amount < -50");
+  EXPECT_EQ(negate_result.rows_returned, 1);  // only amount == 100.0
+}
+
+// Regression coverage: Hive-partition-column materialization on this
+// backend was never exercised end to end before this test (the GPU
+// backend already has ParquetScanOperatorTest.MaterializesPartitionColumnsPerFragment
+// covering its own, independently-implemented equivalent).
+TEST_F(QueryEngineExecuteCpuTest, MaterializesPartitionColumnsAcrossFragments) {
+  const fs::path partition_a = dir_ / "cpu_partitioned" / "region=A";
+  const fs::path partition_b = dir_ / "cpu_partitioned" / "region=B";
+  fs::create_directories(partition_a);
+  fs::create_directories(partition_b);
+
+  auto write_amount_file = [](const std::string& file_path, double value) {
+    arrow::DoubleBuilder amount_builder;
+    ASSERT_TRUE(amount_builder.Append(value).ok());
+    std::shared_ptr<arrow::Array> amount_array;
+    ASSERT_TRUE(amount_builder.Finish(&amount_array).ok());
+    const auto schema = arrow::schema({arrow::field("amount", arrow::float64(), false)});
+    const auto table = arrow::Table::Make(schema, {amount_array});
+    auto sink = arrow::io::FileOutputStream::Open(file_path).ValueOrDie();
+    const arrow::Status status = parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), sink,
+                                                            /*chunk_size=*/1);
+    ASSERT_TRUE(status.ok()) << status.ToString();
+  };
+  write_amount_file((partition_a / "part.parquet").string(), 42.0);
+  write_amount_file((partition_b / "part.parquet").string(), 99.0);
+
+  const QueryResult result = engine_.execute("SELECT region, amount FROM read_parquet('" +
+                                             (dir_ / "cpu_partitioned").string() + "')");
+  ASSERT_EQ(result.rows_returned, 2);
+  std::map<std::string, double> amount_by_region;
+  for (const std::shared_ptr<arrow::RecordBatch>& batch : result.batches) {
+    const auto region_column = std::static_pointer_cast<arrow::StringArray>(batch->GetColumnByName("region"));
+    const auto amount_column = std::static_pointer_cast<arrow::DoubleArray>(batch->GetColumnByName("amount"));
+    ASSERT_NE(region_column, nullptr);
+    ASSERT_NE(amount_column, nullptr);
+    for (std::int64_t i = 0; i < batch->num_rows(); ++i) {
+      amount_by_region[region_column->GetString(i)] = amount_column->Value(i);
+    }
+  }
+  ASSERT_EQ(amount_by_region.size(), 2u);
+  EXPECT_DOUBLE_EQ(amount_by_region.at("A"), 42.0);
+  EXPECT_DOUBLE_EQ(amount_by_region.at("B"), 99.0);
+}
+
+// Regression coverage: no CPU-backend test previously forced a real
+// StorageError translation (corrupt/malformed Parquet content) -- confirms
+// open_fragment_reader()'s error path surfaces a clean exception rather
+// than crashing or hanging.
+TEST_F(QueryEngineExecuteCpuTest, CorruptParquetFileSurfacesCleanError) {
+  const std::string corrupt_path = (dir_ / "corrupt.parquet").string();
+  {
+    std::ofstream corrupt_file(corrupt_path, std::ios::binary);
+    corrupt_file << "not a real parquet file";
+  }
+  EXPECT_THROW((void)(engine_.execute("SELECT * FROM read_parquet('" + corrupt_path + "')")), std::exception);
+}
+
+// Documents a known, acknowledged, out-of-scope limitation rather than a
+// regression: AggregateInputPlan::claimed_names's own comment
+// (acero_query_executor.cpp) explains that two same-named GROUP BY keys
+// from opposite JOIN sides, selected *together*, get a synthetic name for
+// the second one that doesn't match its own HashAggregateNode::
+// output_schema() field name -- a real GetColumnByName() mismatch
+// downstream. Fixing this needs Field-level qualification, explicitly
+// out of scope for that comment; this test exists so the behavior has a
+// regression anchor instead of being silently untested.
+TEST_F(QueryEngineExecuteCpuTest, GroupByOnSameNamedColumnFromBothJoinSidesTogetherIsAKnownLimitation) {
+  EXPECT_THROW((void)(engine_.execute("SELECT l.x, r.x, COUNT(*) AS cnt FROM read_parquet('" +
+                                      left_dup_path_ + "') AS l JOIN read_parquet('" + right_dup_path_ +
+                                      "') AS r ON l.id = r.id GROUP BY l.x, r.x")),
+               std::exception);
 }
 
 }  // namespace

@@ -20,6 +20,7 @@ add_executable(kernellake_gpu_tests
   decimal_test.cpp
   hash_join_test.cpp
   gpu_memory_metrics_test.cpp
+  object_store_datasource_test.cpp
   # OTel-specific: asserts real ObservableGauge/ObservableCounter callback
   # values via kernellake_observability's own in-memory test seam -- see
   # that file's own comment. Only compiled/linked when this build actually

@@ -185,6 +185,94 @@ TEST_F(DecimalQueryTest, AvgOverDecimalIsRejectedAtBindTime) {
   EXPECT_THROW((void)(engine_.execute("SELECT AVG(price) FROM read_parquet('" + path_ + "')")), BindingError);
 }
 
+// Regression coverage: no test anywhere compared DECIMAL results between
+// the CPU and GPU backends before this test -- every other cross-backend
+// parity test (tests/gpu/query_engine_execute_test.cpp) uses a plain
+// DOUBLE column.
+TEST_F(DecimalQueryTest, CpuBackendMatchesGpuBackendForGroupedDecimalSum) {
+  const std::string sql =
+      "SELECT region, SUM(price) AS total FROM read_parquet('" + path_ + "') GROUP BY region ORDER BY region";
+  const QueryResult gpu_result = engine_.execute(sql);
+
+  EngineConfig cpu_config = default_config();
+  cpu_config.engine.backend = "cpu";
+  const QueryEngine cpu_engine(cpu_config);
+  const QueryResult cpu_result = cpu_engine.execute(sql);
+
+  ASSERT_EQ(gpu_result.batches.size(), 1u);
+  ASSERT_EQ(cpu_result.batches.size(), 1u);
+  const auto gpu_total = gpu_result.batches.front()->GetColumnByName("total");
+  const auto cpu_total = cpu_result.batches.front()->GetColumnByName("total");
+  ASSERT_NE(gpu_total, nullptr);
+  ASSERT_NE(cpu_total, nullptr);
+  ASSERT_EQ(gpu_total->length(), cpu_total->length());
+  for (std::int64_t i = 0; i < gpu_total->length(); ++i) {
+    EXPECT_EQ(decimal_text(gpu_total, i), decimal_text(cpu_total, i)) << "row " << i;
+  }
+}
+
+// Regression coverage: cudf_adapter.cpp's decimal_cudf_type_id() picks
+// DECIMAL32 (precision<=9), DECIMAL64 (<=18), or DECIMAL128 (<=38) --
+// every other test in this file uses DECIMAL(10,2), only ever exercising
+// the DECIMAL64 tier. These two tests exercise the other two tiers this
+// project's own width-selection tiering has never had any coverage of.
+TEST(DecimalWidthTierTest, Decimal32TierRoundTripsAndSums) {
+  namespace fs = std::filesystem;
+  const fs::path dir = fs::temp_directory_path() / "kernellake_decimal32_tier_test";
+  fs::create_directories(dir);
+  const std::string path = (dir / "small.parquet").string();
+
+  // precision=5, scale=2 -- comfortably under the DECIMAL32 cutoff (<=9).
+  const auto decimal_type = arrow::decimal32(5, 2);
+  auto price_builder = std::make_shared<arrow::Decimal32Builder>(decimal_type);
+  ASSERT_TRUE(price_builder->Append(arrow::Decimal32::FromString("1.50").ValueOrDie()).ok());
+  ASSERT_TRUE(price_builder->Append(arrow::Decimal32::FromString("2.25").ValueOrDie()).ok());
+  std::shared_ptr<arrow::Array> price_array;
+  ASSERT_TRUE(price_builder->Finish(&price_array).ok());
+  const auto schema = arrow::schema({arrow::field("price", decimal_type, false)});
+  const auto table = arrow::Table::Make(schema, {price_array});
+  auto sink = arrow::io::FileOutputStream::Open(path).ValueOrDie();
+  ASSERT_TRUE(parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), sink, /*chunk_size=*/2).ok());
+
+  QueryEngine engine{default_config()};
+  const QueryResult result = engine.execute("SELECT SUM(price) AS total FROM read_parquet('" + path + "')");
+  ASSERT_EQ(result.batches.size(), 1u);
+  const auto column = result.batches.front()->GetColumnByName("total");
+  ASSERT_NE(column, nullptr);
+  EXPECT_EQ(decimal_text(column, 0), "3.75");
+
+  fs::remove_all(dir);
+}
+
+TEST(DecimalWidthTierTest, Decimal128TierRoundTripsAndSums) {
+  namespace fs = std::filesystem;
+  const fs::path dir = fs::temp_directory_path() / "kernellake_decimal128_tier_test";
+  fs::create_directories(dir);
+  const std::string path = (dir / "large.parquet").string();
+
+  // precision=30, scale=2 -- comfortably over the DECIMAL64 cutoff (<=18),
+  // forcing the DECIMAL128 tier.
+  const auto decimal_type = arrow::decimal128(30, 2);
+  auto price_builder = std::make_shared<arrow::Decimal128Builder>(decimal_type);
+  ASSERT_TRUE(price_builder->Append(arrow::Decimal128::FromString("123456789012345.50").ValueOrDie()).ok());
+  ASSERT_TRUE(price_builder->Append(arrow::Decimal128::FromString("2.25").ValueOrDie()).ok());
+  std::shared_ptr<arrow::Array> price_array;
+  ASSERT_TRUE(price_builder->Finish(&price_array).ok());
+  const auto schema = arrow::schema({arrow::field("price", decimal_type, false)});
+  const auto table = arrow::Table::Make(schema, {price_array});
+  auto sink = arrow::io::FileOutputStream::Open(path).ValueOrDie();
+  ASSERT_TRUE(parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), sink, /*chunk_size=*/2).ok());
+
+  QueryEngine engine{default_config()};
+  const QueryResult result = engine.execute("SELECT SUM(price) AS total FROM read_parquet('" + path + "')");
+  ASSERT_EQ(result.batches.size(), 1u);
+  const auto column = result.batches.front()->GetColumnByName("total");
+  ASSERT_NE(column, nullptr);
+  EXPECT_EQ(decimal_text(column, 0), "123456789012347.75");
+
+  fs::remove_all(dir);
+}
+
 TEST_F(DecimalQueryTest, MixingDecimalWithNonLiteralColumnIsRejected) {
   // `price` (DECIMAL) compared against `quantity`, a non-literal,
   // non-DECIMAL column: not yet supported (see cast_if_needed in

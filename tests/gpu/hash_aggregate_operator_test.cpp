@@ -172,6 +172,55 @@ TEST(HashAggregateOperator, SplitsSingleBatchExceedingMaxDistinctKeys) {
   op.close(context);
 }
 
+// Regression coverage: MIN/MAX in a GROUP BY context had zero test
+// coverage anywhere before this test (SUM/COUNT dominate every other
+// fixture in this file and in the end-to-end GPU suite) -- a materially
+// different code path from SUM's accumulate-and-add, not just a
+// parameter variation.
+TEST(HashAggregateOperator, GroupedMinMaxMatchExpectedValues) {
+  RmmEnvironment env(default_config());
+
+  std::vector<DeviceBatch> batches;
+  batches.push_back(make_batch({1, 1, 1, 2, 2}, {10.0, 20.0, 5.0, 100.0, 7.0}));
+  batches.push_back(make_batch({2}, {3.0}));
+
+  auto region = std::make_shared<ColumnExpression>("region", 0, int32_type(false));
+  std::vector<NamedExpression> group_by = {NamedExpression{region, "region"}};
+
+  auto amount = std::make_shared<ColumnExpression>("amount", 1, float64_type(false));
+  auto min_expr = std::make_shared<AggregateExpression>(AggregateFunction::Min, amount, float64_type(true));
+  auto max_expr = std::make_shared<AggregateExpression>(AggregateFunction::Max, amount, float64_type(true));
+  std::vector<NamedExpression> aggregates = {NamedExpression{min_expr, "lo"},
+                                             NamedExpression{max_expr, "hi"}};
+
+  HashAggregateOperator op(1, std::make_unique<VectorSourceOperator>(std::move(batches)), std::move(group_by),
+                           std::move(aggregates));
+  ExecutionContext context = make_context();
+  op.open(context);
+
+  std::optional<DeviceBatch> result = op.next(context);
+  ASSERT_TRUE(result.has_value());
+  EXPECT_EQ(result->row_count(), 2u);
+  EXPECT_FALSE(op.next(context).has_value());
+
+  const std::vector<int32_t> region_values = copy_to_host<int32_t>(result->view().column(0));
+  const std::vector<double> lo_values = copy_to_host<double>(result->view().column(1));
+  const std::vector<double> hi_values = copy_to_host<double>(result->view().column(2));
+
+  std::map<int32_t, std::pair<double, double>> by_region;
+  for (std::size_t i = 0; i < region_values.size(); ++i) {
+    by_region[region_values[i]] = {lo_values[i], hi_values[i]};
+  }
+
+  ASSERT_EQ(by_region.size(), 2u);
+  EXPECT_DOUBLE_EQ(by_region[1].first, 5.0);
+  EXPECT_DOUBLE_EQ(by_region[1].second, 20.0);
+  EXPECT_DOUBLE_EQ(by_region[2].first, 3.0);
+  EXPECT_DOUBLE_EQ(by_region[2].second, 100.0);
+
+  op.close(context);
+}
+
 TEST(HashAggregateOperator, EmptyInputProducesZeroRowResult) {
   RmmEnvironment env(default_config());
   auto region = std::make_shared<ColumnExpression>("region", 0, int32_type(false));

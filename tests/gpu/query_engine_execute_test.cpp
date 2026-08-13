@@ -12,6 +12,7 @@
 #include <array>
 #include <filesystem>
 #include <map>
+#include <utility>
 
 #include "kernellake/api/query_engine.hpp"
 #include "kernellake/memory/rmm_environment.hpp"
@@ -65,12 +66,31 @@ class QueryEngineExecuteTest : public ::testing::Test {
     const arrow::Status status =
         parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), sink, /*chunk_size=*/3);
     ASSERT_TRUE(status.ok()) << status.ToString();
+
+    regions_path_ = (dir_ / "regions.parquet").string();
+    arrow::StringBuilder region_key_builder;
+    arrow::StringBuilder region_name_builder;
+    ASSERT_TRUE(region_key_builder.Append("A").ok());
+    ASSERT_TRUE(region_name_builder.Append("Alpha").ok());
+    ASSERT_TRUE(region_key_builder.Append("B").ok());
+    ASSERT_TRUE(region_name_builder.Append("Beta").ok());
+    std::shared_ptr<arrow::Array> region_key_array, region_name_array;
+    ASSERT_TRUE(region_key_builder.Finish(&region_key_array).ok());
+    ASSERT_TRUE(region_name_builder.Finish(&region_name_array).ok());
+    const auto regions_schema = arrow::schema(
+        {arrow::field("region", arrow::utf8(), false), arrow::field("region_name", arrow::utf8(), false)});
+    const auto regions_table = arrow::Table::Make(regions_schema, {region_key_array, region_name_array});
+    auto regions_sink = arrow::io::FileOutputStream::Open(regions_path_).ValueOrDie();
+    const arrow::Status regions_status = parquet::arrow::WriteTable(
+        *regions_table, arrow::default_memory_pool(), regions_sink, /*chunk_size=*/2);
+    ASSERT_TRUE(regions_status.ok()) << regions_status.ToString();
   }
 
   void TearDown() override { fs::remove_all(dir_); }
 
   fs::path dir_;
   std::string path_;
+  std::string regions_path_;
   QueryEngine engine_{default_config()};
 };
 
@@ -281,6 +301,60 @@ TEST_F(QueryEngineExecuteTest, CaseInScalarAggregateMatchesExpectedTotal) {
   EXPECT_EQ(high_count_column->Value(0), 2);  // 20.0 and 100.0
 }
 
+// Regression coverage: CASE/LIKE/EXTRACT as a *grouped*-aggregate argument
+// (as opposed to a GROUP BY key, CaseWithGroupByAliasBucketsRows's own
+// shape, or a scalar-aggregate argument, CaseInScalarAggregateMatchesExpectedTotal
+// above) had never actually been executed by any test before this one --
+// this exercises HashAggregateOperator's own materialize_case()/
+// materialize_like() (as distinct from ScalarAggregateOperator's and
+// ProjectionOperator's own copies), which no existing test forced.
+TEST_F(QueryEngineExecuteTest, CaseAndLikeInGroupedAggregateArgumentMatchExpectedTotals) {
+  const QueryResult result = engine_.execute(
+      "SELECT region, SUM(CASE WHEN amount > 15 THEN 1 ELSE 0 END) AS high_count, "
+      "SUM(CASE WHEN region LIKE 'A%' THEN amount ELSE 0 END) AS a_total FROM read_parquet('" +
+      path_ + "') GROUP BY region");
+  ASSERT_EQ(result.rows_returned, 2);
+  const std::shared_ptr<arrow::RecordBatch>& batch = result.batches.front();
+  const auto region_column = std::static_pointer_cast<arrow::StringArray>(batch->GetColumnByName("region"));
+  const auto high_count_column =
+      std::static_pointer_cast<arrow::Int64Array>(batch->GetColumnByName("high_count"));
+  const auto a_total_column = std::static_pointer_cast<arrow::DoubleArray>(batch->GetColumnByName("a_total"));
+  ASSERT_NE(region_column, nullptr);
+  ASSERT_NE(high_count_column, nullptr);
+  ASSERT_NE(a_total_column, nullptr);
+
+  std::map<std::string, std::pair<std::int64_t, double>> by_region;
+  for (std::int64_t i = 0; i < batch->num_rows(); ++i) {
+    by_region[region_column->GetString(i)] = {high_count_column->Value(i), a_total_column->Value(i)};
+  }
+  ASSERT_EQ(by_region.size(), 2u);
+  EXPECT_EQ(by_region.at("A").first, 1);             // only 20.0 > 15
+  EXPECT_DOUBLE_EQ(by_region.at("A").second, 35.0);  // 10+20+5, all region A
+  EXPECT_EQ(by_region.at("B").first, 1);             // only 100.0 > 15
+  EXPECT_DOUBLE_EQ(by_region.at("B").second, 0.0);   // no region-B row matches LIKE 'A%'
+}
+
+// Regression coverage: every existing EXPECT_THROW in this GPU suite is a
+// bind/parse-time error -- InstrumentedOperator's own runtime exception
+// path (operator_builder.cpp: the try/catch around next()/open() that
+// records metrics and calls span_->finish_error() before rethrowing) had
+// never been forced by an actual operator failure during real execution.
+// A deliberately tiny query_memory_limit_bytes makes even this fixture's
+// small scan exceed the limit *during* GPU decode/processing (a real
+// operator-level OutOfMemoryError, not a bare allocation outside the
+// operator tree like RmmEnvironment.RespectsConfiguredQueryMemoryLimit
+// exercises) -- confirms the exception propagates cleanly out of
+// execute() rather than crashing or hanging the process, which is what a
+// bug in this specific catch/rethrow path would actually look like.
+TEST_F(QueryEngineExecuteTest, RealOperatorExceptionDuringExecutionPropagatesCleanly) {
+  EngineConfig config = default_config();
+  config.engine.query_memory_limit_bytes = 1;
+  const QueryEngine tiny_limit_engine(config);
+  EXPECT_THROW((void)(tiny_limit_engine.execute("SELECT region, SUM(amount) AS total FROM read_parquet('" +
+                                                path_ + "') GROUP BY region")),
+               std::exception);
+}
+
 TEST_F(QueryEngineExecuteTest, CastConvertsAmountToInteger) {
   // Every amount in SetUp is already a whole number, so truncate-vs-round
   // ambiguity (our CAST truncates; see docs/ARCHITECTURE.md for why this
@@ -373,6 +447,44 @@ void expect_double_columns_match(const arrow::RecordBatch& gpu_batch, const arro
   }
 }
 
+void expect_string_columns_match(const arrow::RecordBatch& gpu_batch, const arrow::RecordBatch& cpu_batch,
+                                 const std::string& column_name) {
+  const auto gpu_column =
+      std::static_pointer_cast<arrow::StringArray>(gpu_batch.GetColumnByName(column_name));
+  const auto cpu_column =
+      std::static_pointer_cast<arrow::StringArray>(cpu_batch.GetColumnByName(column_name));
+  ASSERT_NE(gpu_column, nullptr);
+  ASSERT_NE(cpu_column, nullptr);
+  ASSERT_EQ(gpu_column->length(), cpu_column->length());
+  for (std::int64_t i = 0; i < gpu_column->length(); ++i) {
+    EXPECT_EQ(gpu_column->GetString(i), cpu_column->GetString(i)) << "row " << i;
+  }
+}
+
+void expect_int64_columns_match(const arrow::RecordBatch& gpu_batch, const arrow::RecordBatch& cpu_batch,
+                                const std::string& column_name) {
+  const auto gpu_column = std::static_pointer_cast<arrow::Int64Array>(gpu_batch.GetColumnByName(column_name));
+  const auto cpu_column = std::static_pointer_cast<arrow::Int64Array>(cpu_batch.GetColumnByName(column_name));
+  ASSERT_NE(gpu_column, nullptr);
+  ASSERT_NE(cpu_column, nullptr);
+  ASSERT_EQ(gpu_column->length(), cpu_column->length());
+  for (std::int64_t i = 0; i < gpu_column->length(); ++i) {
+    EXPECT_EQ(gpu_column->Value(i), cpu_column->Value(i)) << "row " << i;
+  }
+}
+
+// Runs the same SQL against both backends and returns (gpu_result,
+// cpu_result), asserting both produced exactly one batch -- the shared
+// setup every parity test below needs before comparing individual columns.
+std::pair<QueryResult, QueryResult> run_on_both_backends(QueryEngine& gpu_engine, const std::string& sql) {
+  QueryResult gpu_result = gpu_engine.execute(sql);
+  EngineConfig cpu_config = default_config();
+  cpu_config.engine.backend = "cpu";
+  const QueryEngine cpu_engine(cpu_config);
+  QueryResult cpu_result = cpu_engine.execute(sql);
+  return {std::move(gpu_result), std::move(cpu_result)};
+}
+
 TEST_F(QueryEngineExecuteTest, CpuBackendMatchesGpuBackendForFilterAndGroupedAggregate) {
   const std::string sql = "SELECT region, SUM(amount) AS total FROM read_parquet('" + path_ +
                           "') WHERE event_date >= DATE '2026-01-01' GROUP BY region ORDER BY region";
@@ -421,6 +533,114 @@ TEST_F(QueryEngineExecuteTest, CpuBackendMatchesGpuBackendForCountStarAndLimit) 
   ASSERT_EQ(gpu_n->length(), 1);
   ASSERT_EQ(cpu_n->length(), 1);
   EXPECT_EQ(gpu_n->Value(0), cpu_n->Value(0));
+}
+
+// The parity tests above cover exactly two shapes (SUM+GROUP BY+filter,
+// COUNT(*)+LIMIT). Every other tested query shape in this file and in
+// query_engine_execute_cpu_test.cpp has independent, backend-exclusive
+// coverage with no cross-backend check -- the same gap class that produced
+// the historical CASE/EXTRACT-in-WHERE parity bug. These tests close the
+// most consequential of those gaps: MIN/MAX/AVG, JOIN, CASE, LIKE,
+// EXTRACT, CAST, HAVING (literal and subquery), and ORDER BY.
+
+TEST_F(QueryEngineExecuteTest, CpuBackendMatchesGpuBackendForGroupedMinMaxAvg) {
+  const std::string sql =
+      "SELECT region, MIN(amount) AS lo, MAX(amount) AS hi, AVG(amount) AS avg "
+      "FROM read_parquet('" +
+      path_ + "') GROUP BY region ORDER BY region";
+  const auto [gpu_result, cpu_result] = run_on_both_backends(engine_, sql);
+  ASSERT_EQ(gpu_result.batches.size(), 1u);
+  ASSERT_EQ(cpu_result.batches.size(), 1u);
+  const arrow::RecordBatch& gpu_batch = *gpu_result.batches.front();
+  const arrow::RecordBatch& cpu_batch = *cpu_result.batches.front();
+  expect_string_columns_match(gpu_batch, cpu_batch, "region");
+  expect_double_columns_match(gpu_batch, cpu_batch, "lo");
+  expect_double_columns_match(gpu_batch, cpu_batch, "hi");
+  expect_double_columns_match(gpu_batch, cpu_batch, "avg");
+}
+
+TEST_F(QueryEngineExecuteTest, CpuBackendMatchesGpuBackendForJoin) {
+  const std::string sql = "SELECT r.region_name, SUM(s.amount) AS total FROM read_parquet('" + path_ +
+                          "') AS s JOIN read_parquet('" + regions_path_ +
+                          "') AS r ON s.region = r.region GROUP BY r.region_name ORDER BY r.region_name";
+  const auto [gpu_result, cpu_result] = run_on_both_backends(engine_, sql);
+  ASSERT_EQ(gpu_result.batches.size(), 1u);
+  ASSERT_EQ(cpu_result.batches.size(), 1u);
+  const arrow::RecordBatch& gpu_batch = *gpu_result.batches.front();
+  const arrow::RecordBatch& cpu_batch = *cpu_result.batches.front();
+  expect_string_columns_match(gpu_batch, cpu_batch, "region_name");
+  expect_double_columns_match(gpu_batch, cpu_batch, "total");
+}
+
+TEST_F(QueryEngineExecuteTest, CpuBackendMatchesGpuBackendForCaseAndLike) {
+  const std::string sql =
+      "SELECT SUM(CASE WHEN amount > 15 THEN 1 ELSE 0 END) AS high_count, "
+      "SUM(CASE WHEN region LIKE 'A%' THEN amount ELSE 0 END) AS a_total FROM read_parquet('" +
+      path_ + "')";
+  const auto [gpu_result, cpu_result] = run_on_both_backends(engine_, sql);
+  ASSERT_EQ(gpu_result.batches.size(), 1u);
+  ASSERT_EQ(cpu_result.batches.size(), 1u);
+  const arrow::RecordBatch& gpu_batch = *gpu_result.batches.front();
+  const arrow::RecordBatch& cpu_batch = *cpu_result.batches.front();
+  expect_int64_columns_match(gpu_batch, cpu_batch, "high_count");
+  expect_double_columns_match(gpu_batch, cpu_batch, "a_total");
+}
+
+TEST_F(QueryEngineExecuteTest, CpuBackendMatchesGpuBackendForExtractGroupByKey) {
+  const std::string sql =
+      "SELECT EXTRACT(YEAR FROM event_date) AS y, SUM(amount) AS total FROM "
+      "read_parquet('" +
+      path_ + "') GROUP BY y ORDER BY y";
+  const auto [gpu_result, cpu_result] = run_on_both_backends(engine_, sql);
+  ASSERT_EQ(gpu_result.batches.size(), 1u);
+  ASSERT_EQ(cpu_result.batches.size(), 1u);
+  const arrow::RecordBatch& gpu_batch = *gpu_result.batches.front();
+  const arrow::RecordBatch& cpu_batch = *cpu_result.batches.front();
+  expect_int64_columns_match(gpu_batch, cpu_batch, "y");
+  expect_double_columns_match(gpu_batch, cpu_batch, "total");
+}
+
+TEST_F(QueryEngineExecuteTest, CpuBackendMatchesGpuBackendForCast) {
+  // ORDER BY binds against the pre-projection source schema, not a
+  // SELECT-list alias (a separate, pre-existing gap -- not what this test
+  // is about) -- order by the real source column `amount` instead.
+  const std::string sql =
+      "SELECT CAST(amount AS BIGINT) AS amount_int FROM read_parquet('" + path_ + "') ORDER BY amount";
+  const auto [gpu_result, cpu_result] = run_on_both_backends(engine_, sql);
+  ASSERT_EQ(gpu_result.batches.size(), 1u);
+  ASSERT_EQ(cpu_result.batches.size(), 1u);
+  expect_int64_columns_match(*gpu_result.batches.front(), *cpu_result.batches.front(), "amount_int");
+}
+
+TEST_F(QueryEngineExecuteTest, CpuBackendMatchesGpuBackendForHavingWithLiteralAndSubquery) {
+  const std::string literal_sql = "SELECT region, SUM(amount) AS total FROM read_parquet('" + path_ +
+                                  "') GROUP BY region HAVING SUM(amount) > 50";
+  const auto [gpu_literal, cpu_literal] = run_on_both_backends(engine_, literal_sql);
+  ASSERT_EQ(gpu_literal.batches.size(), 1u);
+  ASSERT_EQ(cpu_literal.batches.size(), 1u);
+  expect_string_columns_match(*gpu_literal.batches.front(), *cpu_literal.batches.front(), "region");
+  expect_double_columns_match(*gpu_literal.batches.front(), *cpu_literal.batches.front(), "total");
+
+  const std::string subquery_sql =
+      "SELECT region, SUM(amount) AS total FROM read_parquet('" + path_ +
+      "') GROUP BY region HAVING SUM(amount) > (SELECT SUM(amount) * 0.3 FROM read_parquet('" + path_ + "'))";
+  const auto [gpu_sub, cpu_sub] = run_on_both_backends(engine_, subquery_sql);
+  ASSERT_EQ(gpu_sub.batches.size(), 1u);
+  ASSERT_EQ(cpu_sub.batches.size(), 1u);
+  expect_string_columns_match(*gpu_sub.batches.front(), *cpu_sub.batches.front(), "region");
+  expect_double_columns_match(*gpu_sub.batches.front(), *cpu_sub.batches.front(), "total");
+}
+
+TEST_F(QueryEngineExecuteTest, CpuBackendMatchesGpuBackendForOrderByLimit) {
+  const std::string sql =
+      "SELECT region, amount FROM read_parquet('" + path_ + "') ORDER BY amount DESC LIMIT 3";
+  const auto [gpu_result, cpu_result] = run_on_both_backends(engine_, sql);
+  ASSERT_EQ(gpu_result.batches.size(), 1u);
+  ASSERT_EQ(cpu_result.batches.size(), 1u);
+  const arrow::RecordBatch& gpu_batch = *gpu_result.batches.front();
+  const arrow::RecordBatch& cpu_batch = *cpu_result.batches.front();
+  expect_string_columns_match(gpu_batch, cpu_batch, "region");
+  expect_double_columns_match(gpu_batch, cpu_batch, "amount");
 }
 
 TEST_F(QueryEngineExecuteTest, SplitExecutionPathLeavesMetadataInspectionSecondsNull) {

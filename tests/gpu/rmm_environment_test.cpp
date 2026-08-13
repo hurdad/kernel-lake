@@ -1,5 +1,7 @@
 #include <gtest/gtest.h>
 
+#include <stdexcept>
+
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_buffer.hpp>
 
@@ -12,6 +14,24 @@ namespace {
 TEST(RmmEnvironment, ConstructsAndInstallsCurrentDeviceResource) {
   EngineConfig config = default_config();
   EXPECT_NO_THROW((void)({ RmmEnvironment env(config); }));
+}
+
+// Regression coverage: default_config() leaves use_async_allocator at its
+// own default (true), so every other test in this file only ever
+// exercises build_base_resource()'s cuda_async_memory_resource branch --
+// the non-async rmm::mr::pool_memory_resource construction path had zero
+// coverage before this test.
+TEST(RmmEnvironment, ConstructsWithNonAsyncPoolAllocator) {
+  EngineConfig config = default_config();
+  config.memory.use_async_allocator = false;
+  RmmEnvironment env(config);
+
+  constexpr std::size_t kBytes = 1024 * 1024;  // 1 MiB
+  const MemoryUsage usage = env.track_query([&] {
+    rmm::device_buffer buffer(kBytes, rmm::cuda_stream_view{});
+    EXPECT_EQ(buffer.size(), kBytes);
+  });
+  EXPECT_GE(usage.peak_bytes, static_cast<std::int64_t>(kBytes));
 }
 
 TEST(RmmEnvironment, TracksBytesAllocatedDuringQuery) {
@@ -53,6 +73,31 @@ TEST(RmmEnvironment, QueryMemoryLimitBytesAccessorReflectsExplicitConfig) {
   // fresh resolve_query_memory_limit_bytes() call instead would silently
   // drift for a long-lived instance).
   EXPECT_EQ(env.query_memory_limit_bytes(), 12345u);
+}
+
+// Regression coverage for track_query()'s own doc comment: query() throwing
+// must still run pop_counters() (via the try/catch), or the push/pop stack
+// goes permanently unbalanced, corrupting peak/current byte accounting for
+// the rest of this RmmEnvironment's lifetime. Confirmed here by forcing a
+// throw with no real allocation at all (the stack-balance bug wouldn't
+// depend on whether real device memory was involved), then proving a
+// *subsequent* track_query() call still reports sane byte counts --
+// mirroring TracksBytesAllocatedDuringQuery's own assertions -- rather
+// than inheriting corrupted state from the failed call before it.
+TEST(RmmEnvironment, TrackQueryLeavesCountersBalancedAfterAnException) {
+  EngineConfig config = default_config();
+  RmmEnvironment env(config);
+
+  EXPECT_THROW((void)(env.track_query([&] { throw std::runtime_error("simulated query failure"); })),
+               std::runtime_error);
+
+  constexpr std::size_t kBytes = 1024 * 1024;  // 1 MiB
+  const MemoryUsage usage = env.track_query([&] {
+    rmm::device_buffer buffer(kBytes, rmm::cuda_stream_view{});
+    EXPECT_EQ(buffer.size(), kBytes);
+  });
+  EXPECT_GE(usage.peak_bytes, static_cast<std::int64_t>(kBytes));
+  EXPECT_LT(usage.current_bytes, static_cast<std::int64_t>(kBytes));
 }
 
 TEST(RmmEnvironment, QueryMemoryLimitBytesAccessorAutoDetectsWhenConfigIsZero) {
