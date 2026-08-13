@@ -340,7 +340,15 @@ TEST(Config, LoadConfigFileRejectsMissingPath) {
 // delegating to parse_config()) was never exercised -- only the missing-path
 // rejection above was.
 TEST(Config, LoadConfigFileReadsRealFile) {
-  const std::filesystem::path path = std::filesystem::temp_directory_path() / "kernellake_config_test.yaml";
+  // Suffixed with the test name (not a bare literal) to avoid colliding
+  // with another concurrently-running test binary/preset writing to the
+  // same shared temp directory -- see every other new fixture in this
+  // area (explain_command_test.cpp, generate_data_command_test.cpp,
+  // benchmark_tpch_command_test.cpp) for the same convention.
+  const std::filesystem::path path =
+      std::filesystem::temp_directory_path() /
+      ("kernellake_config_test_" +
+       std::string(::testing::UnitTest::GetInstance()->current_test_info()->name()) + ".yaml");
   {
     std::ofstream out(path);
     out << "engine:\n  device_id: 3\n";
