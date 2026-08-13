@@ -1,6 +1,7 @@
 #include "kernellake/storage/nvme_object_cache.hpp"
 
 #include <arrow/buffer.h>
+#include <arrow/io/memory.h>
 #include <fmt/format.h>
 #include <gtest/gtest.h>
 
@@ -55,6 +56,47 @@ class ThrowingObjectStore final : public ObjectStore {
   [[nodiscard]] std::unique_ptr<RandomAccessObject> open(const Uri&) override {
     throw StorageError("ThrowingObjectStore::open should not be called");
   }
+};
+
+// Wraps a real content buffer but reports a `size()` larger than the
+// buffer actually holds -- simulates a remote object shrinking (or a
+// backend misreporting Content-Length) between the initial stat and the
+// actual byte reads, without needing a real fault-injecting filesystem.
+// populate()'s ReadAt loop trusts this claimed size to know when to stop,
+// so this is exactly what triggers its short-read path
+// (nvme_object_cache.cpp:171-173).
+class ShortReadObject final : public RandomAccessObject {
+ public:
+  ShortReadObject(std::shared_ptr<arrow::io::RandomAccessFile> file, std::uint64_t claimed_size)
+      : file_(std::move(file)), claimed_size_(claimed_size) {}
+
+  [[nodiscard]] std::uint64_t size() const override { return claimed_size_; }
+  [[nodiscard]] std::shared_ptr<arrow::io::RandomAccessFile> as_arrow_file() const override { return file_; }
+
+ private:
+  std::shared_ptr<arrow::io::RandomAccessFile> file_;
+  std::uint64_t claimed_size_;
+};
+
+class ShortReadObjectStore final : public ObjectStore {
+ public:
+  ShortReadObjectStore(std::string real_content, std::uint64_t claimed_size)
+      : real_content_(std::move(real_content)), claimed_size_(claimed_size) {}
+
+  [[nodiscard]] std::vector<ObjectInfo> list(const Uri&) override {
+    throw StorageError("ShortReadObjectStore::list should not be called");
+  }
+  [[nodiscard]] std::vector<ObjectInfo> list_recursive(const Uri&) override {
+    throw StorageError("ShortReadObjectStore::list_recursive should not be called");
+  }
+  [[nodiscard]] std::unique_ptr<RandomAccessObject> open(const Uri&) override {
+    std::shared_ptr<arrow::io::RandomAccessFile> file = arrow::io::BufferReader::FromString(real_content_);
+    return std::make_unique<ShortReadObject>(std::move(file), claimed_size_);
+  }
+
+ private:
+  std::string real_content_;
+  std::uint64_t claimed_size_;
 };
 
 std::string read_all(RandomAccessObject& object) {
@@ -248,6 +290,29 @@ TEST_F(NvmeObjectCacheTest, EvictsLeastRecentlyUsedEntryWhenOverBudget) {
   // The survivor must be "b" (more recently populated), "a" must be gone.
   ThrowingObjectStore throwing_store;
   EXPECT_NO_THROW((void)(cache.get_or_populate(Uri((remote_dir_ / "b.parquet").string()), throwing_store)));
+}
+
+// Regression coverage for populate()'s short-read path
+// (nvme_object_cache.cpp:171-173): the remote backend's open() call
+// reported a size (via RandomAccessObject::size(), what populate() uses to
+// know how many bytes to expect) larger than what ReadAt() actually ever
+// returns -- must stop cleanly at the real content length rather than
+// looping forever or writing garbage past EOF, and the cache's byte-count
+// metrics must reflect the real bytes written, not the falsely-claimed
+// size.
+TEST_F(NvmeObjectCacheTest, PopulateStopsCleanlyOnShortReadAndTracksRealBytesWritten) {
+  ShortReadObjectStore short_read_store(/*real_content=*/"hello", /*claimed_size=*/1000);
+  NvmeObjectCache cache(cache_config());
+  const Uri uri((remote_dir_ / "data.parquet").string());
+
+  std::unique_ptr<RandomAccessObject> object;
+  EXPECT_NO_THROW(object = cache.get_or_populate(uri, short_read_store));
+  ASSERT_NE(object, nullptr);
+  EXPECT_EQ(read_all(*object), "hello");
+
+  const NvmeCacheMetricsSnapshot snapshot = cache.snapshot();
+  EXPECT_EQ(snapshot.current_bytes, 5u);  // strlen("hello"), not the claimed 1000
+  EXPECT_EQ(snapshot.current_entries, 1u);
 }
 
 TEST_F(NvmeObjectCacheTest, ZeroMaxSizeBytesMeansUnbounded) {

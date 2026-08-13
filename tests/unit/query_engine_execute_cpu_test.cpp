@@ -522,6 +522,37 @@ TEST_F(QueryEngineExecuteCpuTest, ThreeTableInnerJoinMatchesExpectedTotals) {
   EXPECT_DOUBLE_EQ(totals_by_manager.at("Bo"), 110.0);  // Beta: 100+7+3
 }
 
+// Regression test for find_scan_boundary()'s join recursion
+// (physical_planner.cpp): a WHERE filter above a 3+-way JOIN chain sits on
+// top of the *outer* HashJoinNode, whose left child is itself another
+// HashJoinNode (the inner sales-regions join), not a ParquetScanNode --
+// find_scan_boundary() must recurse through that nested join correctly to
+// find the combined schema/column-map the WHERE predicate needs remapping
+// against. No existing test combines a WHERE filter with a JOIN chain this
+// deep (ThreeTableInnerJoinMatchesExpectedTotals above has no WHERE at all;
+// InSubqueryWorksAlongsideARealJoin below has WHERE but only a single JOIN).
+TEST_F(QueryEngineExecuteCpuTest, ThreeTableInnerJoinWithWhereFilterMatchesExpectedTotals) {
+  const QueryResult result = engine_.execute(
+      "SELECT m.manager, SUM(s.amount) AS total FROM read_parquet('" + path_ + "') AS s JOIN read_parquet('" +
+      regions_path_ + "') AS r ON s.region = r.region JOIN read_parquet('" + managers_path_ +
+      "') AS m ON r.region_name = m.region_name WHERE s.amount > 5 GROUP BY m.manager");
+
+  ASSERT_EQ(result.rows_returned, 2);
+  const std::shared_ptr<arrow::RecordBatch>& batch = result.batches.front();
+  const auto manager_column = std::static_pointer_cast<arrow::StringArray>(batch->GetColumnByName("manager"));
+  const auto total_column = std::static_pointer_cast<arrow::DoubleArray>(batch->GetColumnByName("total"));
+  ASSERT_NE(manager_column, nullptr);
+  ASSERT_NE(total_column, nullptr);
+
+  std::map<std::string, double> totals_by_manager;
+  for (std::int64_t i = 0; i < batch->num_rows(); ++i) {
+    totals_by_manager[manager_column->GetString(i)] = total_column->Value(i);
+  }
+  ASSERT_EQ(totals_by_manager.size(), 2u);
+  EXPECT_DOUBLE_EQ(totals_by_manager.at("Ann"), 30.0);  // Alpha: 10+20 (amount=5 filtered out by WHERE)
+  EXPECT_DOUBLE_EQ(totals_by_manager.at("Bo"), 107.0);  // Beta: 100+7 (amount=3 filtered out by WHERE)
+}
+
 // Regression test for physical_planner.cpp's remap_columns(): it used to
 // resolve a ColumnExpression above a JOIN by re-looking-up its bare *name*
 // against the combined narrowed schema (Schema::find_field(), first match
@@ -622,6 +653,19 @@ TEST_F(QueryEngineExecuteCpuTest, JoinGroupByHavingOrderByDoesNotMisremapSortKey
   EXPECT_EQ(name_column->GetString(0), "Beta");
   EXPECT_DOUBLE_EQ(total_column->Value(0), 110.0);
 }
+
+// The GROUP BY + HAVING + LIMIT-with-no-ORDER-BY shape (same bug class as
+// JoinGroupByHavingOrderByDoesNotMisremapSortKeyIndices above, one node
+// combination further: LogicalLimit instead of LogicalSort sitting directly
+// on the HAVING LogicalFilter) is verified at the physical-plan level in
+// physical_planner_test.cpp's
+// JoinGroupByHavingLimitRemapsCorrectlyWithNoOrderBy, not here -- see that
+// test's own comment for why: Acero's own "fetch" node unconditionally
+// rejects LIMIT on top of any unordered input (HashAggregateNode's output
+// carries no ordering guarantee), so *no* `GROUP BY ... LIMIT` query without
+// an ORDER BY can execute end to end on this CPU backend today, regardless
+// of HAVING/JOIN -- a separate, pre-existing Acero-integration limitation,
+// not a physical_planner.cpp remapping bug, and out of scope to fix here.
 
 // TPC-H Q11's own shape, end to end: a literal HAVING threshold filters
 // out groups below it. region A totals 35.0, region B totals 110.0 --

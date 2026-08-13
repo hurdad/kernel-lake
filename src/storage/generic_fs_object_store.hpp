@@ -47,4 +47,14 @@ namespace kernellake::detail {
 [[nodiscard]] std::unique_ptr<RandomAccessObject> generic_fs_open(
     const std::shared_ptr<arrow::fs::FileSystem>& fs, std::string_view backend_label, const Uri& uri);
 
+// Strips an "hdfs://namenode:port" authority from `uri`, leaving just the
+// path portion (still "hdfs://"-prefixed) -- e.g.
+// "hdfs://namenode:port/path" -> "hdfs:///path". Declared here (rather than
+// staying file-local to hdfs_object_store.cpp) purely so it's directly unit
+// testable as pure string parsing, the same reason strip_scheme() above is
+// exposed. See hdfs_object_store.cpp's own comment on why HDFS alone (unlike
+// S3/GCS/Azure) needs this extra step before delegating to generic_fs_list()/
+// generic_fs_open().
+[[nodiscard]] Uri strip_hdfs_authority(const Uri& uri);
+
 }  // namespace kernellake::detail

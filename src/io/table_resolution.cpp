@@ -145,7 +145,22 @@ DataType infer_partition_type(const std::vector<std::string>& values) {
 LiteralStorage parse_partition_value(const std::string& value, const DataType& type) {
   switch (type.id) {
     case TypeId::Int64:
-      return static_cast<std::int64_t>(std::stoll(value));
+      // looks_like_int64() (which infer_partition_type() already required
+      // every value in this column to pass before Int64 was ever chosen)
+      // only checks digit shape, not magnitude -- a 21+ digit directory
+      // name like "id=99999999999999999999" is still digit-shaped but
+      // overflows std::int64_t, and std::stoll() throws a raw
+      // std::out_of_range for it rather than the StorageError this file
+      // uses for every other rejection path. Caught and rethrown here so a
+      // malformed/oversized partition value fails the same clean,
+      // catchable way as every other broken partition layout in this file
+      // (see the throws above in resolve_table()), instead of an uncaught
+      // std::exception escaping resolve_table() entirely.
+      try {
+        return static_cast<std::int64_t>(std::stoll(value));
+      } catch (const std::out_of_range&) {
+        throw StorageError(fmt::format("partition value '{}' does not fit in a 64-bit integer", value));
+      }
     case TypeId::Date32:
       return static_cast<std::int64_t>(parse_iso_date(value));
     default:

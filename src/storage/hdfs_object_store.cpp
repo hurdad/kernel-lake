@@ -28,8 +28,12 @@ std::shared_ptr<arrow::fs::FileSystem> make_hdfs_filesystem(const HdfsSection& c
   return *result;
 }
 
-Uri strip_authority(const Uri& uri) {
-  const std::string path = detail::strip_scheme(uri);
+}  // namespace
+
+namespace detail {
+
+Uri strip_hdfs_authority(const Uri& uri) {
+  const std::string path = strip_scheme(uri);
   const std::size_t slash = path.find('/');
   if (slash == std::string::npos) {
     return Uri("hdfs://" + path);
@@ -37,20 +41,20 @@ Uri strip_authority(const Uri& uri) {
   return Uri("hdfs://" + path.substr(slash));
 }
 
-}  // namespace
+}  // namespace detail
 
 HdfsObjectStore::HdfsObjectStore(const HdfsSection& config) : fs_(make_hdfs_filesystem(config)) {}
 
 std::vector<ObjectInfo> HdfsObjectStore::list(const Uri& prefix) {
-  return detail::generic_fs_list(fs_, "hdfs", strip_authority(prefix));
+  return detail::generic_fs_list(fs_, "hdfs", detail::strip_hdfs_authority(prefix));
 }
 
 std::vector<ObjectInfo> HdfsObjectStore::list_recursive(const Uri& prefix) {
-  return detail::generic_fs_list_recursive(fs_, "hdfs", strip_authority(prefix));
+  return detail::generic_fs_list_recursive(fs_, "hdfs", detail::strip_hdfs_authority(prefix));
 }
 
 std::unique_ptr<RandomAccessObject> HdfsObjectStore::open(const Uri& uri) {
-  return detail::generic_fs_open(fs_, "hdfs", strip_authority(uri));
+  return detail::generic_fs_open(fs_, "hdfs", detail::strip_hdfs_authority(uri));
 }
 
 }  // namespace kernellake

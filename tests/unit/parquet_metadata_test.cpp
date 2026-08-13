@@ -5,6 +5,7 @@
 #include <parquet/arrow/writer.h>
 
 #include <filesystem>
+#include <fstream>
 
 #include "kernellake/common/errors.hpp"
 #include "kernellake/io/parquet_metadata.hpp"
@@ -157,6 +158,80 @@ TEST_F(ParquetMetadataTest, PruningKeepsEverythingWhenNoPredicates) {
   const ScanDecision decision = evaluate_pruning(meta, {});
   EXPECT_EQ(decision.selected_row_groups.size(), 2u);
   EXPECT_TRUE(decision.skipped_row_groups.empty());
+}
+
+// decode_statistic()'s default case (DECIMAL, INT96): Arrow's Parquet writer
+// stores DECIMAL128 as FIXED_LEN_BYTE_ARRAY at the physical level, which
+// decode_statistic()'s switch doesn't decode -- confirms has_min_max stays
+// false (rather than crashing on the un-handled physical type, or worse,
+// misinterpreting the raw bytes as some other type) so pruning correctly
+// never tries to use these statistics.
+TEST_F(ParquetMetadataTest, DecimalColumnStatisticsLeaveHasMinMaxFalse) {
+  const std::string decimal_path = (dir_ / "decimal.parquet").string();
+  const auto decimal_type = arrow::decimal128(10, 2);
+  auto price_builder = std::make_shared<arrow::Decimal128Builder>(decimal_type);
+  for (const std::string& text : {"10.50", "20.25"}) {
+    ASSERT_OK(price_builder->Append(arrow::Decimal128::FromString(text).ValueOrDie()));
+  }
+  std::shared_ptr<arrow::Array> price_array;
+  ASSERT_OK(price_builder->Finish(&price_array));
+  const auto schema = arrow::schema({arrow::field("price", decimal_type, false)});
+  const auto table = arrow::Table::Make(schema, {price_array});
+  auto sink_result = arrow::io::FileOutputStream::Open(decimal_path);
+  ASSERT_OK(sink_result.status());
+  ASSERT_OK(parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), *sink_result));
+
+  const FileMetadata meta = inspect_parquet_file(store_, Uri(decimal_path));
+  ASSERT_EQ(meta.row_groups.size(), 1u);
+  const ColumnStatistics& price_stats = meta.row_groups[0].column_statistics.at("price");
+  EXPECT_FALSE(price_stats.has_min_max);
+}
+
+// An all-null column: HasNullCount() is true (null_count == row count), but
+// HasMinMax() is false since there's no non-null value to compute a min/max
+// from -- has_min_max must stay false, not default-construct to some
+// misleading zero value.
+TEST_F(ParquetMetadataTest, AllNullColumnHasNullCountButNoMinMax) {
+  const std::string null_path = (dir_ / "all_null.parquet").string();
+  arrow::Int64Builder id_builder;
+  auto amount_builder = std::make_shared<arrow::DoubleBuilder>();
+  for (int i = 0; i < 3; ++i) {
+    ASSERT_OK(id_builder.Append(i));
+    ASSERT_OK(amount_builder->AppendNull());
+  }
+  std::shared_ptr<arrow::Array> id_array, amount_array;
+  ASSERT_OK(id_builder.Finish(&id_array));
+  ASSERT_OK(amount_builder->Finish(&amount_array));
+  const auto schema = arrow::schema(
+      {arrow::field("id", arrow::int64(), false), arrow::field("amount", arrow::float64(), true)});
+  const auto table = arrow::Table::Make(schema, {id_array, amount_array});
+  auto sink_result = arrow::io::FileOutputStream::Open(null_path);
+  ASSERT_OK(sink_result.status());
+  ASSERT_OK(parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), *sink_result));
+
+  const FileMetadata meta = inspect_parquet_file(store_, Uri(null_path));
+  ASSERT_EQ(meta.row_groups.size(), 1u);
+  const ColumnStatistics& amount_stats = meta.row_groups[0].column_statistics.at("amount");
+  ASSERT_TRUE(amount_stats.has_null_count);
+  EXPECT_EQ(amount_stats.null_count, 3);
+  EXPECT_FALSE(amount_stats.has_min_max);
+}
+
+TEST_F(ParquetMetadataTest, ThrowsOnCorruptedFooter) {
+  const std::string corrupt_path = (dir_ / "corrupt.parquet").string();
+  {
+    std::ifstream in(path_, std::ios::binary);
+    std::ofstream out(corrupt_path, std::ios::binary);
+    out << in.rdbuf();
+  }
+  // Truncate the last 16 bytes -- destroys the footer length + "PAR1" magic
+  // every valid Parquet file ends with, without needing to know that
+  // footer's exact real length up front.
+  const std::uintmax_t original_size = fs::file_size(corrupt_path);
+  ASSERT_GT(original_size, 16u);
+  fs::resize_file(corrupt_path, original_size - 16);
+
+  EXPECT_THROW((void)(inspect_parquet_file(store_, Uri(corrupt_path))), StorageError);
 }
 
 TEST_F(ParquetMetadataTest, PruningDoesNotSkipWhenColumnStatsMissingFromPredicate) {

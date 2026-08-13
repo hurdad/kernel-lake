@@ -176,5 +176,60 @@ TEST_F(TableResolutionTest, RejectsPartitionColumnCollidingWithExistingColumnNam
   EXPECT_THROW((void)resolve_table(store_, {dir_.string()}), StorageError);
 }
 
+// Regression test for the real bug fixed in parse_partition_value(): a
+// partition directory name that's digit-shaped enough to pass
+// looks_like_int64() (only a shape check, no magnitude bound) but too large
+// for std::int64_t used to make std::stoll() throw a raw, uncaught
+// std::out_of_range instead of this file's own StorageError -- inconsistent
+// with every other rejection path here. EXPECT_THROW's exact-type match
+// means this test would itself fail (a std::out_of_range doesn't convert to
+// StorageError) if the fix ever regressed.
+TEST_F(TableResolutionTest, RejectsPartitionValueTooLargeForInt64) {
+  write_file(dir_ / "id=999999999999999999999999" / "part-0.parquet", 0, 2);  // 24 digits, overflows int64
+
+  EXPECT_THROW((void)resolve_table(store_, {dir_.string()}), StorageError);
+}
+
+// infer_partition_type()'s date32 path: "2026-13-40" is digit-shaped enough
+// to pass looks_like_iso_date()'s own shape-only check (10 chars, dashes at
+// positions 4 and 7), but month 13 / day 40 isn't a real calendar date --
+// parse_iso_date() throws SqlError for it, so infer_partition_type() must
+// fall back to string_type() rather than let that exception propagate out of
+// resolve_table() (or worse, silently store a garbage date32 value).
+TEST_F(TableResolutionTest, FallsBackToStringTypeForDigitShapedButInvalidCalendarDate) {
+  write_file(dir_ / "event_date=2026-13-40" / "part-0.parquet", 0, 2);
+
+  const ResolvedTable resolved = resolve_table(store_, {dir_.string()});
+  ASSERT_EQ(resolved.partition_columns.size(), 1u);
+  EXPECT_EQ(resolved.partition_columns[0].type.id, TypeId::String);
+  ASSERT_EQ(resolved.files.size(), 1u);
+  EXPECT_EQ(std::get<std::string>(resolved.files[0].partition_values[0]), "2026-13-40");
+}
+
+// parse_key_value_segment()'s "key starts with a digit" rejection: a
+// directory segment shaped like "1=x" isn't key=value-shaped at all by this
+// file's own rules, so extract_partition_segments() stops scanning right
+// there and this file is treated as having zero partition levels -- not as
+// a partition column literally named "1".
+TEST_F(TableResolutionTest, IgnoresPartitionSegmentWhoseKeyStartsWithADigit) {
+  write_file(dir_ / "1=x" / "part-0.parquet", 0, 2);
+
+  const ResolvedTable resolved = resolve_table(store_, {dir_.string()});
+  EXPECT_TRUE(resolved.partition_columns.empty());
+  ASSERT_EQ(resolved.files.size(), 1u);
+  EXPECT_TRUE(resolved.files[0].partition_values.empty());
+}
+
+// parse_key_value_segment()'s "key has a non-alnum/underscore character"
+// rejection: "a.b=x" fails the same shape check for the same reason.
+TEST_F(TableResolutionTest, IgnoresPartitionSegmentWhoseKeyHasANonAlnumCharacter) {
+  write_file(dir_ / "a.b=x" / "part-0.parquet", 0, 2);
+
+  const ResolvedTable resolved = resolve_table(store_, {dir_.string()});
+  EXPECT_TRUE(resolved.partition_columns.empty());
+  ASSERT_EQ(resolved.files.size(), 1u);
+  EXPECT_TRUE(resolved.files[0].partition_values.empty());
+}
+
 }  // namespace
 }  // namespace kernellake
