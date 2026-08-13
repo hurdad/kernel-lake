@@ -115,6 +115,31 @@ TEST(ParquetPruning, IncomparableTypesNeverPrune) {
   EXPECT_TRUE(decision.skipped_row_groups.empty());
 }
 
+TEST(ParquetPruning, BoolVsNumericIncomparabilityNeverPrunes) {
+  // Statistics are bool but the predicate literal is numeric --
+  // compare_literals() only compares bool-vs-bool or numeric-vs-numeric, so
+  // this must fall back to "must scan" just like the string-vs-numeric case
+  // above, not silently coerce true/false to 1/0.
+  const FileMetadata file = one_row_group_file("active", stats_with_range(false, false));
+  const ScanDecision decision =
+      evaluate_pruning(file, {PushablePredicate{"active", BinaryOperator::Equal, int_literal(0)}});
+  EXPECT_TRUE(decision.skipped_row_groups.empty());
+}
+
+TEST(ParquetPruning, NullLiteralPredicateNeverPrunes) {
+  // predicate_proves_empty() explicitly bails out for a NULL literal
+  // (literal_expr->is_null()) before ever comparing it against min/max --
+  // `col = NULL` is never provably empty from range statistics alone (NULL
+  // isn't representable as an orderable value), so this must always fall
+  // back to "must scan".
+  const FileMetadata file = one_row_group_file("id", stats_with_range(std::int64_t{10}, std::int64_t{20}));
+  auto null_literal = std::make_shared<LiteralExpression>(LiteralExpression::make_null(int64_type(false)));
+  const ScanDecision decision =
+      evaluate_pruning(file, {PushablePredicate{"id", BinaryOperator::Equal, null_literal}});
+  EXPECT_TRUE(decision.skipped_row_groups.empty());
+  ASSERT_EQ(decision.selected_row_groups.size(), 1u);
+}
+
 TEST(ParquetPruning, MultiplePredicatesOnDifferentColumnsEachCanSkip) {
   RowGroupMetadata row_group;
   row_group.index = 0;

@@ -11,6 +11,9 @@ add_executable(kernellake_unit_tests
   storage_test.cpp
   gcs_object_store_test.cpp
   azure_object_store_test.cpp
+  s3_object_store_test.cpp
+  hdfs_object_store_test.cpp
+  generic_fs_object_store_test.cpp
   object_store_registry_test.cpp
   nvme_object_cache_test.cpp
   parquet_metadata_test.cpp
@@ -40,6 +43,17 @@ add_executable(kernellake_unit_tests
   $<$<BOOL:${KERNELLAKE_BUILD_SERVER}>:flight_sql_server_test.cpp>
   $<$<BOOL:${KERNELLAKE_BUILD_SERVER}>:auth_middleware_test.cpp>
   $<$<BOOL:${KERNELLAKE_ENABLE_OTEL}>:query_tracing_test.cpp>
+)
+
+# generic_fs_object_store_test.cpp/hdfs_object_store_test.cpp reach directly
+# into src/storage/generic_fs_object_store.hpp -- a private, non-installed
+# header shared by the S3/GCS/Azure/HDFS backends (see its own doc comment)
+# -- to unit test its detail:: functions (glob_match(), generic_fs_list(),
+# strip_hdfs_authority(), ...) directly against a real
+# arrow::fs::LocalFileSystem, rather than only indirectly through a backend
+# that needs real cloud credentials to even construct.
+target_include_directories(kernellake_unit_tests PRIVATE
+  "${PROJECT_SOURCE_DIR}/src/storage"
 )
 
 target_link_libraries(kernellake_unit_tests PRIVATE

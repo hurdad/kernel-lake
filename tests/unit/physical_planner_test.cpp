@@ -452,6 +452,59 @@ TEST_F(PhysicalPlannerTest, ExplainShowsFilesAndRowGroupCounts) {
   EXPECT_NE(text.find("row_groups: 1/2"), std::string::npos);
 }
 
+// Regression coverage for physical_planner.cpp's references_scan_schema():
+// same bug class as query_engine_execute_cpu_test.cpp's
+// JoinGroupByHavingOrderByDoesNotMisremapSortKeyIndices (a LogicalSort
+// sitting directly on a HAVING LogicalFilter), one node combination
+// further -- a LogicalLimit instead, whenever LIMIT has no ORDER BY to pair
+// with. optimizer.cpp's insert_limit() pushes LogicalLimit down through the
+// aggregate path's re-projection to sit directly on the HAVING
+// LogicalFilter (see insert_limit()'s own comment); references_scan_schema()
+// must recognize that filter's predicate already references the
+// *aggregate's* own output schema, not the scan's, exactly like it already
+// does for the LogicalSort case.
+//
+// Verified here at the plan-construction level rather than through a full
+// end-to-end query_engine_execute_cpu_test.cpp execution: Arrow Acero's own
+// "fetch" node unconditionally rejects LIMIT sitting on top of any
+// unordered input ("Fetch node's input has no meaningful ordering"), and
+// HashAggregateNode's Acero translation carries no ordering guarantee -- so
+// *no* `GROUP BY ... LIMIT` query without an ORDER BY can actually execute
+// end to end on this CPU backend today (confirmed: even the simplest
+// no-HAVING/no-JOIN case, `SELECT region, SUM(amount) FROM t GROUP BY
+// region LIMIT 1`, fails the same way). That's a separate, pre-existing
+// Acero-integration limitation, unrelated to this remapping fix and out of
+// scope to fix here -- this test instead confirms what
+// physical_planner.cpp actually controls: the plan it builds for this
+// shape has correct column indices.
+TEST_F(PhysicalPlannerTest, JoinGroupByHavingLimitRemapsCorrectlyWithNoOrderBy) {
+  const PhysicalPlanPtr plan = plan_for("SELECT region, SUM(amount) AS total FROM read_parquet('" + path_ +
+                                        "') GROUP BY region HAVING SUM(amount) > 5 LIMIT 1");
+
+  const auto* result = dynamic_cast<const ArrowResultNode*>(plan.get());
+  ASSERT_NE(result, nullptr);
+  // The reprojection is a genuine identity relative to HashAggregate's own
+  // [region@0, total@1] output order here, so it's elided (see
+  // ElidesIdentityProjectionAfterColumnPruning above) -- LimitNode sits
+  // directly under ArrowResultNode.
+  const auto* limit = dynamic_cast<const LimitNode*>(result->child().get());
+  ASSERT_NE(limit, nullptr);
+  const auto* filter = dynamic_cast<const FilterNode*>(limit->child().get());
+  ASSERT_NE(filter, nullptr);
+
+  // The HAVING predicate's column reference must still point at the
+  // aggregate's own output position (total@1, HashAggregate's own
+  // [group_by..., aggregates...] order) -- not misremapped against the
+  // scan schema, which has no "total" column at all.
+  const auto* comparison = dynamic_cast<const BinaryExpression*>(filter->predicate().get());
+  ASSERT_NE(comparison, nullptr);
+  const auto* total_column = dynamic_cast<const ColumnExpression*>(comparison->left().get());
+  ASSERT_NE(total_column, nullptr);
+  EXPECT_EQ(total_column->column_index(), 1u);
+
+  EXPECT_NE(dynamic_cast<const HashAggregateNode*>(filter->child().get()), nullptr);
+}
+
 // A key/single-value table with `row_count` rows, one row group -- used by
 // the build-side-selection tests below, where the two joined tables' row
 // counts (not their column shapes) are what matters.
