@@ -138,6 +138,28 @@ USER_DATA=$(cat <<EOF
 #!/bin/bash
 set -euo pipefail
 exec > >(tee /var/log/generate-data.log) 2>&1
+
+# IMDSv2 (token-based) -- this account's instances default to HttpTokens:
+# required, confirmed for real after a plain unauthenticated IMDSv1-style
+# GET silently returned an empty body (401, swallowed by \$(...)), which
+# made "aws ec2 terminate-instances --instance-ids ''" fail with
+# InvalidInstanceID.Malformed and left two real instances running/billing
+# indefinitely instead of self-terminating.
+IMDS_TOKEN=\$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 60")
+INSTANCE_ID=\$(curl -s -H "X-aws-ec2-metadata-token: \${IMDS_TOKEN}" http://169.254.169.254/latest/meta-data/instance-id)
+
+# Registered before any of the steps below that can fail, and unconditional
+# -- a bash EXIT trap fires on every exit path (falling off the end,
+# an explicit exit, or set -e's own automatic exit on an unhandled
+# non-zero return), not just a clean success. A prior version only ever
+# called terminate-instances as the literal last line, reached solely by
+# every step above it succeeding in sequence -- so any failure partway
+# through (e.g. generate_tpch.py OOM-killed) left the instance sitting
+# "running", doing nothing, billing indefinitely, contrary to what this
+# script prints ("self-terminates on completion or failure"). Confirmed
+# for real: a live SF1000 run hit exactly this.
+trap 'aws ec2 terminate-instances --region ${REGION} --instance-ids "\${INSTANCE_ID}"' EXIT
+
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
 apt-get install -y --no-install-recommends python3 python3-pip awscli
@@ -159,16 +181,7 @@ aws s3 sync /data "s3://${BUCKET}/tpch-data/${SF_DIR}/"
 # indistinguishable from a successful, self-terminating run).
 echo '{"scale_factor": ${SCALE_FACTOR}, "compression": "${COMPRESSION}", "compression_level": ${COMPRESSION_LEVEL:-null}, "status": "complete"}' | \\
   aws s3 cp - "s3://${BUCKET}/tpch-data/${SF_DIR}/.generation-complete"
-
-# IMDSv2 (token-based) -- this account's instances default to HttpTokens:
-# required, confirmed for real after a plain unauthenticated IMDSv1-style
-# GET silently returned an empty body (401, swallowed by \$(...)), which
-# made "aws ec2 terminate-instances --instance-ids ''" fail with
-# InvalidInstanceID.Malformed and left two real instances running/billing
-# indefinitely instead of self-terminating.
-IMDS_TOKEN=\$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 60")
-INSTANCE_ID=\$(curl -s -H "X-aws-ec2-metadata-token: \${IMDS_TOKEN}" http://169.254.169.254/latest/meta-data/instance-id)
-aws ec2 terminate-instances --region ${REGION} --instance-ids "\${INSTANCE_ID}"
+# Trap above handles termination on exit -- nothing further needed here.
 EOF
 )
 

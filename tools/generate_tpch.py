@@ -30,7 +30,7 @@ record every one:
     match a real `partsupp` row for that part. `suppliers_for_part()` is
     the deterministic (not dbgen's own selection formula, but the same
     shape) function both `generate_lineitem_batch()`'s `l_suppkey` draw
-    and `generate_partsupp_table()`'s own rows are built from, so they
+    and `generate_partsupp_batch()`'s own rows are built from, so they
     always agree. This is the one foreign key in this generator that
     isn't independently sampled -- every other one still is.
   - `nation`/`region` use real TPC-H `dbgen` reference data (all 25
@@ -98,6 +98,18 @@ PART_ROWS_PER_SF = 200_000
 # OOM-killed a full SF1000 run, which has ~1.5B orders rows, after 127GB
 # RSS). Batch it the same way the --files loop already batches lineitem.
 ORDERS_BATCH_ROWS = 5_000_000
+
+# generate_part_batch/generate_partsupp_batch had the identical unbounded-
+# batch-size problem generate_orders_batch had before ORDERS_BATCH_ROWS
+# existed. part scales directly with SF (PART_ROWS_PER_SF * SF), and
+# partsupp is exactly PARTSUPP_SUPPLIERS_PER_PART (4) times that -- so at
+# SF1000, partsupp alone is 800,000,000 rows. Confirmed for real: a live
+# SF1000 AWS data-gen run OOM-killed a 16GB c6i.2xlarge at 15.5GB RSS
+# inside what was then generate_partsupp_table(), the very first table
+# generated in main(). Batched the same way orders already is, by partkey
+# range (each batch of PART_BATCH_ROWS parts yields
+# PART_BATCH_ROWS * PARTSUPP_SUPPLIERS_PER_PART partsupp rows).
+PART_BATCH_ROWS = 5_000_000
 
 # A representative subset of TPC-H's own p_container domain (dbgen draws
 # from a larger cross product of size/container-type words) -- covers every
@@ -338,8 +350,8 @@ def generate_lineitem_batch(
     )
 
 
-def generate_part_table(rng: random.Random, row_count: int) -> pa.Table:
-    partkey = list(range(1, row_count + 1))
+def generate_part_batch(rng: random.Random, first_partkey: int, row_count: int) -> pa.Table:
+    partkey = list(range(first_partkey, first_partkey + row_count))
     name = [" ".join(rng.sample(P_NAME_WORDS, 5)) for _ in partkey]
     mfgr = [f"Manufacturer#{(k % 5) + 1}" for k in partkey]
     brand = [rng.choice(BRANDS) for _ in partkey]
@@ -382,7 +394,7 @@ def generate_orders_batch(rng: random.Random, first_orderkey: int, row_count: in
     # One row per distinct l_orderkey generate_lineitem_batch produced --
     # TPC-H's own 1:N orders:lineitem relationship -- so every lineitem row
     # has a real order to join against (no dangling foreign keys), same
-    # rationale as generate_part_table's l_partkey range. Batched (see
+    # rationale as generate_part_batch's l_partkey range. Batched (see
     # ORDERS_BATCH_ROWS) rather than building all of `orders` at once, since
     # at large scale factors max_orderkey is itself in the billions.
     orderkey = list(range(first_orderkey, first_orderkey + row_count))
@@ -549,16 +561,19 @@ def generate_supplier_table(rng: random.Random, row_count: int) -> pa.Table:
     )
 
 
-def generate_partsupp_table(rng: random.Random, total_part_rows: int, supplier_rows: int) -> pa.Table:
+def generate_partsupp_batch(rng: random.Random, first_partkey: int, row_count: int, supplier_rows: int) -> pa.Table:
     # Exactly PARTSUPP_SUPPLIERS_PER_PART rows per part, the same
     # suppliers_for_part() set generate_lineitem_batch() draws l_suppkey
     # from -- see that function's own comment for why this pairing has to
     # be exact, not independently sampled the way every other table here
-    # is. total_part_rows * PARTSUPP_SUPPLIERS_PER_PART rows total (e.g.
-    # 800,000 at SF1's 200,000 parts), comparable in size to `customer`.
+    # is. row_count * PARTSUPP_SUPPLIERS_PER_PART rows in this batch (e.g.
+    # 800,000 at SF1's 200,000-part single batch). Batched by partkey range
+    # (see PART_BATCH_ROWS) rather than building all of `partsupp` at once,
+    # since at large scale factors total_part_rows * 4 is itself in the
+    # hundreds of millions.
     partkey = []
     suppkey = []
-    for p in range(1, total_part_rows + 1):
+    for p in range(first_partkey, first_partkey + row_count):
         for s in suppliers_for_part(p, supplier_rows):
             partkey.append(p)
             suppkey.append(s)
@@ -621,21 +636,37 @@ def main() -> int:
     compression = None if args.compression == "none" else args.compression
     compression_level = args.compression_level
 
-    part_table = generate_part_table(rng, total_part_rows)
-    part_path = output_dir / "part-00000.parquet"
-    pq.write_table(
-        part_table, part_path, compression=compression,
-        compression_level=compression_level, row_group_size=args.row_group_rows,
-    )
-    print(f"wrote {total_part_rows} rows to {part_path}")
+    part_file_paths = []
+    part_rows_written = 0
+    partsupp_file_paths = []
+    partsupp_rows_written = 0
+    next_partkey = 1
+    part_file_index = 0
+    while next_partkey <= total_part_rows:
+        batch_rows = min(PART_BATCH_ROWS, total_part_rows - next_partkey + 1)
 
-    partsupp_table = generate_partsupp_table(rng, total_part_rows, SUPPLIER_ROWS)
-    partsupp_path = output_dir / "partsupp-00000.parquet"
-    pq.write_table(
-        partsupp_table, partsupp_path, compression=compression,
-        compression_level=compression_level, row_group_size=args.row_group_rows,
-    )
-    print(f"wrote {partsupp_table.num_rows} rows to {partsupp_path}")
+        part_table = generate_part_batch(rng, next_partkey, batch_rows)
+        part_path = output_dir / f"part-{part_file_index:05d}.parquet"
+        pq.write_table(
+            part_table, part_path, compression=compression,
+            compression_level=compression_level, row_group_size=args.row_group_rows,
+        )
+        part_file_paths.append(str(part_path))
+        part_rows_written += batch_rows
+        print(f"wrote {batch_rows} rows to {part_path}")
+
+        partsupp_table = generate_partsupp_batch(rng, next_partkey, batch_rows, SUPPLIER_ROWS)
+        partsupp_path = output_dir / f"partsupp-{part_file_index:05d}.parquet"
+        pq.write_table(
+            partsupp_table, partsupp_path, compression=compression,
+            compression_level=compression_level, row_group_size=args.row_group_rows,
+        )
+        partsupp_file_paths.append(str(partsupp_path))
+        partsupp_rows_written += partsupp_table.num_rows
+        print(f"wrote {partsupp_table.num_rows} rows to {partsupp_path}")
+
+        next_partkey += batch_rows
+        part_file_index += 1
 
     customer_table = generate_customer_table(rng, CUSTOMER_ROWS)
     customer_path = output_dir / "customer-00000.parquet"
@@ -720,12 +751,12 @@ def main() -> int:
                 "rows": rows_written,
             },
             "part": {
-                "files": [str(part_path)],
-                "rows": total_part_rows,
+                "files": part_file_paths,
+                "rows": part_rows_written,
             },
             "partsupp": {
-                "files": [str(partsupp_path)],
-                "rows": partsupp_table.num_rows,
+                "files": partsupp_file_paths,
+                "rows": partsupp_rows_written,
             },
             "orders": {
                 "files": orders_file_paths,
@@ -753,7 +784,8 @@ def main() -> int:
         json.dump(manifest, manifest_file, indent=2)
 
     print(f"wrote {rows_written} lineitem rows across {len(file_paths)} file(s), "
-          f"{total_part_rows} part rows, {partsupp_table.num_rows} partsupp rows, "
+          f"{part_rows_written} part rows across {len(part_file_paths)} file(s), "
+          f"{partsupp_rows_written} partsupp rows across {len(partsupp_file_paths)} file(s), "
           f"{orders_written} orders rows across "
           f"{len(orders_file_paths)} file(s), {CUSTOMER_ROWS} customer rows, "
           f"{len(NATIONS)} nation rows, {len(REGIONS)} region rows, "
