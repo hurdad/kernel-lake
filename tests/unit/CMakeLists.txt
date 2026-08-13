@@ -4,6 +4,7 @@ add_executable(kernellake_unit_tests
   schema_test.cpp
   arrow_adapter_test.cpp
   expression_test.cpp
+  expression_compiler_cpu_test.cpp
   sql_parser_test.cpp
   subquery_resolver_test.cpp
   binder_test.cpp

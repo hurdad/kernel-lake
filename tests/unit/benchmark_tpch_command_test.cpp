@@ -106,6 +106,151 @@ class BenchmarkTpchCommandRealRunTest : public ::testing::Test {
   std::string output_path_;
 };
 
+TEST_F(BenchmarkTpchCommandRealRunTest, RejectsMissingData) {
+  EngineConfig config = default_config();
+  config.engine.backend = "cpu";
+  const std::vector<std::string_view> args = {"--query-file", query_file_path_, "--query", "1", "--mode",
+                                              "warm"};
+  EXPECT_EQ(run_benchmark_tpch(args, config), 1);
+}
+
+TEST_F(BenchmarkTpchCommandRealRunTest, RejectsExecutionOnlyModeAsNotYetImplemented) {
+  EngineConfig config = default_config();
+  config.engine.backend = "cpu";
+  const std::vector<std::string_view> args = {"--data",  data_path_, "--query-file", query_file_path_,
+                                              "--query", "1",        "--mode",       "execution-only"};
+  EXPECT_EQ(run_benchmark_tpch(args, config), 1);
+}
+
+TEST_F(BenchmarkTpchCommandRealRunTest, RejectsNonPositiveIterations) {
+  EngineConfig config = default_config();
+  config.engine.backend = "cpu";
+  const std::vector<std::string_view> args = {"--data",       data_path_, "--query-file", query_file_path_,
+                                              "--query",      "1",        "--mode",       "warm",
+                                              "--iterations", "0"};
+  EXPECT_EQ(run_benchmark_tpch(args, config), 1);
+}
+
+TEST_F(BenchmarkTpchCommandRealRunTest, RejectsUnreadableQueryFile) {
+  EngineConfig config = default_config();
+  config.engine.backend = "cpu";
+  const std::string missing_query_file = (dir_ / "does-not-exist.sql").string();
+  const std::vector<std::string_view> args = {"--data",  data_path_, "--query-file", missing_query_file,
+                                              "--query", "1",        "--mode",       "warm"};
+  EXPECT_EQ(run_benchmark_tpch(args, config), 1);
+}
+
+// Exercises one of the seven near-identical extra-table discover_parquet_files()
+// blocks' "no files matched" branch (--part-data/--orders-data/etc. are all the
+// same shape -- see the source file's own comment on why there are seven) --
+// representative of all seven, which otherwise share this exact control flow.
+TEST_F(BenchmarkTpchCommandRealRunTest, RejectsWhenExtraTableGlobMatchesNoFiles) {
+  EngineConfig config = default_config();
+  config.engine.backend = "cpu";
+  const fs::path empty_dir = dir_ / "no_part_data";
+  fs::create_directories(empty_dir);
+  const std::string part_glob = (empty_dir / "*.parquet").string();
+  const std::vector<std::string_view> args = {"--data",      data_path_, "--query-file", query_file_path_,
+                                              "--query",     "1",        "--mode",       "warm",
+                                              "--part-data", part_glob};
+  EXPECT_EQ(run_benchmark_tpch(args, config), 1);
+}
+
+// Covers the assignment/discovery/report-population lines for every one of
+// the seven optional extra-table flags in a single run (they don't need to
+// be referenced by the query's own SQL -- discover_parquet_files() and the
+// report["..._data"] population both run purely off whether each flag was
+// given, independent of what strip_comments_and_substitute() does with it).
+TEST_F(BenchmarkTpchCommandRealRunTest, IncludesEveryOptionalTableGlobInReport) {
+  EngineConfig config = default_config();
+  config.engine.backend = "cpu";
+  const std::vector<std::string_view> args = {
+      "--data",          data_path_, "--query-file",    query_file_path_, "--query",         "1",
+      "--mode",          "warm",     "--part-data",     data_path_,       "--orders-data",   data_path_,
+      "--customer-data", data_path_, "--nation-data",   data_path_,       "--supplier-data", data_path_,
+      "--region-data",   data_path_, "--partsupp-data", data_path_,       "--output",        output_path_};
+  EXPECT_EQ(run_benchmark_tpch(args, config), 0);
+
+  std::ifstream report_file(output_path_);
+  std::ostringstream contents;
+  contents << report_file.rdbuf();
+  const nlohmann::json report = nlohmann::json::parse(contents.str());
+  EXPECT_EQ(report["part_data"], data_path_);
+  EXPECT_EQ(report["orders_data"], data_path_);
+  EXPECT_EQ(report["customer_data"], data_path_);
+  EXPECT_EQ(report["nation_data"], data_path_);
+  EXPECT_EQ(report["supplier_data"], data_path_);
+  EXPECT_EQ(report["region_data"], data_path_);
+  EXPECT_EQ(report["partsupp_data"], data_path_);
+}
+
+// mode=="cold" exercises evict_from_page_cache()'s POSIX_FADV_DONTNEED path
+// (best-effort, no assertion on its actual effect -- see the source's own
+// comment on why this can only ever be a hint) -- no prior test used cold
+// mode at all.
+TEST_F(BenchmarkTpchCommandRealRunTest, ColdModeEvictsPageCacheAndStillProducesAReport) {
+  EngineConfig config = default_config();
+  config.engine.backend = "cpu";
+  const std::vector<std::string_view> args = {"--data",   data_path_,  "--query-file", query_file_path_,
+                                              "--query",  "1",         "--mode",       "cold",
+                                              "--output", output_path_};
+  EXPECT_EQ(run_benchmark_tpch(args, config), 0);
+}
+
+// >=2 iterations exercises median_of()'s even-count averaging branch and
+// stddev_of()'s real (non-degenerate, size>=2) computation -- the existing
+// single-iteration test only ever hits their size==1 shortcuts. Non-zero
+// warmup_iterations also exercises the warmup loop body itself.
+TEST_F(BenchmarkTpchCommandRealRunTest, MultipleIterationsWithWarmupComputeRealStatistics) {
+  EngineConfig config = default_config();
+  config.engine.backend = "cpu";
+  const std::vector<std::string_view> args = {"--data",
+                                              data_path_,
+                                              "--query-file",
+                                              query_file_path_,
+                                              "--query",
+                                              "1",
+                                              "--mode",
+                                              "warm",
+                                              "--iterations",
+                                              "2",
+                                              "--warmup-iterations",
+                                              "1",
+                                              "--output",
+                                              output_path_};
+  EXPECT_EQ(run_benchmark_tpch(args, config), 0);
+
+  std::ifstream report_file(output_path_);
+  std::ostringstream contents;
+  contents << report_file.rdbuf();
+  const nlohmann::json report = nlohmann::json::parse(contents.str());
+  EXPECT_EQ(report["iteration_results"].size(), 2u);
+  EXPECT_EQ(report["warmup_iterations"], 1);
+}
+
+// No --output writes the JSON report to stdout instead of a file (see
+// write_query_result-adjacent std::printf branch) -- no prior test omitted
+// --output. stdout isn't captured/asserted on here (same limitation
+// query_command_test.cpp's own --stats test notes for stderr), only that
+// the run still succeeds.
+TEST_F(BenchmarkTpchCommandRealRunTest, WritesReportToStdoutWhenNoOutputPathGiven) {
+  EngineConfig config = default_config();
+  config.engine.backend = "cpu";
+  const std::vector<std::string_view> args = {"--data",  data_path_, "--query-file", query_file_path_,
+                                              "--query", "1",        "--mode",       "warm"};
+  EXPECT_EQ(run_benchmark_tpch(args, config), 0);
+}
+
+TEST_F(BenchmarkTpchCommandRealRunTest, ThrowsCleanErrorWhenOutputPathIsUnwritable) {
+  EngineConfig config = default_config();
+  config.engine.backend = "cpu";
+  const std::string bad_output = (dir_ / "does-not-exist" / "report.json").string();
+  const std::vector<std::string_view> args = {"--data",   data_path_, "--query-file", query_file_path_,
+                                              "--query",  "1",        "--mode",       "warm",
+                                              "--output", bad_output};
+  EXPECT_EQ(run_benchmark_tpch(args, config), 1);
+}
+
 // End-to-end: valid --scale-factor/--query/--iterations/--warmup-iterations
 // values (the same arguments the tests above feed malformed) parse and
 // drive a real query run, closing the loop on the parsing fix rather than

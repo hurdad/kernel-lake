@@ -28,14 +28,14 @@ namespace kernellake {
 //
 // Scope for this phase: plain columns, numeric/string/boolean/date/
 // timestamp literals, arithmetic, comparisons, AND/OR/NOT/IS [NOT] NULL,
-// BETWEEN, and numeric/date/timestamp CAST (needed even though explicit
-// SQL `CAST` is out of this phase's stated scope -- the binder's own safe
-// implicit numeric promotion, e.g. comparing an INT32 column against an
-// integer literal, silently inserts a CastExpression for ordinary
-// comparisons, so this compiler must handle it or reject far more queries
-// than intended). LIKE/IN/CASE/CAST-to-DECIMAL/CAST-to-STRING are not yet
-// supported -- throws ExecutionError naming the unsupported node/target
-// rather than silently miscompiling.
+// BETWEEN, LIKE, CASE, EXTRACT, and numeric/date/timestamp CAST (needed
+// even though explicit SQL `CAST` is out of this phase's stated scope --
+// the binder's own safe implicit numeric promotion, e.g. comparing an
+// INT32 column against an integer literal, silently inserts a
+// CastExpression for ordinary comparisons, so this compiler must handle it
+// or reject far more queries than intended). IN/CAST-to-DECIMAL/CAST-to-
+// STRING are not yet supported -- throws ExecutionError naming the
+// unsupported node/target rather than silently miscompiling.
 [[nodiscard]] arrow::compute::Expression compile_expression_cpu(const Expression& expr);
 
 }  // namespace kernellake
