@@ -124,8 +124,8 @@ TEST_F(QueryCommandTest, RejectsUnreadableSqlFile) {
 // rather than capturing/asserting on the printed text.
 TEST_F(QueryCommandTest, RunsWithStatsFlagWithoutError) {
   const std::string sql = "SELECT id FROM read_parquet('" + path_ + "')";
-  const std::vector<std::string_view> args = {"--sql", sql, "--format", "jsonl", "--output", output_path_,
-                                              "--stats"};
+  const std::vector<std::string_view> args = {"--sql",    sql,          "--format", "jsonl",
+                                              "--output", output_path_, "--stats"};
   EXPECT_EQ(run_query(args, config_), 0);
 }
 
@@ -134,8 +134,8 @@ TEST_F(QueryCommandTest, RunsWithStatsFlagWithoutError) {
 // the rejection path.
 TEST_F(QueryCommandTest, AcceptsExplicitCpuBackendOverride) {
   const std::string sql = "SELECT id FROM read_parquet('" + path_ + "')";
-  const std::vector<std::string_view> args = {"--sql", sql, "--backend", "cpu", "--format",
-                                              "jsonl",  "--output", output_path_};
+  const std::vector<std::string_view> args = {"--sql",    sql,     "--backend", "cpu",
+                                              "--format", "jsonl", "--output",  output_path_};
   EXPECT_EQ(run_query(args, config_), 0);
   EXPECT_NE(read_output().find("{\"id\":0}"), std::string::npos);
 }

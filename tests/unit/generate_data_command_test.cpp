@@ -74,9 +74,17 @@ TEST_F(GenerateDataCommandTest, GeneratesRealDataAndReportsRowCount) {
   // a temporary's buffer would dangle the instant the initializer-list's
   // full expression ends.
   const std::string output_dir = dir_.string();
-  const std::vector<std::string_view> args = {
-      "--output",   output_dir, "--rows",    "10",   "--files",           "1",
-      "--row-group-rows", "10", "--seed",    "1",    "--no-dictionary-encoding"};
+  const std::vector<std::string_view> args = {"--output",
+                                              output_dir,
+                                              "--rows",
+                                              "10",
+                                              "--files",
+                                              "1",
+                                              "--row-group-rows",
+                                              "10",
+                                              "--seed",
+                                              "1",
+                                              "--no-dictionary-encoding"};
   EXPECT_EQ(run_generate_data(args), 0);
 
   ASSERT_TRUE(fs::exists(dir_));
@@ -93,15 +101,22 @@ TEST_F(GenerateDataCommandTest, GeneratesMultipleFilesWithCardinalityAndSkewFlag
   // See GeneratesRealDataAndReportsRowCount above for why this must be a
   // named local rather than an inline dir_.string() temporary.
   const std::string output_dir = dir_.string();
-  const std::vector<std::string_view> args = {
-      "--output",   output_dir,
-      "--rows",     "20",
-      "--files",    "2",
-      "--region-cardinality", "3",
-      "--category-cardinality", "2",
-      "--customer-cardinality", "5",
-      "--null-rate", "0.5",
-      "--skew",     "0.5"};
+  const std::vector<std::string_view> args = {"--output",
+                                              output_dir,
+                                              "--rows",
+                                              "20",
+                                              "--files",
+                                              "2",
+                                              "--region-cardinality",
+                                              "3",
+                                              "--category-cardinality",
+                                              "2",
+                                              "--customer-cardinality",
+                                              "5",
+                                              "--null-rate",
+                                              "0.5",
+                                              "--skew",
+                                              "0.5"};
   EXPECT_EQ(run_generate_data(args), 0);
 
   std::size_t parquet_files = 0;

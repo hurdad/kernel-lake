@@ -33,9 +33,13 @@ AstExprPtr make_subquery() {
   return expr;
 }
 
-[[nodiscard]] bool is_subquery(const AstExprPtr& expr) { return std::holds_alternative<AstSubquery>(expr->node); }
+[[nodiscard]] bool is_subquery(const AstExprPtr& expr) {
+  return std::holds_alternative<AstSubquery>(expr->node);
+}
 
-[[nodiscard]] const AstLiteral& as_literal(const AstExprPtr& expr) { return std::get<AstLiteral>(expr->node); }
+[[nodiscard]] const AstLiteral& as_literal(const AstExprPtr& expr) {
+  return std::get<AstLiteral>(expr->node);
+}
 
 // ---- resolve_subqueries() (HAVING scalar subqueries) ----
 

@@ -194,7 +194,8 @@ TEST(ParseResultFormat, RejectsUnknownFormatName) {
 // own 1-char header), locked in byte-for-byte including the
 // dashes-then-two-spaces separator row.
 TEST_F(ResultFormatterTest, TableFormatAlignsColumnsToWidestCellOrHeader) {
-  const auto schema = arrow::schema({arrow::field("n", arrow::int64(), false), arrow::field("s", arrow::utf8(), false)});
+  const auto schema =
+      arrow::schema({arrow::field("n", arrow::int64(), false), arrow::field("s", arrow::utf8(), false)});
   arrow::Int64Builder n_builder;
   arrow::StringBuilder s_builder;
   ASSERT_TRUE(n_builder.Append(1).ok());
@@ -236,7 +237,8 @@ TEST_F(ResultFormatterTest, TableFormatRendersNullAsLiteralText) {
 // verified directly against a real WriteCSV() call before being hardcoded
 // here, same "locks in" approach as scalar_text()'s tests above.
 TEST_F(ResultFormatterTest, CsvFormatWritesHeaderAndRows) {
-  const auto schema = arrow::schema({arrow::field("n", arrow::int64(), false), arrow::field("s", arrow::utf8(), false)});
+  const auto schema =
+      arrow::schema({arrow::field("n", arrow::int64(), false), arrow::field("s", arrow::utf8(), false)});
   arrow::Int64Builder n_builder;
   arrow::StringBuilder s_builder;
   ASSERT_TRUE(n_builder.Append(1).ok());
