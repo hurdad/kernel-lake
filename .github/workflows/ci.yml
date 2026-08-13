@@ -1,4 +1,4 @@
-# KernelLake CI. One workflow, seven jobs, in dependency order:
+# KernelLake CI. One workflow, eight jobs, in dependency order:
 #
 #   format-check ------------------+
 #                                   +--> docker-publish (push to main only)
@@ -8,6 +8,7 @@
 #
 #   clang-tidy (standalone lint job -- no `needs:` of its own, and not in
 #               docker-publish's `needs:` list either; see below)
+#   coverage    (standalone, same reasoning as clang-tidy -- see below)
 #
 # docker-publish only starts once format-check, cpu-build-test, AND
 # tpch-tooling-smoke have all succeeded (via `needs:`) -- a broken build or
@@ -18,8 +19,11 @@
 # but a lint-only finding blocking the docker image specifically wasn't
 # judged worth coupling here (unlike format-check, which already gated
 # docker-publish before this job existed, so it stayed as-is rather than
-# being second-guessed). server-build-test/otel-build-test are independent
-# of docker-publish's gating: they exist to catch
+# being second-guessed). coverage is the same shape of decision: a real,
+# useful signal on every PR, but not something a coverage dip should ever
+# block a release over on its own, so it's neither a `needs:` of
+# docker-publish nor gated by it. server-build-test/otel-build-test are
+# independent of docker-publish's gating: they exist to catch
 # KERNELLAKE_BUILD_SERVER/KERNELLAKE_ENABLE_OTEL regressions specifically
 # (docker/Dockerfile's own `cmake --preset gpu-dev` invocation turns both on
 # unconditionally, so a failure there would also break docker-publish, but
@@ -188,6 +192,75 @@ jobs:
         run: cmake --build --preset cpu-dev
       - name: Test
         run: ctest --preset cpu-dev --output-on-failure
+
+  coverage:
+    # Independent of cpu-build-test (no `needs:`, same as clang-tidy) --
+    # this rebuilds under a separate `cpu-coverage` preset (cpu-dev plus
+    # gcc's --coverage instrumentation, see CMakePresets.json) rather than
+    # reusing cpu-build-test's own build directory, since a coverage-
+    # instrumented binary is slower and shouldn't be what every other job
+    # is actually testing. See cpu-build-test's own comment on why this
+    # needs ubuntu:26.04 too.
+    runs-on: ubuntu-24.04
+    container: ubuntu:26.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install core toolchain
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build git pkg-config wget ca-certificates lsb-release gnupg \
+            python3 python3-pip \
+            libgtest-dev libbenchmark-dev libspdlog-dev nlohmann-json3-dev libyaml-cpp-dev \
+            libxml2-dev uuid-dev \
+            libavro-dev libcurl4-openssl-dev \
+            libgrpc++-dev protobuf-compiler-grpc
+      - name: Install Apache Arrow / Parquet C++
+        run: |
+          wget -O /tmp/arrow-apt-source.deb \
+            "https://packages.apache.org/artifactory/arrow/ubuntu/apache-arrow-apt-source-latest-$(lsb_release --codename --short).deb"
+          apt-get install -y -V /tmp/arrow-apt-source.deb
+          apt-get update
+          apt-get install -y --no-install-recommends libarrow-dev=25.0.1-1 libparquet-dev=25.0.1-1 libarrow-dataset-dev=25.0.1-1
+      - name: Configure (cpu-coverage preset)
+        run: cmake --preset cpu-coverage
+      - name: Build
+        run: cmake --build --preset cpu-coverage
+      - name: Test
+        run: ctest --preset cpu-coverage --output-on-failure
+      - name: Install gcovr
+        run: pip install --break-system-packages gcovr
+      - name: Generate coverage report
+        # Restricted to src/ and include/ -- vendored third-party code
+        # (build/cpu-coverage/_deps) and the tests themselves are never
+        # part of the numerator or denominator; a test file covering
+        # itself would be a meaningless metric.
+        run: |
+          gcovr --root . \
+            --filter 'src/' --filter 'include/' \
+            --exclude '.*_test\.cpp' \
+            --xml-pretty -o coverage.xml \
+            --print-summary \
+            build/cpu-coverage
+      # Tokenless upload works for public GitHub repos on GitHub-hosted
+      # runners (Codecov identifies the repo via the GitHub OIDC token) --
+      # no CODECOV_TOKEN secret required, but one is picked up
+      # automatically if a maintainer ever adds it. fail_ci_if_error:
+      # false so a Codecov-side outage doesn't fail an otherwise-green PR;
+      # the coverage.xml artifact upload below is the fallback if the
+      # Codecov upload itself doesn't go through.
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: coverage.xml
+          fail_ci_if_error: false
+      - name: Upload coverage report artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage.xml
+          retention-days: 30
 
   tpch-tooling-smoke:
     # See cpu-build-test's own comment on why this needs ubuntu:26.04 too.

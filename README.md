@@ -1,6 +1,7 @@
 # KernelLake
 
 [![CI](https://github.com/hurdad/kernel-lake/actions/workflows/ci.yml/badge.svg)](https://github.com/hurdad/kernel-lake/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/hurdad/kernel-lake/branch/main/graph/badge.svg)](https://codecov.io/gh/hurdad/kernel-lake)
 
 **GPU-native analytics for the open lakehouse.**
 

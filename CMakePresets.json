@@ -77,6 +77,16 @@
       "cacheVariables": {
         "KERNELLAKE_ENABLE_OTEL": "ON"
       }
+    },
+    {
+      "name": "cpu-coverage",
+      "displayName": "Coverage (CPU, gcov)",
+      "inherits": "cpu-dev",
+      "description": "cpu-dev plus gcc's --coverage instrumentation (-fprofile-arcs -ftest-coverage at compile time, --coverage at link time), for CI's coverage job -- see .github/workflows/ci.yml's `coverage` job and docs/ARCHITECTURE.md's CI section. Not for day-to-day development: every translation unit rebuilds slower and larger under instrumentation, and .gcda files accumulate on every test run (`ctest --preset cpu-coverage` again overwrites them, not merges) so stale ones must be cleared with a fresh build directory rather than reused across unrelated runs.",
+      "cacheVariables": {
+        "CMAKE_CXX_FLAGS": "--coverage -fprofile-arcs -ftest-coverage",
+        "CMAKE_EXE_LINKER_FLAGS": "--coverage"
+      }
     }
   ],
   "buildPresets": [
@@ -85,7 +95,8 @@
     { "name": "gpu-dev", "configurePreset": "gpu-dev" },
     { "name": "gpu-release", "configurePreset": "gpu-release" },
     { "name": "server-dev", "configurePreset": "server-dev" },
-    { "name": "otel-dev", "configurePreset": "otel-dev" }
+    { "name": "otel-dev", "configurePreset": "otel-dev" },
+    { "name": "cpu-coverage", "configurePreset": "cpu-coverage" }
   ],
   "testPresets": [
     {
@@ -120,6 +131,12 @@
     {
       "name": "otel-dev",
       "configurePreset": "otel-dev",
+      "output": { "outputOnFailure": true },
+      "execution": { "noTestsAction": "error", "stopOnFailure": false }
+    },
+    {
+      "name": "cpu-coverage",
+      "configurePreset": "cpu-coverage",
       "output": { "outputOnFailure": true },
       "execution": { "noTestsAction": "error", "stopOnFailure": false }
     }
