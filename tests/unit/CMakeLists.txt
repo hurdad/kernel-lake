@@ -45,6 +45,8 @@ add_executable(kernellake_unit_tests
   $<$<NOT:$<BOOL:${KERNELLAKE_ENABLE_OTEL}>>:query_tracing_stub_test.cpp>
   result_formatter_test.cpp
   query_command_test.cpp
+  explain_command_test.cpp
+  generate_data_command_test.cpp
   benchmark_tpch_command_test.cpp
   inspect_parquet_command_test.cpp
   $<$<BOOL:${KERNELLAKE_BUILD_SERVER}>:flight_sql_server_test.cpp>

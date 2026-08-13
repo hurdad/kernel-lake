@@ -6,6 +6,8 @@
 #include <gtest/gtest.h>
 
 #include <arrow/api.h>
+#include <arrow/io/file.h>
+#include <arrow/ipc/reader.h>
 #include <nlohmann/json.hpp>
 
 #include <cstdio>
@@ -13,6 +15,7 @@
 #include <fstream>
 #include <sstream>
 
+#include "kernellake/common/errors.hpp"
 #include "kernellake/cli/result_formatter.hpp"
 
 namespace kernellake::cli {
@@ -183,6 +186,147 @@ TEST(ParseResultFormat, RecognizesEveryDocumentedFormatName) {
 
 TEST(ParseResultFormat, RejectsUnknownFormatName) {
   EXPECT_EQ(parse_result_format("xml"), std::nullopt);
+}
+
+// write_table_format() was entirely uncovered -- every prior test in this
+// file exercised ResultFormat::JsonLines only. Column widths must span both
+// the header and the widest cell in that column ("bb" widens "s" past its
+// own 1-char header), locked in byte-for-byte including the
+// dashes-then-two-spaces separator row.
+TEST_F(ResultFormatterTest, TableFormatAlignsColumnsToWidestCellOrHeader) {
+  const auto schema = arrow::schema({arrow::field("n", arrow::int64(), false), arrow::field("s", arrow::utf8(), false)});
+  arrow::Int64Builder n_builder;
+  arrow::StringBuilder s_builder;
+  ASSERT_TRUE(n_builder.Append(1).ok());
+  ASSERT_TRUE(n_builder.Append(2).ok());
+  ASSERT_TRUE(s_builder.Append("a").ok());
+  ASSERT_TRUE(s_builder.Append("bb").ok());
+  std::shared_ptr<arrow::Array> n_array, s_array;
+  ASSERT_TRUE(n_builder.Finish(&n_array).ok());
+  ASSERT_TRUE(s_builder.Finish(&s_array).ok());
+  const auto batch = arrow::RecordBatch::Make(schema, 2, {n_array, s_array});
+
+  QueryResult result;
+  result.schema = schema;
+  result.batches = {batch};
+
+  write_query_result(result, ResultFormat::Table, path_);
+  EXPECT_EQ(read_output(), "n  s   \n-  --  \n1  a   \n2  bb  \n");
+}
+
+TEST_F(ResultFormatterTest, TableFormatRendersNullAsLiteralText) {
+  const auto schema = arrow::schema({arrow::field("n", arrow::int64(), true)});
+  arrow::Int64Builder builder;
+  ASSERT_TRUE(builder.AppendNull().ok());
+  std::shared_ptr<arrow::Array> array;
+  ASSERT_TRUE(builder.Finish(&array).ok());
+  const auto batch = arrow::RecordBatch::Make(schema, 1, {array});
+
+  QueryResult result;
+  result.schema = schema;
+  result.batches = {batch};
+
+  write_query_result(result, ResultFormat::Table, path_);
+  EXPECT_EQ(read_output(), "n     \n----  \nNULL  \n");
+}
+
+// write_csv_format() was entirely uncovered. Arrow's WriteOptions::Defaults()
+// uses "\n" line endings, writes a header row, and (QuotingStyle::Needed)
+// always quotes string-typed headers/values but never numeric ones --
+// verified directly against a real WriteCSV() call before being hardcoded
+// here, same "locks in" approach as scalar_text()'s tests above.
+TEST_F(ResultFormatterTest, CsvFormatWritesHeaderAndRows) {
+  const auto schema = arrow::schema({arrow::field("n", arrow::int64(), false), arrow::field("s", arrow::utf8(), false)});
+  arrow::Int64Builder n_builder;
+  arrow::StringBuilder s_builder;
+  ASSERT_TRUE(n_builder.Append(1).ok());
+  ASSERT_TRUE(n_builder.Append(2).ok());
+  ASSERT_TRUE(s_builder.Append("a").ok());
+  ASSERT_TRUE(s_builder.Append("b").ok());
+  std::shared_ptr<arrow::Array> n_array, s_array;
+  ASSERT_TRUE(n_builder.Finish(&n_array).ok());
+  ASSERT_TRUE(s_builder.Finish(&s_array).ok());
+  const auto batch = arrow::RecordBatch::Make(schema, 2, {n_array, s_array});
+
+  QueryResult result;
+  result.schema = schema;
+  result.batches = {batch};
+
+  write_query_result(result, ResultFormat::Csv, path_);
+  EXPECT_EQ(read_output(), "\"n\",\"s\"\n1,\"a\"\n2,\"b\"\n");
+}
+
+TEST_F(ResultFormatterTest, CsvFormatQuotesValuesContainingDelimiter) {
+  const auto schema = arrow::schema({arrow::field("s", arrow::utf8(), false)});
+  arrow::StringBuilder builder;
+  ASSERT_TRUE(builder.Append("a,b").ok());
+  std::shared_ptr<arrow::Array> array;
+  ASSERT_TRUE(builder.Finish(&array).ok());
+  const auto batch = arrow::RecordBatch::Make(schema, 1, {array});
+
+  QueryResult result;
+  result.schema = schema;
+  result.batches = {batch};
+
+  write_query_result(result, ResultFormat::Csv, path_);
+  EXPECT_EQ(read_output(), "\"s\"\n\"a,b\"\n");
+}
+
+// write_arrow_ipc_format() was entirely uncovered. Round-trips the written
+// file back through Arrow's own IPC reader rather than asserting on raw
+// bytes (the IPC container format isn't meant to be hand-verified).
+TEST_F(ResultFormatterTest, ArrowIpcFormatRoundTripsThroughRealReader) {
+  const auto schema = arrow::schema({arrow::field("n", arrow::int64(), false)});
+  arrow::Int64Builder builder;
+  ASSERT_TRUE(builder.Append(7).ok());
+  ASSERT_TRUE(builder.Append(9).ok());
+  std::shared_ptr<arrow::Array> array;
+  ASSERT_TRUE(builder.Finish(&array).ok());
+  const auto batch = arrow::RecordBatch::Make(schema, 2, {array});
+
+  QueryResult result;
+  result.schema = schema;
+  result.batches = {batch};
+
+  write_query_result(result, ResultFormat::ArrowIpc, path_);
+
+  auto input = arrow::io::ReadableFile::Open(path_);
+  ASSERT_TRUE(input.ok()) << input.status().ToString();
+  auto reader = arrow::ipc::RecordBatchFileReader::Open(*input);
+  ASSERT_TRUE(reader.ok()) << reader.status().ToString();
+  ASSERT_EQ((*reader)->num_record_batches(), 1);
+  auto read_batch = (*reader)->ReadRecordBatch(0);
+  ASSERT_TRUE(read_batch.ok()) << read_batch.status().ToString();
+  ASSERT_TRUE((*read_batch)->schema()->Equals(*schema));
+  ASSERT_EQ((*read_batch)->num_rows(), 2);
+  EXPECT_EQ(std::static_pointer_cast<arrow::Int64Array>((*read_batch)->column(0))->Value(0), 7);
+  EXPECT_EQ(std::static_pointer_cast<arrow::Int64Array>((*read_batch)->column(0))->Value(1), 9);
+}
+
+// Every format funnels through open_binary_sink()/fopen() for its output
+// file, and an unwritable path (a directory that doesn't exist, so the
+// underlying open(2) fails) is the one error path none of the format
+// functions handle specially -- exercises each one's own
+// arrow_status_message()-wrapped ExecutionError.
+TEST_F(ResultFormatterTest, TableFormatThrowsOnUnopenableOutputPath) {
+  const std::string bad_path = (dir_ / "does-not-exist" / "out").string();
+  QueryResult result;
+  result.schema = arrow::schema({arrow::field("n", arrow::int64(), false)});
+  EXPECT_THROW(write_query_result(result, ResultFormat::Table, bad_path), ExecutionError);
+}
+
+TEST_F(ResultFormatterTest, CsvFormatThrowsOnUnopenableOutputPath) {
+  const std::string bad_path = (dir_ / "does-not-exist" / "out").string();
+  QueryResult result;
+  result.schema = arrow::schema({arrow::field("n", arrow::int64(), false)});
+  EXPECT_THROW(write_query_result(result, ResultFormat::Csv, bad_path), ExecutionError);
+}
+
+TEST_F(ResultFormatterTest, ArrowIpcFormatThrowsOnUnopenableOutputPath) {
+  const std::string bad_path = (dir_ / "does-not-exist" / "out").string();
+  QueryResult result;
+  result.schema = arrow::schema({arrow::field("n", arrow::int64(), false)});
+  EXPECT_THROW(write_query_result(result, ResultFormat::ArrowIpc, bad_path), ExecutionError);
 }
 
 }  // namespace
