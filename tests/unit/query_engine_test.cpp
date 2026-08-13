@@ -84,6 +84,14 @@ TEST_F(QueryEngineTest, ExplainRejectsUnknownColumnWithBindingError) {
                BindingError);
 }
 
+// register_cache_otel_instruments() was never called by any prior test --
+// backend-independent (just wires up the NVMe cache's own OTel instruments,
+// see storage/nvme_cache_otel.hpp), so this doesn't need query execution to
+// actually work on this build.
+TEST_F(QueryEngineTest, RegisterCacheOtelInstrumentsDoesNotThrow) {
+  EXPECT_NO_THROW(engine_.register_cache_otel_instruments());
+}
+
 #ifdef KERNELLAKE_WITH_CUDA
 // GPU-enabled build: execute() actually runs the query -- correctness is
 // covered in depth by tests/gpu/query_engine_execute_test.cpp, but a smoke

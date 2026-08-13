@@ -797,6 +797,74 @@ TEST_F(QueryEngineExecuteCpuTest, NestedHavingSubqueryResolvesInnerSubqueryFirst
   EXPECT_DOUBLE_EQ(total_column->Value(0), 110.0);
 }
 
+// scalar_to_literal() (query_engine.cpp) has a dedicated case for each of
+// DOUBLE/INT64/STRING -- every HAVING/IN-subquery test above returns
+// DOUBLE (SUM) or STRING (region), never a plain INT64 scalar. COUNT(*)
+// (INT64) as a HAVING subquery's own result exercises it here: COUNT(*)
+// over all 6 rows is 6, so "* 10" folds the threshold to 60, excluding
+// region A's 35.0 and keeping region B's 110.0 -- same split as the
+// literal-threshold test above, just reached through an INT64 subquery
+// result instead of a DOUBLE one.
+TEST_F(QueryEngineExecuteCpuTest, HavingSubqueryThresholdFromIntegerCountSucceeds) {
+  const QueryResult result = engine_.execute(
+      "SELECT region, SUM(amount) AS total FROM read_parquet('" + path_ +
+      "') GROUP BY region HAVING SUM(amount) > (SELECT COUNT(*) FROM read_parquet('" + path_ + "')) * 10");
+
+  ASSERT_EQ(result.rows_returned, 1);
+  const std::shared_ptr<arrow::RecordBatch>& batch = result.batches.front();
+  const auto region_column = std::static_pointer_cast<arrow::StringArray>(batch->GetColumnByName("region"));
+  ASSERT_NE(region_column, nullptr);
+  EXPECT_EQ(region_column->GetString(0), "B");
+}
+
+// scalar_to_literal()'s `!scalar->is_valid` branch: a non-grouped scalar
+// aggregate (unlike a plain column SELECT) always emits exactly one row
+// even over zero matching input rows -- SUM of zero rows is NULL, not a
+// zero-row result -- so this differs from
+// HavingSubqueryReturningZeroRowsThrowsExecutionError above (a plain
+// column SELECT, which genuinely returns zero rows there). Both regions'
+// totals are > 0, so if the NULL check on the right side of OR evaluates
+// true for every group (proving scalar_to_literal successfully produced a
+// null AstLiteral rather than throwing), both survive.
+TEST_F(QueryEngineExecuteCpuTest, HavingSubqueryReturningNullScalarSucceeds) {
+  const QueryResult result = engine_.execute(
+      "SELECT region, SUM(amount) AS total FROM read_parquet('" + path_ +
+      "') GROUP BY region HAVING SUM(amount) > 0 AND (SELECT SUM(amount) FROM read_parquet('" + path_ +
+      "') WHERE region = 'nonexistent') IS NULL");
+
+  EXPECT_EQ(result.rows_returned, 2);
+}
+
+// scalar_to_literal()'s final throw: a subquery result type other than
+// DOUBLE/INT64/STRING (here, MIN(event_date) -- DATE32) is rejected with a
+// clear error rather than silently miscompiling.
+TEST_F(QueryEngineExecuteCpuTest, HavingSubqueryReturningUnsupportedTypeThrowsExecutionError) {
+  EXPECT_THROW((void)(engine_.execute("SELECT region, SUM(amount) AS total FROM read_parquet('" + path_ +
+                                      "') GROUP BY region HAVING SUM(amount) > 0 AND "
+                                      "(SELECT MIN(event_date) FROM read_parquet('" +
+                                      path_ + "')) IS NOT NULL")),
+               ExecutionError);
+}
+
+// run_subquery()'s `resolved.join.has_value()` branch (a HAVING/IN
+// subquery that itself joins two sources) had no coverage at all -- every
+// prior subquery test above has a single-table FROM. Same 0.3-of-total
+// threshold/135-split shape as HavingWithScalarSubqueryThresholdFiltersGroups,
+// just computed by a subquery that joins sales back onto regions instead
+// of reading sales alone.
+TEST_F(QueryEngineExecuteCpuTest, HavingSubqueryContainingAJoinSucceeds) {
+  const QueryResult result = engine_.execute(
+      "SELECT region, SUM(amount) AS total FROM read_parquet('" + path_ +
+      "') GROUP BY region HAVING SUM(amount) > (SELECT SUM(s.amount) * 0.3 FROM read_parquet('" + path_ +
+      "') AS s JOIN read_parquet('" + regions_path_ + "') AS r ON s.region = r.region)");
+
+  ASSERT_EQ(result.rows_returned, 1);
+  const std::shared_ptr<arrow::RecordBatch>& batch = result.batches.front();
+  const auto region_column = std::static_pointer_cast<arrow::StringArray>(batch->GetColumnByName("region"));
+  ASSERT_NE(region_column, nullptr);
+  EXPECT_EQ(region_column->GetString(0), "B");
+}
+
 TEST_F(QueryEngineExecuteCpuTest, HavingSubqueryReturningZeroRowsThrowsExecutionError) {
   EXPECT_THROW((void)(engine_.execute("SELECT region, SUM(amount) AS total FROM read_parquet('" + path_ +
                                       "') GROUP BY region HAVING SUM(amount) > "
