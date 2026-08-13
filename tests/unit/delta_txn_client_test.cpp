@@ -3,6 +3,8 @@
 #include <grpcpp/grpcpp.h>
 #include <gtest/gtest.h>
 
+#include <filesystem>
+#include <fstream>
 #include <memory>
 #include <string>
 
@@ -91,6 +93,34 @@ DeltaSection endpoint_config(const std::string& endpoint) {
   config.grpc_endpoint = endpoint;
   return config;
 }
+
+// A real (but throwaway) self-signed certificate -- generated once via
+// `openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days
+// 3650 -nodes -subj "/CN=kernellake-test-ca"` -- for the use_tls tests
+// below, which need real, parseable PEM content, not just any file with
+// bytes in it: build_credentials() (delta_txn_client.cpp) hands
+// tls_ca_cert_path's contents to grpc::SslCredentialsOptions::
+// pem_root_certs verbatim.
+constexpr const char* kSelfSignedTestCertPem = R"pem(-----BEGIN CERTIFICATE-----
+MIIDGzCCAgOgAwIBAgIUbepPJ0w32aRsyjVeHnFWfk+aWCgwDQYJKoZIhvcNAQEL
+BQAwHTEbMBkGA1UEAwwSa2VybmVsbGFrZS10ZXN0LWNhMB4XDTI2MDgxMzAwMTU0
+N1oXDTM2MDgxMDAwMTU0N1owHTEbMBkGA1UEAwwSa2VybmVsbGFrZS10ZXN0LWNh
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA4xpbWKbsu2uPVizDTXPA
+bxwIn3G0DF8lc7nfd0XFbg6ZxAixc3e+huEiQS/REilkWzns3LM1y2mw2Xu9FQfw
+VyG+er6XpisZgz8eiE/aElZIlYW93vmg3hoZDdHJccoeUnhqEYWfbOH/wkwnCbO2
+DKmeOlryCbjPiM1egdNUP6kEWikHe8S7gFWxj0XUD5IFabzBFPQIyRH+yuB+jDl9
+XVpOO4rP3nW4c132zdObSrvFxsiMTu0tk6RDGdK50+4laH0REtThLVp90KcvMmJ1
+M/3/b7r95BeXrzwPntVOOC78mVXnKyZ3oxFRQOyCw/bscOoYcqo5J4b2QuO3VFb7
+oQIDAQABo1MwUTAdBgNVHQ4EFgQUInm6ywMB2mBvQr5d74qbtG/qJF0wHwYDVR0j
+BBgwFoAUInm6ywMB2mBvQr5d74qbtG/qJF0wDwYDVR0TAQH/BAUwAwEB/zANBgkq
+hkiG9w0BAQsFAAOCAQEAToV0sOw9usEx7CNZEG9VtipqWQrLJ4cE3a4GQtd71Y/g
+4JhB4VlxdTL+ka8OsBlpmxWuX+9JIlHszId0CzmjIwq/w3X7BMrPdoMsbk9HvBip
+hrYwYGxF4ArXXdsNO5TsL5kICw4Z9osvPTLqMzx5TEKGQYfNQJBSSQG9vV2HCBZ7
+l2Oj33SWWGrAQcqlmYtMOyMhyY+Oj2P/Rn/BqUUjS6alRJZM95nJ5KbDVEQRaKLg
+NyNz2LMHJ8hp1NtDpZ7epA5SzsRoyuBFtsuWpJQmnjlaKjF+bizMu/+QBmr4nwiX
+cuGxQtdsWW5CGKOCP7iFG3kRUrMKNzC8rdZ9KjxNtA==
+-----END CERTIFICATE-----
+)pem";
 
 TEST(DeltaTxnClient, GetTableReturnsTranslatedMetadata) {
   LocalDeltaTxnServer server;
@@ -263,6 +293,39 @@ TEST(DeltaTxnClient, ListActiveFilesThrowsOnStreamFailure) {
 
 TEST(DeltaTxnClient, ConstructorThrowsWhenEndpointIsEmpty) {
   EXPECT_THROW((void)(DeltaTxnClient(DeltaSection{})), ConfigurationError);
+}
+
+// grpc::CreateChannel()/grpc::SslCredentials() never actually connect or
+// parse the PEM content at construction time (TLS handshake, and thus any
+// certificate parsing, only happens lazily on the first real RPC) -- so
+// this is real, deterministic coverage of the use_tls/SslCredentials/
+// CA-cert-file-read path (delta_txn_client.cpp:17-37) without needing a
+// live TLS-terminated gRPC server: constructing with a real, readable CA
+// cert file must not throw.
+TEST(DeltaTxnClient, ConstructorSucceedsWithTlsAndReadableCaCertPath) {
+  namespace fs = std::filesystem;
+  const fs::path cert_path =
+      fs::temp_directory_path() /
+      fs::path("kernellake_delta_txn_client_test_ca_" +
+               std::to_string(::testing::UnitTest::GetInstance()->random_seed()) + ".pem");
+  {
+    std::ofstream cert_file(cert_path);
+    cert_file << kSelfSignedTestCertPem;
+  }
+
+  DeltaSection config = endpoint_config("127.0.0.1:1");  // never actually dialed
+  config.use_tls = true;
+  config.tls_ca_cert_path = cert_path.string();
+  EXPECT_NO_THROW((void)(DeltaTxnClient(config)));
+
+  fs::remove(cert_path);
+}
+
+TEST(DeltaTxnClient, ConstructorThrowsWhenTlsCaCertPathIsUnreadable) {
+  DeltaSection config = endpoint_config("127.0.0.1:1");
+  config.use_tls = true;
+  config.tls_ca_cert_path = "/nonexistent/path/kernellake-test-ca.pem";
+  EXPECT_THROW((void)(DeltaTxnClient(config)), ConfigurationError);
 }
 
 TEST(DeltaTxnClient, ThrowsOnConnectionFailure) {

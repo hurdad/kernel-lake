@@ -302,6 +302,149 @@ TEST_F(ManifestReaderTest, ReadsDataFileContentFieldWhenPresent) {
   EXPECT_EQ(entries[0].content, 1);
 }
 
+// Same shape as kManifestSchemaJson, but with data_file.file_path missing
+// from the schema entirely -- get_required_string() must reject a
+// *structurally valid* Avro file that simply never declared a required
+// field, not just whole-file corruption (already covered by
+// ThrowsOnNonAvroBytes/ThrowsOnEmptyBytes below).
+constexpr const char* kManifestSchemaMissingFilePathJson = R"({
+  "type": "record",
+  "name": "manifest_entry",
+  "fields": [
+    {"name": "status", "type": "int"},
+    {"name": "data_file", "type": {
+      "type": "record",
+      "name": "r2",
+      "fields": [
+        {"name": "file_format", "type": "string"},
+        {"name": "record_count", "type": "long"},
+        {"name": "file_size_in_bytes", "type": "long"},
+        {"name": "partition", "type": {"type": "record", "name": "r102", "fields": []}}
+      ]
+    }}
+  ]
+})";
+
+// Same shape as kManifestSchemaJson, but data_file.record_count is declared
+// "string" instead of "long" -- get_required_long() must reject a field
+// that's present but the wrong Avro type, not just a missing one.
+constexpr const char* kManifestSchemaWrongRecordCountTypeJson = R"({
+  "type": "record",
+  "name": "manifest_entry",
+  "fields": [
+    {"name": "status", "type": "int"},
+    {"name": "data_file", "type": {
+      "type": "record",
+      "name": "r2",
+      "fields": [
+        {"name": "file_path", "type": "string"},
+        {"name": "file_format", "type": "string"},
+        {"name": "record_count", "type": "string"},
+        {"name": "file_size_in_bytes", "type": "long"},
+        {"name": "partition", "type": {"type": "record", "name": "r102", "fields": []}}
+      ]
+    }}
+  ]
+})";
+
+TEST_F(ManifestReaderTest, ThrowsWhenDataFileIsMissingARequiredField) {
+  AvroFixtureWriter writer(kManifestSchemaMissingFilePathJson);
+  const std::string bytes = writer.write(dir_ / "m0.avro", {[](avro_value_t& v) {
+                                           set_int_field(v, "status", 1);
+                                           avro_value_t data_file;
+                                           avro_value_get_by_name(&v, "data_file", &data_file, nullptr);
+                                           set_string_field(data_file, "file_format", "PARQUET");
+                                           set_long_field(data_file, "record_count", 1);
+                                           set_long_field(data_file, "file_size_in_bytes", 1);
+                                         }});
+
+  EXPECT_THROW((void)(read_manifest_bytes(bytes)), StorageError);
+}
+
+TEST_F(ManifestReaderTest, ThrowsWhenARequiredFieldHasTheWrongAvroType) {
+  AvroFixtureWriter writer(kManifestSchemaWrongRecordCountTypeJson);
+  const std::string bytes =
+      writer.write(dir_ / "m0.avro", {[](avro_value_t& v) {
+                     set_int_field(v, "status", 1);
+                     avro_value_t data_file;
+                     avro_value_get_by_name(&v, "data_file", &data_file, nullptr);
+                     set_string_field(data_file, "file_path", "s3://warehouse/db/orders/part-0.parquet");
+                     set_string_field(data_file, "file_format", "PARQUET");
+                     set_string_field(data_file, "record_count", "not-a-long");  // wrong Avro type
+                     set_long_field(data_file, "file_size_in_bytes", 1);
+                   }});
+
+  EXPECT_THROW((void)(read_manifest_bytes(bytes)), StorageError);
+}
+
+// Same shape as kManifestListSchemaJson, but manifest_path is missing from
+// the schema -- the manifest-list-entry analog of
+// ThrowsWhenDataFileIsMissingARequiredField above.
+constexpr const char* kManifestListSchemaMissingManifestPathJson = R"({
+  "type": "record",
+  "name": "manifest_file",
+  "fields": [
+    {"name": "manifest_length", "type": "long"},
+    {"name": "partition_spec_id", "type": "int"},
+    {"name": "content", "type": "int"},
+    {"name": "added_snapshot_id", "type": "long"}
+  ]
+})";
+
+TEST_F(ManifestReaderTest, ThrowsWhenManifestListEntryIsMissingARequiredField) {
+  AvroFixtureWriter writer(kManifestListSchemaMissingManifestPathJson);
+  const std::string bytes = writer.write(dir_ / "snap-1.avro", {[](avro_value_t& v) {
+                                           set_long_field(v, "manifest_length", 1234);
+                                           set_int_field(v, "partition_spec_id", 0);
+                                           set_int_field(v, "content", 0);
+                                           set_long_field(v, "added_snapshot_id", 42);
+                                         }});
+
+  EXPECT_THROW((void)(read_manifest_list_bytes(bytes)), StorageError);
+}
+
+// data_file.partition declared as a plain "int" instead of a record --
+// decode_partition_struct()'s avro_value_get_size() call fails on a scalar
+// value the same way it would on any non-record/array/map type, exercising
+// its own "couldn't size 'partition' struct" throw path (manifest_reader.cpp
+// :227-232) rather than the more commonly-hit "missing 'partition'
+// altogether" path.
+constexpr const char* kManifestSchemaScalarPartitionJson = R"({
+  "type": "record",
+  "name": "manifest_entry",
+  "fields": [
+    {"name": "status", "type": "int"},
+    {"name": "data_file", "type": {
+      "type": "record",
+      "name": "r2",
+      "fields": [
+        {"name": "file_path", "type": "string"},
+        {"name": "file_format", "type": "string"},
+        {"name": "record_count", "type": "long"},
+        {"name": "file_size_in_bytes", "type": "long"},
+        {"name": "partition", "type": "int"}
+      ]
+    }}
+  ]
+})";
+
+TEST_F(ManifestReaderTest, ThrowsWhenPartitionFieldIsNotAStruct) {
+  AvroFixtureWriter writer(kManifestSchemaScalarPartitionJson);
+  const std::string bytes =
+      writer.write(dir_ / "m0.avro", {[](avro_value_t& v) {
+                     set_int_field(v, "status", 1);
+                     avro_value_t data_file;
+                     avro_value_get_by_name(&v, "data_file", &data_file, nullptr);
+                     set_string_field(data_file, "file_path", "s3://warehouse/db/orders/part-0.parquet");
+                     set_string_field(data_file, "file_format", "PARQUET");
+                     set_long_field(data_file, "record_count", 1);
+                     set_long_field(data_file, "file_size_in_bytes", 1);
+                     set_int_field(data_file, "partition", 7);
+                   }});
+
+  EXPECT_THROW((void)(read_manifest_bytes(bytes)), StorageError);
+}
+
 TEST_F(ManifestReaderTest, ThrowsOnNonAvroBytes) {
   EXPECT_THROW((void)(read_manifest_list_bytes("this is not an avro object container file")), StorageError);
 }

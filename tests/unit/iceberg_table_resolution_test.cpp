@@ -563,6 +563,97 @@ TEST_F(IcebergTableResolutionTest, ThrowsWhenDataFileSchemaDoesNotMatchTableSche
   server.join();
 }
 
+TEST_F(IcebergTableResolutionTest, ThrowsWhenDataFileSchemaHasSameColumnCountButDifferentType) {
+  // Same column count (2) as the declared table schema (id: long, amount:
+  // double), but "id" is written as int32 -- must still be rejected as an
+  // evolved/incompatible schema, not silently accepted just because the
+  // column counts line up (unlike ThrowsWhenDataFileSchemaDoesNotMatchTableSchema
+  // above, which differs in column count).
+  arrow::Int32Builder id_builder;
+  arrow::DoubleBuilder amount_builder;
+  ASSERT_TRUE(id_builder.Append(1).ok());
+  ASSERT_TRUE(amount_builder.Append(1.5).ok());
+  std::shared_ptr<arrow::Array> id_array;
+  std::shared_ptr<arrow::Array> amount_array;
+  ASSERT_TRUE(id_builder.Finish(&id_array).ok());
+  ASSERT_TRUE(amount_builder.Finish(&amount_array).ok());
+  const auto mismatched_schema = arrow::schema(
+      {arrow::field("id", arrow::int32(), false), arrow::field("amount", arrow::float64(), true)});
+  const auto table = arrow::Table::Make(mismatched_schema, {id_array, amount_array});
+  const fs::path data_path = dir_ / "data-0.parquet";
+  auto sink_result = arrow::io::FileOutputStream::Open(data_path.string());
+  ASSERT_TRUE(sink_result.ok());
+  ASSERT_TRUE(parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), *sink_result, 1).ok());
+
+  const fs::path manifest = write_manifest("m0.avro", {{data_path.string(), 1}}, 1);
+  const fs::path manifest_list = write_manifest_list("snap-42.avro", {{manifest.string(), 0}});
+
+  LoopbackHttpServer server;
+  server.respond({http_ok_json(load_table_result_json(manifest_list.string()))});
+
+  IcebergCatalogSection config;
+  config.catalog_uri = server.base_url();
+  IcebergRestCatalogClient catalog(config);
+
+  EXPECT_THROW((void)(resolve_iceberg_table(store_, catalog, {"db"}, "orders", {})), StorageError);
+  server.join();
+}
+
+// A manifest-list entry whose partition_spec_id (write_manifest_list()
+// always writes 0) doesn't match any spec-id the table's own metadata
+// declares (only spec-id 1 here) -- find_partition_spec() falls back to
+// nullptr, and partition pruning simply never applies: even though the
+// predicate below would otherwise prune the "EU" file (see
+// PartitionPruningSkipsFilesWithoutOpeningThem), both files must still
+// come back, proving the spec==nullptr fallback path (not a crash, not a
+// wrong prune) actually runs.
+TEST_F(IcebergTableResolutionTest, MissingPartitionSpecFallsBackToNoPruning) {
+  write_data_file_with_region(dir_ / "data-us.parquet", 0, 5, "US");
+  write_data_file_with_region(dir_ / "data-eu.parquet", 5, 3, "EU");
+
+  const fs::path manifest = write_manifest_with_region_partition(
+      "m0.avro",
+      {{(dir_ / "data-us.parquet").string(), 5, "US"}, {(dir_ / "data-eu.parquet").string(), 3, "EU"}});
+  // partition_spec_id 0, but the table below only declares spec-id 1.
+  const fs::path manifest_list = write_manifest_list("snap-42.avro", {{manifest.string(), 0}});
+
+  const std::string json = fmt::format(R"json({{
+    "metadata": {{
+      "format-version": 2,
+      "location": "{0}",
+      "current-schema-id": 0,
+      "schemas": [{{"schema-id": 0, "fields": [
+        {{"id": 1, "name": "id", "required": true, "type": "long"}},
+        {{"id": 2, "name": "amount", "required": false, "type": "double"}},
+        {{"id": 3, "name": "region", "required": false, "type": "string"}}
+      ]}}],
+      "current-snapshot-id": 42,
+      "snapshots": [{{"snapshot-id": 42, "manifest-list": "{1}"}}],
+      "partition-specs": [
+        {{"spec-id": 1, "fields": [
+          {{"source-id": 3, "field-id": 1000, "name": "region", "transform": "identity"}}
+        ]}}
+      ]
+    }}
+  }})json",
+                                       dir_.string(), manifest_list.string());
+
+  LoopbackHttpServer server;
+  server.respond({http_ok_json(json)});
+
+  IcebergCatalogSection config;
+  config.catalog_uri = server.base_url();
+  IcebergRestCatalogClient catalog(config);
+
+  const std::vector<PushablePredicate> predicates = {
+      PushablePredicate{"region", BinaryOperator::Equal,
+                        std::make_shared<LiteralExpression>(LiteralExpression::make_string("US"))}};
+  const ResolvedTable resolved = resolve_iceberg_table(store_, catalog, {"db"}, "orders", predicates);
+  server.join();
+
+  ASSERT_EQ(resolved.files.size(), 2u);
+}
+
 TEST_F(IcebergTableResolutionTest, TableWithNoCurrentSnapshotResolvesToZeroFiles) {
   const std::string json = R"json({
     "metadata": {

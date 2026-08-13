@@ -301,6 +301,102 @@ TEST(IcebergRestCatalogClient, ThrowsWhenLocationFieldIsMissing) {
   server.join();
 }
 
+TEST(IcebergRestCatalogClient, ThrowsWhenASchemaFieldIsMissingARequiredAttribute) {
+  constexpr const char* kBadJson = R"({
+    "metadata": {
+      "format-version": 2,
+      "location": "s3://warehouse/db/orders",
+      "current-schema-id": 0,
+      "schemas": [{"schema-id": 0, "fields": [{"id": 1, "required": true, "type": "long"}]}]
+    }
+  })";
+  LoopbackHttpServer server;
+  server.respond({http_ok_json(kBadJson)});
+
+  IcebergRestCatalogClient client(catalog_config(server.base_url()));
+  EXPECT_THROW((void)(client.load_table_metadata({"db"}, "orders")), StorageError);
+  server.join();
+}
+
+TEST(IcebergRestCatalogClient, ThrowsWhenAPartitionSpecFieldIsMissingARequiredAttribute) {
+  constexpr const char* kBadJson = R"({
+    "metadata": {
+      "format-version": 2,
+      "location": "s3://warehouse/db/orders",
+      "current-schema-id": 0,
+      "schemas": [{"schema-id": 0, "fields": [{"id": 1, "name": "id", "required": true, "type": "long"}]}],
+      "partition-specs": [
+        {"spec-id": 0, "fields": [{"field-id": 1000, "name": "id_bucket", "transform": "bucket[4]"}]}
+      ]
+    }
+  })";
+  LoopbackHttpServer server;
+  server.respond({http_ok_json(kBadJson)});
+
+  IcebergRestCatalogClient client(catalog_config(server.base_url()));
+  EXPECT_THROW((void)(client.load_table_metadata({"db"}, "orders")), StorageError);
+  server.join();
+}
+
+TEST(IcebergRestCatalogClient, ThrowsWhenASnapshotEntryIsMissingARequiredField) {
+  constexpr const char* kBadJson = R"({
+    "metadata": {
+      "format-version": 2,
+      "location": "s3://warehouse/db/orders",
+      "current-snapshot-id": 42,
+      "snapshots": [{"snapshot-id": 42}]
+    }
+  })";
+  LoopbackHttpServer server;
+  server.respond({http_ok_json(kBadJson)});
+
+  IcebergRestCatalogClient client(catalog_config(server.base_url()));
+  EXPECT_THROW((void)(client.load_table_metadata({"db"}, "orders")), StorageError);
+  server.join();
+}
+
+TEST(IcebergRestCatalogClient, ThrowsWhenOauth2ResponseIsMissingAccessToken) {
+  LoopbackHttpServer server;
+  server.respond({http_ok_json(R"({"expires_in": 3600})")});
+
+  IcebergCatalogSection config = catalog_config(server.base_url());
+  config.credentials_kind = "oauth2_client_credentials";
+  config.oauth2_client_id = "my-client";
+  config.oauth2_client_secret = "my-secret";
+  IcebergRestCatalogClient client(config);
+  EXPECT_THROW((void)(client.load_table_metadata({"db"}, "orders")), StorageError);
+  server.join();
+}
+
+// Proves fetch_oauth2_token()'s own local cached_oauth2_token_/
+// oauth2_token_expiry_unix_seconds_ fast path actually skips the real
+// token-endpoint round trip on a second call from the *same* client
+// instance -- the token server is only handed one canned response, so a
+// second real fetch would find nothing listening and fail/hang instead of
+// silently passing (see LoopbackHttpServer::respond()'s own doc comment).
+TEST(IcebergRestCatalogClient, LoadTableMetadataTwiceOnTheSameClientOnlyFetchesTheTokenOnce) {
+  LoopbackHttpServer server;
+  std::vector<std::string> requests(3);
+  const std::string token_response = R"({"access_token": "cached-token", "expires_in": 3600})";
+  server.respond(
+      {http_ok_json(token_response), http_ok_json(kLoadTableResultJson), http_ok_json(kLoadTableResultJson)},
+      &requests);
+
+  IcebergCatalogSection config = catalog_config(server.base_url());
+  config.credentials_kind = "oauth2_client_credentials";
+  config.oauth2_client_id = "my-client";
+  config.oauth2_client_secret = "my-secret";
+  IcebergRestCatalogClient client(config);
+
+  (void)client.load_table_metadata({"db"}, "orders");
+  (void)client.load_table_metadata({"db"}, "orders");
+  server.join();
+
+  EXPECT_NE(requests[0].find("POST /v1/oauth/tokens"), std::string::npos);
+  EXPECT_NE(requests[1].find("Authorization: Bearer cached-token"), std::string::npos);
+  EXPECT_NE(requests[2].find("Authorization: Bearer cached-token"), std::string::npos);
+}
+
 TEST(IcebergRestCatalogClient, ThrowsOnConnectionFailure) {
   // Nothing listens on this port: curl_easy_perform() should fail with
   // CURLE_COULDNT_CONNECT before any HTTP status even exists.

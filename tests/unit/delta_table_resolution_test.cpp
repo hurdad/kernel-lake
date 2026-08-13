@@ -213,6 +213,182 @@ TEST_F(DeltaTableResolutionTest, ThrowsWhenFileIsMissingAPartitionValue) {
   EXPECT_THROW((void)(resolve_delta_table(store_, client, dir_.string())), StorageError);
 }
 
+// Regression test for the real bug this file's parse_delta_partition_value()
+// used to have: std::stoll()/std::stod() on a malformed numeric partition
+// value threw a raw, uncaught std::invalid_argument instead of this
+// project's own StorageError -- any caller expecting to catch StorageError
+// (every other error path in this file, and every other resolve_*_table()
+// across the codebase) would see it escape uncaught instead.
+TEST_F(DeltaTableResolutionTest, ThrowsStorageErrorOnMalformedNumericPartitionValue) {
+  write_data_file("data-0.parquet", 0, 5);
+
+  LocalDeltaTxnServer server;
+  ::delta::txn::v1::ListActiveFilesResponse header;
+  header.mutable_header()->set_version(1);
+  header.mutable_header()->mutable_metadata()->set_schema_string(
+      R"json({"type":"struct","fields":[
+    {"name":"id","type":"long","nullable":false,"metadata":{}},
+    {"name":"amount","type":"double","nullable":true,"metadata":{}},
+    {"name":"day","type":"integer","nullable":true,"metadata":{}}
+  ]})json");
+  header.mutable_header()->mutable_metadata()->add_partition_columns("day");
+  server.service().list_active_files_responses.push_back(header);
+
+  ::delta::txn::v1::ListActiveFilesResponse batch;
+  ::delta::txn::v1::AddFile* file0 = batch.mutable_batch()->add_files();
+  file0->set_path("data-0.parquet");
+  (*file0->mutable_partition_values())["day"] = "abc";  // not a valid integer
+  server.service().list_active_files_responses.push_back(batch);
+
+  DeltaTxnClient client(endpoint_config(server.endpoint()));
+  EXPECT_THROW((void)(resolve_delta_table(store_, client, dir_.string())), StorageError);
+}
+
+TEST_F(DeltaTableResolutionTest, ThrowsStorageErrorOnMalformedFloatingPointPartitionValue) {
+  write_data_file("data-0.parquet", 0, 5);
+
+  LocalDeltaTxnServer server;
+  ::delta::txn::v1::ListActiveFilesResponse header;
+  header.mutable_header()->set_version(1);
+  header.mutable_header()->mutable_metadata()->set_schema_string(
+      R"json({"type":"struct","fields":[
+    {"name":"id","type":"long","nullable":false,"metadata":{}},
+    {"name":"amount","type":"double","nullable":true,"metadata":{}},
+    {"name":"weight","type":"double","nullable":true,"metadata":{}}
+  ]})json");
+  header.mutable_header()->mutable_metadata()->add_partition_columns("weight");
+  server.service().list_active_files_responses.push_back(header);
+
+  ::delta::txn::v1::ListActiveFilesResponse batch;
+  ::delta::txn::v1::AddFile* file0 = batch.mutable_batch()->add_files();
+  file0->set_path("data-0.parquet");
+  (*file0->mutable_partition_values())["weight"] = "not-a-number";
+  server.service().list_active_files_responses.push_back(batch);
+
+  DeltaTxnClient client(endpoint_config(server.endpoint()));
+  EXPECT_THROW((void)(resolve_delta_table(store_, client, dir_.string())), StorageError);
+}
+
+TEST_F(DeltaTableResolutionTest, ThrowsWhenBooleanPartitionValueIsNeitherTrueNorFalse) {
+  write_data_file("data-0.parquet", 0, 5);
+
+  LocalDeltaTxnServer server;
+  ::delta::txn::v1::ListActiveFilesResponse header;
+  header.mutable_header()->set_version(1);
+  header.mutable_header()->mutable_metadata()->set_schema_string(
+      R"json({"type":"struct","fields":[
+    {"name":"id","type":"long","nullable":false,"metadata":{}},
+    {"name":"amount","type":"double","nullable":true,"metadata":{}},
+    {"name":"active","type":"boolean","nullable":true,"metadata":{}}
+  ]})json");
+  header.mutable_header()->mutable_metadata()->add_partition_columns("active");
+  server.service().list_active_files_responses.push_back(header);
+
+  ::delta::txn::v1::ListActiveFilesResponse batch;
+  ::delta::txn::v1::AddFile* file0 = batch.mutable_batch()->add_files();
+  file0->set_path("data-0.parquet");
+  (*file0->mutable_partition_values())["active"] = "1";  // neither "true" nor "false"
+  server.service().list_active_files_responses.push_back(batch);
+
+  DeltaTxnClient client(endpoint_config(server.endpoint()));
+  EXPECT_THROW((void)(resolve_delta_table(store_, client, dir_.string())), StorageError);
+}
+
+TEST_F(DeltaTableResolutionTest, ThrowsOnTimestampTypedPartitionColumn) {
+  write_data_file("data-0.parquet", 0, 5);
+
+  LocalDeltaTxnServer server;
+  ::delta::txn::v1::ListActiveFilesResponse header;
+  header.mutable_header()->set_version(1);
+  header.mutable_header()->mutable_metadata()->set_schema_string(
+      R"json({"type":"struct","fields":[
+    {"name":"id","type":"long","nullable":false,"metadata":{}},
+    {"name":"amount","type":"double","nullable":true,"metadata":{}},
+    {"name":"created_at","type":"timestamp","nullable":true,"metadata":{}}
+  ]})json");
+  header.mutable_header()->mutable_metadata()->add_partition_columns("created_at");
+  server.service().list_active_files_responses.push_back(header);
+
+  ::delta::txn::v1::ListActiveFilesResponse batch;
+  ::delta::txn::v1::AddFile* file0 = batch.mutable_batch()->add_files();
+  file0->set_path("data-0.parquet");
+  (*file0->mutable_partition_values())["created_at"] = "2026-01-01 00:00:00";
+  server.service().list_active_files_responses.push_back(batch);
+
+  DeltaTxnClient client(endpoint_config(server.endpoint()));
+  EXPECT_THROW((void)(resolve_delta_table(store_, client, dir_.string())), StorageError);
+}
+
+TEST_F(DeltaTableResolutionTest, ThrowsWhenFileSchemaHasSameColumnCountButDifferentType) {
+  // Same column count (2) as the declared table schema (id: long, amount:
+  // double) but "amount" is written as float32, not float64 -- must still
+  // be rejected as an evolved/incompatible schema, not silently accepted
+  // just because the column counts line up.
+  arrow::Int64Builder id_builder;
+  arrow::FloatBuilder amount_builder;
+  ASSERT_TRUE(id_builder.Append(1).ok());
+  ASSERT_TRUE(amount_builder.Append(1.5F).ok());
+  std::shared_ptr<arrow::Array> id_array;
+  std::shared_ptr<arrow::Array> amount_array;
+  ASSERT_TRUE(id_builder.Finish(&id_array).ok());
+  ASSERT_TRUE(amount_builder.Finish(&amount_array).ok());
+  const auto mismatched_schema = arrow::schema(
+      {arrow::field("id", arrow::int64(), false), arrow::field("amount", arrow::float32(), true)});
+  const auto table = arrow::Table::Make(mismatched_schema, {id_array, amount_array});
+  auto sink_result = arrow::io::FileOutputStream::Open((dir_ / "data-0.parquet").string());
+  ASSERT_TRUE(sink_result.ok());
+  ASSERT_TRUE(parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), *sink_result, 1).ok());
+
+  LocalDeltaTxnServer server;
+  ::delta::txn::v1::ListActiveFilesResponse header;
+  header.mutable_header()->set_version(1);
+  header.mutable_header()->mutable_metadata()->set_schema_string(kSchemaWithRegionPartitionJson);
+  header.mutable_header()->mutable_metadata()->add_partition_columns("region");
+  server.service().list_active_files_responses.push_back(header);
+
+  ::delta::txn::v1::ListActiveFilesResponse batch;
+  ::delta::txn::v1::AddFile* file0 = batch.mutable_batch()->add_files();
+  file0->set_path("data-0.parquet");
+  (*file0->mutable_partition_values())["region"] = "US";
+  server.service().list_active_files_responses.push_back(batch);
+
+  DeltaTxnClient client(endpoint_config(server.endpoint()));
+  EXPECT_THROW((void)(resolve_delta_table(store_, client, dir_.string())), StorageError);
+}
+
+// AddFile.path is normally table-root-relative, joined onto table_uri --
+// but the Delta spec also allows a writer to record an absolute URI
+// directly (detected by the presence of "://", same as kernellake::Uri::
+// scheme() itself), which must be used as-is rather than joined. There's no
+// real "s3://..." object for LocalObjectStore to actually open in this test
+// environment, so what's asserted is the *path* the resulting failure names
+// -- it must be the absolute URI unmodified, never table_uri (dir_) joined
+// onto it.
+TEST_F(DeltaTableResolutionTest, UsesAbsoluteAddFilePathAsIsWithoutJoiningTableUri) {
+  LocalDeltaTxnServer server;
+  ::delta::txn::v1::ListActiveFilesResponse header;
+  header.mutable_header()->set_version(1);
+  header.mutable_header()->mutable_metadata()->set_schema_string(kSchemaWithRegionPartitionJson);
+  header.mutable_header()->mutable_metadata()->add_partition_columns("region");
+  server.service().list_active_files_responses.push_back(header);
+
+  ::delta::txn::v1::ListActiveFilesResponse batch;
+  ::delta::txn::v1::AddFile* file0 = batch.mutable_batch()->add_files();
+  const std::string absolute_path = "s3://some-bucket/table/data-0.parquet";
+  file0->set_path(absolute_path);
+  (*file0->mutable_partition_values())["region"] = "US";
+  server.service().list_active_files_responses.push_back(batch);
+
+  DeltaTxnClient client(endpoint_config(server.endpoint()));
+  try {
+    (void)resolve_delta_table(store_, client, dir_.string());
+    FAIL() << "expected resolve_delta_table() to throw trying to open a nonexistent absolute path";
+  } catch (const StorageError& e) {
+    EXPECT_NE(std::string(e.what()).find(absolute_path), std::string::npos) << e.what();
+    EXPECT_EQ(std::string(e.what()).find(dir_.string() + "/" + absolute_path), std::string::npos) << e.what();
+  }
+}
+
 TEST_F(DeltaTableResolutionTest, ThrowsWhenFilePhysicalSchemaDoesNotMatchTableSchema) {
   // Only one column, unlike the declared two-physical-column (id, amount)
   // schema above.
