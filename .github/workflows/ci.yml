@@ -240,10 +240,21 @@ jobs:
         # (build/cpu-coverage/_deps) and the tests themselves are never
         # part of the numerator or denominator; a test file covering
         # itself would be a meaningless metric.
+        #
+        # --gcov-ignore-parse-errors=negative_hits.warn_once_per_file:
+        # gcc's own gcov occasionally emits a negative branch-hit count on
+        # some conditional branches (a real, long-standing gcov bug, not
+        # anything in this codebase -- see
+        # https://gcc.gnu.org/bugzilla/show_bug.cgi?id=68080, hit for real
+        # on src/io/parquet_metadata.cpp's `if (stats->HasMinMax())`).
+        # Newer gcovr treats this as a hard parse error by default; this
+        # downgrades it to one warning per file instead of aborting the
+        # whole report.
         run: |
           gcovr --root . \
             --filter 'src/' --filter 'include/' \
             --exclude '.*_test\.cpp' \
+            --gcov-ignore-parse-errors=negative_hits.warn_once_per_file \
             --xml-pretty -o coverage.xml \
             --print-summary \
             build/cpu-coverage
