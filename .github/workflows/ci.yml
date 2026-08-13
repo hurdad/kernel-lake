@@ -206,10 +206,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install core toolchain
+        # curl (the CLI, not just libcurl4-openssl-dev's headers/lib) is
+        # required here specifically -- codecov-action's own uploader
+        # shells out to it, and plain ubuntu:26.04 doesn't ship it by
+        # default the way the GitHub-hosted runner's own image does. No
+        # other job in this file needs the CLI tool, only this one.
         run: |
           apt-get update
           apt-get install -y --no-install-recommends \
-            build-essential cmake ninja-build git pkg-config wget ca-certificates lsb-release gnupg \
+            build-essential cmake ninja-build git pkg-config wget curl ca-certificates lsb-release gnupg \
             python3 python3-pip \
             libgtest-dev libbenchmark-dev libspdlog-dev nlohmann-json3-dev libyaml-cpp-dev \
             libxml2-dev uuid-dev \
