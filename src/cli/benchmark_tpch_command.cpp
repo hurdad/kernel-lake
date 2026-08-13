@@ -1,8 +1,9 @@
-#include "commands.hpp"
+#include "kernellake/cli/commands.hpp"
 
 #include <fcntl.h>
 #include <unistd.h>
 
+#include <charconv>
 #include <fmt/format.h>
 #include <nlohmann/json.hpp>
 
@@ -22,6 +23,28 @@
 namespace kernellake::cli {
 
 namespace {
+
+// Mirrors generate_data_command.cpp's own parse_number/parse_double: pure
+// (text) -> (ok, value) helpers, so a malformed --scale-factor/--query/
+// --iterations/--warmup-iterations value produces a clean validation error
+// instead of std::stod/std::stoi throwing std::invalid_argument/
+// std::out_of_range uncaught (they used to be called directly in the
+// argument-parsing loop, outside this function's own try block below).
+template <typename T>
+[[nodiscard]] bool parse_number(std::string_view text, T& out) {
+  const auto [ptr, ec] = std::from_chars(text.data(), text.data() + text.size(), out);
+  return ec == std::errc() && ptr == text.data() + text.size();
+}
+
+[[nodiscard]] bool parse_double(std::string_view text, double& out) {
+  try {
+    std::size_t consumed = 0;
+    out = std::stod(std::string(text), &consumed);
+    return consumed == text.size();
+  } catch (const std::exception&) {
+    return false;
+  }
+}
 
 // Best-effort cache eviction for a specific file, usable without root:
 // POSIX_FADV_DONTNEED asks the kernel to drop that file's cached pages. It
@@ -164,8 +187,9 @@ int run_benchmark_tpch(const std::vector<std::string_view>& args, const EngineCo
   int iterations = config.benchmark.default_iterations;
   int warmup_iterations = config.benchmark.warmup_iterations;
   std::optional<std::string> output_path;
+  bool bad_arg = false;
 
-  for (std::size_t i = 0; i < args.size(); ++i) {
+  for (std::size_t i = 0; i < args.size() && !bad_arg; ++i) {
     if (args[i] == "--data" && i + 1 < args.size()) {
       data = args[++i];
     } else if (args[i] == "--part-data" && i + 1 < args.size()) {
@@ -185,18 +209,29 @@ int run_benchmark_tpch(const std::vector<std::string_view>& args, const EngineCo
     } else if (args[i] == "--query-file" && i + 1 < args.size()) {
       query_file_override = args[++i];
     } else if (args[i] == "--scale-factor" && i + 1 < args.size()) {
-      scale_factor = std::stod(std::string(args[++i]));
+      double parsed_scale_factor = 0.0;
+      bad_arg = !parse_double(args[++i], parsed_scale_factor);
+      if (!bad_arg) {
+        scale_factor = parsed_scale_factor;
+      }
     } else if (args[i] == "--query" && i + 1 < args.size()) {
-      query_number = std::stoi(std::string(args[++i]));
+      bad_arg = !parse_number(args[++i], query_number);
     } else if (args[i] == "--mode" && i + 1 < args.size()) {
       mode = args[++i];
     } else if (args[i] == "--iterations" && i + 1 < args.size()) {
-      iterations = std::stoi(std::string(args[++i]));
+      bad_arg = !parse_number(args[++i], iterations);
     } else if (args[i] == "--warmup-iterations" && i + 1 < args.size()) {
-      warmup_iterations = std::stoi(std::string(args[++i]));
+      bad_arg = !parse_number(args[++i], warmup_iterations);
     } else if (args[i] == "--output" && i + 1 < args.size()) {
       output_path = std::string(args[++i]);
     }
+  }
+
+  if (bad_arg) {
+    std::fprintf(stderr,
+                 "kernellake benchmark tpch: invalid numeric argument value for --scale-factor/--query/"
+                 "--iterations/--warmup-iterations\n");
+    return 1;
   }
 
   if (data.empty()) {

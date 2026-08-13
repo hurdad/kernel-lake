@@ -40,8 +40,16 @@ add_executable(kernellake_unit_tests
   query_engine_test.cpp
   query_engine_execute_cpu_test.cpp
   sample_data_generator_test.cpp
+  date_util_test.cpp
+  logging_test.cpp
+  $<$<NOT:$<BOOL:${KERNELLAKE_ENABLE_OTEL}>>:query_tracing_stub_test.cpp>
+  result_formatter_test.cpp
+  query_command_test.cpp
+  benchmark_tpch_command_test.cpp
+  inspect_parquet_command_test.cpp
   $<$<BOOL:${KERNELLAKE_BUILD_SERVER}>:flight_sql_server_test.cpp>
   $<$<BOOL:${KERNELLAKE_BUILD_SERVER}>:auth_middleware_test.cpp>
+  $<$<BOOL:${KERNELLAKE_BUILD_SERVER}>:gpu_execution_coordinator_test.cpp>
   $<$<BOOL:${KERNELLAKE_ENABLE_OTEL}>:query_tracing_test.cpp>
 )
 
@@ -70,6 +78,7 @@ target_link_libraries(kernellake_unit_tests PRIVATE
   kernellake_delta
   kernellake_api
   kernellake_generator
+  kernellake_cli
   GTest::gtest
   GTest::gtest_main
 )

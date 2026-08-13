@@ -7,7 +7,7 @@
 #include <string_view>
 #include <vector>
 
-#include "commands.hpp"
+#include "kernellake/cli/commands.hpp"
 #include "kernellake/common/config.hpp"
 #include "kernellake/common/errors.hpp"
 #include "kernellake/common/logging.hpp"

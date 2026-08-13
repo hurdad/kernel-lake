@@ -1,4 +1,4 @@
-#include "result_formatter.hpp"
+#include "kernellake/cli/result_formatter.hpp"
 
 #include <arrow/api.h>
 #include <arrow/csv/writer.h>
@@ -73,8 +73,23 @@ namespace {
       case '\t':
         escaped += "\\t";
         break;
+      case '\b':
+        escaped += "\\b";
+        break;
+      case '\f':
+        escaped += "\\f";
+        break;
       default:
-        escaped += c;
+        // Every other C0 control character (0x00-0x1F, e.g. embedded NUL)
+        // has no named JSON escape and is otherwise illegal unescaped
+        // inside a JSON string -- \uXXXX is the only valid representation.
+        // Bytes outside this range (0x20 and up, including multi-byte
+        // UTF-8 sequences) pass through unchanged, same as before.
+        if (static_cast<unsigned char>(c) <= 0x1F) {
+          escaped += fmt::format("\\u{:04x}", static_cast<unsigned char>(c));
+        } else {
+          escaped += c;
+        }
     }
   }
   return escaped;
