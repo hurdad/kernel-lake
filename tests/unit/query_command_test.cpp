@@ -109,6 +109,37 @@ TEST_F(QueryCommandTest, RunsRealQueryAndWritesJsonlOutput) {
   EXPECT_NE(output.find("{\"id\":2}"), std::string::npos);
 }
 
+TEST_F(QueryCommandTest, RejectsUnreadableSqlFile) {
+  // Named local, not an inline temporary -- see RunsRealQueryAndWritesJsonlOutput's own
+  // ReadsSqlFromFileArgument-adjacent comment on this file's dangling-std::string_view pitfall.
+  const std::string missing_file = (dir_ / "does-not-exist.sql").string();
+  const std::vector<std::string_view> args = {"--file", missing_file};
+  EXPECT_EQ(run_query(args, config_), 1);
+}
+
+// print_stats()/print_optional() (query_command.cpp) were entirely
+// uncovered -- no prior test passed --stats. They write to stderr, which
+// (unlike the query result itself) has no --output-style redirect this
+// command exposes, so this only asserts the run completes successfully
+// rather than capturing/asserting on the printed text.
+TEST_F(QueryCommandTest, RunsWithStatsFlagWithoutError) {
+  const std::string sql = "SELECT id FROM read_parquet('" + path_ + "')";
+  const std::vector<std::string_view> args = {"--sql", sql, "--format", "jsonl", "--output", output_path_,
+                                              "--stats"};
+  EXPECT_EQ(run_query(args, config_), 0);
+}
+
+// Exercises the effective_config.engine.backend assignment (only reached
+// with a *valid* override) -- RejectsInvalidBackendValue above only covers
+// the rejection path.
+TEST_F(QueryCommandTest, AcceptsExplicitCpuBackendOverride) {
+  const std::string sql = "SELECT id FROM read_parquet('" + path_ + "')";
+  const std::vector<std::string_view> args = {"--sql", sql, "--backend", "cpu", "--format",
+                                              "jsonl",  "--output", output_path_};
+  EXPECT_EQ(run_query(args, config_), 0);
+  EXPECT_NE(read_output().find("{\"id\":0}"), std::string::npos);
+}
+
 TEST_F(QueryCommandTest, ReadsSqlFromFileArgument) {
   const std::string sql_path = (dir_ / "query.sql").string();
   std::ofstream sql_file(sql_path);
