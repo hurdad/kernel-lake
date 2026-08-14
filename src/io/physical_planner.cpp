@@ -400,11 +400,17 @@ PhysicalPlanPtr convert(const LogicalPlanPtr& node, ObjectStore& store, TableSou
     // physically land *before* the build-side swap changes which
     // PhysicalPlanPtr variable holds which side, so the offsets below stay
     // correct either way.
-    const bool swap_for_build_side = [&] {
-      const std::optional<std::int64_t> left_estimate = estimate_row_count(left_child);
-      const std::optional<std::int64_t> right_estimate = estimate_row_count(right_child);
-      return left_estimate && right_estimate && *left_estimate < *right_estimate;
-    }();
+    const std::optional<std::int64_t> left_estimate = estimate_row_count(left_child);
+    const std::optional<std::int64_t> right_estimate = estimate_row_count(right_child);
+    const bool swap_for_build_side = left_estimate && right_estimate && *left_estimate < *right_estimate;
+    // Whichever side ends up in the *build* (right) slot after the swap
+    // decision below -- persisted on HashJoinNode so HashJoinOperator can
+    // size its partition count against it (see choose_partition_count() in
+    // hash_join_operator.cpp). Requires both estimates so it's exactly the
+    // one actually used for the swap decision above, not a fallback guess.
+    const std::optional<std::int64_t> estimated_build_rows =
+        left_estimate && right_estimate ? (swap_for_build_side ? left_estimate : right_estimate)
+                                        : std::nullopt;
     const std::size_t left_narrowed_count = left_child->output_schema().field_count();
     const std::size_t right_narrowed_count = right_child->output_schema().field_count();
     const std::size_t original_left_physical_offset = swap_for_build_side ? right_narrowed_count : 0;
@@ -432,7 +438,8 @@ PhysicalPlanPtr convert(const LogicalPlanPtr& node, ObjectStore& store, TableSou
       std::swap(left_key_narrowed, right_key_narrowed);
     }
     return std::make_shared<HashJoinNode>(std::move(left_child), std::move(right_child), *left_key_narrowed,
-                                          *right_key_narrowed, std::move(combined_column_map));
+                                          *right_key_narrowed, std::move(combined_column_map),
+                                          estimated_build_rows);
   }
   if (const auto* filter = dynamic_cast<const LogicalFilter*>(node.get())) {
     PhysicalPlanPtr child = convert(filter->child(), store, extra_resolver);

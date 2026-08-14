@@ -80,7 +80,13 @@ def configure_duckdb_for_minio(minio_endpoint: str) -> None:
 
 def run_query(cursor, query_number: int, data_glob: str, part_glob: str, orders_glob: str,
              customer_glob: str) -> tuple[bool, float, int]:
-    sql = load_query(query_number, data_glob, part_glob, orders_glob, customer_glob)
+    # nation/supplier/region/partsupp: this script's own `available` query list
+    # (Q1/Q3/Q6/Q12/Q14/Q19) never references those tables -- only Q5/Q7/Q9/Q10
+    # do (see tools/generate_tpch.py's docstring) -- so None is always safe
+    # here, matching load_query()'s own "only required if the query's SQL
+    # actually needs it" contract (tools/validate_tpch.py).
+    sql = load_query(query_number, data_glob, part_glob, orders_glob, customer_glob,
+                     None, None, None, None)
     print(f"--- Q{query_number}: {sql.splitlines()[0]}...")
 
     start = time.time()

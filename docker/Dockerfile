@@ -112,7 +112,16 @@ ENV DEBIAN_FRONTEND=noninteractive
 #      object storage" section); libavro-dev/libcurl4-openssl-dev
 #      (Iceberg manifest reading and REST/OAuth2 calls); gRPC/
 #      opentelemetry-cpp-dev (kernellake-server + OTel export, needed in
-#      both CPU and GPU images now that both ship kernellake-server).
+#      both CPU and GPU images now that both ship kernellake-server);
+#      clang-format-18/clang-tidy-18 (same pinned major version CI's
+#      format-check/clang-tidy jobs and .pre-commit-config.yaml already
+#      use -- lets any image built from this stage run either lint
+#      locally, matching what .pre-commit-config.yaml's own comment
+#      already documents as the correct way to verify GPU-only files
+#      clang-tidy's CI job can't reach, e.g. `docker run --entrypoint
+#      clang-tidy-18 kernellake:gpu-release -p build/gpu-release ...`
+#      against this same image's own already-built compile_commands.json,
+#      no separate install step needed).
 RUN apt-get update && apt-get upgrade -y \
     && apt-get install -y --no-install-recommends \
       wget ca-certificates lsb-release gnupg \
@@ -128,6 +137,7 @@ RUN apt-get update && apt-get upgrade -y \
          libgrpc++-dev protobuf-compiler-grpc opentelemetry-cpp-dev \
          libarrow-dev=25.0.1-1 libparquet-dev=25.0.1-1 libarrow-dataset-dev=25.0.1-1 \
          libarrow-flight-dev=25.0.1-1 libarrow-flight-sql-dev=25.0.1-1 \
+         clang-format-18 clang-tidy-18 \
     && rm -rf /var/lib/apt/lists/* /tmp/arrow-apt-source.deb
 
 # ---------------------------------------------------------------------------

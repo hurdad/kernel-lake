@@ -4,7 +4,9 @@
 #include <nvtx3/nvtx3.hpp>
 
 #include <chrono>
+#include <cstdio>
 #include <optional>
+#include <string>
 
 #include "kernellake/common/errors.hpp"
 #include "kernellake/execution_gpu/arrow_result_operator.hpp"
@@ -122,7 +124,8 @@ class InstrumentedOperator final : public PhysicalOperator {
 
 std::unique_ptr<PhysicalOperator> build(const PhysicalPlanPtr& node, ObjectStore& store,
                                         std::size_t pass_read_limit_bytes, OperatorId& next_id,
-                                        bool nvtx_enabled) {
+                                        bool nvtx_enabled, std::size_t build_side_budget_bytes,
+                                        const std::string& spill_directory) {
   auto instrument = [nvtx_enabled](std::unique_ptr<PhysicalOperator> op) {
     return std::make_unique<InstrumentedOperator>(std::move(op), nvtx_enabled);
   };
@@ -138,51 +141,88 @@ std::unique_ptr<PhysicalOperator> build(const PhysicalPlanPtr& node, ObjectStore
         effective_store, pass_read_limit_bytes, scan->partition_columns()));
   }
   if (const auto* join = dynamic_cast<const HashJoinNode*>(node.get())) {
+    // Computed *before* recursing into children (unlike every other case
+    // here): choose_partition_count() only needs the plan node itself
+    // (HashJoinNode::estimated_build_rows()/right()->output_schema()), not
+    // a built operator, and the result changes what pass_read_limit_bytes
+    // the two child subtrees below should actually use.
+    const std::size_t partition_count = choose_partition_count(
+        join->estimated_build_rows(), join->right()->output_schema(), build_side_budget_bytes);
+    // Halved (not the plain pass_read_limit_bytes every other subtree
+    // gets) only when this join is partitioned: spill_partitioned_to_disk
+    // (hash_join_operator.cpp) runs cudf::hash_partition() on every batch
+    // these two subtrees' own ParquetScanOperators produce, which
+    // allocates a full *reordered copy* of that batch on top of the
+    // decoded batch itself -- a real cost pass_read_limit_bytes' own /4
+    // divisor was never sized to cover (it was tuned for a plain scan
+    // pass, see that divisor's own comment). Confirmed for real: a
+    // partitioned build side alone (halving build_side_budget_bytes from
+    // ceiling/2 to ceiling/8) did *not* fix a real SF1000 TPC-H Q14
+    // bad_alloc -- the failing allocation size stayed ~1.36 GiB,
+    // unmoved, across both budgets, because the actual failure was in
+    // this doubling during the *scan* itself, not bucket sizing.
+    const std::size_t child_pass_read_limit_bytes =
+        partition_count > 1 ? pass_read_limit_bytes / 2 : pass_read_limit_bytes;
     // Built as two separate statements, not two arguments of the same
     // call: argument evaluation order is unspecified in C++, and both
     // recursive build() calls mutate `next_id` as a side effect, so leaving
     // it to the compiler would make operator ID assignment
     // non-deterministic across the two subtrees.
-    std::unique_ptr<PhysicalOperator> left =
-        build(join->left(), store, pass_read_limit_bytes, next_id, nvtx_enabled);
+    std::unique_ptr<PhysicalOperator> left = build(join->left(), store, child_pass_read_limit_bytes, next_id,
+                                                   nvtx_enabled, build_side_budget_bytes, spill_directory);
     std::unique_ptr<PhysicalOperator> right =
-        build(join->right(), store, pass_read_limit_bytes, next_id, nvtx_enabled);
+        build(join->right(), store, child_pass_read_limit_bytes, next_id, nvtx_enabled,
+              build_side_budget_bytes, spill_directory);
     return instrument(std::make_unique<HashJoinOperator>(
         next_id++, std::move(left), std::move(right), join->left_key_index(), join->right_key_index(),
-        std::make_shared<const Schema>(join->output_schema())));
+        std::make_shared<const Schema>(join->output_schema()), partition_count, spill_directory));
   }
   if (const auto* filter = dynamic_cast<const FilterNode*>(node.get())) {
-    return instrument(std::make_unique<FilterOperator>(
-        next_id++, build(filter->child(), store, pass_read_limit_bytes, next_id, nvtx_enabled),
-        filter->predicate()));
+    return instrument(
+        std::make_unique<FilterOperator>(next_id++,
+                                         build(filter->child(), store, pass_read_limit_bytes, next_id,
+                                               nvtx_enabled, build_side_budget_bytes, spill_directory),
+                                         filter->predicate()));
   }
   if (const auto* projection = dynamic_cast<const ProjectionNode*>(node.get())) {
-    return instrument(std::make_unique<ProjectionOperator>(
-        next_id++, build(projection->child(), store, pass_read_limit_bytes, next_id, nvtx_enabled),
-        projection->items()));
+    return instrument(
+        std::make_unique<ProjectionOperator>(next_id++,
+                                             build(projection->child(), store, pass_read_limit_bytes, next_id,
+                                                   nvtx_enabled, build_side_budget_bytes, spill_directory),
+                                             projection->items()));
   }
   if (const auto* hash_aggregate = dynamic_cast<const HashAggregateNode*>(node.get())) {
     return instrument(std::make_unique<HashAggregateOperator>(
-        next_id++, build(hash_aggregate->child(), store, pass_read_limit_bytes, next_id, nvtx_enabled),
+        next_id++,
+        build(hash_aggregate->child(), store, pass_read_limit_bytes, next_id, nvtx_enabled,
+              build_side_budget_bytes, spill_directory),
         hash_aggregate->group_by(), hash_aggregate->aggregates()));
   }
   if (const auto* scalar_aggregate = dynamic_cast<const ScalarAggregateNode*>(node.get())) {
     return instrument(std::make_unique<ScalarAggregateOperator>(
-        next_id++, build(scalar_aggregate->child(), store, pass_read_limit_bytes, next_id, nvtx_enabled),
+        next_id++,
+        build(scalar_aggregate->child(), store, pass_read_limit_bytes, next_id, nvtx_enabled,
+              build_side_budget_bytes, spill_directory),
         scalar_aggregate->aggregates()));
   }
   if (const auto* sort = dynamic_cast<const SortNode*>(node.get())) {
-    return instrument(std::make_unique<SortOperator>(
-        next_id++, build(sort->child(), store, pass_read_limit_bytes, next_id, nvtx_enabled), sort->keys()));
+    return instrument(
+        std::make_unique<SortOperator>(next_id++,
+                                       build(sort->child(), store, pass_read_limit_bytes, next_id,
+                                             nvtx_enabled, build_side_budget_bytes, spill_directory),
+                                       sort->keys()));
   }
   if (const auto* limit = dynamic_cast<const LimitNode*>(node.get())) {
-    return instrument(std::make_unique<LimitOperator>(
-        next_id++, build(limit->child(), store, pass_read_limit_bytes, next_id, nvtx_enabled),
-        limit->limit()));
+    return instrument(
+        std::make_unique<LimitOperator>(next_id++,
+                                        build(limit->child(), store, pass_read_limit_bytes, next_id,
+                                              nvtx_enabled, build_side_budget_bytes, spill_directory),
+                                        limit->limit()));
   }
   if (const auto* arrow_result = dynamic_cast<const ArrowResultNode*>(node.get())) {
     return instrument(std::make_unique<ArrowResultOperator>(
-        next_id++, build(arrow_result->child(), store, pass_read_limit_bytes, next_id, nvtx_enabled)));
+        next_id++, build(arrow_result->child(), store, pass_read_limit_bytes, next_id, nvtx_enabled,
+                         build_side_budget_bytes, spill_directory)));
   }
   throw PlanningError("build_operator_tree: unrecognized physical plan node");
 }
@@ -190,9 +230,12 @@ std::unique_ptr<PhysicalOperator> build(const PhysicalPlanPtr& node, ObjectStore
 }  // namespace
 
 std::unique_ptr<PhysicalOperator> build_operator_tree(const PhysicalPlanPtr& plan, ObjectStore& store,
-                                                      std::size_t pass_read_limit_bytes, bool nvtx_enabled) {
+                                                      std::size_t pass_read_limit_bytes, bool nvtx_enabled,
+                                                      std::size_t build_side_budget_bytes,
+                                                      const std::string& spill_directory) {
   OperatorId next_id = 1;
-  return build(plan, store, pass_read_limit_bytes, next_id, nvtx_enabled);
+  return build(plan, store, pass_read_limit_bytes, next_id, nvtx_enabled, build_side_budget_bytes,
+               spill_directory);
 }
 
 }  // namespace kernellake

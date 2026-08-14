@@ -5,6 +5,8 @@
 #include <rmm/mr/per_device_resource.hpp>
 
 #include <chrono>
+#include <filesystem>
+#include <string>
 
 #include "kernellake/api/query_engine.hpp"
 #include "kernellake/delta/delta_source_resolver.hpp"
@@ -125,8 +127,49 @@ QueryResult QueryEngine::execute(const PhysicalPlanPtr& physical, RmmEnvironment
   // working state all live at once within one pass -- not just the scan
   // itself.
   const std::size_t pass_read_limit_bytes = rmm_environment.query_memory_limit_bytes() / 4;
+  // 1/8th (not half) of the same actually-enforced ceiling. A partitioned
+  // HashJoinOperator's build bucket and pass_read_limit_bytes-sized probe
+  // batches are both alive against the *same* ceiling at once during
+  // probing -- and pass_read_limit_bytes above is already sized assuming
+  // it alone may need up to ~2.4x itself (~0.6x the whole ceiling; the
+  // real ratio measured for HashAggregateOperator's own derived columns at
+  // SF100, see that divisor's own comment -- HashJoinOperator's gather()
+  // producing a concatenated left+right output can plausibly need
+  // comparable headroom for the same reason: real width growth beyond the
+  // raw scanned/materialized columns). A first attempt at half the
+  // ceiling here (leaving too little of that headroom free) OOM'd for
+  // real: a real SF1000 TPC-H Q14 run (build side `part`, small enough to
+  // only need partition_count=3) failed with "Exceeded memory limit
+  // (failed to allocate 1.35 GiB)" -- reproduced twice, including against
+  // a freshly-restarted server, ruling out cross-query state. 1/8th costs
+  // more, smaller buckets (choose_partition_count() picks a larger
+  // partition_count for the same estimated build size), not a free
+  // lunch, but erring toward more partitions is cheap; erring toward too
+  // few risks exactly this failure (see choose_partition_count()'s own
+  // comment in hash_join_operator.hpp/.cpp for how this decides whether
+  // -- and how finely -- a join's build side gets partitioned instead of
+  // materialized whole).
+  const std::size_t build_side_budget_bytes = rmm_environment.query_memory_limit_bytes() / 8;
+  // A partitioned HashJoinOperator spills whole buckets to *disk*, not
+  // host RAM (see that class's own doc comment for why: even after the
+  // build side is bounded, the probe side alone -- e.g. a real SF1000
+  // TPC-H `lineitem`, ~6B rows -- can still exceed host RAM outright,
+  // confirmed for real by a kernellake-server OOM-kill at ~75 GiB RSS
+  // before this existed). storage.cache.directory is reused rather than a
+  // new config field: it's already required to be a real, disk-backed
+  // directory whenever the NVMe object cache is enabled (see
+  // NvmeObjectCache's own docs), so it's already the right kind of place.
+  // Falls back to the system temp directory only when no cache directory
+  // is configured -- see HashJoinOperator's own doc comment for the real
+  // risk that carries (a tmpfs-backed /tmp would silently reintroduce the
+  // exact host-RAM problem this exists to avoid).
+  const std::string spill_directory =
+      config_.storage.cache.enabled && !config_.storage.cache.directory.empty()
+          ? config_.storage.cache.directory
+          : std::filesystem::temp_directory_path().string();
   const std::unique_ptr<PhysicalOperator> root =
-      build_operator_tree(physical, store_, pass_read_limit_bytes, config_.profiling.nvtx);
+      build_operator_tree(physical, store_, pass_read_limit_bytes, config_.profiling.nvtx,
+                          build_side_budget_bytes, spill_directory);
 
   QueryResult result;
   std::int64_t rows_returned = 0;
