@@ -18,13 +18,19 @@ namespace kernellake {
 // AggregateExpression.
 //
 // Partial results are accumulated across batches without retaining input
-// batches (per the spec's "accumulate partial reductions" requirement):
+// batches (per the spec's "accumulate partial reductions" requirement) and
+// entirely device-side, never reading a value back to host per batch:
 // SUM/MIN/MAX use cudf::reduce's `init` parameter to fold each new batch
-// directly into the running scalar; COUNT/AVG's denominator is accumulated
-// as a plain host-side counter (cudf::reduce has no init-based COUNT/MEAN).
-// SUM/MIN/MAX/AVG over zero input rows produce NULL, not zero; COUNT(*)
-// and COUNT(x) produce 0 -- see CountStarCountsRowsAcrossBatchesIncludingZero
-// and SumOfEmptyInputIsNullNotZero in the corresponding test file.
+// directly into the running scalar; COUNT(x)/AVG(x)'s denominator uses the
+// same mechanism over a synthesized ones-column (cudf::reduce has no
+// init-based COUNT/MEAN of its own -- see materialize_count_ones(), the
+// same SUM-of-ones trick HashAggregateOperator::materialize_value_column's
+// CountColumnOnes already uses). CountStar is the one exception: it stays
+// plain host bookkeeping, since batch.row_count() is host-side metadata
+// already and involves no GPU work to begin with. SUM/MIN/MAX/AVG over
+// zero input rows produce NULL, not zero; COUNT(*) and COUNT(x) produce 0
+// -- see CountStarCountsRowsAcrossBatchesIncludingZero and
+// SumOfEmptyInputIsNullNotZero in the corresponding test file.
 class ScalarAggregateOperator final : public PhysicalOperator {
  public:
   ScalarAggregateOperator(OperatorId id, std::unique_ptr<PhysicalOperator> child,
@@ -100,7 +106,19 @@ class ScalarAggregateOperator final : public PhysicalOperator {
     DataType result_type;
     CompiledExpr compiled_argument;               // unused for CountStar (no argument column)
     std::unique_ptr<cudf::scalar> running_value;  // Sum/Min/Max/Avg's running sum
-    std::int64_t running_count = 0;               // Count/CountStar/Avg's denominator
+    // Count/Avg's denominator, accumulated entirely device-side via the same
+    // SUM-of-a-synthesized-ones-column trick HashAggregateOperator's
+    // CountColumnOnes already uses -- see materialize_count_ones() -- so
+    // per-batch accumulation never reads a value back to host (a
+    // cudf::reduce init-overload fold, exactly like running_value above).
+    // nullptr means "no batch has contributed a valid row yet", not zero --
+    // see finalize()'s own handling.
+    std::unique_ptr<cudf::scalar> running_count_scalar;
+    // CountStar only: batch.row_count() is host-side metadata already (no
+    // GPU work, no sync at all), so this stays plain host bookkeeping --
+    // unlike Count(x)/Avg(x) above, there is nothing to move device-side
+    // here.
+    std::int64_t running_count = 0;
   };
 
   [[nodiscard]] CompiledExpr compile_expr(const Expression& expr);
@@ -119,6 +137,15 @@ class ScalarAggregateOperator final : public PhysicalOperator {
   [[nodiscard]] std::unique_ptr<cudf::column> materialize_argument(Accumulator& state,
                                                                    const DeviceBatch& batch,
                                                                    ExecutionContext& context);
+  // An all-valid INT64 ones column (batch.row_count() rows), carrying
+  // `argument`'s own null mask -- summing it gives argument's non-null row
+  // count for this batch, the same CountColumnOnes trick
+  // HashAggregateOperator::materialize_value_column uses, duplicated here
+  // rather than shared since ScalarAggregateOperator has no
+  // ValueColumnKind dispatch to hang a shared helper off of.
+  [[nodiscard]] std::unique_ptr<cudf::column> materialize_count_ones(const cudf::column& argument,
+                                                                     const DeviceBatch& batch,
+                                                                     ExecutionContext& context);
   void process_batch(Accumulator& state, const DeviceBatch& batch, ExecutionContext& context);
   [[nodiscard]] std::unique_ptr<cudf::column> finalize(Accumulator& state, ExecutionContext& context);
 

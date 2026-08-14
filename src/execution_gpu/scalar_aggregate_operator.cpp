@@ -1,10 +1,12 @@
 #include "kernellake/execution_gpu/scalar_aggregate_operator.hpp"
 
 #include <cudf/aggregation.hpp>
+#include <cudf/binaryop.hpp>
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/datetime.hpp>
+#include <cudf/null_mask.hpp>
 #include <cudf/reduction.hpp>
 #include <cudf/scalar/scalar_factories.hpp>
 #include <cudf/strings/contains.hpp>
@@ -194,6 +196,24 @@ std::unique_ptr<cudf::column> ScalarAggregateOperator::materialize_argument(Accu
   return materialize(state.compiled_argument, batch, context);
 }
 
+// Mirrors HashAggregateOperator::materialize_value_column's
+// ValueColumnKind::CountColumnOnes branch exactly -- see that function's
+// own comment.
+std::unique_ptr<cudf::column> ScalarAggregateOperator::materialize_count_ones(const cudf::column& argument,
+                                                                              const DeviceBatch& batch,
+                                                                              ExecutionContext& context) {
+  const std::unique_ptr<cudf::scalar> one =
+      cudf::make_fixed_width_scalar<std::int64_t>(1, context.stream, context.memory_resource);
+  std::unique_ptr<cudf::column> ones = cudf::make_column_from_scalar(
+      *one, static_cast<cudf::size_type>(batch.row_count()), context.stream, context.memory_resource);
+  if (argument.nullable()) {
+    rmm::device_buffer mask = cudf::copy_bitmask(argument.view(), context.stream, context.memory_resource);
+    const cudf::size_type null_count = argument.null_count();
+    ones->set_null_mask(std::move(mask), null_count);
+  }
+  return ones;
+}
+
 void ScalarAggregateOperator::process_batch(Accumulator& state, const DeviceBatch& batch,
                                             ExecutionContext& context) {
   switch (state.function) {
@@ -202,11 +222,24 @@ void ScalarAggregateOperator::process_batch(Accumulator& state, const DeviceBatc
       return;
     case AggregateFunction::Count: {
       std::unique_ptr<cudf::column> column = materialize_argument(state, batch, context);
-      auto agg = cudf::make_count_aggregation<cudf::reduce_aggregation>(cudf::null_policy::EXCLUDE);
-      std::unique_ptr<cudf::scalar> count =
-          cudf::reduce(column->view(), *agg, cudf::data_type{cudf::type_id::INT64}, context.stream,
-                       context.memory_resource);
-      state.running_count += static_cast<cudf::numeric_scalar<std::int64_t>&>(*count).value(context.stream);
+      // Not cudf's own COUNT reduce aggregation -- accumulates the same way
+      // Sum/Min/Max below do (a device-resident running scalar via
+      // cudf::reduce's init overload), so this never reads a value back to
+      // host per batch. See materialize_count_ones()'s own comment.
+      std::unique_ptr<cudf::column> ones = materialize_count_ones(*column, batch, context);
+      if (ones->size() == 0 || ones->null_count() == ones->size()) return;
+
+      auto sum_agg = cudf::make_sum_aggregation<cudf::reduce_aggregation>();
+      if (!state.running_count_scalar) {
+        state.running_count_scalar =
+            cudf::reduce(ones->view(), *sum_agg, cudf::data_type{cudf::type_id::INT64}, context.stream,
+                         context.memory_resource);
+      } else {
+        const std::optional<std::reference_wrapper<cudf::scalar const>> init = *state.running_count_scalar;
+        state.running_count_scalar =
+            cudf::reduce(ones->view(), *sum_agg, cudf::data_type{cudf::type_id::INT64}, init, context.stream,
+                         context.memory_resource);
+      }
       return;
     }
     case AggregateFunction::Sum:
@@ -241,15 +274,13 @@ void ScalarAggregateOperator::process_batch(Accumulator& state, const DeviceBatc
     }
     case AggregateFunction::Avg: {
       std::unique_ptr<cudf::column> column = materialize_argument(state, batch, context);
-      auto count_agg = cudf::make_count_aggregation<cudf::reduce_aggregation>(cudf::null_policy::EXCLUDE);
-      std::unique_ptr<cudf::scalar> count =
-          cudf::reduce(column->view(), *count_agg, cudf::data_type{cudf::type_id::INT64}, context.stream,
-                       context.memory_resource);
-      state.running_count += static_cast<cudf::numeric_scalar<std::int64_t>&>(*count).value(context.stream);
 
       // Same guard as Sum/Min/Max above: a batch contributing zero valid values
       // must not fold into running_value via cudf::reduce's init overload, or it
-      // silently poisons an already-accumulated sum back to NULL.
+      // silently poisons an already-accumulated sum back to NULL. Also skips
+      // the denominator fold below -- running_value and running_count_scalar
+      // are always set together by the same set of batches, so finalize()
+      // only needs to check one of them.
       if (column->size() == 0 || column->null_count() == column->size()) return;
 
       auto sum_agg = cudf::make_sum_aggregation<cudf::reduce_aggregation>();
@@ -260,6 +291,24 @@ void ScalarAggregateOperator::process_batch(Accumulator& state, const DeviceBatc
         const std::optional<std::reference_wrapper<cudf::scalar const>> init = *state.running_value;
         state.running_value = cudf::reduce(column->view(), *sum_agg, cudf::data_type{cudf::type_id::FLOAT64},
                                            init, context.stream, context.memory_resource);
+      }
+
+      // Denominator: same device-resident SUM-of-ones accumulation as
+      // AggregateFunction::Count above, instead of cudf's native MEAN
+      // (which this operator never requests, same rationale as
+      // HashAggregateOperator's own AVG decomposition) or a per-batch host
+      // read.
+      std::unique_ptr<cudf::column> ones = materialize_count_ones(*column, batch, context);
+      auto count_sum_agg = cudf::make_sum_aggregation<cudf::reduce_aggregation>();
+      if (!state.running_count_scalar) {
+        state.running_count_scalar =
+            cudf::reduce(ones->view(), *count_sum_agg, cudf::data_type{cudf::type_id::INT64}, context.stream,
+                         context.memory_resource);
+      } else {
+        const std::optional<std::reference_wrapper<cudf::scalar const>> init = *state.running_count_scalar;
+        state.running_count_scalar =
+            cudf::reduce(ones->view(), *count_sum_agg, cudf::data_type{cudf::type_id::INT64}, init,
+                         context.stream, context.memory_resource);
       }
       return;
     }
@@ -272,11 +321,24 @@ std::unique_ptr<cudf::column> ScalarAggregateOperator::finalize(Accumulator& sta
   const cudf::data_type output_type = to_cudf_type(state.result_type);
 
   switch (state.function) {
-    case AggregateFunction::CountStar:
-    case AggregateFunction::Count: {
+    case AggregateFunction::CountStar: {
       cudf::numeric_scalar<std::int64_t> scalar(state.running_count, true, context.stream,
                                                 context.memory_resource);
       return cudf::make_column_from_scalar(scalar, 1, context.stream, context.memory_resource);
+    }
+    case AggregateFunction::Count: {
+      // COUNT(x) of zero (or all-NULL) input is 0, not NULL -- matching
+      // CountStar's own semantics, unlike Sum/Min/Max/Avg below, which are
+      // genuinely NULL over zero valid rows. No host read needed either
+      // way: make_column_from_scalar takes running_count_scalar by
+      // reference and fills the output column with it entirely
+      // device-side.
+      if (!state.running_count_scalar) {
+        cudf::numeric_scalar<std::int64_t> zero(0, true, context.stream, context.memory_resource);
+        return cudf::make_column_from_scalar(zero, 1, context.stream, context.memory_resource);
+      }
+      return cudf::make_column_from_scalar(*state.running_count_scalar, 1, context.stream,
+                                           context.memory_resource);
     }
     case AggregateFunction::Sum:
     case AggregateFunction::Min:
@@ -289,16 +351,27 @@ std::unique_ptr<cudf::column> ScalarAggregateOperator::finalize(Accumulator& sta
       return cudf::make_column_from_scalar(*state.running_value, 1, context.stream, context.memory_resource);
     }
     case AggregateFunction::Avg: {
-      if (!state.running_value || state.running_count == 0) {
+      // running_value/running_count_scalar are always set together (see
+      // process_batch's own comment) -- checking one suffices.
+      if (!state.running_value) {
         std::unique_ptr<cudf::scalar> null_scalar =
             cudf::make_default_constructed_scalar(output_type, context.stream, context.memory_resource);
         return cudf::make_column_from_scalar(*null_scalar, 1, context.stream, context.memory_resource);
       }
-      const double sum_value =
-          static_cast<cudf::numeric_scalar<double>&>(*state.running_value).value(context.stream);
-      cudf::numeric_scalar<double> avg_scalar(sum_value / static_cast<double>(state.running_count), true,
-                                              context.stream, context.memory_resource);
-      return cudf::make_column_from_scalar(avg_scalar, 1, context.stream, context.memory_resource);
+      // Divide device-side (both operands wrapped as 1-row columns) rather
+      // than reading sum/count back to host and dividing on the CPU --
+      // mirrors HashAggregateOperator's own AVG finalization, just over a
+      // single row instead of one row per group.
+      const std::unique_ptr<cudf::column> sum_column =
+          cudf::make_column_from_scalar(*state.running_value, 1, context.stream, context.memory_resource);
+      const std::unique_ptr<cudf::column> count_column_int64 = cudf::make_column_from_scalar(
+          *state.running_count_scalar, 1, context.stream, context.memory_resource);
+      const std::unique_ptr<cudf::column> count_column =
+          cudf::cast(count_column_int64->view(), cudf::data_type{cudf::type_id::FLOAT64}, context.stream,
+                     context.memory_resource);
+      return cudf::binary_operation(sum_column->view(), count_column->view(), cudf::binary_operator::DIV,
+                                    cudf::data_type{cudf::type_id::FLOAT64}, context.stream,
+                                    context.memory_resource);
     }
   }
   throw ExecutionError("unreachable: unknown AggregateFunction");

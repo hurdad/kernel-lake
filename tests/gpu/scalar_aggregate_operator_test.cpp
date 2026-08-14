@@ -2,7 +2,9 @@
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/filling.hpp>
+#include <cudf/null_mask.hpp>
 #include <cudf/scalar/scalar_factories.hpp>
+#include <rmm/device_buffer.hpp>
 
 #include "kernellake/execution_gpu/filter_operator.hpp"
 #include "kernellake/execution_gpu/projection_operator.hpp"
@@ -131,6 +133,95 @@ TEST(ScalarAggregateOperator, CountStarCountsRowsAcrossBatchesIncludingZero) {
     EXPECT_EQ(single_row_value<std::int64_t>(*result), 0);
     op.close(context);
   }
+}
+
+// COUNT(x) (not COUNT(*)) had no dedicated test at all before -- its own
+// accumulation now uses the same device-resident SUM-of-a-synthesized-
+// ones-column trick as Sum/Min/Max (see the header's own comment), so this
+// exercises the same three concerns those already have their own tests
+// for: multi-batch accumulation, surviving an entirely-NULL batch without
+// getting poisoned, and empty input producing 0 (not NULL, unlike
+// Sum/Min/Max/Avg) -- plus NULL rows within an otherwise-valid batch
+// actually being excluded from the count.
+TEST(ScalarAggregateOperator, CountOfColumnExcludesNullsAndSurvivesAnEntirelyNullBatch) {
+  RmmEnvironment env(default_config());
+  Schema schema({Field{"amount", float64_type(true)}});
+  std::vector<DeviceBatch> batches;
+  {
+    // 5 rows, none NULL.
+    std::vector<std::unique_ptr<cudf::column>> columns;
+    columns.push_back(filled_column(cudf::type_id::FLOAT64, 10.0, 5));
+    batches.push_back(DeviceBatch(std::make_unique<cudf::table>(std::move(columns)),
+                                  std::make_shared<const Schema>(schema)));
+  }
+  {
+    // Entirely NULL batch -- must not wipe out the running count.
+    std::vector<std::unique_ptr<cudf::column>> columns;
+    columns.push_back(all_null_column(cudf::type_id::FLOAT64, 3));
+    batches.push_back(DeviceBatch(std::make_unique<cudf::table>(std::move(columns)),
+                                  std::make_shared<const Schema>(schema)));
+  }
+  {
+    // 4 rows, 2 of them NULL (rows 1 and 3) -- COUNT(x) must exclude just
+    // those 2, not the whole batch. cudf's null mask is a bit-per-row
+    // Arrow-style validity bitmap (1 = valid, LSB = row 0); built by hand
+    // here since this test target links plain cudf, not cudf's own
+    // fixed_width_column_wrapper test-only helpers.
+    auto column =
+        cudf::make_numeric_column(cudf::data_type{cudf::type_id::FLOAT64}, 4, cudf::mask_state::ALL_VALID);
+    cudf::mutable_column_view view = column->mutable_view();
+    auto scalar = cudf::make_fixed_width_scalar<double>(7.0);
+    cudf::fill_in_place(view, 0, 4, *scalar);
+    const cudf::bitmask_type valid_mask_word = 0b0101;  // rows 0,2 valid; rows 1,3 null.
+    // cudf requires a null mask buffer padded/aligned per
+    // bitmask_allocation_size_bytes(), not just sizeof(one word) -- a
+    // smaller buffer trips "null mask buffer size should match the size
+    // of the column" at column::set_null_mask() time.
+    rmm::device_buffer null_mask(cudf::bitmask_allocation_size_bytes(4), rmm::cuda_stream_default);
+    cudaMemsetAsync(null_mask.data(), 0, null_mask.size(), rmm::cuda_stream_default.value());
+    cudaMemcpyAsync(null_mask.data(), &valid_mask_word, sizeof(valid_mask_word), cudaMemcpyHostToDevice,
+                    rmm::cuda_stream_default.value());
+    rmm::cuda_stream_default.synchronize();
+    column->set_null_mask(std::move(null_mask), /*new_null_count=*/2);
+    std::vector<std::unique_ptr<cudf::column>> columns;
+    columns.push_back(std::move(column));
+    batches.push_back(DeviceBatch(std::make_unique<cudf::table>(std::move(columns)),
+                                  std::make_shared<const Schema>(schema)));
+  }
+
+  auto amount = std::make_shared<ColumnExpression>("amount", 0, float64_type(true));
+  auto count_expr =
+      std::make_shared<AggregateExpression>(AggregateFunction::Count, amount, int64_type(false));
+  std::vector<NamedExpression> aggregates = {NamedExpression{count_expr, "n"}};
+
+  ScalarAggregateOperator op(1, std::make_unique<VectorSourceOperator>(std::move(batches)),
+                             std::move(aggregates));
+  ExecutionContext context = make_context();
+  op.open(context);
+  std::optional<DeviceBatch> result = op.next(context);
+  ASSERT_TRUE(result.has_value());
+  EXPECT_FALSE(single_row_is_null(*result));
+  // 5 (batch 1) + 0 (all-NULL batch 2) + 2 (batch 3, 2 of 4 rows NULL) = 7.
+  EXPECT_EQ(single_row_value<std::int64_t>(*result), 7);
+  op.close(context);
+}
+
+TEST(ScalarAggregateOperator, CountOfColumnOverEmptyInputIsZeroNotNull) {
+  RmmEnvironment env(default_config());
+  auto amount = std::make_shared<ColumnExpression>("amount", 0, float64_type(true));
+  auto count_expr =
+      std::make_shared<AggregateExpression>(AggregateFunction::Count, amount, int64_type(false));
+  std::vector<NamedExpression> aggregates = {NamedExpression{count_expr, "n"}};
+
+  ScalarAggregateOperator op(1, std::make_unique<VectorSourceOperator>(std::vector<DeviceBatch>{}),
+                             std::move(aggregates));
+  ExecutionContext context = make_context();
+  op.open(context);
+  std::optional<DeviceBatch> result = op.next(context);
+  ASSERT_TRUE(result.has_value());
+  EXPECT_FALSE(single_row_is_null(*result));
+  EXPECT_EQ(single_row_value<std::int64_t>(*result), 0);
+  op.close(context);
 }
 
 TEST(ScalarAggregateOperator, SumOfEmptyInputIsNullNotZero) {
