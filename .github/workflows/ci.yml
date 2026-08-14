@@ -541,7 +541,7 @@ jobs:
       - name: generate-data smoke test
         run: |
           docker run --rm -v "$PWD:/workspace" -w /workspace kernellake-build-base:ci \
-            ./build/cpu-dev/src/cli/kernellake generate-data --output /tmp/kernellake-sales --rows 10000 --files 2
+            ./build/cpu-dev/src/cli/kernellake generate-data --output /workspace/tmp/kernellake-sales --rows 10000 --files 2
 
       # SF1 is the spec's own CI recommendation, but that is a ~6,000,000-row
       # generation run (see tools/generate_tpch.py); a much smaller scale
@@ -550,19 +550,20 @@ jobs:
       # available" implies scale is adjusted to the environment). Run the
       # real SF1 generation manually or on a runner sized for it.
       #
-      # pyarrow is installed here, in the same docker run as the script
-      # that needs it, not baked into build-base (only this one job needs
-      # it) and not a separate step (each `docker run` is its own
-      # ephemeral container -- a package installed in one step's container
-      # is gone by the next step's, since only the bind-mounted /workspace
-      # persists across separate docker run invocations, not the rest of
-      # that container's filesystem).
+      # Output goes under /workspace/tmp, not plain /tmp: each `docker run`
+      # below is its own ephemeral container, and only the bind-mounted
+      # /workspace persists across separate docker run invocations, not the
+      # rest of that container's filesystem -- a real failure this exact
+      # job hit for real, generating into plain /tmp here and then the
+      # query-file validation step below finding nothing there. Same
+      # reasoning already applied to pyarrow itself: installed here, in the
+      # same docker run as the script that needs it, not a separate step.
       - name: TPC-H data-generation smoke test (small scale factor)
         run: |
           docker run --rm -v "$PWD:/workspace" -w /workspace kernellake-build-base:ci \
             bash -c "
               pip install --break-system-packages pyarrow &&
-              python3 tools/generate_tpch.py --scale-factor 0.001 --output /tmp/kernellake-tpch-smoke \
+              python3 tools/generate_tpch.py --scale-factor 0.001 --output /workspace/tmp/kernellake-tpch-smoke \
                 --row-group-rows 2000 --files 1
             "
 
@@ -588,14 +589,14 @@ jobs:
               # expression.
               for q in benchmarks/tpch/queries/*.sql; do
                 sql=$(grep -v "^--" "$q" | tr "\n" " " | \
-                  sed "s|{data}|/tmp/kernellake-tpch-smoke/lineitem-*.parquet|g; \
-                       s|{part_data}|/tmp/kernellake-tpch-smoke/part-*.parquet|g; \
-                       s|{orders_data}|/tmp/kernellake-tpch-smoke/orders-*.parquet|g; \
-                       s|{customer_data}|/tmp/kernellake-tpch-smoke/customer-*.parquet|g; \
-                       s|{supplier_data}|/tmp/kernellake-tpch-smoke/supplier-*.parquet|g; \
-                       s|{nation_data}|/tmp/kernellake-tpch-smoke/nation-*.parquet|g; \
-                       s|{region_data}|/tmp/kernellake-tpch-smoke/region-*.parquet|g; \
-                       s|{partsupp_data}|/tmp/kernellake-tpch-smoke/partsupp-*.parquet|g")
+                  sed "s|{data}|/workspace/tmp/kernellake-tpch-smoke/lineitem-*.parquet|g; \
+                       s|{part_data}|/workspace/tmp/kernellake-tpch-smoke/part-*.parquet|g; \
+                       s|{orders_data}|/workspace/tmp/kernellake-tpch-smoke/orders-*.parquet|g; \
+                       s|{customer_data}|/workspace/tmp/kernellake-tpch-smoke/customer-*.parquet|g; \
+                       s|{supplier_data}|/workspace/tmp/kernellake-tpch-smoke/supplier-*.parquet|g; \
+                       s|{nation_data}|/workspace/tmp/kernellake-tpch-smoke/nation-*.parquet|g; \
+                       s|{region_data}|/workspace/tmp/kernellake-tpch-smoke/region-*.parquet|g; \
+                       s|{partsupp_data}|/workspace/tmp/kernellake-tpch-smoke/partsupp-*.parquet|g")
                 echo "=== $q ==="
                 ./build/cpu-dev/src/cli/kernellake explain --sql "$sql"
               done
