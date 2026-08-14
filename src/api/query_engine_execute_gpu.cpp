@@ -181,7 +181,7 @@ QueryResult QueryEngine::execute(const PhysicalPlanPtr& physical, RmmEnvironment
     while (std::optional<DeviceBatch> batch = root->next(context)) {
       rows_returned += static_cast<std::int64_t>(batch->row_count());
       const auto d2h_start = std::chrono::steady_clock::now();
-      result.batches.push_back(to_arrow_record_batch(*batch));
+      result.batches.push_back(to_arrow_record_batch(*batch, context.stream, context.memory_resource));
       device_to_host_seconds +=
           std::chrono::duration<double>(std::chrono::steady_clock::now() - d2h_start).count();
     }

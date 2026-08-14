@@ -10,8 +10,9 @@
 
 namespace kernellake {
 
-std::shared_ptr<arrow::RecordBatch> to_arrow_record_batch(const cudf::table_view& view,
-                                                          const Schema& schema) {
+std::shared_ptr<arrow::RecordBatch> to_arrow_record_batch(const cudf::table_view& view, const Schema& schema,
+                                                          rmm::cuda_stream_view stream,
+                                                          rmm::device_async_resource_ref mr) {
   std::vector<cudf::column_metadata> column_metadata;
   column_metadata.reserve(schema.field_count());
   for (const Field& field : schema.fields()) {
@@ -19,7 +20,7 @@ std::shared_ptr<arrow::RecordBatch> to_arrow_record_batch(const cudf::table_view
   }
 
   const cudf::unique_schema_t arrow_schema = cudf::to_arrow_schema(view, column_metadata);
-  const cudf::unique_device_array_t device_array = cudf::to_arrow_host(view);
+  const cudf::unique_device_array_t device_array = cudf::to_arrow_host(view, stream, mr);
 
   // ImportRecordBatch consumes (releases) both structs per the C Data
   // Interface contract; arrow_schema/device_array's own unique_ptr deleters
@@ -34,11 +35,14 @@ std::shared_ptr<arrow::RecordBatch> to_arrow_record_batch(const cudf::table_view
   return *result;
 }
 
-std::shared_ptr<arrow::RecordBatch> to_arrow_record_batch(const DeviceBatch& batch) {
-  return to_arrow_record_batch(batch.view(), batch.schema());
+std::shared_ptr<arrow::RecordBatch> to_arrow_record_batch(const DeviceBatch& batch,
+                                                          rmm::cuda_stream_view stream,
+                                                          rmm::device_async_resource_ref mr) {
+  return to_arrow_record_batch(batch.view(), batch.schema(), stream, mr);
 }
 
-DeviceBatch from_arrow_record_batch(const arrow::RecordBatch& batch, std::shared_ptr<const Schema> schema) {
+DeviceBatch from_arrow_record_batch(const arrow::RecordBatch& batch, std::shared_ptr<const Schema> schema,
+                                    rmm::cuda_stream_view stream, rmm::device_async_resource_ref mr) {
   ArrowArray c_array{};
   ArrowSchema c_schema{};
   const arrow::Status status = arrow::ExportRecordBatch(batch, &c_array, &c_schema);
@@ -50,7 +54,7 @@ DeviceBatch from_arrow_record_batch(const arrow::RecordBatch& batch, std::shared
   // input Array/Schema -- that is the caller's responsibility.
   std::unique_ptr<cudf::table> table;
   try {
-    table = cudf::from_arrow(&c_schema, &c_array);
+    table = cudf::from_arrow(&c_schema, &c_array, stream, mr);
   } catch (...) {
     if (c_array.release != nullptr) {
       c_array.release(&c_array);

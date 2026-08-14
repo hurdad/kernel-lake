@@ -56,7 +56,8 @@ std::shared_ptr<arrow::ipc::RecordBatchFileReader> open_partition_reader(const s
 }
 
 std::vector<DeviceBatch> read_partition_batches(const std::string& path,
-                                                const std::shared_ptr<const Schema>& schema) {
+                                                const std::shared_ptr<const Schema>& schema,
+                                                ExecutionContext& context) {
   const std::shared_ptr<arrow::ipc::RecordBatchFileReader> reader = open_partition_reader(path);
   std::vector<DeviceBatch> batches;
   batches.reserve(static_cast<std::size_t>(reader->num_record_batches()));
@@ -66,7 +67,8 @@ std::vector<DeviceBatch> read_partition_batches(const std::string& path,
       throw ExecutionError(fmt::format("failed to read hash-join spill batch from '{}': {}", path,
                                        batch_result.status().ToString()));
     }
-    batches.push_back(from_arrow_record_batch(**batch_result, schema));
+    batches.push_back(
+        from_arrow_record_batch(**batch_result, schema, context.stream, context.memory_resource));
   }
   return batches;
 }
@@ -87,16 +89,12 @@ std::vector<DeviceBatch> read_partition_batches(const std::string& path,
 // closed once `child` is exhausted.
 //
 // Each reordered/sliced device table's destruction (a stream-ordered free
-// on context.stream, via context.memory_resource) is only actually safe
-// once to_arrow_host()'s device->host copy below (inside
-// to_arrow_record_batch()) has completed -- that copy runs on CUDA's null
-// stream with no explicit stream argument (see arrow_bridge.cpp), so this
-// relies on context.stream being a plain *blocking* stream (cuda_utils.cpp's
-// CudaStream -- never created with cudaStreamNonBlocking): a blocking
-// stream's operations implicitly wait for prior null-stream work to
-// finish, and vice versa. Same reliance this codebase's one other
-// device<->host boundary already documents (cuda_utils.cpp's CudaStream
-// comment), not a new risk.
+// on context.stream, via context.memory_resource) is safe once
+// to_arrow_host()'s device->host copy below (inside to_arrow_record_batch(),
+// called with this same context.stream/context.memory_resource) has
+// completed -- properly stream-ordered against the rest of this query's
+// work, not an implicit dependency on cudf's null-stream default the way
+// this used to be documented here.
 void spill_partitioned_to_disk(PhysicalOperator& child, cudf::size_type key_index,
                                std::size_t partition_count, const std::filesystem::path& scratch_dir,
                                const std::string& side_prefix, std::vector<std::string>& paths_out,
@@ -147,7 +145,7 @@ void spill_partitioned_to_disk(PhysicalOperator& child, cudf::size_type key_inde
       const std::vector<cudf::table_view> sliced =
           cudf::slice(reordered->view(), {begin, end}, context.stream);
       const std::shared_ptr<arrow::RecordBatch> record_batch =
-          to_arrow_record_batch(sliced.front(), *schema_out);
+          to_arrow_record_batch(sliced.front(), *schema_out, context.stream, context.memory_resource);
       ensure_writer_open(i, *record_batch);
       const arrow::Status status = writers[i]->WriteRecordBatch(*record_batch);
       if (!status.ok()) {
@@ -306,7 +304,7 @@ void HashJoinOperator::ensure_partition_built(ExecutionContext& context) {
   // ~1/partition_count_ of the whole build side, comfortably under the
   // budget choose_partition_count() sized partition_count_ against.
   const std::vector<DeviceBatch> batches =
-      read_partition_batches(build_partition_paths_[current_partition_], right_schema_);
+      read_partition_batches(build_partition_paths_[current_partition_], right_schema_, context);
   right_table_ = concatenate_batches(batches, context);
   build_hash_join(context);
   current_partition_built_ = true;
@@ -390,7 +388,8 @@ std::optional<DeviceBatch> HashJoinOperator::next(ExecutionContext& context) {
                                              batch_result.status().ToString()));
           }
           ++probe_batch_index_;
-          DeviceBatch left_batch = from_arrow_record_batch(**batch_result, left_schema_);
+          DeviceBatch left_batch =
+              from_arrow_record_batch(**batch_result, left_schema_, context.stream, context.memory_resource);
           if (std::optional<DeviceBatch> result = probe_one_batch(left_batch, context)) {
             return result;
           }
