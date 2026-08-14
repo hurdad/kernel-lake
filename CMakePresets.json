@@ -87,6 +87,16 @@
         "CMAKE_CXX_FLAGS": "--coverage -fprofile-arcs -ftest-coverage",
         "CMAKE_EXE_LINKER_FLAGS": "--coverage"
       }
+    },
+    {
+      "name": "gpu-coverage",
+      "displayName": "Coverage (GPU, gcov)",
+      "inherits": "gpu-dev",
+      "description": "gpu-dev plus gcc's --coverage instrumentation, same rationale as cpu-coverage -- for CI's gpu-coverage job (self-hosted GPU runner only, see .github/workflows/ci.yml). This project has no .cu files of its own (src/execution_gpu/*.cpp are plain C++ calling into cudf/rmm's precompiled libraries), so gcov works here exactly as it does under cpu-coverage; only KERNELLAKE_WITH_CUDA=ON's own translation units need a real CUDA toolkit + GPU to build/run at all. gpu-dev's CMAKE_CUDA_COMPILER hardcodes /usr/local/cuda/bin/nvcc (the Docker image's layout); a self-hosted runner whose nvcc lives elsewhere (e.g. an apt-installed toolkit) should override it explicitly at configure time (`-DCMAKE_CUDA_COMPILER=$(command -v nvcc)`) rather than this preset guessing a path that wouldn't generalize.",
+      "cacheVariables": {
+        "CMAKE_CXX_FLAGS": "--coverage -fprofile-arcs -ftest-coverage",
+        "CMAKE_EXE_LINKER_FLAGS": "--coverage"
+      }
     }
   ],
   "buildPresets": [
@@ -96,7 +106,8 @@
     { "name": "gpu-release", "configurePreset": "gpu-release" },
     { "name": "server-dev", "configurePreset": "server-dev" },
     { "name": "otel-dev", "configurePreset": "otel-dev" },
-    { "name": "cpu-coverage", "configurePreset": "cpu-coverage" }
+    { "name": "cpu-coverage", "configurePreset": "cpu-coverage" },
+    { "name": "gpu-coverage", "configurePreset": "gpu-coverage" }
   ],
   "testPresets": [
     {
@@ -137,6 +148,12 @@
     {
       "name": "cpu-coverage",
       "configurePreset": "cpu-coverage",
+      "output": { "outputOnFailure": true },
+      "execution": { "noTestsAction": "error", "stopOnFailure": false }
+    },
+    {
+      "name": "gpu-coverage",
+      "configurePreset": "gpu-coverage",
       "output": { "outputOnFailure": true },
       "execution": { "noTestsAction": "error", "stopOnFailure": false }
     }

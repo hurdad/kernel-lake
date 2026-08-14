@@ -1,4 +1,4 @@
-# KernelLake CI. One workflow, eight jobs, in dependency order:
+# KernelLake CI. One workflow, nine jobs, in dependency order:
 #
 #   format-check ------------------+
 #                                   +--> docker-publish (push to main only)
@@ -6,9 +6,10 @@
 #                     +--> server-build-test
 #                     +--> otel-build-test
 #
-#   clang-tidy (standalone lint job -- no `needs:` of its own, and not in
-#               docker-publish's `needs:` list either; see below)
-#   coverage    (standalone, same reasoning as clang-tidy -- see below)
+#   clang-tidy   (standalone lint job -- no `needs:` of its own, and not in
+#                 docker-publish's `needs:` list either; see below)
+#   coverage     (standalone, same reasoning as clang-tidy -- see below)
+#   gpu-coverage (standalone, self-hosted-GPU-runner-only -- see below)
 #
 # docker-publish only starts once format-check, cpu-build-test, AND
 # tpch-tooling-smoke have all succeeded (via `needs:`) -- a broken build or
@@ -75,12 +76,27 @@
 # stretch before that was noticed and corrected. Treat a red run as a real
 # signal, not noise to route around.
 #
-# GPU-dependent work (the `gpu-dev` preset, `tests/gpu/`, real query
-# execution, DuckDB cross-validation, and TPC-H benchmarks) is
-# intentionally NOT run here: standard GitHub-hosted runners have no GPU,
-# and per the spec's own rule, KernelLake never reports a skipped-GPU test
-# as passing. That work needs a self-hosted GPU runner, which is not
-# configured in this repository -- see docs/ROADMAP.md.
+# Most GPU-dependent work (real query execution, DuckDB cross-validation,
+# and TPC-H benchmarks) still only ever runs manually, off-CI: standard
+# GitHub-hosted runners have no GPU, and per the spec's own rule,
+# KernelLake never reports a skipped-GPU test as passing. `gpu-coverage`
+# (below) is the one exception -- it runs on a self-hosted runner with a
+# real GPU attached (label `[self-hosted, gpu]`), which is why it's the
+# only job in this file not on `ubuntu-24.04`.
+#
+# That self-hosted runner is a real, persistent machine (not an ephemeral
+# GitHub-hosted one), and this repository is public -- a fork's PR could
+# otherwise modify this workflow file and have its own arbitrary code
+# execute on that machine (which also holds real AWS/SSH credentials for
+# this project's benchmark infrastructure). `gpu-coverage`'s own
+# `if: github.event_name != 'pull_request'` guard is the mitigation: the
+# job only ever dispatches on a direct push to `main` (which only a
+# maintainer can do) or manual `workflow_dispatch`, never on a
+# pull_request event (including from this same repo, not just forks) --
+# so a PR's workflow-file changes are inert as far as this job is
+# concerned, no matter who opened it or what they changed. Don't relax
+# this without re-reading GitHub's own self-hosted-runner security
+# guidance for public repositories first.
 name: CI
 
 on:
@@ -282,6 +298,88 @@ jobs:
         with:
           name: coverage-report
           path: coverage.xml
+          retention-days: 30
+
+  gpu-coverage:
+    # See this file's own top-of-file comment for the full self-hosted-
+    # runner security rationale -- this `if:` is the actual enforcement of
+    # it: only a direct push to main or a manual workflow_dispatch reaches
+    # this job, never a pull_request (same-repo or fork).
+    if: github.event_name != 'pull_request'
+    runs-on: [self-hosted, gpu]
+    # No `container:` here, deliberately unlike every other job in this
+    # file: a GPU job needs the host's own CUDA driver/toolkit and its
+    # already-fetched build/gpu-coverage/_deps (librmm/libcudf/libkvikio,
+    # each a many-minute FetchContent download+build) -- starting from a
+    # fresh container on every run would mean redoing that provisioning
+    # from scratch every single time instead of once when the runner was
+    # set up, and a container also can't see the GPU without extra
+    # NVIDIA-container-toolkit configuration this runner doesn't have.
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify GPU is visible
+        # Fails fast with a clear message rather than letting CMake's own
+        # much-less-obvious CUDA-toolkit-detection error stand in for "the
+        # runner's GPU disappeared/driver broke" if that ever happens.
+        run: nvidia-smi
+      - name: Clean stale coverage build directory
+        # Unlike the `coverage` job's fresh ubuntu:26.04 container, this
+        # runner's filesystem persists between runs -- cpu-coverage's own
+        # preset doc comment warns .gcda files accumulate/overwrite with a
+        # checksum mismatch across source changes if the build directory
+        # isn't fresh; this is that same requirement, made explicit since
+        # nothing else here provides it for free.
+        run: rm -rf build/gpu-coverage
+      - name: Configure (gpu-coverage preset)
+        # CMAKE_CUDA_COMPILER overridden explicitly: gpu-dev (which
+        # gpu-coverage inherits) hardcodes /usr/local/cuda/bin/nvcc for the
+        # Docker image's layout -- this runner's own toolkit puts nvcc
+        # wherever its package manager does instead, so `command -v nvcc`
+        # is resolved fresh here rather than the preset guessing a path
+        # that wouldn't generalize across self-hosted runners.
+        run: cmake --preset gpu-coverage -DCMAKE_CUDA_COMPILER="$(command -v nvcc)"
+      - name: Build
+        run: cmake --build --preset gpu-coverage --target kernellake_gpu_tests
+      - name: Test
+        run: ctest --preset gpu-coverage --output-on-failure
+      - name: Install gcovr
+        run: pip install --break-system-packages gcovr
+      - name: Generate coverage report
+        # Scoped to only the files that actually require
+        # KERNELLAKE_WITH_CUDA=ON to compile/execute at all -- unlike the
+        # `coverage` job's broad `src/`+`include/` filter, a matching
+        # broad filter here would mostly re-report the exact same CPU-only
+        # lines that job already covers (gpu-dev builds everything, GPU
+        # and CPU code alike), just exercised by a different test binary.
+        # Uploaded under its own `gpu` flag below so Codecov keeps it as a
+        # distinct component instead of blending it with the `coverage`
+        # job's own (different) numbers for any file that happens to
+        # appear in both.
+        run: |
+          gcovr --root . \
+            --filter 'src/execution_gpu/' \
+            --filter 'src/api/query_engine_execute_gpu' \
+            --filter 'src/memory/gpu_memory_metrics' \
+            --filter 'src/memory/rmm_environment' \
+            --filter 'src/server/gpu_execution_coordinator_gpu' \
+            --exclude '.*_test\.cpp' \
+            --exclude '.*/_deps/.*' \
+            --gcov-ignore-parse-errors=negative_hits.warn_once_per_file \
+            --xml-pretty -o gpu-coverage.xml \
+            --print-summary \
+            build/gpu-coverage
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: gpu-coverage.xml
+          flags: gpu
+          fail_ci_if_error: false
+      - name: Upload coverage report artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: gpu-coverage-report
+          path: gpu-coverage.xml
           retention-days: 30
 
   tpch-tooling-smoke:
