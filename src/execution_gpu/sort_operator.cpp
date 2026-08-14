@@ -5,13 +5,15 @@
 #include <cudf/sorting.hpp>
 #include <cudf/transform.hpp>
 
+#include <algorithm>
+
 #include "kernellake/expression/expression.hpp"
 
 namespace kernellake {
 
 SortOperator::SortOperator(OperatorId id, std::unique_ptr<PhysicalOperator> child,
-                           std::vector<LogicalSort::Key> keys)
-    : id_(id), child_(std::move(child)), keys_(std::move(keys)) {}
+                           std::vector<LogicalSort::Key> keys, std::optional<std::int64_t> limit)
+    : id_(id), child_(std::move(child)), keys_(std::move(keys)), limit_(limit) {}
 
 SortOperator::CompiledKey SortOperator::compile_key(const LogicalSort::Key& key) {
   if (const auto* column_ref = dynamic_cast<const ColumnExpression*>(key.expr.get())) {
@@ -29,6 +31,10 @@ void SortOperator::open(ExecutionContext& context) {
 std::optional<DeviceBatch> SortOperator::next(ExecutionContext& context) {
   if (produced_) return std::nullopt;
   produced_ = true;
+
+  // Matches LimitOperator::next()'s own `remaining_ <= 0` short-circuit: a
+  // fused LIMIT 0 never pulls a single row from child, let alone sorts.
+  if (limit_.has_value() && *limit_ <= 0) return std::nullopt;
 
   std::vector<DeviceBatch> batches;
   while (std::optional<DeviceBatch> batch = child_->next(context)) {
@@ -70,9 +76,20 @@ std::optional<DeviceBatch> SortOperator::next(ExecutionContext& context) {
   const cudf::table_view key_table_view(key_views);
   const std::unique_ptr<cudf::column> sorted_indices =
       cudf::stable_sorted_order(key_table_view, orders, null_orders, context.stream, context.memory_resource);
+
+  // A fused LIMIT only needs the first N sorted indices -- the gather below
+  // is what actually materializes row data, so shrinking its index list to N
+  // (instead of every row) is what makes the fusion worthwhile.
+  cudf::column_view gather_indices = sorted_indices->view();
+  if (limit_.has_value()) {
+    const cudf::size_type keep =
+        static_cast<cudf::size_type>(std::min<std::int64_t>(*limit_, gather_indices.size()));
+    gather_indices = cudf::slice(sorted_indices->view(), {0, keep}).front();
+  }
+
   std::unique_ptr<cudf::table> sorted =
-      cudf::gather(combined_view, sorted_indices->view(), cudf::out_of_bounds_policy::DONT_CHECK,
-                   context.stream, context.memory_resource);
+      cudf::gather(combined_view, gather_indices, cudf::out_of_bounds_policy::DONT_CHECK, context.stream,
+                   context.memory_resource);
   return DeviceBatch(std::move(sorted), schema);
 }
 

@@ -213,6 +213,22 @@ std::unique_ptr<PhysicalOperator> build(const PhysicalPlanPtr& node, ObjectStore
                                        sort->keys()));
   }
   if (const auto* limit = dynamic_cast<const LimitNode*>(node.get())) {
+    // ORDER BY ... LIMIT N: fuse into a single SortOperator instead of a
+    // separate Sort+Limit pair. Unfused, SortOperator::next() gathers every
+    // sorted row (the whole result set) and then LimitOperator immediately
+    // slices that down to the first N and discards the rest -- pure waste
+    // for the common top-N-rows query shape (e.g. TPC-H Q10). Passing the
+    // limit into SortOperator lets its own gather materialize only the top N
+    // rows to begin with. Only a direct Sort child qualifies -- anything
+    // else between them (a Projection, say) isn't safe to skip over, so
+    // falls through to the plain LimitOperator path below.
+    if (const auto* sort = dynamic_cast<const SortNode*>(limit->child().get())) {
+      return instrument(
+          std::make_unique<SortOperator>(next_id++,
+                                         build(sort->child(), store, pass_read_limit_bytes, next_id,
+                                               nvtx_enabled, build_side_budget_bytes, spill_directory),
+                                         sort->keys(), limit->limit()));
+    }
     return instrument(
         std::make_unique<LimitOperator>(next_id++,
                                         build(limit->child(), store, pass_read_limit_bytes, next_id,

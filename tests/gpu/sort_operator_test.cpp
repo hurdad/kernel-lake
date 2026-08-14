@@ -125,6 +125,69 @@ TEST(SortOperator, EmptyInputProducesNoBatches) {
   sort.close(context);
 }
 
+// Covers operator_builder.cpp's ORDER BY ... LIMIT N fusion: SortOperator's
+// optional `limit` constructor argument, which makes its own gather()
+// materialize only the top N sorted rows instead of the whole result set.
+TEST(SortOperator, FusedLimitReturnsOnlyTopNSortedRows) {
+  RmmEnvironment env(default_config());
+  std::vector<DeviceBatch> batches;
+  batches.push_back(make_int_batch({5, 1, 3}));
+  batches.push_back(make_int_batch({4, 2}));
+
+  auto key = std::make_shared<ColumnExpression>("a", 0, int32_type(false));
+  std::vector<LogicalSort::Key> keys = {LogicalSort::Key{key, /*ascending=*/true}};
+  SortOperator sort(1, std::make_unique<VectorSourceOperator>(std::move(batches)), std::move(keys),
+                    /*limit=*/2);
+  ExecutionContext context = make_context();
+  sort.open(context);
+
+  std::optional<DeviceBatch> result = sort.next(context);
+  ASSERT_TRUE(result.has_value());
+  EXPECT_EQ(result->row_count(), 2u);
+  EXPECT_EQ(copy_to_host<std::int32_t>(result->view().column(0)), (std::vector<std::int32_t>{1, 2}));
+  EXPECT_FALSE(sort.next(context).has_value());
+  sort.close(context);
+}
+
+// A fused limit that exceeds the row count must behave like no limit at
+// all (matches LimitOperator's own `batch_rows <= remaining_` pass-through
+// case), not error or pad with anything.
+TEST(SortOperator, FusedLimitLargerThanRowCountReturnsAllRows) {
+  RmmEnvironment env(default_config());
+  std::vector<DeviceBatch> batches;
+  batches.push_back(make_int_batch({5, 1, 3}));
+
+  auto key = std::make_shared<ColumnExpression>("a", 0, int32_type(false));
+  std::vector<LogicalSort::Key> keys = {LogicalSort::Key{key, /*ascending=*/true}};
+  SortOperator sort(1, std::make_unique<VectorSourceOperator>(std::move(batches)), std::move(keys),
+                    /*limit=*/100);
+  ExecutionContext context = make_context();
+  sort.open(context);
+
+  std::optional<DeviceBatch> result = sort.next(context);
+  ASSERT_TRUE(result.has_value());
+  EXPECT_EQ(copy_to_host<std::int32_t>(result->view().column(0)), (std::vector<std::int32_t>{1, 3, 5}));
+  sort.close(context);
+}
+
+// Matches LimitOperator::next()'s own `remaining_ <= 0` short-circuit: a
+// fused LIMIT 0 must produce no rows without erroring, even though sorting
+// zero rows is a degenerate case for stable_sorted_order/gather.
+TEST(SortOperator, FusedZeroLimitProducesNoBatches) {
+  RmmEnvironment env(default_config());
+  std::vector<DeviceBatch> batches;
+  batches.push_back(make_int_batch({5, 1, 3}));
+
+  auto key = std::make_shared<ColumnExpression>("a", 0, int32_type(false));
+  std::vector<LogicalSort::Key> keys = {LogicalSort::Key{key, /*ascending=*/true}};
+  SortOperator sort(1, std::make_unique<VectorSourceOperator>(std::move(batches)), std::move(keys),
+                    /*limit=*/0);
+  ExecutionContext context = make_context();
+  sort.open(context);
+  EXPECT_FALSE(sort.next(context).has_value());
+  sort.close(context);
+}
+
 class SortOperatorStringKeyTest : public ::testing::Test {
  protected:
   void SetUp() override {

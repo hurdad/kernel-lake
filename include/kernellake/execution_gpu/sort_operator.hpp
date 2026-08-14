@@ -2,6 +2,7 @@
 
 #include <cudf/table/table.hpp>
 
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -19,9 +20,20 @@ namespace kernellake {
 // whole result set, not bounded like the streaming operators), sorts via
 // cudf::stable_sorted_order + cudf::gather, and returns exactly one output
 // batch before reporting exhausted.
+//
+// `limit`, when set, fuses a following LIMIT N into the sort: operator_builder
+// recognizes a LimitNode whose only child is a SortNode and builds a single
+// SortOperator instead of a separate SortOperator+LimitOperator pair. The
+// gather in next() then only materializes the top N sorted rows rather than
+// the whole result set -- stable_sorted_order still has to look at every row
+// to determine the order, but the expensive part (gathering every column's
+// data for every row) shrinks from the full row count to N. Equivalent to
+// building the two operators separately, just without materializing (and
+// then discarding almost all of) the full sorted table in between.
 class SortOperator final : public PhysicalOperator {
  public:
-  SortOperator(OperatorId id, std::unique_ptr<PhysicalOperator> child, std::vector<LogicalSort::Key> keys);
+  SortOperator(OperatorId id, std::unique_ptr<PhysicalOperator> child, std::vector<LogicalSort::Key> keys,
+               std::optional<std::int64_t> limit = std::nullopt);
 
   void open(ExecutionContext& context) override;
   std::optional<DeviceBatch> next(ExecutionContext& context) override;
@@ -48,6 +60,7 @@ class SortOperator final : public PhysicalOperator {
   OperatorId id_;
   std::unique_ptr<PhysicalOperator> child_;
   std::vector<LogicalSort::Key> keys_;
+  std::optional<std::int64_t> limit_;
   ExpressionCompiler compiler_;
   std::vector<CompiledKey> compiled_keys_;
   bool produced_ = false;
