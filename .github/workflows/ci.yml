@@ -1,39 +1,45 @@
-# KernelLake CI. One workflow, ten jobs, in dependency order:
+# KernelLake CI. One workflow, eleven jobs, in dependency order:
 #
 #   build-base-image (warms the shared GHA cache; see its own comment)
 #         |
 #         +--> clang-tidy
 #         +--> cpu-build-test --+--> tpch-tooling-smoke --+
 #         |                     +--> server-build-test    +--> docker-publish
-#         |                     +--> otel-build-test          (push to main
-#         +--> coverage                                        only)
+#         |                     +--> otel-build-test      |    (push to main
+#         +--> coverage                                   |     only)
+#                                                           |
+#   gpu-build-test (self-hosted-GPU-runner-only) -----------+
+#   gpu-coverage   (self-hosted-GPU-runner-only, standalone -- see below)
 #
-#   gpu-coverage (standalone, self-hosted-GPU-runner-only -- see below)
-#
-# docker-publish only starts once format-check, cpu-build-test, AND
-# tpch-tooling-smoke have all succeeded (via `needs:`) -- a broken build or
-# a query file that stops parsing is never shipped as an image. clang-tidy
-# is a lint job that reads `needs: build-base-image` only for a warm
-# Docker layer cache, not because it depends on cpu-build-test's own
-# result, and isn't in docker-publish's `needs:` list either -- a
-# clang-tidy regression should be visibly red on the PR/commit, same as
-# any other job, but a lint-only finding blocking the docker image
-# specifically wasn't judged worth coupling here (unlike format-check,
-# which already gated docker-publish before this job existed, so it
-# stayed as-is rather than being second-guessed). coverage/gpu-coverage
-# are the same shape of decision: real, useful signals on every push, but
-# not something a coverage dip should ever block a release over on its
-# own, so neither is a `needs:` of docker-publish nor gated by it.
-# server-build-test/otel-build-test are independent of docker-publish's
-# gating: they exist to catch KERNELLAKE_BUILD_SERVER/KERNELLAKE_ENABLE_OTEL
-# regressions specifically (docker/Dockerfile's own `cmake --preset
-# gpu-dev` invocation turns both on unconditionally, so a failure there
-# would also break docker-publish, but these two jobs run the CPU-only
-# server-dev/otel-dev presets instead of gpu-dev, so their pass/fail is
-# deliberately independent of what docker-publish actually ships).
-# Cross-workflow `needs:` isn't a feature GitHub Actions has, which is why
-# this is one file instead of a separate docker-publish.yml gated some
-# other way (e.g. `workflow_run`, which has its own checkout/SHA gotchas).
+# docker-publish only starts once format-check, cpu-build-test,
+# tpch-tooling-smoke, AND gpu-build-test have all succeeded (via `needs:`)
+# -- a broken build, a query file that stops parsing, or a broken GPU test
+# is never shipped as an image (runtime-cpu and runtime-gpu both, since
+# they're built in the same job). clang-tidy is a lint job that reads
+# `needs: build-base-image` only for a warm Docker layer cache, not
+# because it depends on cpu-build-test's own result, and isn't in
+# docker-publish's `needs:` list either -- a clang-tidy regression should
+# be visibly red on the PR/commit, same as any other job, but a lint-only
+# finding blocking the docker image specifically wasn't judged worth
+# coupling here (unlike format-check, which already gated docker-publish
+# before this job existed, so it stayed as-is rather than being
+# second-guessed). coverage/gpu-coverage are the same shape of decision:
+# real, useful signals on every push, but not something a coverage dip
+# should ever block a release over on its own, so neither is a `needs:` of
+# docker-publish nor gated by it -- gpu-build-test exists specifically so
+# docker-publish has a *pass/fail* GPU gate that's separate from
+# gpu-coverage's own (slower, coverage-instrumented, narrower-scoped --
+# see gpu-build-test's own comment) build. server-build-test/otel-build-test
+# are independent of docker-publish's gating: they exist to catch
+# KERNELLAKE_BUILD_SERVER/KERNELLAKE_ENABLE_OTEL regressions specifically
+# (docker/Dockerfile's own `cmake --preset gpu-dev` invocation turns both on
+# unconditionally, so a failure there would also break docker-publish, but
+# these two jobs run the CPU-only server-dev/otel-dev presets instead of
+# gpu-dev, so their pass/fail is deliberately independent of what
+# docker-publish actually ships). Cross-workflow `needs:` isn't a feature
+# GitHub Actions has, which is why this is one file instead of a separate
+# docker-publish.yml gated some other way (e.g. `workflow_run`, which has
+# its own checkout/SHA gotchas).
 #
 # Every job's underlying commands (CMake presets, ctest, docker buildx)
 # mirror commands actually run and verified in this repository's own
@@ -84,21 +90,22 @@
 # Most GPU-dependent work (real query execution, DuckDB cross-validation,
 # and TPC-H benchmarks) still only ever runs manually, off-CI: standard
 # GitHub-hosted runners have no GPU, and per the spec's own rule,
-# KernelLake never reports a skipped-GPU test as passing. `gpu-coverage`
-# (below) is the one exception -- it runs on a self-hosted runner with a
-# real GPU attached (label `[self-hosted, gpu]`), which is why it's the
-# only job in this file not on `ubuntu-24.04`.
+# KernelLake never reports a skipped-GPU test as passing. `gpu-build-test`
+# and `gpu-coverage` are the exceptions -- both run on the same
+# self-hosted runner with a real GPU attached (label `[self-hosted,
+# gpu]`), which is why they're the only two jobs in this file not on
+# `ubuntu-24.04`.
 #
 # That self-hosted runner is a real, persistent machine (not an ephemeral
 # GitHub-hosted one), and this repository is public -- a fork's PR could
 # otherwise modify this workflow file and have its own arbitrary code
 # execute on that machine (which also holds real AWS/SSH credentials for
-# this project's benchmark infrastructure). `gpu-coverage`'s own
-# `if: github.event_name != 'pull_request'` guard is the mitigation: the
+# this project's benchmark infrastructure). Both jobs' own
+# `if: github.event_name != 'pull_request'` guard is the mitigation: each
 # job only ever dispatches on a direct push to `main` (which only a
 # maintainer can do) or manual `workflow_dispatch`, never on a
 # pull_request event (including from this same repo, not just forks) --
-# so a PR's workflow-file changes are inert as far as this job is
+# so a PR's workflow-file changes are inert as far as either job is
 # concerned, no matter who opened it or what they changed. Don't relax
 # this without re-reading GitHub's own self-hosted-runner security
 # guidance for public repositories first.
@@ -333,6 +340,61 @@ jobs:
           name: coverage-report
           path: coverage.xml
           retention-days: 30
+
+  # Split out from gpu-coverage (not reusing it as docker-publish's own GPU
+  # gate) for two real reasons: gpu-coverage only builds the
+  # kernellake_gpu_tests *target* specifically, not the full gpu-dev build
+  # (src/cli, src/server's GPU coordinator, benchmarks) that
+  # docker-publish's own runtime-gpu image actually ships -- a broken
+  # src/cli or GPU server-coordinator compile could pass gpu-coverage's own
+  # gate undetected. And gpu-coverage's --coverage instrumentation makes
+  # every build/run slower than a plain gpu-dev one needs to be, for a job
+  # whose only job here is pass/fail, not a coverage number.
+  gpu-build-test:
+    # See this file's own top-of-file comment for the full self-hosted-
+    # runner security rationale -- this `if:` is the actual enforcement of
+    # it: only a direct push to main or a manual workflow_dispatch reaches
+    # this job, never a pull_request (same-repo or fork). Same guard
+    # gpu-coverage uses, and for the identical reason -- this job also runs
+    # on the self-hosted runner, so it must never dispatch from an
+    # untrusted PR either.
+    if: github.event_name != 'pull_request'
+    runs-on: [self-hosted, gpu]
+    steps:
+      - uses: actions/checkout@v7
+      - name: Verify GPU is visible on the host
+        run: nvidia-smi
+      - uses: docker/setup-buildx-action@v4
+      - name: Build coverage image (gpu-build-base target)
+        # Same image gpu-coverage uses -- Docker's own local layer cache on
+        # this persistent runner means whichever of the two jobs runs
+        # second gets an instant cache hit from the other, no duplicated
+        # work either way.
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: docker/Dockerfile
+          target: gpu-build-base
+          load: true
+          tags: kernellake-gpu-build-base:ci
+      - name: Verify GPU passthrough into containers works
+        run: docker run --rm --gpus all kernellake-gpu-build-base:ci nvidia-smi
+      - name: Configure, build, and test (gpu-dev preset, full build)
+        # No --target restriction (unlike gpu-coverage) -- this builds
+        # everything gpu-dev covers, src/cli and src/server's GPU
+        # coordinator included, matching what docker-publish's own
+        # runtime-gpu image actually ships. No coverage instrumentation
+        # either, so no stale-build-directory concern the way
+        # gpu-coverage's own .gcda files have -- a normal incremental
+        # ninja build is safe to reuse across runs here.
+        run: |
+          docker run --rm --gpus all -u "$(id -u):$(id -g)" -v "$PWD:/workspace" -w /workspace \
+            kernellake-gpu-build-base:ci \
+            bash -c "
+              cmake --preset gpu-dev -DCMAKE_CUDA_COMPILER=/usr/bin/nvcc &&
+              cmake --build --preset gpu-dev &&
+              ctest --preset gpu-dev --output-on-failure
+            "
 
   gpu-coverage:
     # See this file's own top-of-file comment for the full self-hosted-
@@ -627,7 +689,18 @@ jobs:
 
   docker-publish:
     runs-on: ubuntu-24.04
-    needs: [format-check, cpu-build-test, tpch-tooling-smoke]
+    # gpu-build-test included so a broken GPU build/test never ships in
+    # runtime-gpu either, the same protection cpu-build-test already gives
+    # runtime-cpu -- previously nothing gated runtime-gpu's publish on a
+    # real GPU test run at all (gpu-release's own Dockerfile stage can't
+    # run ctest at `docker build` time, no GPU device then). Trade-off
+    # accepted knowingly: this couples docker-publish (both images, one
+    # job) to the self-hosted runner's own availability -- if that machine
+    # is offline, gpu-build-test never completes and this job waits on it
+    # indefinitely rather than skipping, unlike a pull_request run (where
+    # gpu-build-test's own `if:` skips it cleanly and this job's identical
+    # `if:` skips right along with it).
+    needs: [format-check, cpu-build-test, tpch-tooling-smoke, gpu-build-test]
     # Only publish on an actual push to main -- never on pull_request (a
     # fork's PR run has no packages:write on GITHUB_TOKEN anyway, and an
     # untrusted PR build shouldn't produce a published image) or when one
