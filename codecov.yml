@@ -1,0 +1,33 @@
+# Defines a "gpu" component so Codecov reports a real, isolated coverage
+# percentage for GPU-only code instead of blending it against the whole
+# repo's line count.
+#
+# Real bug this fixes: the `gpu` flag (.github/workflows/ci.yml's
+# gpu-coverage job uploads gpu-coverage.xml under `flags: gpu`) is scoped
+# server-side to a small, deliberate subset of the codebase -- only the
+# files that actually require KERNELLAKE_WITH_CUDA=ON to compile/execute
+# at all (see that job's own gcovr --filter list, mirrored as `paths`
+# below). Without a component explicitly scoping the flag to those same
+# paths, Codecov's own /flags/ API computed that flag's coverage against
+# the *entire* repo's line count as the denominator (8545 lines, most of
+# which the gpu flag never uploads data for at all) instead of just the
+# ~1980 lines it actually covers -- reporting 48.47% when a real local
+# rebuild of the exact same commit, using the exact same gcovr command
+# this job runs, measured 85.3%. Confirmed via Codecov's own component
+# docs: "If both flag_regexes and paths are defined for a component, that
+# filter is AND-style" -- paths alone isn't enough, since without the
+# flag_regexes match a path-only component would also pull in whatever
+# the unflagged CPU session reports for any file that happens to overlap
+# (none currently do, but nothing enforces that staying true).
+component_management:
+  individual_components:
+    - component_id: gpu
+      name: GPU execution
+      paths:
+        - src/execution_gpu/**
+        - src/api/query_engine_execute_gpu.cpp
+        - src/memory/gpu_memory_metrics*.cpp
+        - src/memory/rmm_environment.cpp
+        - src/server/gpu_execution_coordinator_gpu.cpp
+      flag_regexes:
+        - gpu
