@@ -263,7 +263,7 @@ jobs:
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: test-results-cpu.xml
-          report-type: test_results
+          report_type: test_results
           fail_ci_if_error: false
 
   coverage:
@@ -429,7 +429,7 @@ jobs:
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: test-results-gpu.xml
-          report-type: test_results
+          report_type: test_results
           flags: gpu
           fail_ci_if_error: false
 
