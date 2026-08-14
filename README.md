@@ -321,11 +321,12 @@ docker run --rm -v /tmp/kernellake-sales:/data:ro \
 to `ghcr.io/hurdad/kernel-lake-gpu:latest` on every push to `main` -- but
 only after `format-check`, `cpu-build-test`, and `tpch-tooling-smoke` all
 succeed, so a broken build is never shipped as an image.
-`kernel-lake-cpu:latest` is a multi-arch (`linux/amd64`+`linux/arm64`)
-manifest -- every `runtime-cpu` dependency is a plain apt package with a
-real arm64 build on Ubuntu 26.04, confirmed by a real
-`docker buildx build --platform linux/arm64` (via QEMU user-mode emulation;
-no arm64 hardware or runner was used to verify this). `kernel-lake-gpu` is
+`kernel-lake-cpu:latest` is `linux/amd64` only -- arm64 publishing was
+previously enabled (every `runtime-cpu` dependency is a plain apt package
+with a real arm64 build on Ubuntu 26.04, confirmed by a real
+`docker buildx build --platform linux/arm64` via QEMU user-mode emulation)
+but has since been turned back off; see `.github/workflows/ci.yml`'s
+`docker-publish` job for how to re-enable it. `kernel-lake-gpu` is
 `linux/amd64` only for now -- CUDA/RAPIDS' own arm64 support needs real
 arm64 GPU hardware (e.g. NVIDIA Grace/Jetson) to verify, which hasn't
 happened yet; see `docs/ROADMAP.md`. `docker run --gpus all` against a real

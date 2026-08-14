@@ -1,68 +1,73 @@
-# KernelLake CI. One workflow, nine jobs, in dependency order:
+# KernelLake CI. One workflow, ten jobs, in dependency order:
 #
-#   format-check ------------------+
-#                                   +--> docker-publish (push to main only)
-#   cpu-build-test --+--> tpch-tooling-smoke --+
-#                     +--> server-build-test
-#                     +--> otel-build-test
+#   build-base-image (warms the shared GHA cache; see its own comment)
+#         |
+#         +--> clang-tidy
+#         +--> cpu-build-test --+--> tpch-tooling-smoke --+
+#         |                     +--> server-build-test    +--> docker-publish
+#         |                     +--> otel-build-test          (push to main
+#         +--> coverage                                        only)
 #
-#   clang-tidy   (standalone lint job -- no `needs:` of its own, and not in
-#                 docker-publish's `needs:` list either; see below)
-#   coverage     (standalone, same reasoning as clang-tidy -- see below)
 #   gpu-coverage (standalone, self-hosted-GPU-runner-only -- see below)
 #
 # docker-publish only starts once format-check, cpu-build-test, AND
 # tpch-tooling-smoke have all succeeded (via `needs:`) -- a broken build or
 # a query file that stops parsing is never shipped as an image. clang-tidy
-# (like format-check) is a standalone lint job with no `needs:` of its own
-# and isn't in docker-publish's `needs:` list either -- a clang-tidy
-# regression should be visibly red on the PR/commit, same as any other job,
-# but a lint-only finding blocking the docker image specifically wasn't
-# judged worth coupling here (unlike format-check, which already gated
-# docker-publish before this job existed, so it stayed as-is rather than
-# being second-guessed). coverage is the same shape of decision: a real,
-# useful signal on every PR, but not something a coverage dip should ever
-# block a release over on its own, so it's neither a `needs:` of
-# docker-publish nor gated by it. server-build-test/otel-build-test are
-# independent of docker-publish's gating: they exist to catch
-# KERNELLAKE_BUILD_SERVER/KERNELLAKE_ENABLE_OTEL regressions specifically
-# (docker/Dockerfile's own `cmake --preset gpu-dev` invocation turns both on
-# unconditionally, so a failure there would also break docker-publish, but
-# these two jobs run the CPU-only server-dev/otel-dev presets instead of
-# gpu-dev, so their pass/fail is deliberately independent of what
-# docker-publish actually ships). Cross-workflow `needs:` isn't a feature
-# GitHub Actions has, which is why this is one file instead of a separate
-# docker-publish.yml gated some other way (e.g. `workflow_run`, which has
-# its own checkout/SHA gotchas).
+# is a lint job that reads `needs: build-base-image` only for a warm
+# Docker layer cache, not because it depends on cpu-build-test's own
+# result, and isn't in docker-publish's `needs:` list either -- a
+# clang-tidy regression should be visibly red on the PR/commit, same as
+# any other job, but a lint-only finding blocking the docker image
+# specifically wasn't judged worth coupling here (unlike format-check,
+# which already gated docker-publish before this job existed, so it
+# stayed as-is rather than being second-guessed). coverage/gpu-coverage
+# are the same shape of decision: real, useful signals on every push, but
+# not something a coverage dip should ever block a release over on its
+# own, so neither is a `needs:` of docker-publish nor gated by it.
+# server-build-test/otel-build-test are independent of docker-publish's
+# gating: they exist to catch KERNELLAKE_BUILD_SERVER/KERNELLAKE_ENABLE_OTEL
+# regressions specifically (docker/Dockerfile's own `cmake --preset
+# gpu-dev` invocation turns both on unconditionally, so a failure there
+# would also break docker-publish, but these two jobs run the CPU-only
+# server-dev/otel-dev presets instead of gpu-dev, so their pass/fail is
+# deliberately independent of what docker-publish actually ships).
+# Cross-workflow `needs:` isn't a feature GitHub Actions has, which is why
+# this is one file instead of a separate docker-publish.yml gated some
+# other way (e.g. `workflow_run`, which has its own checkout/SHA gotchas).
 #
-# Every job's underlying shell commands (apt installs, CMake presets,
-# ctest, docker buildx) mirror commands actually run and verified in this
-# repository's own development environment. All five build-and-test jobs
-# (clang-tidy, cpu-build-test, tpch-tooling-smoke, server-build-test,
-# otel-build-test) run inside a plain `ubuntu:26.04` container (the
-# `container:` key, on the same `ubuntu-24.04` GitHub-hosted runner --
-# there is no `ubuntu-26.04` runner label yet) rather than on the runner's
-# own Ubuntu 24.04 directly:
-# libarrow-flight-sql-dev and opentelemetry-cpp-dev have always needed
-# 26.04 (see docs/ARCHITECTURE.md's "Ubuntu 26.04 baseline" section for
-# why -- Ubuntu 24.04's system Abseil is too old, so Arrow bundles its own
-# incomplete private copy there instead), and cloud object storage support
-# (see "Cloud object storage" in the same doc) means every build now
-# unconditionally links Arrow's bundled google-cloud-cpp/Azure SDK C++
-# code too, not just the server/otel-enabled presets -- so this same
-# constraint now applies to cpu-build-test/tpch-tooling-smoke as well,
-# not just server-build-test/otel-build-test.
+# Every job's underlying commands (CMake presets, ctest, docker buildx)
+# mirror commands actually run and verified in this repository's own
+# development environment. build-base-image, clang-tidy, cpu-build-test,
+# coverage, tpch-tooling-smoke, server-build-test, and otel-build-test all
+# build (or reuse, via a shared GHA cache scope -- see build-base-image's
+# own comment) docker/Dockerfile's `build-base` stage and `docker run`
+# their own preset/test/lint commands against it, rather than each
+# apt-installing its own hand-maintained copy of the same toolchain --
+# that used to be five separate, driftable package lists with no guarantee
+# they'd ever stayed in sync with docker/Dockerfile's own. build-base is
+# ubuntu:26.04-based: libarrow-flight-sql-dev and opentelemetry-cpp-dev
+# have always needed 26.04 (see docs/ARCHITECTURE.md's "Ubuntu 26.04
+# baseline" section for why -- Ubuntu 24.04's system Abseil is too old, so
+# Arrow bundles its own incomplete private copy there instead), and cloud
+# object storage support (see "Cloud object storage" in the same doc)
+# means every build now unconditionally links Arrow's bundled
+# google-cloud-cpp/Azure SDK C++ code too, not just the server/otel-enabled
+# presets. gpu-coverage uses the identical pattern against
+# docker/Dockerfile's `gpu-build-base` stage instead (see its own comment
+# for why it doesn't share build-base's GHA cache scope). format-check is
+# the one job with no Docker/build-base involvement at all -- it only
+# needs clang-format-18 on the bare runner, nothing this project builds.
 #
-# Every libarrow*-dev package installed below is pinned to =25.0.1-1 (the
-# exact apt package version string, Debian revision included) -- matching
-# how every other real third-party dependency in this project is pinned
-# (see docker/Dockerfile's own comment on this). Every other apt package
-# here (gRPC, opentelemetry-cpp-dev, gtest, benchmark, spdlog,
+# Every libarrow*-dev package build-base installs is pinned to =25.0.1-1
+# (the exact apt package version string, Debian revision included) --
+# matching how every other real third-party dependency in this project is
+# pinned (see docker/Dockerfile's own comment on this). Every other apt
+# package there (gRPC, opentelemetry-cpp-dev, gtest, benchmark, spdlog,
 # nlohmann-json, yaml-cpp, avro-c, libcurl, libxml2, ...) is left unpinned
 # for now. If the 25.0.1-1 build ever disappears from Apache's apt repo,
 # bump this pin to whatever revision `apt-cache policy libarrow-dev`
-# reports as available then, in every job below plus docker/Dockerfile and
-# README.md -- don't drop back to unpinned.
+# reports as available then, in docker/Dockerfile (the one place it's
+# still hand-written) and README.md -- don't drop back to unpinned.
 #
 # This workflow runs for real on GitHub Actions on every push to main (not
 # a hypothetical -- real run history exists and is inspectable via
@@ -107,10 +112,44 @@ on:
   workflow_dispatch: {}
 
 jobs:
+  # Builds docker/Dockerfile's `build-base` stage once (every CPU-side
+  # toolchain package this whole file needs: build-essential/cmake/ninja,
+  # gtest/benchmark/spdlog/nlohmann-json/yaml-cpp, Arrow/Parquet/Flight/
+  # Flight-SQL pinned to =25.0.1-1, gRPC, opentelemetry-cpp-dev,
+  # clang-format-18/clang-tidy-18, gcovr -- see that stage's own comment)
+  # and pushes it to the GHA cache under a single shared scope, so every
+  # job below that also builds `target: build-base` gets a cache *hit*
+  # instead of a race between several jobs' own cache-to writes for the
+  # same scope landing in an unpredictable order. This job never `push:`s
+  # or `load:`s the image itself -- populating the cache is the only
+  # point of it, no test/lint work happens here.
+  #
+  # Replaces what used to be five separate, hand-maintained copies of the
+  # same apt package list (one inside each of clang-tidy/cpu-build-test/
+  # tpch-tooling-smoke/server-build-test/otel-build-test/coverage's own
+  # steps) with docker/Dockerfile's build-base stage as the one source of
+  # truth -- those five jobs now each `docker build --target build-base`
+  # (fast, cache-from this job's own warm scope) then `docker run` their
+  # own preset/test commands against it, instead of apt-installing
+  # anything themselves.
+  build-base-image:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - name: Build and cache build-base image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: docker/Dockerfile
+          target: build-base
+          cache-from: type=gha,scope=build-base
+          cache-to: type=gha,mode=max,scope=build-base
+
   format-check:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install clang-format
         run: sudo apt-get update && sudo apt-get install -y clang-format-18
       - name: Check formatting
@@ -138,120 +177,101 @@ jobs:
   # top-of-file comment) -- verify those locally with a real gpu-dev build
   # before merging a change that touches them.
   clang-tidy:
+    needs: build-base-image
     runs-on: ubuntu-24.04
-    container: ubuntu:26.04
     steps:
-      - uses: actions/checkout@v4
-      - name: Install core toolchain
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - name: Build coverage image (build-base target, cached)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: docker/Dockerfile
+          target: build-base
+          load: true
+          tags: kernellake-build-base:ci
+          cache-from: type=gha,scope=build-base
+      - name: Configure, build, and run clang-tidy
         run: |
-          apt-get update
-          apt-get install -y --no-install-recommends \
-            build-essential cmake ninja-build git pkg-config wget ca-certificates lsb-release gnupg \
-            python3 python3-pip \
-            libgtest-dev libbenchmark-dev libspdlog-dev nlohmann-json3-dev libyaml-cpp-dev \
-            libxml2-dev uuid-dev clang-tidy-18 \
-            libavro-dev libcurl4-openssl-dev \
-            libgrpc++-dev protobuf-compiler-grpc
-      - name: Install Apache Arrow / Parquet C++
-        run: |
-          wget -O /tmp/arrow-apt-source.deb \
-            "https://packages.apache.org/artifactory/arrow/ubuntu/apache-arrow-apt-source-latest-$(lsb_release --codename --short).deb"
-          apt-get install -y -V /tmp/arrow-apt-source.deb
-          apt-get update
-          apt-get install -y --no-install-recommends libarrow-dev=25.0.1-1 libparquet-dev=25.0.1-1 libarrow-dataset-dev=25.0.1-1
-      - name: Configure and build (cpu-dev preset)
-        run: |
-          cmake --preset cpu-dev
-          cmake --build --preset cpu-dev
-      - name: Run clang-tidy
-        run: |
-          files=$(find src -name '*.cpp' \
-            ! -path 'src/execution_gpu/*' \
-            ! -path 'src/memory/*' \
-            ! -name 'query_engine_execute_gpu.cpp' \
-            ! -path 'src/server/*' \
-            ! -name 'query_tracing_otel.cpp' \
-            ! -name 'query_tracing_test_support.cpp')
-          run-clang-tidy-18 -p build/cpu-dev -quiet -j "$(nproc)" -warnings-as-errors='*' $files
+          docker run --rm -u "$(id -u):$(id -g)" -v "$PWD:/workspace" -w /workspace \
+            kernellake-build-base:ci \
+            bash -c "
+              cmake --preset cpu-dev &&
+              cmake --build --preset cpu-dev &&
+              files=\$(find src -name '*.cpp' \
+                ! -path 'src/execution_gpu/*' \
+                ! -path 'src/memory/*' \
+                ! -name 'query_engine_execute_gpu.cpp' \
+                ! -path 'src/server/*' \
+                ! -name 'query_tracing_otel.cpp' \
+                ! -name 'query_tracing_test_support.cpp') &&
+              run-clang-tidy-18 -p build/cpu-dev -quiet -j \"\$(nproc)\" -warnings-as-errors='*' \$files
+            "
 
   cpu-build-test:
-    # See this file's own top-of-file comment: plain ubuntu:26.04 (via
-    # `container:`, same runner as every other job), not the runner's own
-    # Ubuntu 24.04 directly -- config.hpp unconditionally pulls in Arrow's
-    # bundled google-cloud-cpp/Azure SDK C++ code now (see
-    # docs/ARCHITECTURE.md's "Cloud object storage" section), which needs
-    # the same newer system Abseil 26.04 has and 24.04 doesn't.
+    # Config.hpp unconditionally pulls in Arrow's bundled google-cloud-cpp/
+    # Azure SDK C++ code now (see docs/ARCHITECTURE.md's "Cloud object
+    # storage" section), which needs the newer system Abseil build-base's
+    # own ubuntu:26.04 base has -- see that stage's own comment.
+    needs: build-base-image
     runs-on: ubuntu-24.04
-    container: ubuntu:26.04
     steps:
-      - uses: actions/checkout@v4
-      - name: Install core toolchain
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - name: Build coverage image (build-base target, cached)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: docker/Dockerfile
+          target: build-base
+          load: true
+          tags: kernellake-build-base:ci
+          cache-from: type=gha,scope=build-base
+      - name: Configure, build, and test
         run: |
-          apt-get update
-          apt-get install -y --no-install-recommends \
-            build-essential cmake ninja-build git pkg-config wget ca-certificates lsb-release gnupg \
-            python3 python3-pip \
-            libgtest-dev libbenchmark-dev libspdlog-dev nlohmann-json3-dev libyaml-cpp-dev \
-            libxml2-dev uuid-dev \
-            libavro-dev libcurl4-openssl-dev \
-            libgrpc++-dev protobuf-compiler-grpc
-      - name: Install Apache Arrow / Parquet C++
-        run: |
-          wget -O /tmp/arrow-apt-source.deb \
-            "https://packages.apache.org/artifactory/arrow/ubuntu/apache-arrow-apt-source-latest-$(lsb_release --codename --short).deb"
-          apt-get install -y -V /tmp/arrow-apt-source.deb
-          apt-get update
-          apt-get install -y --no-install-recommends libarrow-dev=25.0.1-1 libparquet-dev=25.0.1-1 libarrow-dataset-dev=25.0.1-1
-      - name: Configure (cpu-dev preset)
-        run: cmake --preset cpu-dev
-      - name: Build
-        run: cmake --build --preset cpu-dev
-      - name: Test
-        run: ctest --preset cpu-dev --output-on-failure
+          docker run --rm -u "$(id -u):$(id -g)" -v "$PWD:/workspace" -w /workspace \
+            kernellake-build-base:ci \
+            bash -c "
+              cmake --preset cpu-dev &&
+              cmake --build --preset cpu-dev &&
+              ctest --preset cpu-dev --output-on-failure
+            "
 
   coverage:
-    # Independent of cpu-build-test (no `needs:`, same as clang-tidy) --
-    # this rebuilds under a separate `cpu-coverage` preset (cpu-dev plus
-    # gcc's --coverage instrumentation, see CMakePresets.json) rather than
+    # Rebuilds under a separate `cpu-coverage` preset (cpu-dev plus gcc's
+    # --coverage instrumentation, see CMakePresets.json) rather than
     # reusing cpu-build-test's own build directory, since a coverage-
     # instrumented binary is slower and shouldn't be what every other job
-    # is actually testing. See cpu-build-test's own comment on why this
-    # needs ubuntu:26.04 too.
+    # is actually testing -- `needs: build-base-image` here is only for a
+    # warm cache, not because this job depends on cpu-build-test passing.
+    #
+    # Builds+runs against docker/Dockerfile's own `build-base` stage
+    # (docker/build-push-action, cache-from build-base-image's own warm
+    # GHA cache) instead of apt-installing the same toolchain/Arrow
+    # packages directly in this job's own steps -- avoids a second,
+    # driftable copy of that package list (the one this job used to carry
+    # directly matched docker/Dockerfile's own build-base stage by hand,
+    # with no guarantee the two ever stayed in sync). gpu-coverage below
+    # uses the identical pattern against gpu-build-base; ctest itself only
+    # ever runs via `docker run` *after* the image is built, never inside
+    # the Dockerfile -- `docker build` has no access to whatever device a
+    # test suite needs (irrelevant for CPU tests, but the same reason
+    # gpu-coverage's own GPU tests can't run at image-build time either).
+    needs: build-base-image
     runs-on: ubuntu-24.04
-    container: ubuntu:26.04
     steps:
-      - uses: actions/checkout@v4
-      - name: Install core toolchain
-        # curl (the CLI, not just libcurl4-openssl-dev's headers/lib) is
-        # required here specifically -- codecov-action's own uploader
-        # shells out to it, and plain ubuntu:26.04 doesn't ship it by
-        # default the way the GitHub-hosted runner's own image does. No
-        # other job in this file needs the CLI tool, only this one.
-        run: |
-          apt-get update
-          apt-get install -y --no-install-recommends \
-            build-essential cmake ninja-build git pkg-config wget curl ca-certificates lsb-release gnupg \
-            python3 python3-pip \
-            libgtest-dev libbenchmark-dev libspdlog-dev nlohmann-json3-dev libyaml-cpp-dev \
-            libxml2-dev uuid-dev \
-            libavro-dev libcurl4-openssl-dev \
-            libgrpc++-dev protobuf-compiler-grpc
-      - name: Install Apache Arrow / Parquet C++
-        run: |
-          wget -O /tmp/arrow-apt-source.deb \
-            "https://packages.apache.org/artifactory/arrow/ubuntu/apache-arrow-apt-source-latest-$(lsb_release --codename --short).deb"
-          apt-get install -y -V /tmp/arrow-apt-source.deb
-          apt-get update
-          apt-get install -y --no-install-recommends libarrow-dev=25.0.1-1 libparquet-dev=25.0.1-1 libarrow-dataset-dev=25.0.1-1
-      - name: Configure (cpu-coverage preset)
-        run: cmake --preset cpu-coverage
-      - name: Build
-        run: cmake --build --preset cpu-coverage
-      - name: Test
-        run: ctest --preset cpu-coverage --output-on-failure
-      - name: Install gcovr
-        run: pip install --break-system-packages gcovr
-      - name: Generate coverage report
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - name: Build coverage image (build-base target, cached)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: docker/Dockerfile
+          target: build-base
+          load: true
+          tags: kernellake-build-base:ci
+          cache-from: type=gha,scope=build-base
+      - name: Configure, build, test, and generate coverage report
         # Restricted to src/ and include/ -- vendored third-party code
         # (build/cpu-coverage/_deps) and the tests themselves are never
         # part of the numerator or denominator; a test file covering
@@ -271,15 +291,29 @@ jobs:
         # Newer gcovr treats this as a hard parse error by default; this
         # downgrades it to one warning per file instead of aborting the
         # whole report.
+        #
+        # -u/--user matches the container process's UID/GID to the
+        # runner's own checkout owner, so every file docker run creates
+        # (build/, coverage.xml) is owned by the same user afterward --
+        # without it, root-owned build output would break later
+        # non-Docker steps (the Codecov/artifact uploads) that read it
+        # back outside the container.
         run: |
-          gcovr --root . \
-            --filter 'src/' --filter 'include/' \
-            --exclude '.*_test\.cpp' \
-            --exclude '.*/_deps/.*' \
-            --gcov-ignore-parse-errors=negative_hits.warn_once_per_file \
-            --xml-pretty -o coverage.xml \
-            --print-summary \
-            build/cpu-coverage
+          docker run --rm -u "$(id -u):$(id -g)" -v "$PWD:/workspace" -w /workspace \
+            kernellake-build-base:ci \
+            bash -c "
+              cmake --preset cpu-coverage &&
+              cmake --build --preset cpu-coverage &&
+              ctest --preset cpu-coverage --output-on-failure &&
+              gcovr --root . \
+                --filter 'src/' --filter 'include/' \
+                --exclude '.*_test\.cpp' \
+                --exclude '.*/_deps/.*' \
+                --gcov-ignore-parse-errors=negative_hits.warn_once_per_file \
+                --xml-pretty -o coverage.xml \
+                --print-summary \
+                build/cpu-coverage
+            "
       # Tokenless upload works for public GitHub repos on GitHub-hosted
       # runners (Codecov identifies the repo via the GitHub OIDC token) --
       # no CODECOV_TOKEN secret required, but one is picked up
@@ -288,13 +322,13 @@ jobs:
       # the coverage.xml artifact upload below is the fallback if the
       # Codecov upload itself doesn't go through.
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v5
+        uses: codecov/codecov-action@v7
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: coverage.xml
           fail_ci_if_error: false
       - name: Upload coverage report artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: coverage-report
           path: coverage.xml
@@ -307,44 +341,68 @@ jobs:
     # this job, never a pull_request (same-repo or fork).
     if: github.event_name != 'pull_request'
     runs-on: [self-hosted, gpu]
-    # No `container:` here, deliberately unlike every other job in this
-    # file: a GPU job needs the host's own CUDA driver/toolkit and its
-    # already-fetched build/gpu-coverage/_deps (librmm/libcudf/libkvikio,
-    # each a many-minute FetchContent download+build) -- starting from a
-    # fresh container on every run would mean redoing that provisioning
-    # from scratch every single time instead of once when the runner was
-    # set up, and a container also can't see the GPU without extra
-    # NVIDIA-container-toolkit configuration this runner doesn't have.
+    # No `container:` job-level key here (unlike `coverage` using
+    # docker/build-push-action's `load: true` + a plain `docker run`
+    # instead) -- GitHub Actions' own `container:` key can't pass `--gpus
+    # all` through to the container it starts, so GPU passthrough has to
+    # go through an explicit `docker run` step instead. This also runs
+    # ctest/gcovr *after* the image is built, never inside
+    # docker/Dockerfile's own gpu-build-base target -- `docker build` has
+    # no GPU access at all (only `docker run --gpus all` does), the same
+    # reason gpu-release's own image build never runs ctest either (see
+    # that stage's comment).
     steps:
-      - uses: actions/checkout@v4
-      - name: Verify GPU is visible
+      - uses: actions/checkout@v7
+      - name: Verify GPU is visible on the host
         # Fails fast with a clear message rather than letting CMake's own
         # much-less-obvious CUDA-toolkit-detection error stand in for "the
         # runner's GPU disappeared/driver broke" if that ever happens.
         run: nvidia-smi
+      - uses: docker/setup-buildx-action@v4
+      - name: Build coverage image (gpu-build-base target)
+        # No GHA cache-from/cache-to here (unlike the `coverage` job) --
+        # this runner is a persistent machine, not an ephemeral
+        # GitHub-hosted one, so Docker's own local layer cache already
+        # makes every run after the first one fast without needing the
+        # extra network round trip pushing/pulling a remote cache would
+        # cost. `load: true` still applies -- the built image needs to
+        # land in this runner's local Docker daemon for the `docker run`
+        # steps below to use it.
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: docker/Dockerfile
+          target: gpu-build-base
+          load: true
+          tags: kernellake-gpu-build-base:ci
+      - name: Verify GPU passthrough into containers works
+        # A separate, real concern from the host-level check above: the
+        # NVIDIA Container Toolkit has to be installed and configured with
+        # Docker specifically (`nvidia-ctk runtime configure`) for `--gpus
+        # all` to work at all -- a runner can see its own GPU fine via a
+        # bare `nvidia-smi` while this still fails if that toolkit was
+        # never set up. Caught here, once, with an unambiguous error,
+        # rather than as a confusing failure three steps later. Reuses the
+        # image just built above (it already has nvidia-smi via
+        # nvidia-cuda-toolkit) rather than pulling a separate external
+        # image just for this check.
+        run: docker run --rm --gpus all kernellake-gpu-build-base:ci nvidia-smi
       - name: Clean stale coverage build directory
-        # Unlike the `coverage` job's fresh ubuntu:26.04 container, this
-        # runner's filesystem persists between runs -- cpu-coverage's own
-        # preset doc comment warns .gcda files accumulate/overwrite with a
+        # This runner's filesystem persists between runs -- cpu-coverage's
+        # own preset doc comment (gpu-coverage inherits the same gcov
+        # instrumentation) warns .gcda files accumulate/overwrite with a
         # checksum mismatch across source changes if the build directory
         # isn't fresh; this is that same requirement, made explicit since
         # nothing else here provides it for free.
         run: rm -rf build/gpu-coverage
-      - name: Configure (gpu-coverage preset)
+      - name: Configure, build, test, and generate coverage report
         # CMAKE_CUDA_COMPILER overridden explicitly: gpu-dev (which
-        # gpu-coverage inherits) hardcodes /usr/local/cuda/bin/nvcc for the
-        # Docker image's layout -- this runner's own toolkit puts nvcc
-        # wherever its package manager does instead, so `command -v nvcc`
-        # is resolved fresh here rather than the preset guessing a path
-        # that wouldn't generalize across self-hosted runners.
-        run: cmake --preset gpu-coverage -DCMAKE_CUDA_COMPILER="$(command -v nvcc)"
-      - name: Build
-        run: cmake --build --preset gpu-coverage --target kernellake_gpu_tests
-      - name: Test
-        run: ctest --preset gpu-coverage --output-on-failure
-      - name: Install gcovr
-        run: pip install --break-system-packages gcovr
-      - name: Generate coverage report
+        # gpu-coverage inherits) hardcodes /usr/local/cuda/bin/nvcc for
+        # NVIDIA's own installer layout, but gpu-build-base installs CUDA
+        # via apt's nvidia-cuda-toolkit instead (Debian packaging
+        # convention: /usr/bin/nvcc) -- same override docker/Dockerfile's
+        # own gpu-release stage already uses for the identical reason.
+        #
         # Scoped to only the files that actually require
         # KERNELLAKE_WITH_CUDA=ON to compile/execute at all -- unlike the
         # `coverage` job's broad `src/`+`include/` filter, a matching
@@ -355,66 +413,73 @@ jobs:
         # distinct component instead of blending it with the `coverage`
         # job's own (different) numbers for any file that happens to
         # appear in both.
+        #
+        # -u/--user matches the container process's UID/GID to the
+        # runner's own checkout owner, same reasoning as the `coverage`
+        # job's identical flag.
         run: |
-          gcovr --root . \
-            --filter 'src/execution_gpu/' \
-            --filter 'src/api/query_engine_execute_gpu' \
-            --filter 'src/memory/gpu_memory_metrics' \
-            --filter 'src/memory/rmm_environment' \
-            --filter 'src/server/gpu_execution_coordinator_gpu' \
-            --exclude '.*_test\.cpp' \
-            --exclude '.*/_deps/.*' \
-            --gcov-ignore-parse-errors=negative_hits.warn_once_per_file \
-            --xml-pretty -o gpu-coverage.xml \
-            --print-summary \
-            build/gpu-coverage
+          docker run --rm --gpus all -u "$(id -u):$(id -g)" -v "$PWD:/workspace" -w /workspace \
+            kernellake-gpu-build-base:ci \
+            bash -c "
+              cmake --preset gpu-coverage -DCMAKE_CUDA_COMPILER=/usr/bin/nvcc &&
+              cmake --build --preset gpu-coverage --target kernellake_gpu_tests &&
+              ctest --preset gpu-coverage --output-on-failure &&
+              gcovr --root . \
+                --filter 'src/execution_gpu/' \
+                --filter 'src/api/query_engine_execute_gpu' \
+                --filter 'src/memory/gpu_memory_metrics' \
+                --filter 'src/memory/rmm_environment' \
+                --filter 'src/server/gpu_execution_coordinator_gpu' \
+                --exclude '.*_test\.cpp' \
+                --exclude '.*/_deps/.*' \
+                --gcov-ignore-parse-errors=negative_hits.warn_once_per_file \
+                --xml-pretty -o gpu-coverage.xml \
+                --print-summary \
+                build/gpu-coverage
+            "
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v5
+        uses: codecov/codecov-action@v7
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: gpu-coverage.xml
           flags: gpu
           fail_ci_if_error: false
       - name: Upload coverage report artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: gpu-coverage-report
           path: gpu-coverage.xml
           retention-days: 30
 
   tpch-tooling-smoke:
-    # See cpu-build-test's own comment on why this needs ubuntu:26.04 too.
+    needs: [build-base-image, cpu-build-test]
     runs-on: ubuntu-24.04
-    container: ubuntu:26.04
-    needs: cpu-build-test
     steps:
-      - uses: actions/checkout@v4
-      - name: Install core toolchain
-        run: |
-          apt-get update
-          apt-get install -y --no-install-recommends \
-            build-essential cmake ninja-build git pkg-config wget ca-certificates lsb-release gnupg \
-            python3 python3-pip \
-            libgtest-dev libbenchmark-dev libspdlog-dev nlohmann-json3-dev libyaml-cpp-dev \
-            libxml2-dev uuid-dev \
-            libavro-dev libcurl4-openssl-dev \
-            libgrpc++-dev protobuf-compiler-grpc
-      - name: Install Apache Arrow / Parquet C++
-        run: |
-          wget -O /tmp/arrow-apt-source.deb \
-            "https://packages.apache.org/artifactory/arrow/ubuntu/apache-arrow-apt-source-latest-$(lsb_release --codename --short).deb"
-          apt-get install -y -V /tmp/arrow-apt-source.deb
-          apt-get update
-          apt-get install -y --no-install-recommends libarrow-dev=25.0.1-1 libparquet-dev=25.0.1-1 libarrow-dataset-dev=25.0.1-1
-      - name: Install pyarrow (for generate_tpch.py)
-        run: pip install --user --break-system-packages pyarrow
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - name: Build coverage image (build-base target, cached)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: docker/Dockerfile
+          target: build-base
+          load: true
+          tags: kernellake-build-base:ci
+          cache-from: type=gha,scope=build-base
+      # No -u UID:GID on any docker run below (unlike cpu-build-test/
+      # clang-tidy/coverage) -- this job's own pip install needs a writable
+      # home directory, and nothing downstream of these steps reads
+      # build/ back out on the host, so running as root here (matching
+      # this job's own pre-Docker container: ubuntu:26.04 behavior, which
+      # also ran as root) is simplest.
       - name: Build (cpu-dev preset)
         run: |
-          cmake --preset cpu-dev
-          cmake --build --preset cpu-dev
+          docker run --rm -v "$PWD:/workspace" -w /workspace kernellake-build-base:ci \
+            bash -c "cmake --preset cpu-dev && cmake --build --preset cpu-dev"
       - name: generate-data smoke test
         run: |
-          ./build/cpu-dev/src/cli/kernellake generate-data --output /tmp/kernellake-sales --rows 10000 --files 2
+          docker run --rm -v "$PWD:/workspace" -w /workspace kernellake-build-base:ci \
+            ./build/cpu-dev/src/cli/kernellake generate-data --output /tmp/kernellake-sales --rows 10000 --files 2
 
       # SF1 is the spec's own CI recommendation, but that is a ~6,000,000-row
       # generation run (see tools/generate_tpch.py); a much smaller scale
@@ -422,10 +487,22 @@ jobs:
       # spec section's own allowance ("SF1000 where sufficient storage is
       # available" implies scale is adjusted to the environment). Run the
       # real SF1 generation manually or on a runner sized for it.
+      #
+      # pyarrow is installed here, in the same docker run as the script
+      # that needs it, not baked into build-base (only this one job needs
+      # it) and not a separate step (each `docker run` is its own
+      # ephemeral container -- a package installed in one step's container
+      # is gone by the next step's, since only the bind-mounted /workspace
+      # persists across separate docker run invocations, not the rest of
+      # that container's filesystem).
       - name: TPC-H data-generation smoke test (small scale factor)
         run: |
-          python3 tools/generate_tpch.py --scale-factor 0.001 --output /tmp/kernellake-tpch-smoke \
-            --row-group-rows 2000 --files 1
+          docker run --rm -v "$PWD:/workspace" -w /workspace kernellake-build-base:ci \
+            bash -c "
+              pip install --break-system-packages pyarrow &&
+              python3 tools/generate_tpch.py --scale-factor 0.001 --output /tmp/kernellake-tpch-smoke \
+                --row-group-rows 2000 --files 1
+            "
 
       # No GPU here, so `kernellake query` can't run -- `explain` still
       # exercises SQL parsing, binding, logical planning, optimization, and
@@ -434,136 +511,119 @@ jobs:
       # parses/binds against the schema generate_tpch.py produces.
       - name: TPC-H query-file validation (parse/bind/plan only, no GPU)
         run: |
-          # {data} must resolve to lineitem-*.parquet specifically, not a
-          # bare *.parquet glob -- generate_tpch.py now writes lineitem/
-          # part/orders/customer/supplier/nation/region/partsupp all into
-          # this same directory, so an unqualified glob would pull in
-          # every table at once and fail with a schema mismatch. Every
-          # other placeholder any query file references is substituted
-          # unconditionally too, one sed expression per placeholder (with
-          # /g, since some queries -- e.g. Q7's/Q11's own {nation_data} --
-          # reference the same placeholder more than once); a query file
-          # that doesn't contain a given placeholder is unaffected by that
-          # expression.
-          for q in benchmarks/tpch/queries/*.sql; do
-            sql=$(grep -v '^--' "$q" | tr '\n' ' ' | \
-              sed "s|{data}|/tmp/kernellake-tpch-smoke/lineitem-*.parquet|g; \
-                   s|{part_data}|/tmp/kernellake-tpch-smoke/part-*.parquet|g; \
-                   s|{orders_data}|/tmp/kernellake-tpch-smoke/orders-*.parquet|g; \
-                   s|{customer_data}|/tmp/kernellake-tpch-smoke/customer-*.parquet|g; \
-                   s|{supplier_data}|/tmp/kernellake-tpch-smoke/supplier-*.parquet|g; \
-                   s|{nation_data}|/tmp/kernellake-tpch-smoke/nation-*.parquet|g; \
-                   s|{region_data}|/tmp/kernellake-tpch-smoke/region-*.parquet|g; \
-                   s|{partsupp_data}|/tmp/kernellake-tpch-smoke/partsupp-*.parquet|g")
-            echo "=== $q ==="
-            ./build/cpu-dev/src/cli/kernellake explain --sql "$sql"
-          done
+          docker run --rm -v "$PWD:/workspace" -w /workspace kernellake-build-base:ci \
+            bash -c '
+              # {data} must resolve to lineitem-*.parquet specifically, not a
+              # bare *.parquet glob -- generate_tpch.py now writes lineitem/
+              # part/orders/customer/supplier/nation/region/partsupp all into
+              # this same directory, so an unqualified glob would pull in
+              # every table at once and fail with a schema mismatch. Every
+              # other placeholder any query file references is substituted
+              # unconditionally too, one sed expression per placeholder (with
+              # /g, since some queries -- e.g. Q7'"'"'s/Q11'"'"'s own {nation_data} --
+              # reference the same placeholder more than once); a query file
+              # that does not contain a given placeholder is unaffected by that
+              # expression.
+              for q in benchmarks/tpch/queries/*.sql; do
+                sql=$(grep -v "^--" "$q" | tr "\n" " " | \
+                  sed "s|{data}|/tmp/kernellake-tpch-smoke/lineitem-*.parquet|g; \
+                       s|{part_data}|/tmp/kernellake-tpch-smoke/part-*.parquet|g; \
+                       s|{orders_data}|/tmp/kernellake-tpch-smoke/orders-*.parquet|g; \
+                       s|{customer_data}|/tmp/kernellake-tpch-smoke/customer-*.parquet|g; \
+                       s|{supplier_data}|/tmp/kernellake-tpch-smoke/supplier-*.parquet|g; \
+                       s|{nation_data}|/tmp/kernellake-tpch-smoke/nation-*.parquet|g; \
+                       s|{region_data}|/tmp/kernellake-tpch-smoke/region-*.parquet|g; \
+                       s|{partsupp_data}|/tmp/kernellake-tpch-smoke/partsupp-*.parquet|g")
+                echo "=== $q ==="
+                ./build/cpu-dev/src/cli/kernellake explain --sql "$sql"
+              done
+            '
 
   server-build-test:
     # kernellake-server (KERNELLAKE_BUILD_SERVER=ON) needs
     # libarrow-flight-sql-dev, which does not link against Ubuntu 24.04's
     # system Abseil -- see docs/ARCHITECTURE.md's "Ubuntu 26.04 baseline"
-    # section. Standard GitHub-hosted runners don't offer an ubuntu-26.04
-    # label yet, so this job stays on the same ubuntu-24.04 runner as every
-    # other job but runs its steps inside a plain `ubuntu:26.04` container
-    # instead (the `container:` key), the same base image
-    # `docker/Dockerfile` itself builds on.
+    # section, and docker/Dockerfile's build-base stage's own comment for
+    # why that stage (ubuntu:26.04-based) already carries every package
+    # this job needs, Flight SQL and gRPC included -- nothing extra to
+    # install here.
+    needs: [build-base-image, cpu-build-test]
     runs-on: ubuntu-24.04
-    container: ubuntu:26.04
-    needs: cpu-build-test
     steps:
-      - uses: actions/checkout@v4
-      - name: Install core toolchain
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - name: Build coverage image (build-base target, cached)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: docker/Dockerfile
+          target: build-base
+          load: true
+          tags: kernellake-build-base:ci
+          cache-from: type=gha,scope=build-base
+      - name: Configure, build, and test
         run: |
-          apt-get update
-          apt-get install -y --no-install-recommends \
-            build-essential cmake ninja-build git pkg-config wget ca-certificates lsb-release gnupg \
-            python3 python3-pip \
-            libgtest-dev libbenchmark-dev libspdlog-dev nlohmann-json3-dev libyaml-cpp-dev \
-            libxml2-dev uuid-dev clang-tidy-18 \
-            libavro-dev libcurl4-openssl-dev
-      - name: Install Apache Arrow / Parquet / Flight SQL C++
-        run: |
-          wget -O /tmp/arrow-apt-source.deb \
-            "https://packages.apache.org/artifactory/arrow/ubuntu/apache-arrow-apt-source-latest-$(lsb_release --codename --short).deb"
-          apt-get install -y -V /tmp/arrow-apt-source.deb
-          apt-get update
-          apt-get install -y --no-install-recommends \
-            libarrow-dev=25.0.1-1 libparquet-dev=25.0.1-1 libarrow-dataset-dev=25.0.1-1 \
-            libarrow-flight-dev=25.0.1-1 libarrow-flight-sql-dev=25.0.1-1
-      - name: Install gRPC
-        run: apt-get install -y --no-install-recommends libgrpc++-dev protobuf-compiler-grpc
-      - name: Configure (server-dev preset)
-        run: cmake --preset server-dev
-      - name: Build
-        run: cmake --build --preset server-dev
-      - name: Test
-        run: ctest --preset server-dev --output-on-failure
+          docker run --rm -u "$(id -u):$(id -g)" -v "$PWD:/workspace" -w /workspace \
+            kernellake-build-base:ci \
+            bash -c "
+              cmake --preset server-dev &&
+              cmake --build --preset server-dev &&
+              ctest --preset server-dev --output-on-failure
+            "
       # The clang-tidy job above covers every file the `cpu-dev` preset builds;
       # src/server/*.cpp only exists in this preset (KERNELLAKE_BUILD_SERVER),
       # so it's checked here instead, against this job's own already-built
       # server-dev compile_commands.json.
       - name: Run clang-tidy (src/server -- server-dev-only files)
-        run: run-clang-tidy-18 -p build/server-dev -quiet -j "$(nproc)" -warnings-as-errors='*' src/server/*.cpp
+        run: |
+          docker run --rm -u "$(id -u):$(id -g)" -v "$PWD:/workspace" -w /workspace \
+            kernellake-build-base:ci \
+            bash -c "run-clang-tidy-18 -p build/server-dev -quiet -j \"\$(nproc)\" -warnings-as-errors='*' src/server/*.cpp"
 
   otel-build-test:
     # kernellake's OpenTelemetry integration (KERNELLAKE_ENABLE_OTEL=ON)
     # needs opentelemetry-cpp-dev, which -- like libarrow-flight-sql-dev --
     # has no Ubuntu 24.04 apt package at all (FetchContent vendoring would
     # be the only option there; see docs/ARCHITECTURE.md's "Ubuntu 26.04
-    # baseline" section). Same container: ubuntu:26.04 approach as
-    # server-build-test, for the same reason (no ubuntu-26.04 GitHub-hosted
-    # runner label yet).
-    #
-    # Also needs gRPC explicitly: opentelemetry-cpp-dev's own apt Depends
-    # is just `opentelemetry-cpp (= ...)` -- no gRPC dependency declared at
-    # the package-manager level at all (confirmed via `apt-cache depends
-    # opentelemetry-cpp-dev`) -- but its exporters_otlp_grpc CMake
-    # component needs gRPC's own CMake config package (from libgrpc++-dev)
-    # to resolve find_package(opentelemetry-cpp ... COMPONENTS
-    # exporters_otlp_grpc ...) at all. The root CMakeLists.txt's own
-    # find_package(gRPC REQUIRED) is scoped to KERNELLAKE_BUILD_SERVER
-    # only, not KERNELLAKE_ENABLE_OTEL, so this job needs its own explicit
-    # install, same package as server-build-test's "Install gRPC" step.
+    # baseline" section). docker/Dockerfile's build-base stage (ubuntu:
+    # 26.04-based) already carries opentelemetry-cpp-dev and gRPC, same
+    # reasoning as server-build-test's own comment -- nothing extra to
+    # install here either.
+    needs: [build-base-image, cpu-build-test]
     runs-on: ubuntu-24.04
-    container: ubuntu:26.04
-    needs: cpu-build-test
     steps:
-      - uses: actions/checkout@v4
-      - name: Install core toolchain
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - name: Build coverage image (build-base target, cached)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: docker/Dockerfile
+          target: build-base
+          load: true
+          tags: kernellake-build-base:ci
+          cache-from: type=gha,scope=build-base
+      - name: Configure, build, and test
         run: |
-          apt-get update
-          apt-get install -y --no-install-recommends \
-            build-essential cmake ninja-build git pkg-config wget ca-certificates lsb-release gnupg \
-            python3 python3-pip \
-            libgtest-dev libbenchmark-dev libspdlog-dev nlohmann-json3-dev libyaml-cpp-dev \
-            libxml2-dev uuid-dev clang-tidy-18 \
-            libavro-dev libcurl4-openssl-dev
-      - name: Install Apache Arrow / Parquet C++
-        run: |
-          wget -O /tmp/arrow-apt-source.deb \
-            "https://packages.apache.org/artifactory/arrow/ubuntu/apache-arrow-apt-source-latest-$(lsb_release --codename --short).deb"
-          apt-get install -y -V /tmp/arrow-apt-source.deb
-          apt-get update
-          apt-get install -y --no-install-recommends libarrow-dev=25.0.1-1 libparquet-dev=25.0.1-1 libarrow-dataset-dev=25.0.1-1
-      - name: Install opentelemetry-cpp
-        run: apt-get install -y --no-install-recommends opentelemetry-cpp-dev
-      - name: Install gRPC
-        run: apt-get install -y --no-install-recommends libgrpc++-dev protobuf-compiler-grpc
-      - name: Configure (otel-dev preset)
-        run: cmake --preset otel-dev
-      - name: Build
-        run: cmake --build --preset otel-dev
-      - name: Test
-        run: ctest --preset otel-dev --output-on-failure
+          docker run --rm -u "$(id -u):$(id -g)" -v "$PWD:/workspace" -w /workspace \
+            kernellake-build-base:ci \
+            bash -c "
+              cmake --preset otel-dev &&
+              cmake --build --preset otel-dev &&
+              ctest --preset otel-dev --output-on-failure
+            "
       # See server-build-test's own equivalent step: src/observability's
       # OTEL-specific files only exist in this preset
       # (KERNELLAKE_ENABLE_OTEL), so they're checked here against this job's
       # own already-built otel-dev compile_commands.json.
       - name: Run clang-tidy (src/observability -- otel-dev-only files)
         run: |
-          run-clang-tidy-18 -p build/otel-dev -quiet -j "$(nproc)" -warnings-as-errors='*' \
-            src/observability/query_tracing_otel.cpp src/observability/query_tracing_test_support.cpp
+          docker run --rm -u "$(id -u):$(id -g)" -v "$PWD:/workspace" -w /workspace \
+            kernellake-build-base:ci \
+            bash -c "
+              run-clang-tidy-18 -p build/otel-dev -quiet -j \"\$(nproc)\" -warnings-as-errors='*' \
+                src/observability/query_tracing_otel.cpp src/observability/query_tracing_test_support.cpp
+            "
 
   docker-publish:
     runs-on: ubuntu-24.04
@@ -578,7 +638,7 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Free up runner disk space
         run: |
@@ -591,58 +651,50 @@ jobs:
 
       # Two separate repositories, not one repository with :cpu/:gpu tags --
       # kernel-lake-cpu and kernel-lake-gpu (each :latest). Only the two
-      # runtime-{cpu,gpu} targets are published; the dev-{cpu,gpu} build
-      # stages (full toolchain, source tree) are intermediate-only now (see
-      # docker/Dockerfile's own top-of-file comment) -- nothing publishes a
-      # :dev image any more.
+      # runtime-{cpu,gpu} targets are published; the build-base/cpu-release/
+      # gpu-build-base/gpu-release stages (full toolchain, source tree) are
+      # intermediate-only (see docker/Dockerfile's own top-of-file comment)
+      # -- nothing publishes a :dev image any more.
       - name: Compute lowercase repository base name
         id: image
         run: echo "base=ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
 
-      - uses: docker/setup-qemu-action@v3
-
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # linux/amd64,linux/arm64: every dependency runtime-cpu needs is a
-      # plain apt package with a real arm64 build on Ubuntu 26.04 (verified
-      # by a real docker buildx build --platform linux/arm64 -- runs under
-      # QEMU user-mode emulation on this project's own amd64 development
-      # machine, since no arm64 runner is available either here or on
-      # GitHub-hosted infrastructure yet). docker/build-push-action pushes
-      # one multi-arch manifest list per tag, not a separate arch-suffixed
-      # tag -- `docker pull ghcr.io/.../kernel-lake-cpu:latest` resolves to
-      # the right architecture automatically on either host.
+      # linux/amd64 only -- arm64 was previously also built here (verified
+      # working via QEMU user-mode emulation, since no arm64 runner is
+      # available), but deliberately turned back off; re-enable by adding
+      # `linux/arm64` back to `platforms:` and restoring a
+      # `docker/setup-qemu-action@v3` step before this one if needed again.
       - name: Build and push CPU runtime image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: docker/Dockerfile
           target: runtime-cpu
-          platforms: linux/amd64,linux/arm64
+          platforms: linux/amd64
           push: true
           tags: ${{ steps.image.outputs.base }}-cpu:latest
           cache-from: type=gha,scope=runtime-cpu
           cache-to: type=gha,mode=max,scope=runtime-cpu
 
-      # linux/amd64 only, for now: nvidia-cuda-toolkit/libcufile-dev's own
+      # linux/amd64 only here too: nvidia-cuda-toolkit/libcufile-dev's own
       # arm64 apt availability and RAPIDS libcudf/RMM's arm64 wheel support
-      # (cmake/ThirdPartyRapids.cmake's pinned `-cu12` PyPI wheels) haven't
-      # been verified for real yet -- unlike runtime-cpu above, getting this
-      # wrong can't be caught by a build-only smoke test (CUDA/RAPIDS code
-      # only actually exercises real GPU execution paths at `docker run
-      # --gpus all` time, which needs real arm64 GPU hardware, e.g. NVIDIA
-      # Grace/Jetson, to verify at all -- see docs/ROADMAP.md). Extending
-      # this to linux/amd64,linux/arm64 is a tracked follow-up once that
-      # verification happens, not an oversight.
+      # (cmake/ThirdPartyRapids.cmake's pinned `-cu12` PyPI wheels) have
+      # never been verified for real -- unlike runtime-cpu above, getting
+      # this wrong can't be caught by a build-only smoke test (CUDA/RAPIDS
+      # code only actually exercises real GPU execution paths at `docker
+      # run --gpus all` time, which needs real arm64 GPU hardware, e.g.
+      # NVIDIA Grace/Jetson, to verify at all -- see docs/ROADMAP.md).
       - name: Build and push GPU runtime image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: docker/Dockerfile

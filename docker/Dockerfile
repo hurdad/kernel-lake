@@ -122,6 +122,10 @@ ENV DEBIAN_FRONTEND=noninteractive
 #      clang-tidy-18 kernellake:gpu-release -p build/gpu-release ...`
 #      against this same image's own already-built compile_commands.json,
 #      no separate install step needed).
+#   4. gcovr (pip, not apt -- Ubuntu's own gcovr package lags upstream) --
+#      used by .github/workflows/ci.yml's coverage/gpu-coverage jobs, both
+#      of which `docker run` a stage built from this one rather than
+#      installing gcovr fresh in a separate CI step every run.
 RUN apt-get update && apt-get upgrade -y \
     && apt-get install -y --no-install-recommends \
       wget ca-certificates lsb-release gnupg \
@@ -138,7 +142,8 @@ RUN apt-get update && apt-get upgrade -y \
          libarrow-dev=25.0.1-1 libparquet-dev=25.0.1-1 libarrow-dataset-dev=25.0.1-1 \
          libarrow-flight-dev=25.0.1-1 libarrow-flight-sql-dev=25.0.1-1 \
          clang-format-18 clang-tidy-18 \
-    && rm -rf /var/lib/apt/lists/* /tmp/arrow-apt-source.deb
+    && rm -rf /var/lib/apt/lists/* /tmp/arrow-apt-source.deb \
+    && pip install --break-system-packages --no-cache-dir gcovr
 
 # ---------------------------------------------------------------------------
 # cpu-release: full CPU-only build environment, repo built inside it
@@ -165,21 +170,35 @@ ENTRYPOINT ["/workspace/build/cpu-release/src/cli/kernellake"]
 CMD ["--help"]
 
 # ---------------------------------------------------------------------------
-# gpu-release: full GPU build environment, repo built inside it
-# (`gpu-release` preset -- optimized, RelWithDebInfo -- + BUILD_SERVER/
-# ENABLE_OTEL). Also a complete, runnable image on its own (`--target
-# gpu-release`).
+# gpu-build-base: build-base plus the CUDA toolkit and gcovr -- everything a
+# GPU build needs *before* the repo is copied in. Not a runnable image on
+# its own. Split out from gpu-release (which used to install CUDA inline)
+# so .github/workflows/ci.yml's gpu-coverage job can build/cache this exact
+# stage and `docker run` its own configure/build/test/coverage steps
+# against a live checkout, without also paying for gpu-release's own baked-
+# in build every time.
 # ---------------------------------------------------------------------------
-FROM build-base AS gpu-release
+FROM build-base AS gpu-build-base
 
 # CUDA toolkit + GPUDirect Storage headers, both from Ubuntu's own apt
 # repos. libcufile-dev is not pulled in by nvidia-cuda-toolkit itself but is
 # required by kvikio (a libcudf dependency) -- confirmed by a real
 # configure failure ("Compiled with cuFile support but cuFile not found")
-# before this line was added.
+# before this line was added. gcovr is already present via build-base.
 RUN apt-get update && apt-get install -y --no-install-recommends \
       nvidia-cuda-toolkit libcufile-dev \
     && rm -rf /var/lib/apt/lists/*
+
+# ---------------------------------------------------------------------------
+# gpu-release: full GPU build environment, repo built inside it
+# (`gpu-release` preset -- optimized, RelWithDebInfo -- + BUILD_SERVER/
+# ENABLE_OTEL). Also a complete, runnable image on its own (`--target
+# gpu-release`). Built FROM gpu-build-base (not build-base directly) so
+# that stage's CUDA-toolkit/gcovr layer is shared with, not duplicated for,
+# .github/workflows/ci.yml's gpu-coverage job -- see gpu-build-base's own
+# comment.
+# ---------------------------------------------------------------------------
+FROM gpu-build-base AS gpu-release
 
 WORKDIR /workspace
 COPY . .
