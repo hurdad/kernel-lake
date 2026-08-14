@@ -516,13 +516,26 @@ jobs:
         # -u/--user matches the container process's UID/GID to the
         # runner's own checkout owner, same reasoning as the `coverage`
         # job's identical flag.
+        #
+        # ctest --test-dir build/gpu-coverage/tests/gpu, not plain `ctest
+        # --preset gpu-coverage`: the build step above only builds the
+        # kernellake_gpu_tests *target* (deliberately -- see gpu-build-test's
+        # own comment on why), but a preset-wide ctest run still tries to
+        # execute every test CMake registered project-wide, including
+        # tests/unit's own suite, which was never built. That reports as a
+        # real CTest failure (`kernellake_unit_tests_NOT_BUILT`), confirmed
+        # for real against a live run (this job failed with exactly that
+        # error before this fix) and confirmed fixed the same way --
+        # --test-dir scopes ctest to just that one CMake subdirectory's own
+        # registered tests, which only depends on kernellake_gpu_tests
+        # having been built.
         run: |
           docker run --rm --gpus all -u "$(id -u):$(id -g)" -v "$PWD:/workspace" -w /workspace \
             kernellake-gpu-build-base:ci \
             bash -c "
               cmake --preset gpu-coverage -DCMAKE_CUDA_COMPILER=/usr/bin/nvcc &&
               cmake --build --preset gpu-coverage --target kernellake_gpu_tests &&
-              ctest --preset gpu-coverage --output-on-failure &&
+              ctest --test-dir build/gpu-coverage/tests/gpu --output-on-failure &&
               gcovr --root . \
                 --filter 'src/execution_gpu/' \
                 --filter 'src/api/query_engine_execute_gpu' \
