@@ -23,11 +23,11 @@ namespace kernellake {
 //
 // Each incoming batch is aggregated on its own with a plain, one-shot
 // `cudf::groupby::groupby` (cost scales with that batch's actual row count
-// and actual distinct-key count), then folded into `accumulated_` by
-// concatenating [accumulated_, this batch's partial result] and running
-// another plain groupby over that (cost scales with accumulated_'s
-// actual size so far, which stays small for the common low-cardinality
-// case -- TPC-H's GROUP BYs included). This replaces an earlier design
+// and actual distinct-key count). That partial result is *not* folded into
+// `accumulated_` immediately every time -- see flush_pending()'s own
+// comment for why touching accumulated_ on every single batch scales badly
+// once distinct-key count is large, and the size-adaptive batching that
+// avoids it. This replaces an earlier design
 // built on cudf::groupby::streaming_groupby: profiling a real SF1000 TPC-H
 // Q1 run found that design spending 67.5 of 106.9 total seconds inside
 // HashAggregate despite the query having only 3 real distinct groups --
@@ -219,6 +219,13 @@ class HashAggregateOperator final : public PhysicalOperator {
   [[nodiscard]] std::unique_ptr<cudf::table> run_groupby_and_assemble(const cudf::table_view& key_view,
                                                                       const cudf::table_view& value_view,
                                                                       ExecutionContext& context);
+  // Folds every table in `pending_partials_` (plus `accumulated_`, if any)
+  // into a single new `accumulated_` via one concatenate+groupby, then
+  // clears `pending_partials_`/`pending_rows_` -- the batching mechanism
+  // process_batch() uses instead of touching `accumulated_` on every batch.
+  // See process_batch()'s call site for when this actually runs. No-op if
+  // `pending_partials_` is empty.
+  void flush_pending(ExecutionContext& context);
 
   OperatorId id_;
   std::unique_ptr<PhysicalOperator> child_;
@@ -244,11 +251,19 @@ class HashAggregateOperator final : public PhysicalOperator {
   // consumed and how to combine them into its single output column.
   std::vector<AggregateOutputKind> aggregate_output_kind_;
 
-  // The running partial-aggregate result, folded in one batch at a time by
-  // process_batch() -- null until the first batch arrives (see the class
-  // comment). Column layout: group_by_.size() key columns, then one column
-  // per physical_agg_kind_ entry, same order throughout.
+  // The running partial-aggregate result, folded in by flush_pending() --
+  // null until the first flush (see the class comment). Column layout:
+  // group_by_.size() key columns, then one column per physical_agg_kind_
+  // entry, same order throughout.
   std::unique_ptr<cudf::table> accumulated_;
+  // Per-batch partial-aggregate results not yet folded into accumulated_ --
+  // see flush_pending()'s own comment for the batching strategy. Same
+  // column layout as accumulated_.
+  std::vector<std::unique_ptr<cudf::table>> pending_partials_;
+  // Sum of pending_partials_'s row counts -- tracked incrementally rather
+  // than re-summed on every process_batch() call, since it's checked once
+  // per batch.
+  cudf::size_type pending_rows_ = 0;
   bool any_batch_seen_ = false;
   bool produced_ = false;
 };

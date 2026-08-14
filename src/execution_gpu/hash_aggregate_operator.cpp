@@ -352,24 +352,65 @@ void HashAggregateOperator::process_batch(const DeviceBatch& batch, ExecutionCon
       column_range(combined_view, 0, group_by_count),
       column_range(combined_view, group_by_count, combined_view.num_columns()), context);
 
-  if (accumulated_ == nullptr) {
-    accumulated_ = std::move(partial);
+  pending_rows_ += partial->num_rows();
+  pending_partials_.push_back(std::move(partial));
+
+  // Defer folding into accumulated_ until pending_partials_ has accumulated
+  // at least as many rows as accumulated_ already has -- see
+  // flush_pending()'s own comment for why.
+  if (accumulated_ == nullptr || pending_rows_ >= accumulated_->num_rows()) {
+    flush_pending(context);
+  }
+}
+
+// Folding every batch's partial result into accumulated_ immediately (the
+// original design) touches accumulated_'s full row count on every single
+// batch: for a low-cardinality GROUP BY, accumulated_ stays small forever,
+// so this is cheap and was never worth complicating. For a high-cardinality
+// GROUP BY, though, accumulated_ grows toward the query's real distinct-key
+// count, and re-scanning/re-concatenating all of it on every one of
+// (potentially many thousands of) incoming batches makes total merge cost
+// scale with batches * distinct_keys rather than with the input size.
+//
+// Deferring the fold until pending_partials_ has accumulated at least as
+// many rows as accumulated_ currently holds is a size-adaptive doubling
+// strategy (the same shape as std::vector's amortized-growth rule, just
+// applied to merge frequency instead of allocation): once accumulated_'s
+// size plateaus near the query's real distinct-key count D, this triggers
+// roughly every D/batch_size batches, each flush costing O(D), for a total
+// merge cost of O(D) per D rows of input -- i.e. O(total_rows) overall
+// instead of O(batches * D). Low-cardinality GROUP BYs still flush almost
+// every batch (accumulated_ stays tiny, so the threshold is trivially
+// reached), matching the original per-batch behavior for that case.
+void HashAggregateOperator::flush_pending(ExecutionContext& context) {
+  if (pending_partials_.empty()) {
+    return;
+  }
+
+  if (accumulated_ == nullptr && pending_partials_.size() == 1) {
+    // First flush of a single partial: no accumulated_ to merge against and
+    // nothing else pending, so the partial's own groupby result already is
+    // the correct accumulated_ -- no redundant re-aggregation needed.
+    accumulated_ = std::move(pending_partials_.front());
   } else {
-    // Fold this batch's partial result into the running total: concatenate
-    // [accumulated so far, this batch's partial] (same column layout) and
-    // re-aggregate -- correct because every physical value column here is
-    // SUM/MIN/MAX, all associative/self-combinable (see the header's class
-    // comment). Cost scales with accumulated_'s actual size so far, which
-    // stays small for a low-cardinality GROUP BY no matter how many passes
-    // have gone by.
+    std::vector<cudf::table_view> views;
+    views.reserve(pending_partials_.size() + 1);
+    if (accumulated_ != nullptr) {
+      views.push_back(accumulated_->view());
+    }
+    for (const std::unique_ptr<cudf::table>& partial : pending_partials_) {
+      views.push_back(partial->view());
+    }
     const std::unique_ptr<cudf::table> concatenated =
-        cudf::concatenate(std::vector<cudf::table_view>{accumulated_->view(), partial->view()},
-                          context.stream, context.memory_resource);
+        cudf::concatenate(views, context.stream, context.memory_resource);
     const cudf::table_view concat_view = concatenated->view();
+    const auto group_by_count = static_cast<cudf::size_type>(group_by_.size());
     accumulated_ = run_groupby_and_assemble(
         column_range(concat_view, 0, group_by_count),
         column_range(concat_view, group_by_count, concat_view.num_columns()), context);
   }
+  pending_partials_.clear();
+  pending_rows_ = 0;
 
   if (accumulated_->num_rows() > max_distinct_keys_) {
     throw ExecutionError(
@@ -384,6 +425,7 @@ std::optional<DeviceBatch> HashAggregateOperator::next(ExecutionContext& context
   while (std::optional<DeviceBatch> batch = child_->next(context)) {
     process_batch(*batch, context);
   }
+  flush_pending(context);
   produced_ = true;
 
   if (!any_batch_seen_) {

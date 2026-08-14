@@ -2,6 +2,7 @@
 
 #include <map>
 
+#include "kernellake/common/errors.hpp"
 #include "kernellake/execution_gpu/hash_aggregate_operator.hpp"
 #include "kernellake/memory/rmm_environment.hpp"
 
@@ -218,6 +219,104 @@ TEST(HashAggregateOperator, GroupedMinMaxMatchExpectedValues) {
   EXPECT_DOUBLE_EQ(by_region[2].first, 3.0);
   EXPECT_DOUBLE_EQ(by_region[2].second, 100.0);
 
+  op.close(context);
+}
+
+// Regression coverage for flush_pending()'s size-adaptive batching (see its
+// own comment in hash_aggregate_operator.cpp): accumulated_ is no longer
+// folded on every single batch, only when pending_partials_ has caught up
+// in row count -- this exercises many batches with heavily repeated keys,
+// so correctness has to hold both across mid-loop flushes (whenever the
+// threshold is crossed) and the mandatory final flush in next() (for
+// whatever's still pending when child_ is exhausted), without knowing or
+// depending on exactly when either happens.
+TEST(HashAggregateOperator, AccumulatesCorrectlyAcrossManySmallBatchesWithRepeatedKeys) {
+  RmmEnvironment env(default_config());
+
+  constexpr int kBatchCount = 23;  // deliberately not a multiple of kDistinctKeys
+  constexpr int kDistinctKeys = 5;
+  std::vector<DeviceBatch> batches;
+  batches.reserve(kBatchCount);
+  for (int i = 0; i < kBatchCount; ++i) {
+    batches.push_back(make_batch({i % kDistinctKeys}, {1.0}));
+  }
+
+  auto region = std::make_shared<ColumnExpression>("region", 0, int32_type(false));
+  std::vector<NamedExpression> group_by = {NamedExpression{region, "region"}};
+
+  auto amount = std::make_shared<ColumnExpression>("amount", 1, float64_type(false));
+  auto sum_expr = std::make_shared<AggregateExpression>(AggregateFunction::Sum, amount, float64_type(true));
+  auto count_expr =
+      std::make_shared<AggregateExpression>(AggregateFunction::CountStar, nullptr, int64_type(false));
+  std::vector<NamedExpression> aggregates = {NamedExpression{sum_expr, "total"},
+                                             NamedExpression{count_expr, "n"}};
+
+  HashAggregateOperator op(1, std::make_unique<VectorSourceOperator>(std::move(batches)), std::move(group_by),
+                           std::move(aggregates));
+  ExecutionContext context = make_context();
+  op.open(context);
+
+  std::optional<DeviceBatch> result = op.next(context);
+  ASSERT_TRUE(result.has_value());
+  EXPECT_EQ(result->row_count(), static_cast<std::size_t>(kDistinctKeys));
+  EXPECT_FALSE(op.next(context).has_value());
+
+  const std::vector<int32_t> region_values = copy_to_host<int32_t>(result->view().column(0));
+  const std::vector<double> total_values = copy_to_host<double>(result->view().column(1));
+  const std::vector<std::int64_t> count_values = copy_to_host<std::int64_t>(result->view().column(2));
+
+  std::map<int32_t, std::pair<double, std::int64_t>> by_region;
+  for (std::size_t i = 0; i < region_values.size(); ++i) {
+    by_region[region_values[i]] = {total_values[i], count_values[i]};
+  }
+  ASSERT_EQ(by_region.size(), static_cast<std::size_t>(kDistinctKeys));
+  for (int key = 0; key < kDistinctKeys; ++key) {
+    // key appears once every kDistinctKeys batches out of kBatchCount total.
+    const std::int64_t expected_count = (kBatchCount - key + kDistinctKeys - 1) / kDistinctKeys;
+    EXPECT_DOUBLE_EQ(by_region[key].first, static_cast<double>(expected_count));
+    EXPECT_EQ(by_region[key].second, expected_count);
+  }
+
+  op.close(context);
+}
+
+// Regression coverage: max_distinct_keys is now only checked when
+// flush_pending() actually runs, not after every single batch (see its own
+// comment). The final flush in next() always runs once child_ is
+// exhausted regardless of whether any mid-loop flush ever triggered, so a
+// cardinality cap violation spread across many small batches -- none of
+// which individually would have crossed the threshold that triggers an
+// early flush -- must still be caught by the time next() returns, not
+// silently allowed through.
+TEST(HashAggregateOperator, ExceedingMaxDistinctKeysAcrossManyDeferredBatchesStillThrows) {
+  RmmEnvironment env(default_config());
+
+  // 10 batches, each introducing one brand-new distinct key (never
+  // repeated) -- accumulated_ starts at 1 row after the first (immediate)
+  // flush, so every batch after that only ever contributes 1 pending row at
+  // a time, keeping pending_rows_ well under accumulated_'s own row count
+  // and deferring the fold for many batches in a row.
+  constexpr int kBatchCount = 10;
+  std::vector<DeviceBatch> batches;
+  batches.reserve(kBatchCount);
+  for (int i = 0; i < kBatchCount; ++i) {
+    batches.push_back(make_batch({i}, {1.0}));
+  }
+
+  auto region = std::make_shared<ColumnExpression>("region", 0, int32_type(false));
+  std::vector<NamedExpression> group_by = {NamedExpression{region, "region"}};
+  auto amount = std::make_shared<ColumnExpression>("amount", 1, float64_type(false));
+  auto sum_expr = std::make_shared<AggregateExpression>(AggregateFunction::Sum, amount, float64_type(true));
+  std::vector<NamedExpression> aggregates = {NamedExpression{sum_expr, "total"}};
+
+  // Well under kBatchCount's 10 real distinct keys, so this must throw by
+  // the time all input is consumed -- whether or not any mid-loop flush
+  // happened to trigger before then.
+  HashAggregateOperator op(1, std::make_unique<VectorSourceOperator>(std::move(batches)), std::move(group_by),
+                           std::move(aggregates), /*max_distinct_keys=*/5);
+  ExecutionContext context = make_context();
+  op.open(context);
+  EXPECT_THROW(op.next(context), ExecutionError);
   op.close(context);
 }
 
