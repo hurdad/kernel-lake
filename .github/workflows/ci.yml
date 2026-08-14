@@ -234,6 +234,13 @@ jobs:
           load: true
           tags: kernellake-build-base:ci
           cache-from: type=gha,scope=build-base
+      # --output-junit takes an absolute path deliberately: `ctest --preset`
+      # runs with build/cpu-dev (the preset's own binaryDir) as its working
+      # directory internally, so a bare relative filename here would land
+      # inside build/cpu-dev/ instead of /workspace where the Codecov
+      # upload step below expects to find it -- confirmed for real, a
+      # relative path silently wrote the file one directory level off from
+      # where it was expected.
       - name: Configure, build, and test
         run: |
           docker run --rm -u "$(id -u):$(id -g)" -v "$PWD:/workspace" -w /workspace \
@@ -241,8 +248,23 @@ jobs:
             bash -c "
               cmake --preset cpu-dev &&
               cmake --build --preset cpu-dev &&
-              ctest --preset cpu-dev --output-on-failure
+              ctest --preset cpu-dev --output-on-failure --output-junit /workspace/test-results-cpu.xml
             "
+      # if: !cancelled() (not the default `success()`) so this still runs
+      # and uploads whichever tests DID execute even when ctest above
+      # fails some of them -- test analytics is most useful exactly when
+      # something failed. Only a genuine job cancellation skips it. If
+      # cmake/cmake --build itself fails before ctest ever runs, the file
+      # never gets created at all; fail_ci_if_error: false keeps that from
+      # becoming a second, confusing failure on top of the real one.
+      - name: Upload test results to Codecov
+        if: ${{ !cancelled() }}
+        uses: codecov/codecov-action@v7
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: test-results-cpu.xml
+          report-type: test_results
+          fail_ci_if_error: false
 
   coverage:
     # Rebuilds under a separate `cpu-coverage` preset (cpu-dev plus gcc's
@@ -379,6 +401,10 @@ jobs:
           tags: kernellake-gpu-build-base:ci
       - name: Verify GPU passthrough into containers works
         run: docker run --rm --gpus all kernellake-gpu-build-base:ci nvidia-smi
+      # --output-junit takes an absolute path deliberately -- same reason
+      # as cpu-build-test's own identical comment: `ctest --preset` runs
+      # with build/gpu-dev as its own working directory, so a relative
+      # filename would land there instead of /workspace.
       - name: Configure, build, and test (gpu-dev preset, full build)
         # No --target restriction (unlike gpu-coverage) -- this builds
         # everything gpu-dev covers, src/cli and src/server's GPU
@@ -393,8 +419,19 @@ jobs:
             bash -c "
               cmake --preset gpu-dev -DCMAKE_CUDA_COMPILER=/usr/bin/nvcc &&
               cmake --build --preset gpu-dev &&
-              ctest --preset gpu-dev --output-on-failure
+              ctest --preset gpu-dev --output-on-failure --output-junit /workspace/test-results-gpu.xml
             "
+      # Same if: !cancelled() reasoning as cpu-build-test's own identical
+      # step -- upload whichever tests ran even if some of them failed.
+      - name: Upload test results to Codecov
+        if: ${{ !cancelled() }}
+        uses: codecov/codecov-action@v7
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: test-results-gpu.xml
+          report-type: test_results
+          flags: gpu
+          fail_ci_if_error: false
 
   gpu-coverage:
     # See this file's own top-of-file comment for the full self-hosted-
