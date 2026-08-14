@@ -243,6 +243,119 @@ TEST_F(HashJoinQueryTest, ThreeWayJoinGroupedSumMatchesExpectedTotals) {
   EXPECT_DOUBLE_EQ(totals_by_region.at("South"), 75.0);
 }
 
+// End-to-end coverage for HashJoinOperator's *partitioned* (grace hash
+// join) path, through the real parse -> plan -> physical-plan ->
+// build_operator_tree() -> execute pipeline -- not just the hand-built-
+// operator unit tests in hash_join_operator_test.cpp. A deliberately small
+// (but not pathologically tiny -- see below) engine.query_memory_limit_bytes
+// (see EngineConfig below) makes query_engine_execute_gpu.cpp's
+// build_side_budget_bytes small too, so choose_partition_count() picks
+// partition_count > 1 for a real join through the real planner, not a
+// value poked in directly via a test-only constructor argument.
+//
+// query_memory_limit_bytes must stay well above cudf's own real, data-
+// independent fixed overhead per query (confirmed for real: a first
+// attempt at 16 KiB failed with "Exceeded memory limit (failed to
+// allocate 1.031250 KiB)" -- the very first small allocation of the real
+// pipeline already exceeded a ceiling that tiny; docs/ROADMAP.md's SF100
+// entry separately measured this fixed floor around ~76 MiB). So this
+// test uses a real, comfortably-large ceiling (128 MiB) and instead scales
+// the *row count* up (3,000,000, not 2,000) far enough that the estimate
+// still clears the budget with real margin.
+TEST(HashJoinPartitionedQueryTest, PartitionedJoinThroughRealPlannerMatchesExpectedTotals) {
+  const fs::path dir = fs::temp_directory_path() / fs::path("kernellake_hash_join_partitioned_test");
+  fs::create_directories(dir);
+  const std::string customers_path = (dir / "customers.parquet").string();
+  const std::string orders_path = (dir / "orders.parquet").string();
+
+  // 3,000,000 customers (customer_id 0..2999999, a short name each) -- the
+  // build (right) side.
+  constexpr std::int64_t kCustomerCount = 3'000'000;
+  {
+    arrow::Int64Builder customer_id_builder;
+    arrow::StringBuilder name_builder;
+    for (std::int64_t i = 0; i < kCustomerCount; ++i) {
+      ASSERT_TRUE(customer_id_builder.Append(i).ok());
+      ASSERT_TRUE(name_builder.Append("customer_" + std::to_string(i)).ok());
+    }
+    std::shared_ptr<arrow::Array> customer_id_array, name_array;
+    ASSERT_TRUE(customer_id_builder.Finish(&customer_id_array).ok());
+    ASSERT_TRUE(name_builder.Finish(&name_array).ok());
+    const auto schema = arrow::schema(
+        {arrow::field("customer_id", arrow::int64(), false), arrow::field("name", arrow::utf8(), false)});
+    const auto table = arrow::Table::Make(schema, {customer_id_array, name_array});
+    auto sink = arrow::io::FileOutputStream::Open(customers_path).ValueOrDie();
+    ASSERT_TRUE(
+        parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), sink, /*chunk_size=*/500).ok());
+  }
+  // Orders (probe/left side): one order each against customers 0, 1,
+  // 1500000, and 2999999 (spanning the low end, middle, and high end of
+  // the build side's key range, so this exercises more than just whichever
+  // bucket key 0 happens to land in).
+  {
+    arrow::Int64Builder order_id_builder;
+    arrow::Int64Builder customer_id_builder;
+    arrow::DoubleBuilder amount_builder;
+    const std::vector<std::int64_t> order_ids = {1, 2, 3, 4};
+    const std::vector<std::int64_t> customer_ids = {0, 1, 1500000, 2999999};
+    const std::vector<double> amounts = {10.0, 20.0, 30.0, 40.0};
+    for (std::size_t i = 0; i < order_ids.size(); ++i) {
+      ASSERT_TRUE(order_id_builder.Append(order_ids[i]).ok());
+      ASSERT_TRUE(customer_id_builder.Append(customer_ids[i]).ok());
+      ASSERT_TRUE(amount_builder.Append(amounts[i]).ok());
+    }
+    std::shared_ptr<arrow::Array> order_id_array, customer_id_array, amount_array;
+    ASSERT_TRUE(order_id_builder.Finish(&order_id_array).ok());
+    ASSERT_TRUE(customer_id_builder.Finish(&customer_id_array).ok());
+    ASSERT_TRUE(amount_builder.Finish(&amount_array).ok());
+    const auto schema = arrow::schema({arrow::field("order_id", arrow::int64(), false),
+                                       arrow::field("customer_id", arrow::int64(), false),
+                                       arrow::field("amount", arrow::float64(), false)});
+    const auto table = arrow::Table::Make(schema, {order_id_array, customer_id_array, amount_array});
+    auto sink = arrow::io::FileOutputStream::Open(orders_path).ValueOrDie();
+    ASSERT_TRUE(
+        parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), sink, /*chunk_size=*/4).ok());
+  }
+
+  EngineConfig config = default_config();
+  // 128 MiB -> build_side_budget_bytes = 64 MiB (67,108,864 bytes). 3M rows
+  // * estimate_row_width_bytes() (customer_id int64 [8] + name string
+  // [heuristic 24] = 32 bytes/row) = ~96,000,000 estimated bytes, clears
+  // that budget with real (~1.4x) margin, so choose_partition_count()
+  // picks partition_count > 1 for real -- while pass_read_limit_bytes (32
+  // MiB) stays comfortably large enough for the real scan/join pipeline's
+  // own fixed overhead (see this test's own top comment).
+  config.engine.query_memory_limit_bytes = 128ULL * 1024 * 1024;
+  QueryEngine engine(config);
+
+  const QueryResult result = engine.execute("SELECT o.order_id, c.name, o.amount FROM read_parquet('" +
+                                            orders_path + "') AS o JOIN read_parquet('" + customers_path +
+                                            "') AS c ON o.customer_id = c.customer_id ORDER BY o.order_id");
+  ASSERT_EQ(result.batches.size(), 1u);
+  const std::shared_ptr<arrow::RecordBatch>& batch = result.batches.front();
+  ASSERT_EQ(batch->num_rows(), 4);
+
+  const auto order_id_column =
+      std::static_pointer_cast<arrow::Int64Array>(batch->GetColumnByName("order_id"));
+  const auto name_column = std::static_pointer_cast<arrow::StringArray>(batch->GetColumnByName("name"));
+  const auto amount_column = std::static_pointer_cast<arrow::DoubleArray>(batch->GetColumnByName("amount"));
+  ASSERT_NE(order_id_column, nullptr);
+  ASSERT_NE(name_column, nullptr);
+  ASSERT_NE(amount_column, nullptr);
+
+  const std::vector<std::int64_t> expected_order_ids = {1, 2, 3, 4};
+  const std::vector<std::string> expected_names = {"customer_0", "customer_1", "customer_1500000",
+                                                   "customer_2999999"};
+  const std::vector<double> expected_amounts = {10.0, 20.0, 30.0, 40.0};
+  for (std::int64_t i = 0; i < batch->num_rows(); ++i) {
+    EXPECT_EQ(order_id_column->Value(i), expected_order_ids[static_cast<std::size_t>(i)]);
+    EXPECT_EQ(name_column->GetString(i), expected_names[static_cast<std::size_t>(i)]);
+    EXPECT_DOUBLE_EQ(amount_column->Value(i), expected_amounts[static_cast<std::size_t>(i)]);
+  }
+
+  fs::remove_all(dir);
+}
+
 TEST_F(HashJoinQueryTest, RejectsLeftJoinAtParseTime) {
   EXPECT_THROW((void)(engine_.execute("SELECT o.order_id FROM read_parquet('" + orders_path_ +
                                       "') AS o LEFT JOIN read_parquet('" + customers_path_ +

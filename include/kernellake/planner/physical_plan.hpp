@@ -126,18 +126,31 @@ class ParquetScanNode final : public PhysicalPlanNode {
 class HashJoinNode final : public PhysicalPlanNode {
  public:
   HashJoinNode(PhysicalPlanPtr left, PhysicalPlanPtr right, std::size_t left_key_index,
-               std::size_t right_key_index, std::vector<std::optional<std::size_t>> original_column_map = {})
+               std::size_t right_key_index, std::vector<std::optional<std::size_t>> original_column_map = {},
+               std::optional<std::int64_t> estimated_build_rows = std::nullopt)
       : left_(std::move(left)),
         right_(std::move(right)),
         left_key_index_(left_key_index),
         right_key_index_(right_key_index),
         schema_(build_schema(left_->output_schema(), right_->output_schema())),
-        original_column_map_(std::move(original_column_map)) {}
+        original_column_map_(std::move(original_column_map)),
+        estimated_build_rows_(estimated_build_rows) {}
 
   [[nodiscard]] const PhysicalPlanPtr& left() const noexcept { return left_; }
   [[nodiscard]] const PhysicalPlanPtr& right() const noexcept { return right_; }
   [[nodiscard]] std::size_t left_key_index() const noexcept { return left_key_index_; }
   [[nodiscard]] std::size_t right_key_index() const noexcept { return right_key_index_; }
+  // Rough, pre-filter row-count estimate of the *build* (right) side --
+  // exactly the value physical_planner.cpp's own estimate_row_count()
+  // already computes to decide which side to build on (see that
+  // function's doc comment for the estimate's caveats), just persisted
+  // here instead of only used transiently for the swap decision. nullopt
+  // when no estimate was available. Used by operator_builder.cpp to size
+  // HashJoinOperator's partition count -- see that file and
+  // hash_join_operator.cpp's choose_partition_count().
+  [[nodiscard]] std::optional<std::int64_t> estimated_build_rows() const noexcept {
+    return estimated_build_rows_;
+  }
   [[nodiscard]] const Schema& output_schema() const override { return schema_; }
   [[nodiscard]] std::string_view node_name() const noexcept override { return "HashJoin"; }
   [[nodiscard]] std::vector<PhysicalPlanPtr> children() const override { return {left_, right_}; }
@@ -172,6 +185,7 @@ class HashJoinNode final : public PhysicalPlanNode {
   std::size_t right_key_index_;
   Schema schema_;
   std::vector<std::optional<std::size_t>> original_column_map_;
+  std::optional<std::int64_t> estimated_build_rows_;
 };
 
 class FilterNode final : public PhysicalPlanNode {
