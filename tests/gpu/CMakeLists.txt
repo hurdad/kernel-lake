@@ -6,6 +6,7 @@
 add_executable(kernellake_gpu_tests
   rmm_environment_test.cpp
   cuda_utils_test.cpp
+  cudf_adapter_test.cpp
   device_batch_test.cpp
   arrow_bridge_test.cpp
   expression_compiler_test.cpp
