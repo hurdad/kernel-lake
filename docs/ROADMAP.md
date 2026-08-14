@@ -3808,6 +3808,32 @@ log` is the authoritative chronology if that ordering ever matters.
   engines' access to the same files) -- not done this session. Like the
   GDS finding above, this increasingly looks like it may not have a fix
   within kernellake's own code either way, but that isn't confirmed yet.
+
+  Follow-up (separate session): checked one specific, kernellake-side
+  variant of the "scattered access pattern" idea -- that Parquet
+  row-group *pruning* itself (via `l_shipdate`'s min/max stats) might be
+  selecting a sparse, non-contiguous subset of row groups for Q6's
+  date-range predicate, forcing scattered reads regardless of anything
+  cudf's chunked reader does internally. Ruled out, not the cause:
+  `evaluate_pruning()` (`src/io/parquet_pruning.cpp:121-150`) does build
+  `selected_row_groups` (`std::vector<int>`,
+  `include/kernellake/io/parquet_pruning.hpp:16`) as a plain ascending
+  index list that *can* have gaps -- but `tools/generate_tpch.py`'s
+  `lineitem` generator draws each row's `l_shipdate` independently and
+  uniformly at random across the full ~7-year TPC-H date range
+  (`generate_tpch.py:270-273`), uncorrelated with row order. With row
+  groups defaulting to 1M rows each (`generate_tpch.py:618`), that many
+  i.i.d. random draws per row group means every row group's
+  `[min,max]` shipdate span covers nearly the entire dataset -- so Q6's
+  predicate prunes almost no row groups at all on this project's own
+  generated data. Selection is contiguous/full in practice, not sparse;
+  `ParquetScanOperator` also does no coalescing of its own either way, it
+  hands whatever index list it gets straight to cudf's
+  `parquet_reader_options.row_groups()`
+  (`src/execution_gpu/parquet_scan_operator.cpp:76,89,114-115,125`), so
+  there's no kernellake-side scheduling layer this finding would even
+  motivate changing. The narrower cudf-internal access-pattern question
+  above is unaffected by this and remains genuinely open.
 - NVMe cache tier (see "Done" above -- a real MinIO round trip, including
   a real backend-fully-offline test, is now verified): a genuine
   before/after wall-clock speed comparison against a real cross-network S3
