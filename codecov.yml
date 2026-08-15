@@ -31,3 +31,26 @@ component_management:
         - src/server/gpu_execution_coordinator_gpu.cpp
       flag_regexes:
         - gpu
+
+# gpu-coverage (.github/workflows/ci.yml) only runs on a direct push to main
+# or workflow_dispatch -- its own `if: github.event_name != 'pull_request'`
+# guard, required because it's the only job here that runs on the
+# self-hosted GPU runner (see that job's own comment on why). That means no
+# pull_request commit ever uploads a report carrying the `gpu` flag, only
+# the unflagged coverage.xml from the `coverage` job (CPU-only, gcovr's own
+# `src/`+`include/` filter there never touches GPU-only files, since
+# cpu-coverage's build doesn't compile them at all).
+#
+# Without carryforward, Codecov's PR-vs-base diff would compare that
+# GPU-less PR report against main's own report (which does carry the `gpu`
+# flag's ~1980 lines at ~85% coverage, from the most recent push-to-main
+# run) -- making every single PR look like it regresses total project
+# coverage, purely because the GPU lines are absent from its own report,
+# not because anything in the PR actually changed. `carryforward: true`
+# tells Codecov to keep reusing the most recent `gpu`-flagged upload for
+# any commit that doesn't produce a new one itself, so PR comparisons stay
+# apples-to-apples.
+flag_management:
+  individual_flags:
+    - name: gpu
+      carryforward: true
