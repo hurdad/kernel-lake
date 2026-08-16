@@ -116,6 +116,37 @@ document what was actually done and measured.
    large-result query on the local GPU. Sufficient to answer the question
    this item existed to answer (is #1 worth doing) without the GUI trace.
 
+6. ~~Parallelize Parquet decode across files/streams, not just decode-vs-compute
+   (opt #3 above already did the latter).~~ **Prototyped 2026-08-15 -- see
+   "Parallel-decode prototype" below: no reliable win, and a real,
+   reproducible regression past 2 concurrent streams. De-prioritized.**
+   Originally motivated by code read (2026-08-15): for a multi-file,
+   non-partitioned scan, `ParquetScanOperator` builds **one**
+   `cudf::io::chunked_parquet_reader` over the entire file list, driven by
+   **one** background thread (`decode_thread_`) on **one** `decode_stream_`,
+   pulling through a single-slot read-ahead queue
+   (`src/execution_gpu/parquet_scan_operator.cpp:73-100,138-204`) -- no
+   thread pool, no per-file/per-row-group dispatch, no multiple concurrent
+   readers. For a table with many files (e.g. SF1000 `lineitem`, ~1,586
+   objects in the real S3 prefix), decode itself is fully serial across
+   files: one chunk in flight at a time, however many files are queued
+   behind it. Live `nvidia-smi dmon` sampling during a real SF1000 AWS run
+   (2026-08-15) showed the GPU mostly idle (0-3% SM utilization on most
+   1-second samples, bursting to 60% only occasionally) while memory stayed
+   pegged near the query's ceiling throughout -- consistent with a single
+   decode stream gating throughput. **That framing turned out to be
+   misleading**: idle SM% doesn't mean idle decompression-engine/copy
+   capacity, and the prototype below found splitting decode across streams
+   contends for that shared capacity rather than exploiting spare room in
+   it, the opposite of what opt #3 found for decode-vs-compute overlap.
+   - Tradeoff (as originally scoped, now moot given the measured result):
+     would have needed either N decode threads each with their own
+     reader/stream, or a deeper multi-chunk read-ahead queue instead of
+     today's single slot, plus weighing more concurrent in-flight GPU
+     memory against the tight headroom found in the SF1000 Q3 OOM below.
+     Not worth taking on any of that complexity given the prototype's
+     result.
+
 ## Profiling results (2026-08-08, local RTX 5060 Ti)
 
 Caveat on the first two tables below, called out already in
@@ -364,6 +395,76 @@ Wall time is still the trustworthy end-to-end number; treat
 `parquet_decoding_seconds` as a genuine measurement of decode-stream time,
 not as directly comparable pre/post this change.
 
+## Parallel-decode prototype (opt #6): does splitting decode across files help? No.
+
+Motivated by live `nvidia-smi` sampling during a real SF1000 AWS run
+(2026-08-15, see opportunity #6 above) showing the GPU mostly idle on SM%
+while `ParquetScanOperator` serializes every file's decode through one
+`chunked_parquet_reader`/one thread/one stream. Before touching the real
+operator, followed opt #3's own template: an isolated standalone
+prototype, not wired into KernelLake, linked directly against the
+vendored `libcudf`/`librmm` (flags pulled from `compile_commands.json`,
+same as opt #3's prototype).
+
+**Method.** Real local SF10 `lineitem` data (16 files, snappy, this dev
+box's own `sf10-snappy` set -- a smaller stand-in for the SF1000 dataset
+that motivated this, but real generated TPC-H data, not synthetic).
+Reads 4 columns (`l_shipdate`, `l_quantity`, `l_extendedprice`,
+`l_discount` -- Q6's shape, matching opt #3's own column choice) via
+`cudf::io::chunked_parquet_reader`, on an idle GPU (confirmed via
+`nvidia-smi`: 10% utilization, 1.2GiB used, no contention) this dev
+machine's RTX 5060 Ti, 16GiB:
+- **Baseline**: exactly mirrors `ParquetScanOperator::open()`'s current
+  production shape -- one reader spanning all 16 files, one stream,
+  `has_next()`/`read_chunk()` in a loop until exhausted.
+- **Candidate**: files split round-robin into N groups (N in {2, 4, 8,
+  16}), each group decoded by its own reader on its own stream from its
+  own `std::thread`, all launched concurrently and joined at the end.
+
+**Result**, 3 independent process runs (5 measured iterations each,
+median reported, row counts cross-checked equal to baseline on every
+run):
+
+| N streams | run 1 | run 2 | run 3 |
+|---|---|---|---|
+| 2 | +12.3% | +3.3% | -3.6% |
+| 4 | +0.8% | -8.0% | -17.7% |
+| 8 | -20.5% | -26.7% | -41.1% |
+| 16 | -62.0% | -73.4% | -90.7% |
+
+(Positive = faster than baseline, negative = slower.)
+
+**Real, reproducible -- and negative, past N=2.** N=2's result straddles
+zero across three independent runs (noise, not a real effect); N=4, 8,
+and 16 are consistently and increasingly *worse* than the single-reader
+baseline, in every run, by a wide and growing margin. This is the
+opposite of opt #3's own finding: decode-vs-compute overlap (one decode
+stream running alongside the consumer's compute stream) found genuine
+idle capacity to exploit, because the two streams do fundamentally
+different kinds of work. Decode-vs-decode across N streams does the
+*same* kind of work N times concurrently -- Parquet decompression on this
+GPU is not free-standing SM-bound work that idle SM% implies there's room
+for; multiple concurrent chunked-reader instances appear to contend for
+shared decompression-engine/copy-engine capacity (and, less measurable
+here, host-thread/driver-level serialization around each reader's own
+`has_next()`/`read_chunk()` calls), so adding more concurrent streams adds
+pure overhead once that shared capacity is saturated -- past a very low
+concurrency threshold, immediately in this measurement.
+
+**Conclusion: don't implement this.** The `nvidia-smi` SM%-idle
+observation that motivated this item was a real observation but a
+misleading diagnosis -- idle SM time during decode doesn't mean there's
+spare decode throughput to parallelize into, the same way idle compute
+time during I/O doesn't always mean an I/O-bound wait is parallelizable
+if the underlying resource is already saturated by something else (here,
+a single GPU's decompression/copy engines, not SMs). Opportunity #6 above
+is marked de-prioritized; `ParquetScanOperator`'s single-reader/
+single-stream design for the non-partitioned path is correct as-is. (This
+result is specific to a desktop RTX 5060 Ti under WSL2 -- it's possible a
+datacenter GPU with more/dedicated decompression engines behaves
+differently, but that would need its own real measurement, not an
+assumption, before revisiting this.)
+
 ## Recommendation
 
 #1 (pinned memory) is now de-prioritized based on the measurements above --
@@ -392,6 +493,16 @@ that work overlapped with compute.
 #2 (concurrent queries) remains the biggest structural change and should
 wait until there's a concrete reason (observed queueing under real load)
 to take on the RMM-sharing redesign it requires.
+
+#6 (parallel decode across files) is now de-prioritized based on a real
+prototype (see above) -- the opposite outcome from #3: no reliable win at
+any tested concurrency, and a reproducible regression past 2 streams.
+Don't pursue this; `ParquetScanOperator`'s existing single-reader design
+for the non-partitioned path already appears to be the right shape. The
+SF1000 GPU-idle observation that motivated this item is better explained
+by opportunity #4 (`pass_read_limit_bytes` retuning, still open) or by the
+memory-pressure findings in the SF1000 Q3 OOM section above than by a
+decode-parallelism gap.
 
 ## Follow-up: GPU memory growing across benchmark runs
 
@@ -842,3 +953,70 @@ code needed to change.
   (well under the L4's 24GB), 10 correct rows returned,
   `elapsed_wall_seconds` 32.2s. The original crash
   (`RMM failure: Exceeded memory limit`) is gone.
+
+**Open again at SF1000 (2026-08-15) -- same failure mode, 10x the scale.**
+A real SF1000 AWS run (same `g6.2xlarge`/L4, both fixes above already in
+place) hit the identical OOM shape on Q3:
+`RMM failure: Exceeded memory limit (failed to allocate 328.06 MiB)`,
+via `adbc_driver_manager.OperationalError` over Flight SQL, and it takes
+the whole `aws_benchmark_runner.py` process down with it (no per-query
+exception handling there -- one query's failure aborts the run before any
+results are written, a separate harness-level gap from the OOM itself).
+Not yet root-caused the way the SF100 case was -- SF100's fix (predicate
+pushdown + `max_distinct_keys` 10M -> 20M) got real headroom (9.9 GiB
+peak, well under 24GB) at that scale, but SF1000's ~10x larger post-filter
+join inputs and proportionally larger distinct-group cardinality
+apparently exceed it again. Live `nvidia-smi` sampling during this same
+run showed device memory pegged at ~20.6/23GB (~89.5%) even on the
+queries that *don't* OOM (Q1/Q6/Q12/Q14/Q19), which is what opportunity #6
+above cross-references -- headroom is already tight before Q3 runs at
+all, so anything that increases concurrent in-flight GPU memory (like
+opportunity #6's multi-stream decode) needs to be weighed against this,
+not layered on top of it for free. Worked around for now by excluding Q3
+from the SF1000 `--query` list rather than blocking the rest of the run
+on a live root-cause; retuning `pass_read_limit_bytes` (opportunity #4,
+still open) or moving to a larger-memory GPU instance
+(`g6.4xlarge`/`g6.8xlarge`, unlocked by the 2026-08-11 quota increase) are
+the two most direct levers, but neither has been tried yet at this scale.
+
+**Actually root-caused 2026-08-16 -- neither of the above levers was it.**
+The real cause: `HashJoinOperator` already has a grace-hash partitioned/
+disk-spilling build-side path (added `b915063`, 2026-08-13, for the
+Q12/Q14/Q19 host-RAM OOMs -- bounds *device* memory to one partition/batch
+at a time, not just host RAM as an earlier read of this history assumed;
+`docs/ARCHITECTURE.md`'s own build-side-selection section was stale on
+this point until today), and it targets exactly this GPU-OOM failure mode
+when it engages. It just never engaged for Q3: `choose_partition_count()`
+(`hash_join_operator.cpp`) sizes off `HashJoinNode::estimated_build_rows()`,
+which for Q3's `(customer JOIN orders) JOIN lineitem` left-deep chain came
+from `estimate_row_count()`'s own `min(left, right)` fallback for a nested
+join used as an outer join's operand (`physical_planner.cpp`, same
+function `estimate_selectivity()` was added to for the Q12 fix below).
+`customer JOIN orders` is a foreign-key join -- most of the *larger* side
+(orders) survives, since real referential integrity means most orders
+match some surviving customer row -- so the true inner-join output tracks
+`orders_filtered` (the larger input), not `min(customer_filtered,
+orders_filtered)`. At SF1000 that `min()` badly undersized the estimate,
+kept it under `build_side_budget_bytes`, `choose_partition_count()`
+decided partitioning wasn't needed, and the outer join's real (much
+larger) build side then hit `HashJoinOperator::open()`'s unbounded
+`cudf::concatenate()` -- the exact `RMM failure: Exceeded memory limit`
+this section describes, now explained down to the specific wrong number
+that caused it.
+
+**Fix:** `estimate_row_count()`'s `HashJoinNode` case now returns
+`max(left, right)` instead of `min(left, right)`. Deliberately the
+conservative direction to be wrong in -- see that function's own updated
+comment -- overestimating a nested join's size can only trigger
+partitioning/build-side swaps more readily than strictly necessary (cheap),
+never less (the failure mode this bug actually caused). Verified so far:
+real pre/post `git worktree` A/B confirms Q12's own build-side swap still
+picks correctly (this change is a different code path, but shares the
+same function); Q3 matches DuckDB row-for-row on real local SF10 data
+(`peak_gpu_memory_bytes` 2.89 GiB there, well under any budget at that
+scale, so SF10 doesn't exercise the actual bug); full unit + GPU test
+suites pass (one pre-existing, unrelated `QueryTracingTest` flake, not
+caused by this change). **Not yet confirmed at real SF1000 scale** -- that
+needs a real AWS run with Q3 included, the same way every other fix in
+this section was ultimately validated. Q3 is still excluded from the
+`--query` list pending that confirmation.

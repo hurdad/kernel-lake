@@ -3,6 +3,7 @@
 #include <fmt/format.h>
 
 #include <algorithm>
+#include <cmath>
 
 #include "kernellake/common/errors.hpp"
 #include "kernellake/io/parquet_metadata.hpp"
@@ -142,18 +143,106 @@ bool is_identity_projection(const std::vector<NamedExpression>& items, const Sch
   return true;
 }
 
+// Rough default-selectivity heuristic for estimate_row_count()'s FilterNode
+// case below, in the same spirit as classic optimizers that fall back to
+// fixed per-predicate-shape defaults absent real column statistics/
+// histograms (this project has none -- Parquet row-group min/max stats
+// drive evaluate_pruning()'s exact, provable row-group elimination
+// elsewhere, but say nothing about selectivity *within* a kept row group).
+// Never a correctness concern either way estimate_row_count() only feeds
+// the hash join build-side choice (see that function's own comment), a
+// pure performance heuristic -- an inner join's result is identical
+// regardless of which side builds, so a wrong selectivity guess costs
+// performance, never correctness. Walks top-level AND/OR structure
+// recursively (mirroring optimizer.cpp's own flatten_and_conjuncts(), same
+// idea applied to estimation instead of pushdown) so a WHERE clause's
+// several independent predicates each contribute their own discount rather
+// than the whole clause being treated as one opaque unit.
+//
+// Real motivating case: TPC-H Q12 (orders JOIN lineitem, WHERE clause
+// entirely on lineitem columns) -- orders has no predicate of its own (the
+// query's own semantics need it in full), while lineitem's WHERE clause
+// (l_shipmode IN (...), a shipdate/commitdate/receiptdate ordering
+// constraint, a one-year receiptdate range) is genuinely selective. Without
+// this, both sides were compared by whole-file row count alone, orders'
+// raw count came out smaller than lineitem's raw count at SF1000, and
+// HashJoinOperator built its hash table on the *larger* (post-filter)
+// side -- confirmed as the real, reproducible cause of Q12 running slower
+// on KernelLake than on PySpark in two separate real AWS SF1000 runs
+// (2026-08-16).
+double estimate_selectivity(const Expression& predicate) {
+  if (const auto* binary = dynamic_cast<const BinaryExpression*>(&predicate)) {
+    switch (binary->op()) {
+      case BinaryOperator::And:
+        return estimate_selectivity(*binary->left()) * estimate_selectivity(*binary->right());
+      case BinaryOperator::Or: {
+        // Independence-assumption union, same as a classic optimizer's
+        // default absent real correlation statistics: P(A or B) = P(A) +
+        // P(B) - P(A)*P(B), clamped to 1.0 so a long OR chain (e.g. an
+        // IN-list desugared into ORed equalities) can't estimate above
+        // "every row passes."
+        const double left = estimate_selectivity(*binary->left());
+        const double right = estimate_selectivity(*binary->right());
+        return std::min(1.0, left + right - left * right);
+      }
+      case BinaryOperator::Equal:
+        return 0.1;
+      case BinaryOperator::NotEqual:
+        return 0.9;
+      case BinaryOperator::Less:
+      case BinaryOperator::LessEqual:
+      case BinaryOperator::Greater:
+      case BinaryOperator::GreaterEqual:
+        return 0.33;
+      default:
+        // Arithmetic operators (Add/Subtract/Multiply/Divide) never appear
+        // as a filter's own top-level boolean shape; no discount if one
+        // somehow does.
+        return 1.0;
+    }
+  }
+  if (dynamic_cast<const BetweenExpression*>(&predicate)) {
+    return 0.25;
+  }
+  if (const auto* unary = dynamic_cast<const UnaryExpression*>(&predicate)) {
+    switch (unary->op()) {
+      case UnaryOperator::Not:
+        return 1.0 - estimate_selectivity(*unary->operand());
+      case UnaryOperator::IsNull:
+        return 0.05;
+      case UnaryOperator::IsNotNull:
+        return 0.95;
+      default:
+        return 1.0;
+    }
+  }
+  if (dynamic_cast<const LikeExpression*>(&predicate)) {
+    return 0.25;
+  }
+  // Anything else (a bare boolean column, CASE, a function call, ...): no
+  // discount rather than a guess -- estimate_row_count() would rather
+  // slightly overestimate a filtered scan's size (worst case: a missed
+  // build-side swap) than underestimate it (worst case: swapping onto a
+  // side that turns out not to be smaller after all).
+  return 1.0;
+}
+
 // Estimates a physical plan node's output row count, for choosing a hash
 // join's build side (HashJoinOperator always materializes its *right*
 // child into device memory -- see that class's own doc comment -- so the
 // smaller side should end up there, not whichever side a query happened
-// to write first). This is a rough, pre-filter/pre-aggregation size
-// estimate, not real cardinality estimation: a ParquetScanNode reports the
-// sum of its scanned files' whole-file row counts (ignoring row-group
-// pruning and any filter selectivity), and every single-child node above
-// it (Filter, Projection, aggregates, Sort, Limit, ...) just passes that
-// estimate through unchanged via its generic children() accessor, rather
-// than needing a case for every node type. Returns nullopt when no
-// estimate is available (never guesses in that case).
+// to write first). Not real cardinality estimation -- no histograms, no
+// join-selectivity modeling -- but no longer purely pre-filter either: a
+// ParquetScanNode reports the sum of its scanned files' whole-file row
+// counts (still ignoring row-group pruning, which evaluate_pruning() only
+// applies when a predicate provably eliminates whole row groups -- most
+// TPC-H-derived predicates here don't, since generate_tpch.py assigns
+// values uniformly at random per row, uncorrelated with row-group layout);
+// a FilterNode discounts its child's estimate via estimate_selectivity()
+// above; every other single-child node (Projection, aggregates, Sort,
+// Limit, ...) still just passes its child's estimate through unchanged via
+// the generic children() accessor. Returns nullopt when no estimate is
+// available (never guesses in that case).
 std::optional<std::int64_t> estimate_row_count(const PhysicalPlanPtr& node) {
   if (const auto* scan = dynamic_cast<const ParquetScanNode*>(node.get())) {
     std::int64_t total = 0;
@@ -162,18 +251,50 @@ std::optional<std::int64_t> estimate_row_count(const PhysicalPlanPtr& node) {
     }
     return total;
   }
+  if (const auto* filter = dynamic_cast<const FilterNode*>(node.get())) {
+    const std::optional<std::int64_t> child_estimate = estimate_row_count(filter->child());
+    if (!child_estimate) {
+      return std::nullopt;
+    }
+    const double selectivity = estimate_selectivity(*filter->predicate());
+    return static_cast<std::int64_t>(std::llround(static_cast<double>(*child_estimate) * selectivity));
+  }
   if (const auto* join = dynamic_cast<const HashJoinNode*>(node.get())) {
     const std::optional<std::int64_t> left_estimate = estimate_row_count(join->left());
     const std::optional<std::int64_t> right_estimate = estimate_row_count(join->right());
     if (!left_estimate || !right_estimate) {
       return std::nullopt;
     }
-    // A real inner join's output can exceed either input (duplicate
-    // keys), but "smaller of the two inputs" is the usual fallback real
-    // planners use absent join-selectivity statistics, and is enough to
-    // let an N-way chain's outer join estimate a nested join child's
-    // size too.
-    return std::min(*left_estimate, *right_estimate);
+    // max(), not min() (fixed 2026-08-16 -- see below): this estimate only
+    // matters when this HashJoinNode is itself the left or right child of
+    // an *outer* join in an N-way chain (the only caller, this function's
+    // own recursion from the outer join's own left_estimate/right_estimate
+    // above -- see convert()'s JOIN case, where the identical
+    // left_estimate/right_estimate pattern also becomes that outer join's
+    // own estimated_build_rows). For every real TPC-H-derived N-way chain
+    // this engine runs, that inner join is a foreign-key join (e.g. Q3's
+    // customer JOIN orders feeding the outer join against lineitem): most
+    // rows on the *larger* side survive (each has a matching key on the
+    // smaller side, by construction of real referential integrity), so the
+    // join's true output tracks the larger input's size, not the smaller
+    // one -- min() was a real, confirmed bug, not just a theoretical
+    // under-estimate. Real SF1000 TPC-H Q3 GPU OOM root-caused to exactly
+    // this (2026-08-16): min(customer_filtered, orders_filtered) badly
+    // undersized the customer-JOIN-orders inner join's real output (an FK
+    // join, output size tracks orders_filtered, the larger side, not
+    // customer_filtered), so the outer join's estimated_build_rows stayed
+    // under build_side_budget_bytes (query_engine_execute_gpu.cpp) and
+    // choose_partition_count() (hash_join_operator.cpp) decided
+    // partitioning wasn't needed -- when the join's *actual* build side, at
+    // real SF1000 scale, was large enough that HashJoinOperator::open()'s
+    // unbounded, unpartitioned cudf::concatenate() OOM'd. max() is the
+    // conservative direction to be wrong in: it can only trigger
+    // partitioning/build-side swaps *more* readily than strictly necessary
+    // (cheap -- see choose_partition_count()'s own comment on why erring
+    // toward more partitions is safe), never less, unlike min() silently
+    // under-provisioning toward the exact failure this was meant to guard
+    // against.
+    return std::max(*left_estimate, *right_estimate);
   }
   const std::vector<PhysicalPlanPtr> children = node->children();
   if (children.size() == 1) {

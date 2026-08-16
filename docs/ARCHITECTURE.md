@@ -486,7 +486,7 @@ external NVTX profiling.
 | `HashAggregateOperator` | `GROUP BY`: each incoming batch is aggregated on its own with a plain, one-shot `cudf::groupby::groupby`, then folded into a running partial result (concatenate + re-aggregate) -- not `cudf::groupby::streaming_groupby` (replaced: that design coupled `max_distinct_keys` to an unrelated per-call row-count limit, causing severe slowdowns on low-cardinality GROUP BYs over large scans). `accumulated_` exceeding `max_distinct_keys` (default 20M) throws. |
 | `LimitOperator` | `cudf::slice` + the `cudf::table` copy constructor to truncate the final batch |
 | `SortOperator` | `ORDER BY`: **blocking**, unlike every operator above -- consumes `child` to exhaustion, concatenates every batch (`cudf::concatenate`) into one table, then `cudf::stable_sorted_order` + `cudf::gather`. Memory footprint is the whole result set, not bounded like the streaming operators. |
-| `HashJoinOperator` | Two-table `INNER JOIN`: its *build* (right) side is **blocking** like `SortOperator` (consumed to exhaustion, concatenated into one table, then wraps a single `cudf::hash_join`); its *probe* (left) side streams normally, one `inner_join()` + double-`cudf::gather` per batch. See "Hash joins" above. |
+| `HashJoinOperator` | Two-table `INNER JOIN`: when `choose_partition_count()` decides the build side is small enough, its *build* (right) side is **blocking** like `SortOperator` (consumed to exhaustion, concatenated into one table, then wraps a single `cudf::hash_join`); otherwise both sides are grace-hash partitioned and spilled to disk, bounding device memory to one partition/batch at a time (`b915063`, 2026-08-13). Its *probe* (left) side streams normally, one `inner_join()` + double-`cudf::gather` per batch (unpartitioned case). See "Hash joins" above. |
 | `ArrowResultOperator` | Trivial passthrough; the actual `DeviceBatch` -> `arrow::RecordBatch` conversion happens in `QueryEngine::execute()` via `to_arrow_record_batch()`, since `PhysicalOperator::next()` must return a `DeviceBatch` |
 
 Two correctness details worth knowing if you touch these operators:
@@ -934,36 +934,70 @@ would fail on an implementation detail unrelated to correctness.
 - **Size-aware build-side selection.** `physical_planner.cpp`'s
   `convert()` estimates both sides' row counts (`estimate_row_count()`: a
   `ParquetScanNode` reports the sum of its scanned files' whole-file row
-  counts; a nested `HashJoinNode` reports `min(left, right)`; every
+  counts; a `FilterNode` discounts its child's estimate via
+  `estimate_selectivity()` -- classic fixed per-predicate-shape defaults
+  absent real histograms (equality ~10%, range/inequality ~33%, `BETWEEN`/
+  `LIKE` ~25%, `AND` multiplies, `OR` unions under an independence
+  assumption), walking top-level `AND`/`OR` structure recursively; a
+  nested `HashJoinNode` reports `min(left, right)`; every other
   single-child node above either just passes its child's estimate through
   via the generic `children()` accessor, no per-node-type case needed) and
   swaps `left`/`right` (and their key indices) whenever the left side's
   estimate is smaller -- since `HashJoinOperator` (GPU) and Acero's
   `"hashjoin"` (CPU) both always materialize their *right* child, this
   puts the actually-smaller table there regardless of which side a query
-  wrote first. This is a rough, pre-filter/pre-aggregation estimate (not
-  real cardinality estimation, no join-selectivity modeling), and it's a
+  wrote first. Still not real cardinality estimation (no histograms, no
+  join-selectivity modeling, row-group pruning itself isn't reflected --
+  see `estimate_row_count()`'s own comment on why most TPC-H-derived
+  predicates here don't prune row groups at all), and it's a
   planning-time decision applied identically to both backends, not a
   per-backend cost model. Safe to reorder: every expression above a
   `HashJoinNode` already resolves columns by *name* against its own
   `output_schema()` (see `find_scan_schema()`'s own comment above), never
   by fixed position, and the same holds recursively into an outer join's
-  own key resolution in an N-way chain. Verified for real against SF10
-  TPC-H data: Q12's `orders JOIN lineitem` now builds on `orders` (the
-  smaller table) instead of `lineitem`, confirmed via `kernellake explain
-  --format json`; Q3's 3-way chain shows the swap propagating sensibly
-  through both join steps (smallest table innermost/build, largest
-  outermost/probe). This build-side sizing heuristic narrows, but on its
-  own doesn't eliminate, OOM risk from a large build side -- neither
-  execution operator has a bounded/streaming join design (see below), so
-  an arbitrarily large build side, even the smaller of the two, can still
-  exceed available memory at large enough scale. A real SF100 GPU OOM on
-  TPC-H Q3 (a 3-way join) turned out to have a different, more direct
-  cause -- see "Predicate pushdown across a join" below and
-  `docs/GPU_OPTIMIZATIONS.md` -- and is now confirmed fixed at real SF100
-  scale; this heuristic's own remaining exposure (a build side that's
-  genuinely large even after correct join-side selection and predicate
-  pushdown) is real but separate, and still applies.
+  own key resolution in an N-way chain.
+
+  **Fixed 2026-08-16: the pre-selectivity version of this heuristic got
+  Q12 wrong, for real, at real SF1000 scale.** Q12's `orders JOIN
+  lineitem` has no predicate on `orders` at all (the query's own
+  semantics need it in full) and a genuinely selective `WHERE` clause on
+  `lineitem` (shipmode/date-ordering/one-year-range). Comparing *whole-
+  file* row counts alone -- what this heuristic did before
+  `estimate_selectivity()` existed -- found `orders`' raw ~1.5B rows
+  smaller than `lineitem`'s raw ~6B, so the swap fired and built the hash
+  table on the *larger* (post-filter) side: the opposite of optimal.
+  Confirmed as the real, reproducible cause of Q12 running slower on
+  KernelLake than on PySpark in two separate real AWS SF1000 benchmark
+  runs (`benchmarks/aws/`, ~331-345s vs. ~246-256s). Verified fixed via a
+  real pre/post `git worktree` A/B on real local SF10 data: `kernellake
+  explain --format text` confirms the swap no longer fires (`orders`
+  stays left/probe, filtered `lineitem` stays right/build); results match
+  DuckDB row-for-row on the same data; full unit + GPU test suites still
+  pass. SF10's own `orders` table (~15M rows) is small enough that the
+  wall-time delta there is modest (real, but only a few percent) -- the
+  effect scales with data size and is expected to be much larger at
+  SF1000, where `orders` is ~1.5B rows.
+
+  This build-side sizing heuristic narrows, but on its own doesn't
+  eliminate, OOM risk from a large build side. **Corrected 2026-08-16**:
+  the GPU `HashJoinOperator` is *not* purely blocking/unbounded any more
+  -- it gained a grace-hash partitioned, disk-spilling build-side path
+  (`b915063`, 2026-08-13; see the `HashJoinOperator` table row below) that
+  bounds device memory to one partition/batch at a time when it engages.
+  Acero's CPU `"hashjoin"` has no equivalent, so a large build side there
+  still risks host OOM regardless. Even on the GPU side, partitioning only
+  *engages* when `choose_partition_count()`'s own build-side estimate
+  (`HashJoinNode::estimated_build_rows()`, sourced from this same
+  `estimate_row_count()`) is accurate enough to notice the build side is
+  large -- a real SF1000 TPC-H Q3 GPU OOM (3-way join) turned out to be
+  exactly a case where that estimate was itself wrong (a nested join's
+  output badly under-estimated for a foreign-key join shape), not a
+  missing bounded-join design -- see `docs/GPU_OPTIMIZATIONS.md`'s "Open
+  again at SF1000" / "Actually root-caused 2026-08-16" for the full
+  writeup and fix (also in this same function, not yet confirmed at real
+  SF1000 scale). A real SF100 GPU OOM on the same query earlier had a
+  different, more direct cause -- see "Predicate pushdown across a join"
+  below -- and is confirmed fixed at real SF100 scale.
 - **N-way joins, generalized from an original two-table-only design.** A
   real investigation found the underlying `hsql` SQL parser already parses
   `A JOIN B JOIN C ON ...` correctly into a left-deep nested `TableRef` tree
