@@ -13,12 +13,26 @@
 # Usage:
 #   ./run_s3_throughput_all_instances.sh --scale-factor 100 --output-dir "$RUN_DIR"
 #     [--bucket <bucket>] [--compression snappy] [--table lineitem]
-#     [--concurrency-levels "1,4,8,16,32,64"] [--objects-per-level 20]
+#     [--concurrency-levels "1,4,8,16,32,64"] [--objects-per-level 20] [--concurrent]
 #
 # --bucket defaults to `terraform output -raw s3_bucket_name` if omitted.
 # Requires SSH access to every instance (same ssh_key_name/
 # allowed_ssh_cidr as the rest of this harness) and the "ubuntu" user, same
 # as every other scp/ssh step in docs/RUNBOOK.md.
+#
+# --concurrent (2026-08-15): by default this measures each instance's S3
+# throughput one at a time, sequentially -- real, but it doesn't answer
+# whether running all three engines' own benchmark legs *at the same time*
+# (a real question raised about whether concurrent cross-instance S3 reads
+# interfere with each other) would see lower throughput than isolated,
+# one-at-a-time measurement. --concurrent runs every instance's
+# measure_s3_throughput.sh at the same time instead (backgrounded,
+# `wait`ed together) and suffixes every output file with "-concurrent" so
+# both modes' results can coexist in the same --output-dir. Run this script
+# twice, once with and once without --concurrent, then diff the two sets
+# of max_throughput_mbps per host (compare_s3_concurrent_vs_sequential.py)
+# to answer that empirically instead of arguing from AWS's documented
+# per-instance bandwidth/Gateway-Endpoint architecture alone.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -32,6 +46,7 @@ TABLE="lineitem"
 CONCURRENCY_LEVELS="1,4,8,16,32,64"
 OBJECTS_PER_LEVEL=20
 OUTPUT_DIR=""
+CROSS_INSTANCE_CONCURRENT=false
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -43,6 +58,7 @@ while [ $# -gt 0 ]; do
     --concurrency-levels) CONCURRENCY_LEVELS="$2"; shift 2 ;;
     --objects-per-level) OBJECTS_PER_LEVEL="$2"; shift 2 ;;
     --output-dir) OUTPUT_DIR="$2"; shift 2 ;;
+    --concurrent) CROSS_INSTANCE_CONCURRENT=true; shift 1 ;;
     *) echo "Unknown argument: $1" >&2; exit 1 ;;
   esac
 done
@@ -80,22 +96,29 @@ tf_output_raw() {
 
 # Runs measure_s3_throughput.sh against one host, labeled, writing its
 # result into $OUTPUT_DIR -- the one piece of work repeated for every
-# instance below.
+# instance below. Output filename gets a "-concurrent" suffix under
+# --concurrent so a sequential run's files (no suffix) are never
+# overwritten by a concurrent run against the same --output-dir --
+# compare_s3_concurrent_vs_sequential.py expects both to coexist.
 run_one() {
   local host="$1" label="$2"
+  local suffix=""
+  if [ "$CROSS_INSTANCE_CONCURRENT" = true ]; then
+    suffix="-concurrent"
+  fi
   if [ -z "$host" ]; then
     echo "=== Skipping ${label}: no instance (disabled or not provisioned) ===" >&2
     return
   fi
-  echo "=== Measuring S3 throughput on ${label} (${host}) ===" >&2
+  echo "=== Measuring S3 throughput on ${label} (${host})${suffix:+, concurrent mode} ===" >&2
   scp -o StrictHostKeyChecking=accept-new "${SCRIPT_DIR}/measure_s3_throughput.sh" "ubuntu@${host}:~/"
   ssh -o StrictHostKeyChecking=accept-new "ubuntu@${host}" \
     "./measure_s3_throughput.sh --bucket '$BUCKET' --scale-factor '$SCALE_FACTOR' \
      --compression '$COMPRESSION' ${COMPRESSION_LEVEL_FLAG} --table '$TABLE' \
      --concurrency-levels '$CONCURRENCY_LEVELS' --objects-per-level '$OBJECTS_PER_LEVEL' \
-     --label '$label' --output s3-throughput.json"
-  scp -o StrictHostKeyChecking=accept-new "ubuntu@${host}:~/s3-throughput.json" "${OUTPUT_DIR}/s3-throughput-${label}.json"
-  echo "=== ${label}: wrote ${OUTPUT_DIR}/s3-throughput-${label}.json ===" >&2
+     --label '${label}${suffix}' --output s3-throughput.json"
+  scp -o StrictHostKeyChecking=accept-new "ubuntu@${host}:~/s3-throughput.json" "${OUTPUT_DIR}/s3-throughput-${label}${suffix}.json"
+  echo "=== ${label}: wrote ${OUTPUT_DIR}/s3-throughput-${label}${suffix}.json ===" >&2
 }
 
 # KernelLake: one label per replica (kernellake-0, kernellake-1, ...) --
@@ -118,15 +141,39 @@ import json, sys
 for ip in (json.load(sys.stdin) or []):
     print(ip)
 ')
+# run_bg: under --concurrent, launches run_one in the background so every
+# instance's measurement overlaps in real wall-clock time instead of one
+# finishing before the next starts; under the default sequential mode,
+# runs it in the foreground exactly as before. The trailing `wait` (after
+# every instance below has been dispatched) is a no-op when nothing was
+# backgrounded, so this is safe to call unconditionally in both modes.
+run_bg() {
+  if [ "$CROSS_INSTANCE_CONCURRENT" = true ]; then
+    run_one "$@" &
+  else
+    run_one "$@"
+  fi
+}
+
 if [ "${#KL_HOSTS[@]}" -eq 0 ]; then
   echo "=== Skipping kernellake: no instances (kernellake_instance_count=0 or not provisioned) ===" >&2
 else
   for i in "${!KL_HOSTS[@]}"; do
-    run_one "${KL_HOSTS[$i]}" "kernellake-${i}"
+    run_bg "${KL_HOSTS[$i]}" "kernellake-${i}"
   done
 fi
 
-run_one "$(tf_output_raw spark_host_public_ip)" "spark"
-run_one "$(tf_output_raw duckdb_host_public_ip)" "duckdb"
+run_bg "$(tf_output_raw spark_host_public_ip)" "spark"
+run_bg "$(tf_output_raw duckdb_host_public_ip)" "duckdb"
 
-echo "=== Done. Combine into one chart: python3 ../reporting/plot_s3_throughput.py --input-dir '$OUTPUT_DIR' --output '$OUTPUT_DIR/s3-throughput.png' ===" >&2
+# No-op when nothing was backgrounded (sequential mode) -- see run_bg's own
+# comment. Under --concurrent, this is what actually makes the script wait
+# for every instance's measurement to finish before declaring done.
+wait
+
+if [ "$CROSS_INSTANCE_CONCURRENT" = true ]; then
+  echo "=== Done (concurrent mode). Compare against a prior sequential run: python3 ../scripts/compare_s3_concurrent_vs_sequential.py --input-dir '$OUTPUT_DIR' ===" >&2
+else
+  echo "=== Done. Combine into one chart: python3 ../reporting/plot_s3_throughput.py --input-dir '$OUTPUT_DIR' --output '$OUTPUT_DIR/s3-throughput.png' ===" >&2
+  echo "=== To check whether concurrent cross-instance S3 reads interfere with each other, also run: $0 --scale-factor '$SCALE_FACTOR' --output-dir '$OUTPUT_DIR' --concurrent ===" >&2
+fi

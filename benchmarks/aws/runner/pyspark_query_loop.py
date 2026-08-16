@@ -204,8 +204,17 @@ def main() -> int:
                          help="zstd only -- reads tpch-data/sf<N>-zstd-l<N>/ instead of the "
                               "un-suffixed tpch-data/sf<N>-zstd/ (PyArrow's own default level).")
     parser.add_argument("--query", default="all", help="Query number, or 'all' for every supported query")
-    parser.add_argument("--iterations", type=int, default=2)
-    parser.add_argument("--modes", default="cold,warm", help="Comma-separated: cold,warm (see module docstring)")
+    # 1, not 2 (2026-08-15) -- same reasoning as duckdb_query_loop.py's
+    # identical change: every cold rep now gets a fresh session, so a
+    # second rep is a real but redundant second cold measurement, not
+    # worth its own cost/time at SF1000+ scale.
+    parser.add_argument("--iterations", type=int, default=1)
+    # Defaults to cold-only (2026-08-15): warm/cached numbers don't
+    # represent real behavior once a table's working set exceeds whatever
+    # cache is in front of it, which any real production scale eventually
+    # does -- cold is the honest worst-case number to report. Pass
+    # `--modes cold,warm` explicitly to still measure both.
+    parser.add_argument("--modes", default="cold", help="Comma-separated: cold,warm (see module docstring)")
     parser.add_argument("--executor-memory", default="48g", help="Sized for the default m7i.4xlarge host -- lower if spark_instance_type is smaller")
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
@@ -224,7 +233,15 @@ def main() -> int:
             samples = []
             row_count = None
             for rep in range(args.iterations):
-                if mode == "cold" and rep == 0:
+                # Every cold rep gets a fresh SparkSession, not just rep 0
+                # -- same fix as duckdb_query_loop.py's identical bug
+                # (2026-08-15): with rep 0 only, a second cold rep reused
+                # rep 0's now-warm session/JVM, making it indistinguishable
+                # from an actual warm rep. statistics.median() then quietly
+                # averaged one genuinely-cold sample with one
+                # accidentally-warm one, diluting every reported "cold"
+                # number toward warm instead of measuring it.
+                if mode == "cold":
                     # A fresh SparkSession (not just fresh views) for a
                     # genuine "cold" rep -- same convention as
                     # duckdb_query_loop.py's fresh-connection-per-cold-rep

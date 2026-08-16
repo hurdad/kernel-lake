@@ -134,6 +134,19 @@ def new_duckdb_connection(region: str):
     con.load_extension("aws")
     con.sql("CREATE OR REPLACE SECRET (TYPE S3, PROVIDER CREDENTIAL_CHAIN)")
     con.sql(f"SET s3_region = '{region}'")
+    # Worst-case/no-cache cold benchmarking (2026-08-15): duckdb.connect()
+    # with no path is already an in-memory database with no local
+    # disk-backed cache in the S3 read path (httpfs streams straight into
+    # this connection's own buffer pool, never through a local file Linux's
+    # page cache could intercept), so the fresh-connection-per-cold-rep
+    # reset above is the real cache-clearing mechanism, not an OS-level
+    # cache drop. These two SETs are belt-and-suspenders on top of that:
+    # DuckDB's own object/HTTP-metadata caches default on and are otherwise
+    # scoped to the connection's lifetime anyway (already cleared by the
+    # reconnect), but disabling them explicitly removes any doubt that a
+    # within-connection cache could still be doing something.
+    con.sql("SET enable_object_cache = false")
+    con.sql("SET enable_http_metadata_cache = false")
     return con
 
 
@@ -171,8 +184,18 @@ def main() -> int:
                          help="zstd only -- reads tpch-data/sf<N>-zstd-l<N>/ instead of the "
                               "un-suffixed tpch-data/sf<N>-zstd/ (PyArrow's own default level).")
     parser.add_argument("--query", default="all", help="Query number, or 'all' for every supported query")
-    parser.add_argument("--iterations", type=int, default=2)
-    parser.add_argument("--modes", default="cold,warm", help="Comma-separated: cold,warm (see module docstring)")
+    # 1, not 2 (2026-08-15): now that every cold rep gets a fresh
+    # connection (see new_duckdb_connection() call site below), a second
+    # rep is a genuine but redundant second cold measurement, not a
+    # median-vs-noise check worth its own real cost/time at SF1000+ scale
+    # -- median_stats() of a single sample just reports that sample.
+    parser.add_argument("--iterations", type=int, default=1)
+    # Defaults to cold-only (2026-08-15): warm/cached numbers don't
+    # represent real behavior once a table's working set exceeds whatever
+    # cache is in front of it, which any real production scale eventually
+    # does -- cold is the honest worst-case number to report. Pass
+    # `--modes cold,warm` explicitly to still measure both.
+    parser.add_argument("--modes", default="cold", help="Comma-separated: cold,warm (see module docstring)")
     parser.add_argument("--region", default="us-east-1")
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
@@ -190,7 +213,17 @@ def main() -> int:
             samples = []
             row_count = None
             for rep in range(args.iterations):
-                if mode == "cold" and rep == 0:
+                # Every cold rep gets a fresh connection, not just rep 0 --
+                # with rep 0 only, a second cold rep reused rep 0's now-
+                # populated connection state, making it indistinguishable
+                # from a warm rep. Confirmed for real on a SF1000 run
+                # (2026-08-15): "cold" min_seconds landed within noise of
+                # the corresponding warm median every time, and
+                # statistics.median() of [true_cold, accidentally_warm]
+                # silently averaged the two -- reported "cold" numbers were
+                # diluted roughly 2x toward warm, not a genuine cold
+                # measurement at all.
+                if mode == "cold":
                     con.close()
                     con = new_duckdb_connection(args.region)
                 table, elapsed = run_duckdb_query(con, query_number, globs)

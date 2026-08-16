@@ -505,10 +505,19 @@ def benchmark_query(
         validated = None
         validated_duckdb = None
         for rep in range(iterations):
-            is_first_rep = rep == 0
-            if mode == "cold" and is_first_rep and kernellake_ssh_host and ssh_key_path:
+            # Every cold rep resets, not just rep 0 (2026-08-15 fix): with
+            # is_first_rep-only gating, a second cold rep reused rep 0's
+            # already-restarted-and-now-warm server/session, making it
+            # indistinguishable from a real warm rep -- statistics.median()
+            # then quietly averaged one genuinely-cold sample with one
+            # accidentally-warm one, diluting every reported "cold" number
+            # toward warm instead of measuring it. Confirmed for real on a
+            # SF1000 run: DuckDB's own identical bug (duckdb_query_loop.py)
+            # produced a "cold" min_seconds within noise of its warm
+            # median every time.
+            if mode == "cold" and kernellake_ssh_host and ssh_key_path:
                 restart_kernellake_server(kernellake_ssh_host, ssh_key_path)
-            if mode == "cold" and is_first_rep and spark is not None:
+            if mode == "cold" and spark is not None:
                 spark.stop()
                 spark = new_spark_session(
                     spark_master_host, iceberg_catalog_uri, iceberg_warehouse,
@@ -518,7 +527,7 @@ def benchmark_query(
                     spark, s3_bucket, scale_factor, compression, table_format,
                     compression_level=compression_level,
                 )
-            if mode == "cold" and is_first_rep and duckdb_con is not None:
+            if mode == "cold" and duckdb_con is not None:
                 duckdb_con.close()
                 duckdb_con = new_duckdb_connection(aws_region)
 
@@ -615,8 +624,23 @@ def main() -> int:
     # N iterations, cold mode restarting the server/session on every rep 1)
     # was taking too long in practice at real EC2 GPU-hour cost -- 2 still
     # gives a median across 2 samples per mode, just a cheaper/faster run.
-    parser.add_argument("--iterations", type=int, default=2)
-    parser.add_argument("--modes", default="cold,warm")
+    # 1, not 2 (2026-08-15) -- same reasoning as duckdb_query_loop.py's/
+    # pyspark_query_loop.py's identical change: every cold rep now gets a
+    # fresh server/session, so a second rep is a real but redundant second
+    # cold measurement, not worth its own cost/time at SF1000+ scale.
+    parser.add_argument("--iterations", type=int, default=1)
+    # Defaults to cold-only (2026-08-16, matching duckdb_query_loop.py's/
+    # pyspark_query_loop.py's identical default change earlier the same
+    # day) -- warm/cached numbers don't represent real behavior once a
+    # table's working set exceeds cache capacity. This default was
+    # originally missed here specifically: a real SF1000 run silently ran
+    # both cold and warm for KernelLake anyway (this flag's old
+    # "cold,warm" default), inflating its completed-query count 2x in
+    # cost_per_query_table()'s denominator relative to Spark/DuckDB's own
+    # correctly-cold-only counts -- made KernelLake's reported cost/query
+    # look ~2.1x cheaper than the real, apples-to-apples ~6% edge. Pass
+    # `--modes cold,warm` explicitly to still measure both.
+    parser.add_argument("--modes", default="cold")
     parser.add_argument("--spark-executor-memory", default="48g",
                          help="Must fit within this local[*] host's own real RAM -- defaults assume the "
                               "standard spark_instance_type (m7i.4xlarge, 64GB). Too high hangs forever "

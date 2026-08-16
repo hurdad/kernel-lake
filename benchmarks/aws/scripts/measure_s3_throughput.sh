@@ -103,6 +103,55 @@ fi
 
 echo "=== Found ${#KEY_SIZE_PAIRS[@]} object(s) ===" >&2
 
+# CPU utilization capture (2026-08-15): added to check a real hypothesis
+# from a prior SF1000 run -- KernelLake's g6.2xlarge measured raw S3
+# throughput *below* its own guaranteed network baseline while the
+# r6i.4xlarge CPU hosts measured *above* theirs, a bigger gap than the
+# bandwidth specs alone predict. Two real, concrete differences pointed at
+# CPU contention rather than a network-hardware ceiling: g6.2xlarge has
+# half r6i.4xlarge's vCPUs (8 vs 16), and (unlike the Spark/DuckDB hosts'
+# init scripts, which install only the runtime) the KernelLake host's own
+# kernellake-host-init.sh unconditionally starts kernellake-server +
+# dcgm-exporter + otel-collector + node-exporter as background containers
+# regardless of whether this test is actually using them -- real CPU load
+# already present before this script's own aws s3 cp processes start.
+# Never confirmed directly (the instance terminated before it could be
+# checked live) -- this makes it a measured fact instead of a hypothesis.
+#
+# /proc/stat, not `mpstat`/`top`: no extra package to install on a host
+# this script might run against for the first time (sysstat isn't
+# guaranteed present), and the standard jiffies-delta calculation needs
+# nothing beyond a file every Linux kernel already exposes. First line
+# ("cpu  ...") is the all-CPU aggregate; fields after the "cpu" label are
+# user/nice/system/idle/iowait/irq/softirq/steal (in that order) -- total
+# minus (idle+iowait) is time spent doing real work.
+cpu_snapshot() {
+  read -r _ user nice system idle iowait irq softirq steal _ _ < /proc/stat
+  echo "$((user + nice + system + idle + iowait + irq + softirq + steal)) $((idle + iowait))"
+}
+
+cpu_util_between() {
+  local total_before="$1" idle_before="$2" total_after="$3" idle_after="$4"
+  local total_delta=$((total_after - total_before))
+  local idle_delta=$((idle_after - idle_before))
+  if [ "$total_delta" -le 0 ]; then
+    echo "0.0"
+    return
+  fi
+  echo "scale=1; 100 * (1 - ${idle_delta} / ${total_delta})" | bc
+}
+
+VCPU_COUNT=$(nproc)
+# 2-second idle-baseline sample before any concurrency level runs -- this
+# is what actually tests the "background containers already loading the
+# CPU" half of the hypothesis above, independent of the throughput test's
+# own CPU cost.
+read -r BASE_TOTAL_BEFORE BASE_IDLE_BEFORE <<< "$(cpu_snapshot)"
+sleep 2
+read -r BASE_TOTAL_AFTER BASE_IDLE_AFTER <<< "$(cpu_snapshot)"
+BASELINE_CPU_UTIL=$(cpu_util_between "$BASE_TOTAL_BEFORE" "$BASE_IDLE_BEFORE" "$BASE_TOTAL_AFTER" "$BASE_IDLE_AFTER")
+echo "=== Idle-baseline CPU utilization (before any S3 requests): ${BASELINE_CPU_UTIL}% of ${VCPU_COUNT} vCPUs ===" >&2
+
 IFS=',' read -r -a LEVELS <<< "$CONCURRENCY_LEVELS"
 
 RESULTS_JSON="[]"
@@ -114,6 +163,7 @@ for LEVEL in "${LEVELS[@]}"; do
   PIDS=()
   TMP_DIR=$(mktemp -d)
 
+  read -r CPU_TOTAL_BEFORE CPU_IDLE_BEFORE <<< "$(cpu_snapshot)"
   START=$(date +%s.%N)
   for ((i = 0; i < OBJECTS_PER_LEVEL; i++)); do
     PAIR="${KEY_SIZE_PAIRS[$((i % ${#KEY_SIZE_PAIRS[@]}))]}"
@@ -134,13 +184,15 @@ for LEVEL in "${LEVELS[@]}"; do
   done
   wait
   END=$(date +%s.%N)
+  read -r CPU_TOTAL_AFTER CPU_IDLE_AFTER <<< "$(cpu_snapshot)"
   rm -rf "$TMP_DIR"
 
   ELAPSED=$(echo "$END - $START" | bc)
   THROUGHPUT_MBPS=$(echo "scale=2; ($TOTAL_BYTES / 1000000) / $ELAPSED" | bc)
   THROUGHPUT_GBPS=$(echo "scale=3; ($TOTAL_BYTES * 8 / 1000000000) / $ELAPSED" | bc)
+  CPU_UTIL=$(cpu_util_between "$CPU_TOTAL_BEFORE" "$CPU_IDLE_BEFORE" "$CPU_TOTAL_AFTER" "$CPU_IDLE_AFTER")
 
-  echo "    ${TOTAL_BYTES} bytes in ${ELAPSED}s = ${THROUGHPUT_MBPS} MB/s (${THROUGHPUT_GBPS} Gbps)" >&2
+  echo "    ${TOTAL_BYTES} bytes in ${ELAPSED}s = ${THROUGHPUT_MBPS} MB/s (${THROUGHPUT_GBPS} Gbps), CPU ${CPU_UTIL}% of ${VCPU_COUNT} vCPUs" >&2
 
   RESULTS_JSON=$(echo "$RESULTS_JSON" | python3 -c "
 import json, sys
@@ -152,6 +204,7 @@ results.append({
     'elapsed_seconds': $ELAPSED,
     'throughput_mbps': $THROUGHPUT_MBPS,
     'throughput_gbps': $THROUGHPUT_GBPS,
+    'cpu_util_percent': $CPU_UTIL,
 })
 json.dump(results, sys.stdout)
 ")
