@@ -170,7 +170,18 @@ TEST_F(QueryEngineDeltaTest, ExplainProducesFullPhysicalPlanOverRealDataFiles) {
   write_data_file("data-0.parquet", 0, 5);
   write_data_file("data-1.parquet", 5, 5);
   LocalDeltaTxnServer server;
-  configure_active_files(server.service(), /*version=*/1, {"data-0.parquet", "data-1.parquet"});
+  // Named local, not an inline brace-init temporary passed directly as the
+  // argument -- GCC 15's -Wfree-nonheap-object otherwise misfires here
+  // (confirmed false positive: real double-free would need a mismatched
+  // delete, not a std::vector<std::string> destroying normally). The
+  // "offset 32" in that warning matches sizeof(std::string) on libstdc++
+  // exactly -- GCC's escape analysis loses track of which object's buffer
+  // is being freed when the vector-of-strings destructor chain gets
+  // heavily inlined right at this temporary's destruction point. A named
+  // local sidesteps the specific inlining shape that trips it, with no
+  // behavior change.
+  const std::vector<std::string> active_files = {"data-0.parquet", "data-1.parquet"};
+  configure_active_files(server.service(), /*version=*/1, active_files);
 
   QueryEngine engine(config_with_delta_endpoint(server.endpoint()));
   const PhysicalPlanPtr plan = engine.explain("SELECT id FROM read_delta('" + dir_.string() + "')");
@@ -187,7 +198,10 @@ TEST_F(QueryEngineDeltaTest, ExecuteRunsQueryEndToEndOverRealDataFiles) {
   write_data_file("data-0.parquet", 0, 5);
   write_data_file("data-1.parquet", 5, 3);
   LocalDeltaTxnServer server;
-  configure_active_files(server.service(), /*version=*/1, {"data-0.parquet", "data-1.parquet"});
+  // Named local -- see the identical comment on this same pattern in
+  // ExplainProducesFullPhysicalPlanOverRealDataFiles above.
+  const std::vector<std::string> active_files = {"data-0.parquet", "data-1.parquet"};
+  configure_active_files(server.service(), /*version=*/1, active_files);
 
   EngineConfig config = config_with_delta_endpoint(server.endpoint());
   config.engine.backend = "cpu";
