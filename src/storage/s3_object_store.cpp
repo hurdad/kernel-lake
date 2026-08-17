@@ -50,6 +50,19 @@ std::shared_ptr<arrow::fs::FileSystem> make_s3_filesystem_from_options(const arr
 }
 
 std::shared_ptr<arrow::fs::FileSystem> make_s3_filesystem(const S3Section& config) {
+  // Must run before any Configure*Credentials() call below, not just before
+  // S3FileSystem::Make() inside make_s3_filesystem_from_options() --
+  // ConfigureDefaultCredentials()/ConfigureAssumeRoleCredentials()/etc.
+  // construct real AWS SDK credential-provider objects (e.g.
+  // DefaultAWSCredentialsProviderChain) that touch AWS SDK global state
+  // (Aws::Config::ConfigAndCredentialsCacheManager) requiring Aws::InitAPI()
+  // to have already run. Confirmed for real: moving this call to only
+  // happen inside make_s3_filesystem_from_options() (after credential
+  // configuration) segfaulted every real (non-anonymous, non-explicit-key)
+  // S3 construction with a null-cache-manager crash inside
+  // STSAssumeRoleWebIdentityCredentialsProvider's constructor.
+  ensure_s3_initialized(config.s3_event_loop_threads);
+
   // S3Options' credentials_kind selection is which factory/Configure*()
   // method is called, not stored state on the options struct itself (see
   // config.hpp's own comment on S3Section) -- start from the caller's
