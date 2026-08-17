@@ -500,9 +500,10 @@ any tested concurrency, and a reproducible regression past 2 streams.
 Don't pursue this; `ParquetScanOperator`'s existing single-reader design
 for the non-partitioned path already appears to be the right shape. The
 SF1000 GPU-idle observation that motivated this item is better explained
-by opportunity #4 (`pass_read_limit_bytes` retuning, still open) or by the
-memory-pressure findings in the SF1000 Q3 OOM section above than by a
-decode-parallelism gap.
+by opportunity #4 (`pass_read_limit_bytes` retuning -- confirmed real
+below, don't shrink it below auto-sizing) or by the memory-pressure
+findings in the SF1000 Q3 OOM section above than by a decode-parallelism
+gap.
 
 ## Follow-up: GPU memory growing across benchmark runs
 
@@ -1020,3 +1021,48 @@ caused by this change). **Not yet confirmed at real SF1000 scale** -- that
 needs a real AWS run with Q3 included, the same way every other fix in
 this section was ultimately validated. Q3 is still excluded from the
 `--query` list pending that confirmation.
+
+**Update 2026-08-17**: confirmed at real SF1000 scale. Q3 completed
+successfully in the SF1000 v3 AWS run (queries 1/6/12/14/19) -- but Q3
+itself still had to be excluded from that run, for an unrelated reason:
+`HashAggregateOperator`'s `max_distinct_keys` cap doesn't converge at this
+scale (real cardinality confirmed >77M and climbing, the cap was already
+raised once from 20M to 75M and still wasn't enough -- see
+`docs/ARCHITECTURE.md`'s `HashAggregateOperator` row and the commit
+history around `02b8293`). The join-OOM this section fixes and the
+aggregate-cap issue are separate bugs in separate operators; fixing one
+doesn't fix the other.
+
+## Confirmed: opportunity #4 (`pass_read_limit_bytes` retuning), real A/B (2026-08-17)
+
+Real controlled A/B against SF1000 `lineitem` on AWS (`g6.4xlarge`),
+via `kernellake benchmark tpch` run directly (bypassing Flight SQL --
+the CLI binary ships inside the published `runtime-gpu` image at
+`/opt/kernellake/bin/kernellake`, usable standalone with `--config`).
+Auto-sizing (`engine.query_memory_limit_bytes: 0`, 90% of free VRAM at
+startup, `resolve_query_memory_limit_bytes()`) vs. an explicit, heavily
+constrained override:
+
+| Config | `pass_read_limit_bytes` | wall | decode | compute-only | peak GPU mem |
+|---|---|---|---|---|---|
+| auto (≈21GB limit) | ≈5.3GB | 209.3s | 118.9s (57% of wall) | 79.6s | 3.17GB |
+| explicit `query_memory_limit_bytes: 2GiB` | ≈536MB | 495.0s | 408.9s (83% of wall) | 76.1s | 288MB |
+
+Shrinking the pass size ~10x made decode **3.44x slower** and wall time
+**2.36x slower**, while compute-only time stayed flat (79.6s vs 76.1s,
+within noise) -- clean confirmation this is a scan/decode pass-count
+effect (more, smaller `cudf::chunked_parquet_reader` passes, each paying
+fixed per-pass `has_next()` round-trip overhead -- see the real-S3 fix
+above for why `has_next()`, not `read_chunk()`, is where the real cost
+lives), not a GPU compute artifact.
+
+**Conclusion: don't shrink `query_memory_limit_bytes` below what
+auto-sizing already picks.** Could not test going *bigger* than auto in
+this same experiment -- auto already claims ~90% of free VRAM (little
+room left before the literal device ceiling), and this query's actual
+peak usage (3.17GB) was already far below even the auto ceiling (~21GB),
+so raising the limit further wouldn't have grown the effective pass size
+anyway. **Still open**: whether there's a sweet spot *between* auto's
+~5.3GB and some larger explicit value, or whether it plateaus once passes
+are "big enough" -- would need a query/dataset where auto-sizing's actual
+peak usage gets closer to its own ceiling to test meaningfully.
