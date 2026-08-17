@@ -14,18 +14,33 @@ namespace kernellake {
 
 namespace {
 
-void ensure_s3_initialized() {
+// `InitializeS3()` directly, not the bare `EnsureS3Initialized()` (which
+// always uses Arrow's own S3GlobalOptions::Defaults(), num_event_loop_threads
+// == 1) -- so S3Section::s3_event_loop_threads actually takes effect. This
+// is a genuinely process-wide, initialize-once AWS SDK setting: only the
+// *first* S3ObjectStore constructed in this process determines it, same as
+// Arrow's own EnsureS3Initialized() semantics ("if necessary, this will call
+// InitializeS3() with some default options" -- once already initialized,
+// later calls are no-ops regardless of what they ask for). Constructing a
+// second S3ObjectStore with a different event_loop_threads value later in
+// the same process silently keeps the first value; not worth guarding
+// against explicitly since nothing in this codebase constructs more than
+// one S3Section per process today.
+void ensure_s3_initialized(int event_loop_threads) {
   static std::once_flag flag;
-  std::call_once(flag, [] {
-    const arrow::Status status = arrow::fs::EnsureS3Initialized();
+  std::call_once(flag, [event_loop_threads] {
+    arrow::fs::S3GlobalOptions options = arrow::fs::S3GlobalOptions::Defaults();
+    options.num_event_loop_threads = event_loop_threads;
+    const arrow::Status status = arrow::fs::InitializeS3(options);
     if (!status.ok()) {
       throw StorageError(fmt::format("s3: failed to initialize AWS SDK: {}", status.ToString()));
     }
   });
 }
 
-std::shared_ptr<arrow::fs::FileSystem> make_s3_filesystem_from_options(const arrow::fs::S3Options& options) {
-  ensure_s3_initialized();
+std::shared_ptr<arrow::fs::FileSystem> make_s3_filesystem_from_options(const arrow::fs::S3Options& options,
+                                                                       int event_loop_threads = 1) {
+  ensure_s3_initialized(event_loop_threads);
   const arrow::Result<std::shared_ptr<arrow::fs::S3FileSystem>> result =
       arrow::fs::S3FileSystem::Make(options);
   if (!result.ok()) {
@@ -35,8 +50,6 @@ std::shared_ptr<arrow::fs::FileSystem> make_s3_filesystem_from_options(const arr
 }
 
 std::shared_ptr<arrow::fs::FileSystem> make_s3_filesystem(const S3Section& config) {
-  ensure_s3_initialized();
-
   // S3Options' credentials_kind selection is which factory/Configure*()
   // method is called, not stored state on the options struct itself (see
   // config.hpp's own comment on S3Section) -- start from the caller's
@@ -65,7 +78,7 @@ std::shared_ptr<arrow::fs::FileSystem> make_s3_filesystem(const S3Section& confi
     options.ConfigureDefaultCredentials();
   }
 
-  return make_s3_filesystem_from_options(options);
+  return make_s3_filesystem_from_options(options, config.s3_event_loop_threads);
 }
 
 }  // namespace

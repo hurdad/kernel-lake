@@ -126,6 +126,8 @@ EngineConfig parse_config(const std::string& yaml_text) {
 
   const YAML::Node s3 = child(storage, "s3");
   config.storage.s3.credentials_kind = read_or(s3, "credentials_kind", config.storage.s3.credentials_kind);
+  config.storage.s3.s3_event_loop_threads =
+      read_or(s3, "event_loop_threads", config.storage.s3.s3_event_loop_threads);
   arrow::fs::S3Options& s3_opts = config.storage.s3.options;
   s3_opts.smart_defaults = read_or(s3, "smart_defaults", s3_opts.smart_defaults);
   s3_opts.region = read_or(s3, "region", s3_opts.region);
@@ -381,6 +383,11 @@ void validate_config(const EngineConfig& config) {
   if (config.engine.backend != "gpu" && config.engine.backend != "cpu") {
     throw ConfigurationError(
         fmt::format("engine.backend '{}' is unsupported (expected 'gpu' or 'cpu')", config.engine.backend));
+  }
+
+  if (config.storage.s3.s3_event_loop_threads <= 0) {
+    throw ConfigurationError(fmt::format("storage.s3.event_loop_threads must be > 0, got {}",
+                                         config.storage.s3.s3_event_loop_threads));
   }
 
   if (config.memory.pool_initial_bytes == 0) {

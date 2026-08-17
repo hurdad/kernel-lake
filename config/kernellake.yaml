@@ -34,6 +34,14 @@ storage:
     endpoint_override: ""      # e.g. "localhost:9000" for MinIO
     scheme: https               # https | http -- MinIO w/o TLS needs http
     tls_verify_certificates: true
+    # Threads backing the AWS SDK's process-wide S3 I/O event loop
+    # (arrow::fs::S3GlobalOptions::num_event_loop_threads). Arrow's own
+    # default (1) is documented as fine for "at most, in the hundreds" of
+    # concurrent connections -- a single large Parquet scan pass at real
+    # SF1000 scale can burst well past that. Only the *first* S3 config
+    # constructed in this process actually takes effect (see
+    # S3Section::s3_event_loop_threads's own comment).
+    event_loop_threads: 1
   gcs:
     credentials_kind: default  # anonymous | default | access_token | service_account_json
     endpoint_override: ""      # e.g. "localhost:4443" for fake-gcs-server

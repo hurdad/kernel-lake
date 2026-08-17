@@ -45,6 +45,22 @@ TEST(Config, RejectsZeroBatchRows) {
   EXPECT_THROW((void)(validate_config(config)), ConfigurationError);
 }
 
+TEST(Config, ParsesS3EventLoopThreads) {
+  const std::string yaml = R"(
+storage:
+  s3:
+    event_loop_threads: 4
+)";
+  const EngineConfig config = parse_config(yaml);
+  EXPECT_EQ(config.storage.s3.s3_event_loop_threads, 4);
+}
+
+TEST(Config, RejectsZeroS3EventLoopThreads) {
+  EngineConfig config = default_config();
+  config.storage.s3.s3_event_loop_threads = 0;
+  EXPECT_THROW((void)(validate_config(config)), ConfigurationError);
+}
+
 TEST(Config, RejectsContradictoryMemoryPool) {
   EngineConfig config = default_config();
   config.memory.pool_initial_bytes = 100;

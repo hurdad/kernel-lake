@@ -89,6 +89,23 @@ struct S3Section {
   // "web_identity" uses the AWS SDK's own AssumeRoleWithWebIdentity env
   // vars (AWS_WEB_IDENTITY_TOKEN_FILE, etc.), nothing further to configure.
   std::string credentials_kind = "default";
+  // Threads backing the AWS Common Runtime's S3 I/O event loop for the
+  // whole process (arrow::fs::S3GlobalOptions::num_event_loop_threads,
+  // plumbed through s3_object_store.cpp's ensure_s3_initialized() calling
+  // arrow::fs::InitializeS3() directly instead of the bare
+  // EnsureS3Initialized(), which always uses Arrow's own default of 1).
+  // This is a genuinely process-global, initialize-once AWS SDK setting
+  // (not per-S3Section/per-filesystem), but there's only one S3Section per
+  // running kernellake-server process, so it lives here rather than
+  // inventing a separate top-level config section for one field.
+  // Arrow's own doc calls 1 "recommended... when the # of connections is
+  // expected to be, at most, in the hundreds" -- ObjectStoreDatasource's
+  // device_read_async() can burst well past that for a single Parquet scan
+  // pass at SF1000 scale (pass_read_limit_bytes ~5GB, many concurrent
+  // column-chunk reads), all funneled through this one thread regardless
+  // of how many host_read() threads are in flight -- a real, not yet
+  // confirmed, hypothesis for real-S3 throughput lagging under load.
+  int s3_event_loop_threads = 1;
 };
 
 struct GcsSection {
