@@ -103,9 +103,20 @@ struct S3Section {
   // device_read_async() can burst well past that for a single Parquet scan
   // pass at SF1000 scale (pass_read_limit_bytes ~5GB, many concurrent
   // column-chunk reads), all funneled through this one thread regardless
-  // of how many host_read() threads are in flight -- a real, not yet
-  // confirmed, hypothesis for real-S3 throughput lagging under load.
-  int s3_event_loop_threads = 1;
+  // of how many host_read() threads are in flight. Confirmed for real
+  // (2026-08-17, real SF1000 Q6, g6.4xlarge, 3 cold reps per config): 1 ->
+  // 4 gave a genuine, reproducible ~13% wall-time improvement (mean
+  // 201.3s -> 174.7s), well outside both configs' run-to-run stddev.
+  // 4 -> 8 (this instance's vCPU count) made no further difference to the
+  // mean (176.4s, statistically indistinguishable from 4's 174.7s) -- the
+  // benefit plateaus once the event loop has "enough" threads, since the
+  // actual work is I/O-wait-bound, not CPU-bound, so matching vCPU count
+  // buys nothing further. 4 chosen as the new default over 8 for the same
+  // result at lower resource cost (fewer OS threads) -- not because of a
+  // variance difference between the two (8's stddev happened to be
+  // tighter in this one 3-sample run, 3.2s vs 4's 12.6s, but with only 3
+  // reps per config that alone isn't a robust signal either way).
+  int s3_event_loop_threads = 4;
 };
 
 struct GcsSection {
