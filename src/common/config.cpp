@@ -113,6 +113,7 @@ EngineConfig parse_config(const std::string& yaml_text) {
   config.engine.query_memory_limit_bytes =
       read_or(engine, "query_memory_limit_bytes", config.engine.query_memory_limit_bytes);
   config.engine.backend = read_or(engine, "backend", config.engine.backend);
+  config.engine.max_distinct_keys = read_or(engine, "max_distinct_keys", config.engine.max_distinct_keys);
 
   const YAML::Node memory = root["memory"];
   config.memory.pool_initial_bytes = read_or(memory, "pool_initial_bytes", config.memory.pool_initial_bytes);

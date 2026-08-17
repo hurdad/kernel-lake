@@ -7,6 +7,12 @@ engine:
   # (include/kernellake/common/config.hpp) for why. Set an explicit
   # non-zero byte count here to override auto-detection.
   query_memory_limit_bytes: 0
+  # 0 means "use HashAggregateOperator::kDefaultMaxDistinctKeys". A fixed
+  # safety cap on GROUP BY result cardinality, not a cardinality estimate
+  # -- see EngineSection::max_distinct_keys's own comment for why this is
+  # config-driven (real TPC-H scale factor has already needed this raised
+  # twice: SF100's ~10.8M measured distinct groups, SF1000's ~38.9M).
+  max_distinct_keys: 0
 
 memory:
   pool_initial_bytes: 1073741824

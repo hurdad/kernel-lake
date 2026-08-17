@@ -125,7 +125,7 @@ class InstrumentedOperator final : public PhysicalOperator {
 std::unique_ptr<PhysicalOperator> build(const PhysicalPlanPtr& node, ObjectStore& store,
                                         std::size_t pass_read_limit_bytes, OperatorId& next_id,
                                         bool nvtx_enabled, std::size_t build_side_budget_bytes,
-                                        const std::string& spill_directory) {
+                                        const std::string& spill_directory, std::uint64_t max_distinct_keys) {
   auto instrument = [nvtx_enabled](std::unique_ptr<PhysicalOperator> op) {
     return std::make_unique<InstrumentedOperator>(std::move(op), nvtx_enabled);
   };
@@ -169,10 +169,10 @@ std::unique_ptr<PhysicalOperator> build(const PhysicalPlanPtr& node, ObjectStore
     // it to the compiler would make operator ID assignment
     // non-deterministic across the two subtrees.
     std::unique_ptr<PhysicalOperator> left = build(join->left(), store, child_pass_read_limit_bytes, next_id,
-                                                   nvtx_enabled, build_side_budget_bytes, spill_directory);
+                                                   nvtx_enabled, build_side_budget_bytes, spill_directory, max_distinct_keys);
     std::unique_ptr<PhysicalOperator> right =
         build(join->right(), store, child_pass_read_limit_bytes, next_id, nvtx_enabled,
-              build_side_budget_bytes, spill_directory);
+              build_side_budget_bytes, spill_directory, max_distinct_keys);
     return instrument(std::make_unique<HashJoinOperator>(
         next_id++, std::move(left), std::move(right), join->left_key_index(), join->right_key_index(),
         std::make_shared<const Schema>(join->output_schema()), partition_count, spill_directory));
@@ -181,35 +181,45 @@ std::unique_ptr<PhysicalOperator> build(const PhysicalPlanPtr& node, ObjectStore
     return instrument(
         std::make_unique<FilterOperator>(next_id++,
                                          build(filter->child(), store, pass_read_limit_bytes, next_id,
-                                               nvtx_enabled, build_side_budget_bytes, spill_directory),
+                                               nvtx_enabled, build_side_budget_bytes, spill_directory, max_distinct_keys),
                                          filter->predicate()));
   }
   if (const auto* projection = dynamic_cast<const ProjectionNode*>(node.get())) {
     return instrument(
         std::make_unique<ProjectionOperator>(next_id++,
                                              build(projection->child(), store, pass_read_limit_bytes, next_id,
-                                                   nvtx_enabled, build_side_budget_bytes, spill_directory),
+                                                   nvtx_enabled, build_side_budget_bytes, spill_directory, max_distinct_keys),
                                              projection->items()));
   }
   if (const auto* hash_aggregate = dynamic_cast<const HashAggregateNode*>(node.get())) {
-    return instrument(std::make_unique<HashAggregateOperator>(
-        next_id++,
+    std::unique_ptr<PhysicalOperator> child =
         build(hash_aggregate->child(), store, pass_read_limit_bytes, next_id, nvtx_enabled,
-              build_side_budget_bytes, spill_directory),
-        hash_aggregate->group_by(), hash_aggregate->aggregates()));
+              build_side_budget_bytes, spill_directory, max_distinct_keys);
+    // 0 means "unset in config" -- HashAggregateOperator's own default
+    // constructor argument (kDefaultMaxDistinctKeys) only applies when the
+    // parameter is omitted entirely, so an explicit 0 has to be resolved
+    // here instead of just forwarded.
+    if (max_distinct_keys != 0) {
+      return instrument(std::make_unique<HashAggregateOperator>(
+          next_id++, std::move(child), hash_aggregate->group_by(), hash_aggregate->aggregates(),
+          static_cast<cudf::size_type>(max_distinct_keys)));
+    }
+    return instrument(std::make_unique<HashAggregateOperator>(next_id++, std::move(child),
+                                                               hash_aggregate->group_by(),
+                                                               hash_aggregate->aggregates()));
   }
   if (const auto* scalar_aggregate = dynamic_cast<const ScalarAggregateNode*>(node.get())) {
     return instrument(std::make_unique<ScalarAggregateOperator>(
         next_id++,
         build(scalar_aggregate->child(), store, pass_read_limit_bytes, next_id, nvtx_enabled,
-              build_side_budget_bytes, spill_directory),
+              build_side_budget_bytes, spill_directory, max_distinct_keys),
         scalar_aggregate->aggregates()));
   }
   if (const auto* sort = dynamic_cast<const SortNode*>(node.get())) {
     return instrument(
         std::make_unique<SortOperator>(next_id++,
                                        build(sort->child(), store, pass_read_limit_bytes, next_id,
-                                             nvtx_enabled, build_side_budget_bytes, spill_directory),
+                                             nvtx_enabled, build_side_budget_bytes, spill_directory, max_distinct_keys),
                                        sort->keys()));
   }
   if (const auto* limit = dynamic_cast<const LimitNode*>(node.get())) {
@@ -226,19 +236,19 @@ std::unique_ptr<PhysicalOperator> build(const PhysicalPlanPtr& node, ObjectStore
       return instrument(
           std::make_unique<SortOperator>(next_id++,
                                          build(sort->child(), store, pass_read_limit_bytes, next_id,
-                                               nvtx_enabled, build_side_budget_bytes, spill_directory),
+                                               nvtx_enabled, build_side_budget_bytes, spill_directory, max_distinct_keys),
                                          sort->keys(), limit->limit()));
     }
     return instrument(
         std::make_unique<LimitOperator>(next_id++,
                                         build(limit->child(), store, pass_read_limit_bytes, next_id,
-                                              nvtx_enabled, build_side_budget_bytes, spill_directory),
+                                              nvtx_enabled, build_side_budget_bytes, spill_directory, max_distinct_keys),
                                         limit->limit()));
   }
   if (const auto* arrow_result = dynamic_cast<const ArrowResultNode*>(node.get())) {
     return instrument(std::make_unique<ArrowResultOperator>(
         next_id++, build(arrow_result->child(), store, pass_read_limit_bytes, next_id, nvtx_enabled,
-                         build_side_budget_bytes, spill_directory)));
+                         build_side_budget_bytes, spill_directory, max_distinct_keys)));
   }
   throw PlanningError("build_operator_tree: unrecognized physical plan node");
 }
@@ -248,10 +258,11 @@ std::unique_ptr<PhysicalOperator> build(const PhysicalPlanPtr& node, ObjectStore
 std::unique_ptr<PhysicalOperator> build_operator_tree(const PhysicalPlanPtr& plan, ObjectStore& store,
                                                       std::size_t pass_read_limit_bytes, bool nvtx_enabled,
                                                       std::size_t build_side_budget_bytes,
-                                                      const std::string& spill_directory) {
+                                                      const std::string& spill_directory,
+                                                      std::uint64_t max_distinct_keys) {
   OperatorId next_id = 1;
   return build(plan, store, pass_read_limit_bytes, next_id, nvtx_enabled, build_side_budget_bytes,
-               spill_directory);
+               spill_directory, max_distinct_keys);
 }
 
 }  // namespace kernellake

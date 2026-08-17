@@ -57,14 +57,18 @@ namespace kernellake {
 // hence still a generous fixed default, see kDefaultMaxDistinctKeys.
 class HashAggregateOperator final : public PhysicalOperator {
  public:
-  // Was 10'000'000 -- real SF100 TPC-H Q3 (customer/orders/lineitem,
-  // GROUP BY l_orderkey/o_orderdate/o_shippriority) produces ~10.8M
-  // distinct groups before its ORDER BY/LIMIT 10 trims the final result,
-  // confirmed hitting this cap on real EC2 data. Doubled rather than
-  // raised to just clear that one number -- this is a fixed safety cap
-  // with no cardinality estimation behind it (see the class comment
-  // above), so headroom matters more than precision here.
-  static constexpr cudf::size_type kDefaultMaxDistinctKeys = 20'000'000;
+  // Was 10'000'000, then 20'000'000 -- real SF100 TPC-H Q3
+  // (customer/orders/lineitem, GROUP BY l_orderkey/o_orderdate/
+  // o_shippriority) produces ~10.8M distinct groups before its ORDER BY/
+  // LIMIT 10 trims the final result (confirmed hitting the 10M cap on
+  // real EC2 data, which is what raised it to 20M at ~1.85x headroom).
+  // Real SF1000 Q3 produces ~38.9M distinct groups, confirmed hitting the
+  // 20M cap on real EC2 data in turn. Raised again at roughly the same
+  // ~1.85x headroom ratio rather than just clearing the one number -- this
+  // is a fixed safety cap with no cardinality estimation behind it (see
+  // the class comment above), so headroom matters more than precision
+  // here.
+  static constexpr cudf::size_type kDefaultMaxDistinctKeys = 75'000'000;
 
   HashAggregateOperator(OperatorId id, std::unique_ptr<PhysicalOperator> child,
                         std::vector<NamedExpression> group_by, std::vector<NamedExpression> aggregates,

@@ -185,7 +185,7 @@ QueryResult QueryEngine::execute(const PhysicalPlanPtr& physical, RmmEnvironment
                                           : std::filesystem::temp_directory_path().string();
   const std::unique_ptr<PhysicalOperator> root =
       build_operator_tree(physical, store_, pass_read_limit_bytes, config_.profiling.nvtx,
-                          build_side_budget_bytes, spill_directory);
+                          build_side_budget_bytes, spill_directory, config_.engine.max_distinct_keys);
 
   QueryResult result;
   std::int64_t rows_returned = 0;

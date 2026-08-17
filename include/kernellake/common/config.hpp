@@ -34,6 +34,15 @@ struct EngineSection {
   // backend needs no CUDA at all. `kernellake query --backend cpu|gpu`
   // overrides this per invocation without editing the config file.
   std::string backend = "gpu";
+  // Forwarded to every HashAggregateOperator as its own max_distinct_keys
+  // (see that class's own doc comment) -- a fixed safety cap on result
+  // cardinality, not a cardinality estimate. 0 (the default) means "use
+  // HashAggregateOperator::kDefaultMaxDistinctKeys". This has already
+  // needed raising twice as real TPC-H scale factor grew (SF100's real Q3
+  // measured ~10.8M distinct groups, SF1000's ~38.9M), each time requiring
+  // a code change + rebuild; making it config-driven means the next scale
+  // bump is a YAML edit + restart instead.
+  std::uint64_t max_distinct_keys = 0;
 };
 
 struct MemorySection {

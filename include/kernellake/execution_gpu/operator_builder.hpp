@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <string>
 
@@ -39,6 +40,12 @@ namespace kernellake {
 // (prefers storage.cache.directory, a real-disk path this project's own
 // NVMe cache already requires whenever it's configured).
 //
+// `max_distinct_keys` (0 = HashAggregateOperator's own
+// kDefaultMaxDistinctKeys) is forwarded to every HashAggregateNode's
+// HashAggregateOperator as its own fixed result-cardinality safety cap --
+// see EngineConfig::EngineSection::max_distinct_keys for why this is
+// config-driven rather than a compile-time constant.
+//
 // Every node in the returned tree is wrapped (see operator_builder.cpp's
 // InstrumentedOperator) to record its own wall-clock next() time into
 // ExecutionContext::metrics when non-null, and to emit an NVTX range per
@@ -50,6 +57,7 @@ namespace kernellake {
                                                                     std::size_t pass_read_limit_bytes,
                                                                     bool nvtx_enabled = false,
                                                                     std::size_t build_side_budget_bytes = 0,
-                                                                    const std::string& spill_directory = "");
+                                                                    const std::string& spill_directory = "",
+                                                                    std::uint64_t max_distinct_keys = 0);
 
 }  // namespace kernellake
