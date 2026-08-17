@@ -117,10 +117,18 @@ cd /opt/kernellake-bench
 # requirement of its own, S3 is still the durable source of truth.
 #
 # `${nvme_cache_enabled}` (kernellake_nvme_cache_enabled in variables.tf)
-# gates this whole detection/mount step: "false" skips it outright and
-# falls straight to the same disabled-placeholder path used when no
-# device is present at all, so a benchmark run can force every read to
-# genuinely hit S3 instead of a warm repeat-scan cache.
+# only gates the *object-read cache feature* (storage.cache.enabled below),
+# so a benchmark run can force every scan to genuinely hit S3 instead of a
+# warm repeat-scan cache. It does NOT gate whether the real NVMe device
+# gets mounted to /cache in the first place -- the hash-join spill path
+# (src/execution_gpu/hash_join_operator.cpp) needs a real, writable,
+# disk-backed /cache regardless of whether the read-cache feature itself
+# is on, so the mount step below always runs when instance-store NVMe is
+# physically present. Coupling those two concerns together previously
+# meant disabling the cache feature silently left /cache bound to a tiny,
+# non-writable placeholder on the root volume, which then broke spilling
+# with an unrelated "Permission denied" error at query time instead of at
+# boot.
 NVME_CACHE_HOST_DIR=""
 NVME_CACHE_MAX_BYTES=0
 NVME_CACHE_ENABLED=false
@@ -159,7 +167,7 @@ find_existing_mount() {
   done
 }
 
-if [ "${nvme_cache_enabled}" = "true" ] && [ "$${#INSTANCE_STORE_DEVICES[@]}" -gt 0 ]; then
+if [ "$${#INSTANCE_STORE_DEVICES[@]}" -gt 0 ]; then
   echo "=== Found $${#INSTANCE_STORE_DEVICES[@]} local NVMe instance-store device(s): $${INSTANCE_STORE_DEVICES[*]} ==="
 
   EXISTING_MOUNT=""
@@ -191,22 +199,23 @@ if [ "${nvme_cache_enabled}" = "true" ] && [ "$${#INSTANCE_STORE_DEVICES[@]}" -g
 
   chmod 1777 "$NVME_CACHE_HOST_DIR"  # container runs as non-root; world-writable+sticky, same convention as /tmp
 
-  # 90% of the real formatted filesystem size, not a guessed constant --
-  # leaves headroom for filesystem overhead/metadata so the cache's own
-  # eviction logic (LRU-by-mtime, src/storage/nvme_object_cache.cpp) never
-  # races a hard ENOSPC from the OS itself.
-  FS_BYTES=$(df --output=size -B1 "$NVME_CACHE_HOST_DIR" | tail -1 | tr -d ' ')
-  NVME_CACHE_MAX_BYTES=$(( FS_BYTES * 90 / 100 ))
-  NVME_CACHE_ENABLED=true
-  echo "=== NVMe cache ready at $NVME_CACHE_HOST_DIR ($FS_BYTES formatted bytes, $NVME_CACHE_MAX_BYTES byte cache budget) ==="
-else
-  if [ "${nvme_cache_enabled}" != "true" ]; then
-    echo "=== NVMe cache explicitly disabled (kernellake_nvme_cache_enabled=false) -- storage.cache stays disabled ==="
+  if [ "${nvme_cache_enabled}" = "true" ]; then
+    # 90% of the real formatted filesystem size, not a guessed constant --
+    # leaves headroom for filesystem overhead/metadata so the cache's own
+    # eviction logic (LRU-by-mtime, src/storage/nvme_object_cache.cpp) never
+    # races a hard ENOSPC from the OS itself.
+    FS_BYTES=$(df --output=size -B1 "$NVME_CACHE_HOST_DIR" | tail -1 | tr -d ' ')
+    NVME_CACHE_MAX_BYTES=$(( FS_BYTES * 90 / 100 ))
+    NVME_CACHE_ENABLED=true
+    echo "=== NVMe cache ready at $NVME_CACHE_HOST_DIR ($FS_BYTES formatted bytes, $NVME_CACHE_MAX_BYTES byte cache budget) ==="
   else
-    echo "=== No local NVMe instance-store device found on this instance -- storage.cache stays disabled ==="
+    echo "=== NVMe cache explicitly disabled (kernellake_nvme_cache_enabled=false) -- storage.cache stays disabled, but real NVMe at $NVME_CACHE_HOST_DIR is still mounted to /cache for hash-join spill ==="
   fi
+else
+  echo "=== No local NVMe instance-store device found on this instance -- storage.cache stays disabled, spill falls back to a root-disk placeholder ==="
   NVME_CACHE_HOST_DIR="/opt/kernellake-bench/cache-disabled-placeholder"
   mkdir -p "$NVME_CACHE_HOST_DIR"
+  chmod 1777 "$NVME_CACHE_HOST_DIR"  # same convention as the real-NVMe path above -- must stay writable by the container's non-root user even though caching is off
 fi
 
 # --- kernellake-server config -------------------------------------------
