@@ -157,16 +157,32 @@ QueryResult QueryEngine::execute(const PhysicalPlanPtr& physical, RmmEnvironment
   // confirmed for real by a kernellake-server OOM-kill at ~75 GiB RSS
   // before this existed). storage.cache.directory is reused rather than a
   // new config field: it's already required to be a real, disk-backed
-  // directory whenever the NVMe object cache is enabled (see
-  // NvmeObjectCache's own docs), so it's already the right kind of place.
+  // directory whenever it's configured at all (see NvmeObjectCache's own
+  // docs), so it's already the right kind of place.
+  //
+  // Deliberately keyed on cache.directory being non-empty alone, *not*
+  // cache.enabled too (fixed 2026-08-17 -- the original version here
+  // gated on both, coupling two independent concerns: whether S3 reads
+  // get cached has nothing to do with whether a real disk-backed
+  // directory exists for join spilling). Real, reproducible bug this
+  // caused: a worst-case/no-cache SF1000 benchmark run
+  // (kernellake_nvme_cache_enabled=false, but the same real 521GB NVMe
+  // volume still mounted and still configured as cache.directory) hit Q3's
+  // hash join needing to spill, fell through to the system temp directory
+  // since cache.enabled was false, and that turned out to be a small
+  // tmpfs-backed /tmp on that instance -- "No space left on device"
+  // partway through spilling, the exact host-RAM-shaped failure this
+  // design already knew to worry about (see the temp-directory fallback's
+  // own remaining comment below), just reached through a gap in the
+  // condition rather than truly having no directory configured at all.
   // Falls back to the system temp directory only when no cache directory
-  // is configured -- see HashJoinOperator's own doc comment for the real
-  // risk that carries (a tmpfs-backed /tmp would silently reintroduce the
-  // exact host-RAM problem this exists to avoid).
-  const std::string spill_directory =
-      config_.storage.cache.enabled && !config_.storage.cache.directory.empty()
-          ? config_.storage.cache.directory
-          : std::filesystem::temp_directory_path().string();
+  // is configured at all -- see HashJoinOperator's own doc comment for
+  // the real risk that still carries whenever that fallback is actually
+  // hit (a tmpfs-backed /tmp would silently reintroduce the exact
+  // host-RAM problem this exists to avoid).
+  const std::string spill_directory = !config_.storage.cache.directory.empty()
+                                          ? config_.storage.cache.directory
+                                          : std::filesystem::temp_directory_path().string();
   const std::unique_ptr<PhysicalOperator> root =
       build_operator_tree(physical, store_, pass_read_limit_bytes, config_.profiling.nvtx,
                           build_side_budget_bytes, spill_directory);
