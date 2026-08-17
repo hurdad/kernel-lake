@@ -168,8 +168,9 @@ std::unique_ptr<PhysicalOperator> build(const PhysicalPlanPtr& node, ObjectStore
     // recursive build() calls mutate `next_id` as a side effect, so leaving
     // it to the compiler would make operator ID assignment
     // non-deterministic across the two subtrees.
-    std::unique_ptr<PhysicalOperator> left = build(join->left(), store, child_pass_read_limit_bytes, next_id,
-                                                   nvtx_enabled, build_side_budget_bytes, spill_directory, max_distinct_keys);
+    std::unique_ptr<PhysicalOperator> left =
+        build(join->left(), store, child_pass_read_limit_bytes, next_id, nvtx_enabled,
+              build_side_budget_bytes, spill_directory, max_distinct_keys);
     std::unique_ptr<PhysicalOperator> right =
         build(join->right(), store, child_pass_read_limit_bytes, next_id, nvtx_enabled,
               build_side_budget_bytes, spill_directory, max_distinct_keys);
@@ -178,18 +179,18 @@ std::unique_ptr<PhysicalOperator> build(const PhysicalPlanPtr& node, ObjectStore
         std::make_shared<const Schema>(join->output_schema()), partition_count, spill_directory));
   }
   if (const auto* filter = dynamic_cast<const FilterNode*>(node.get())) {
-    return instrument(
-        std::make_unique<FilterOperator>(next_id++,
-                                         build(filter->child(), store, pass_read_limit_bytes, next_id,
-                                               nvtx_enabled, build_side_budget_bytes, spill_directory, max_distinct_keys),
-                                         filter->predicate()));
+    return instrument(std::make_unique<FilterOperator>(
+        next_id++,
+        build(filter->child(), store, pass_read_limit_bytes, next_id, nvtx_enabled, build_side_budget_bytes,
+              spill_directory, max_distinct_keys),
+        filter->predicate()));
   }
   if (const auto* projection = dynamic_cast<const ProjectionNode*>(node.get())) {
-    return instrument(
-        std::make_unique<ProjectionOperator>(next_id++,
-                                             build(projection->child(), store, pass_read_limit_bytes, next_id,
-                                                   nvtx_enabled, build_side_budget_bytes, spill_directory, max_distinct_keys),
-                                             projection->items()));
+    return instrument(std::make_unique<ProjectionOperator>(
+        next_id++,
+        build(projection->child(), store, pass_read_limit_bytes, next_id, nvtx_enabled,
+              build_side_budget_bytes, spill_directory, max_distinct_keys),
+        projection->items()));
   }
   if (const auto* hash_aggregate = dynamic_cast<const HashAggregateNode*>(node.get())) {
     std::unique_ptr<PhysicalOperator> child =
@@ -204,9 +205,8 @@ std::unique_ptr<PhysicalOperator> build(const PhysicalPlanPtr& node, ObjectStore
           next_id++, std::move(child), hash_aggregate->group_by(), hash_aggregate->aggregates(),
           static_cast<cudf::size_type>(max_distinct_keys)));
     }
-    return instrument(std::make_unique<HashAggregateOperator>(next_id++, std::move(child),
-                                                               hash_aggregate->group_by(),
-                                                               hash_aggregate->aggregates()));
+    return instrument(std::make_unique<HashAggregateOperator>(
+        next_id++, std::move(child), hash_aggregate->group_by(), hash_aggregate->aggregates()));
   }
   if (const auto* scalar_aggregate = dynamic_cast<const ScalarAggregateNode*>(node.get())) {
     return instrument(std::make_unique<ScalarAggregateOperator>(
@@ -216,11 +216,11 @@ std::unique_ptr<PhysicalOperator> build(const PhysicalPlanPtr& node, ObjectStore
         scalar_aggregate->aggregates()));
   }
   if (const auto* sort = dynamic_cast<const SortNode*>(node.get())) {
-    return instrument(
-        std::make_unique<SortOperator>(next_id++,
-                                       build(sort->child(), store, pass_read_limit_bytes, next_id,
-                                             nvtx_enabled, build_side_budget_bytes, spill_directory, max_distinct_keys),
-                                       sort->keys()));
+    return instrument(std::make_unique<SortOperator>(
+        next_id++,
+        build(sort->child(), store, pass_read_limit_bytes, next_id, nvtx_enabled, build_side_budget_bytes,
+              spill_directory, max_distinct_keys),
+        sort->keys()));
   }
   if (const auto* limit = dynamic_cast<const LimitNode*>(node.get())) {
     // ORDER BY ... LIMIT N: fuse into a single SortOperator instead of a
@@ -233,17 +233,17 @@ std::unique_ptr<PhysicalOperator> build(const PhysicalPlanPtr& node, ObjectStore
     // else between them (a Projection, say) isn't safe to skip over, so
     // falls through to the plain LimitOperator path below.
     if (const auto* sort = dynamic_cast<const SortNode*>(limit->child().get())) {
-      return instrument(
-          std::make_unique<SortOperator>(next_id++,
-                                         build(sort->child(), store, pass_read_limit_bytes, next_id,
-                                               nvtx_enabled, build_side_budget_bytes, spill_directory, max_distinct_keys),
-                                         sort->keys(), limit->limit()));
+      return instrument(std::make_unique<SortOperator>(
+          next_id++,
+          build(sort->child(), store, pass_read_limit_bytes, next_id, nvtx_enabled, build_side_budget_bytes,
+                spill_directory, max_distinct_keys),
+          sort->keys(), limit->limit()));
     }
-    return instrument(
-        std::make_unique<LimitOperator>(next_id++,
-                                        build(limit->child(), store, pass_read_limit_bytes, next_id,
-                                              nvtx_enabled, build_side_budget_bytes, spill_directory, max_distinct_keys),
-                                        limit->limit()));
+    return instrument(std::make_unique<LimitOperator>(
+        next_id++,
+        build(limit->child(), store, pass_read_limit_bytes, next_id, nvtx_enabled, build_side_budget_bytes,
+              spill_directory, max_distinct_keys),
+        limit->limit()));
   }
   if (const auto* arrow_result = dynamic_cast<const ArrowResultNode*>(node.get())) {
     return instrument(std::make_unique<ArrowResultOperator>(

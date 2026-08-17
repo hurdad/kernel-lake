@@ -52,12 +52,9 @@ namespace kernellake {
 // next() call when `nvtx_enabled` is true (see EngineConfig's
 // ProfilingSection::nvtx) -- this is generic instrumentation, not something
 // any individual operator implements itself.
-[[nodiscard]] std::unique_ptr<PhysicalOperator> build_operator_tree(const PhysicalPlanPtr& plan,
-                                                                    ObjectStore& store,
-                                                                    std::size_t pass_read_limit_bytes,
-                                                                    bool nvtx_enabled = false,
-                                                                    std::size_t build_side_budget_bytes = 0,
-                                                                    const std::string& spill_directory = "",
-                                                                    std::uint64_t max_distinct_keys = 0);
+[[nodiscard]] std::unique_ptr<PhysicalOperator> build_operator_tree(
+    const PhysicalPlanPtr& plan, ObjectStore& store, std::size_t pass_read_limit_bytes,
+    bool nvtx_enabled = false, std::size_t build_side_budget_bytes = 0,
+    const std::string& spill_directory = "", std::uint64_t max_distinct_keys = 0);
 
 }  // namespace kernellake
