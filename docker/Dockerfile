@@ -274,7 +274,16 @@ COPY . .
 # all` does) -- per this project's own rule, a skipped-GPU test must never
 # be reported as passing, so it isn't run here at all rather than faked.
 # Verify gpu-release's tests with a real `docker run --gpus all` against
-# this image instead (see README.md/docs/ARCHITECTURE.md).
+# this image built with -DKERNELLAKE_BUILD_TESTS=ON instead (see
+# README.md/docs/ARCHITECTURE.md).
+#
+# -DKERNELLAKE_BUILD_TESTS=OFF: the gpu-release preset (CMakePresets.json)
+# defaults this ON, which without ctest ever running here (see above) just
+# means compiling the entire tests/gpu/ + tests/unit/ suites for nothing --
+# real, wasted time sitting directly in docker-publish-gpu's critical path,
+# confirmed for real on a live SF1000 benchmarking run whose retry kept
+# stalling waiting on this job. cpu-release above leaves it ON since ctest
+# genuinely runs there as a build-time correctness gate.
 #
 # --mount=type=cache: same BuildKit cache-mount reasoning as cpu-release's
 # own identical comment above -- id=ccache-gpu-release keeps this stage's
@@ -287,6 +296,7 @@ RUN --mount=type=cache,target=/root/.ccache,id=ccache-gpu-release \
       -DCMAKE_CUDA_ARCHITECTURES="70-real;75-real;80-real;86-real;89" \
       -DKERNELLAKE_BUILD_SERVER=ON \
       -DKERNELLAKE_ENABLE_OTEL=ON \
+      -DKERNELLAKE_BUILD_TESTS=OFF \
       -DCMAKE_C_COMPILER_LAUNCHER=ccache \
       -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
       -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache \
