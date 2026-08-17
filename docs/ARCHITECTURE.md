@@ -25,6 +25,25 @@ planning by `tests/unit/`, GPU execution by `tests/gpu/` (see "CPU/GPU build
 split" below for why GPU execution lives in a separate test binary and
 CMake preset rather than `tests/unit/`).
 
+```mermaid
+flowchart TD
+    A["SQL text"] --> B["SQL parser<br/>kernellake::sql"]
+    B --> C["Binder / type checker<br/>kernellake::bind_query"]
+    C --> D["Logical plan<br/>kernellake::LogicalPlanNode"]
+    D --> E["Rule-based optimizer<br/>kernellake::optimize"]
+    E --> F["File discovery<br/>ObjectStore::discover_parquet_files"]
+    F --> G["Parquet metadata + pruning<br/>inspect_parquet_file / evaluate_pruning"]
+    G --> H["Physical plan<br/>kernellake::PhysicalPlanNode"]
+    H --> I{"engine.backend"}
+    I -- "gpu (default)" --> J["GPU operator tree<br/>PhysicalOperator / DeviceBatch"]
+    I -- "cpu" --> K["Arrow Acero execution<br/>execution_cpu"]
+    J --> L["Arrow result"]
+    K --> L
+```
+
+Everything through the physical plan is backend-agnostic; only the last
+stage forks on `engine.backend` (see "CPU/GPU build split" below).
+
 ## Module layout
 
 | Module | Contents |
@@ -477,13 +496,40 @@ external NVTX profiling.
 
 ### GPU operators
 
+`build_operator_tree()` (`operator_builder.cpp`) walks the physical plan
+top-down and instantiates one concrete operator per node, bottom-up in the
+`std::unique_ptr` chain each one owns as its `child`. A representative
+TPC-H-shaped query (two-table join, `GROUP BY`, `ORDER BY ... LIMIT`) looks
+like this, data flowing upward from the two scans:
+
+```mermaid
+flowchart BT
+    S1["ParquetScanOperator<br/>(left table)"] --> J["HashJoinOperator<br/>streaming probe / blocking or partitioned build"]
+    S2["ParquetScanOperator<br/>(right table)"] --> J
+    J --> F["FilterOperator<br/>(if any residual predicate)"]
+    F --> AG["HashAggregateOperator<br/>(GROUP BY) or ScalarAggregateOperator<br/>(no GROUP BY)"]
+    AG --> P["ProjectionOperator"]
+    P --> SO["SortOperator<br/>blocking (ORDER BY / LIMIT fused)"]
+    SO --> AR["ArrowResultOperator"]
+    AR --> OUT["arrow::RecordBatch stream<br/>(Flight SQL response)"]
+```
+
+Every operator is also wrapped in `InstrumentedOperator` (not shown above),
+which records per-`next()` wall-clock time into `MetricsRegistry` and emits
+an NVTX range, so the same tree shape shows up directly in a trace tool.
+Most operators are **streaming** (bounded memory, one batch of `child` in
+flight at a time); `SortOperator` and a non-partitioned `HashJoinOperator`
+build side are **blocking** (consume `child` to exhaustion first) -- see
+each operator's own row in the table below for which.
+
 | Operator | Notes |
 | --- | --- |
 | `ParquetScanOperator` | `cudf::io::chunked_parquet_reader`, bounded by `pass_read_limit_bytes` (not row count) |
 | `FilterOperator` | `cudf::compute_column` + `cudf::apply_boolean_mask` over a compiled AST predicate |
 | `ProjectionOperator` | Compiled AST per computed item; a bare column reference is copied directly instead (see below) |
 | `ScalarAggregateOperator` | No `GROUP BY`: `cudf::reduce` with its `init` parameter folds each batch into a running scalar (SUM/MIN/MAX/AVG numerator); COUNT/AVG's denominator is a host-side counter. Empty input produces NULL, not zero, except `COUNT(*)`/`COUNT(x)` which produce 0. |
-| `HashAggregateOperator` | `GROUP BY`: each incoming batch is aggregated on its own with a plain, one-shot `cudf::groupby::groupby`, then folded into a running partial result (concatenate + re-aggregate) -- not `cudf::groupby::streaming_groupby` (replaced: that design coupled `max_distinct_keys` to an unrelated per-call row-count limit, causing severe slowdowns on low-cardinality GROUP BYs over large scans). `accumulated_` exceeding `max_distinct_keys` (default 20M) throws. |
+| `HashAggregateOperator` | `GROUP BY`: each incoming batch is aggregated on its own with a plain, one-shot `cudf::groupby::groupby`, then folded into a running partial result (concatenate + re-aggregate) -- not `cudf::groupby::streaming_groupby` (replaced: that design coupled `max_distinct_keys` to an unrelated per-call row-count limit, causing severe slowdowns on low-cardinality GROUP BYs over large scans). `accumulated_` exceeding `max_distinct_keys` (default 75M, config-driven via
+`engine.max_distinct_keys` in `kernellake.yaml`) throws. |
 | `LimitOperator` | `cudf::slice` + the `cudf::table` copy constructor to truncate the final batch |
 | `SortOperator` | `ORDER BY`: **blocking**, unlike every operator above -- consumes `child` to exhaustion, concatenates every batch (`cudf::concatenate`) into one table, then `cudf::stable_sorted_order` + `cudf::gather`. Memory footprint is the whole result set, not bounded like the streaming operators. |
 | `HashJoinOperator` | Two-table `INNER JOIN`: when `choose_partition_count()` decides the build side is small enough, its *build* (right) side is **blocking** like `SortOperator` (consumed to exhaustion, concatenated into one table, then wraps a single `cudf::hash_join`); otherwise both sides are grace-hash partitioned and spilled to disk, bounding device memory to one partition/batch at a time (`b915063`, 2026-08-13). Its *probe* (left) side streams normally, one `inner_join()` + double-`cudf::gather` per batch (unpartitioned case). See "Hash joins" above. |
