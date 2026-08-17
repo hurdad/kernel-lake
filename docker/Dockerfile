@@ -1,3 +1,12 @@
+# syntax=docker/dockerfile:1
+# Explicit frontend pin (added 2026-08-17, alongside this file's first use
+# of `RUN --mount=type=cache` in cpu-release/gpu-release below): modern
+# Docker/buildx defaults to a recent-enough frontend that this likely
+# wasn't strictly required, but a `RUN --mount` syntax failure would be a
+# real, if unlikely, way for docker-publish-cpu/-gpu to break -- pin
+# explicitly rather than rely on whatever a given runner's Docker install
+# happens to default to.
+#
 # Single multi-stage Dockerfile publishing two runtime images from one
 # source of truth: `runtime-cpu` (CPU-only, no CUDA/RAPIDS -- built from the
 # `cpu-release` preset) and `runtime-gpu` (full CUDA/RAPIDS build -- built
@@ -126,6 +135,24 @@ ENV DEBIAN_FRONTEND=noninteractive
 #      used by .github/workflows/ci.yml's coverage/gpu-coverage jobs, both
 #      of which `docker run` a stage built from this one rather than
 #      installing gcovr fresh in a separate CI step every run.
+#   5. ccache -- every CI job that actually compiles (cpu-build-test,
+#      gpu-build-test, coverage, gpu-coverage, server-build-test,
+#      otel-build-test, clang-tidy, and cpu-release/gpu-release below)
+#      previously started stone cold every run, recompiling the entire
+#      tree from scratch on every push -- Docker's own layer cache doesn't
+#      help here even for the two in-Dockerfile release builds, since
+#      `COPY . .` (and therefore the `RUN cmake --build` layer after it)
+#      invalidates on *any* file change anywhere in the repo, which is
+#      every real push. Installed here so it's baked into the image these
+#      jobs already build/cache instead of an apt-get that'd run fresh
+#      every time; each job passes -DCMAKE_<LANG>_COMPILER_LAUNCHER=ccache
+#      at configure time and either mounts a host-persisted, GHA-cached
+#      ccache directory into its own `docker run` invocation (the six
+#      jobs in .github/workflows/ci.yml that build outside the Dockerfile
+#      -- see each one's own `Restore ccache` step), or uses a BuildKit
+#      `RUN --mount=type=cache` (cpu-release/gpu-release below, which
+#      build *inside* the Dockerfile itself -- see those stages' own
+#      comments).
 RUN apt-get update && apt-get upgrade -y \
     && apt-get install -y --no-install-recommends \
       wget ca-certificates lsb-release gnupg \
@@ -134,7 +161,7 @@ RUN apt-get update && apt-get upgrade -y \
     && apt-get install -y -V /tmp/arrow-apt-source.deb \
     && apt-get update \
     && apt-get install -y --no-install-recommends \
-         build-essential cmake ninja-build git pkg-config \
+         build-essential cmake ninja-build git pkg-config ccache \
          python3 python3-pip \
          libgtest-dev libbenchmark-dev libspdlog-dev nlohmann-json3-dev libyaml-cpp-dev \
          libxml2-dev uuid-dev libavro-dev libcurl4-openssl-dev \
@@ -160,9 +187,25 @@ COPY . .
 # needs no GPU device, so it can run at `docker build` time same as
 # CI's cpu-build-test/server-build-test/otel-build-test jobs do outside
 # Docker -- a broken build never makes it into runtime-cpu.
-RUN cmake --preset cpu-release \
+#
+# --mount=type=cache,target=/root/.ccache: a BuildKit cache mount, not
+# Docker's regular layer cache -- this RUN layer's own cache key is
+# invalidated by the `COPY . .` layer above on every real push (any file
+# change anywhere in the repo invalidates it), so without this the build
+# below would recompile the entire tree from scratch every single build
+# regardless of how little actually changed. A cache mount persists
+# across builds independent of layer invalidation (backed by
+# docker/build-push-action@v7's own cache-to/cache-from GHA scope, same
+# mechanism the rest of this Dockerfile already relies on for layer
+# caching). id=ccache-cpu-release keeps this stage's cache namespace
+# separate from gpu-release's own below, since both may build in the same
+# CI run.
+RUN --mount=type=cache,target=/root/.ccache,id=ccache-cpu-release \
+    cmake --preset cpu-release \
       -DKERNELLAKE_BUILD_SERVER=ON \
       -DKERNELLAKE_ENABLE_OTEL=ON \
+      -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+      -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
     && cmake --build --preset cpu-release \
     && ctest --preset cpu-release --output-on-failure
 
@@ -232,11 +275,21 @@ COPY . .
 # be reported as passing, so it isn't run here at all rather than faked.
 # Verify gpu-release's tests with a real `docker run --gpus all` against
 # this image instead (see README.md/docs/ARCHITECTURE.md).
-RUN cmake --preset gpu-release \
+#
+# --mount=type=cache: same BuildKit cache-mount reasoning as cpu-release's
+# own identical comment above -- id=ccache-gpu-release keeps this stage's
+# ccache namespace separate from cpu-release's. ccache does cache nvcc
+# invocations too (not just gcc/g++), so this covers the CUDA translation
+# units, not just the plain C++ ones.
+RUN --mount=type=cache,target=/root/.ccache,id=ccache-gpu-release \
+    cmake --preset gpu-release \
       -DCMAKE_CUDA_COMPILER=/usr/bin/nvcc \
       -DCMAKE_CUDA_ARCHITECTURES="70-real;75-real;80-real;86-real;89" \
       -DKERNELLAKE_BUILD_SERVER=ON \
       -DKERNELLAKE_ENABLE_OTEL=ON \
+      -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+      -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+      -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache \
     && cmake --build --preset gpu-release
 
 ENTRYPOINT ["/workspace/build/gpu-release/src/cli/kernellake"]
