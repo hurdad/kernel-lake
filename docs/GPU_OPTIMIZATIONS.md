@@ -465,6 +465,52 @@ datacenter GPU with more/dedicated decompression engines behaves
 differently, but that would need its own real measurement, not an
 assumption, before revisiting this.)
 
+## Getting around decompression-bound decode (2026-08-17 discussion, not yet tested)
+
+Given decode is confirmed decompression-bound (above) and, separately, that
+concurrent decode streams on this GPU already measured as contending for
+shared decompression/copy-engine capacity rather than scaling (opt #6
+above), options to actually reduce or route around the cost, roughly
+cheapest/most-proven first:
+
+1. **Cheaper codec, or none.** Already the confirmed lever above (snappy
+   +22-60%, zstd +41-68% vs. uncompressed). Not yet acted on -- real
+   storage/S3-transfer cost tradeoff never priced.
+2. **Try lz4.** Untested here. Typically decodes faster than both snappy
+   and zstd for a middling ratio -- a real candidate to add to the same
+   A/B if the codec question gets revisited.
+3. **Reduce bytes decompressed, not decompression speed.** Already
+   banked, not a new lever: `ParquetScanOperator` already pushes column
+   projection (`.column_names(columns_)`) and row-group pruning
+   (`.row_groups(...)`) into `cudf::io::parquet_reader_options` -- confirmed
+   by reading `parquet_scan_operator.cpp` directly, not assumed.
+4. **Bigger decode batches.** `pass_read_limit_bytes` (opt #4, never
+   retuned) sizes how much cudf's nvCOMP-backed batched decompression
+   processes per pass; bigger batches generally get better occupancy and
+   amortize launch overhead. Unexplored, plausibly cheap, untested.
+5. **Check for dedicated hardware decompression.** If nvCOMP dispatches
+   this codec/GPU combo through a fixed-function decompression unit
+   rather than an SM-resident kernel, decode wouldn't contend with
+   compute (or with other queries' compute) for SMs at all -- would
+   directly bear on the concurrency-mutex plan below. Not checked.
+6. **CPU-side decompression offload.** Bigger, more invasive: decompress
+   on host cores (measured well under saturation on the AWS network-
+   instance investigation) and DMA only the decompressed bytes to the
+   GPU. Real potential, but risks just moving the bottleneck to PCIe
+   transfer -- needs its own measurement before committing.
+
+**Bears directly on the concurrency-mutex plan** (see "Root cause is
+narrower..." section above): opt #6's already-measured result -- N
+concurrent decode streams contending for shared decompression/copy-engine
+capacity, getting *worse* past N=2, not better -- is the same shape of
+resource contention that concurrent *queries* would hit if their workloads
+are decode-heavy. Don't assume dropping the mutex yields even a modest
+throughput gain for decode-heavy query mixes without checking; it's
+plausible it comes back flat or negative on this same GPU, mirroring opt
+#6's result. The planned `scaling_test.py` re-run after the mutex fix
+should specifically watch for this, not just confirm throughput moved off
+flat.
+
 ## Recommendation
 
 #1 (pinned memory) is now de-prioritized based on the measurements above --
