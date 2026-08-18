@@ -538,14 +538,91 @@ attribution) layered over the *same* shared limiter/pool underneath --
 without touching the single global per-device slot, which would stay
 fixed to the shared base resource for the process's whole lifetime.
 
-**Next session's actual task**: audit every `cudf::`/allocation call site
-in `execution_gpu/` to confirm none silently fall through to the
-implicit global current-device resource instead of the explicit
-`context.memory_resource` -- if even one path does, that's a real
-correctness gap for concurrent execution, not just a missing feature.
-Only after that audit is clean does implementing per-query stats
-wrappers (dropping the mutex, replacing it with per-query resource
-isolation) become safe to attempt.
+**Also confirmed this session, before the audit below**: `QueryEngine::execute()`
+(`src/api/query_engine_execute_gpu.cpp`) already constructs `const CudaStream
+stream;` as a local -- every call already gets its own fresh CUDA stream.
+Stream isolation across concurrent queries needs no fix. The remaining gap
+is narrower still: that same function initializes
+`context.memory_resource` from `rmm::mr::get_current_device_resource_ref()`
+-- the shared global resource -- not a fresh per-query wrapper. That one
+line is where per-query `statistics_resource_adaptor` isolation would plug
+in, *if* the audit below comes back clean.
+
+**Audit done (2026-08-17): it did not come back clean.** Grepped every
+`cudf::`/`rmm::` allocation call site across all 16 files in
+`execution_gpu/`. Most operators (`filter_operator.cpp`,
+`projection_operator.cpp`, `hash_aggregate_operator.cpp`,
+`hash_join_operator.cpp`, `sort_operator.cpp`, `scalar_aggregate_operator.cpp`,
+the per-batch decode path in `parquet_scan_operator.cpp`) are clean --
+every real allocation explicitly passes `context.stream, context.memory_resource`,
+confirmed line-by-line including multi-line call continuations. Two real,
+concrete gaps found:
+
+1. **`ObjectStoreDatasource::device_read()`** (`object_store_datasource.cpp:111`):
+   `rmm::device_buffer buffer(size, stream);` -- omits the `mr` argument,
+   so it silently defaults to `rmm::mr::get_current_device_resource_ref()`,
+   the shared global resource, not `context.memory_resource`. Root cause:
+   `cudf::io::datasource::device_read()` is a `cudf`-owned virtual
+   signature -- `(offset, size, stream)`, no `mr` parameter exists to
+   receive it. Every Parquet scan's raw compressed-page staging buffer
+   (read from S3/local storage, before cudf's own decode) allocates
+   through this path. Fix: give `ObjectStoreDatasource` a stored
+   `rmm::device_async_resource_ref` member (passed in at construction,
+   where `ParquetScanOperator::open()` already has `context.memory_resource`
+   in scope) and pass it explicitly instead of relying on the omitted
+   default arg.
+
+2. **Literal-scalar construction** (`cudf_adapter.cpp`'s `literal_to_scalar()`/
+   `make_decimal_scalar()`, and the `cudf::numeric_scalar`/`string_scalar`/
+   `fixed_point_scalar`/`timestamp_scalar` constructors they call):
+   constructed with no explicit `stream`/`mr` arguments at all, so both
+   default -- `cudf::get_default_stream()` and
+   `cudf::get_current_device_resource_ref()`. Three of four call sites
+   (`ProjectionOperator::compile_value()`, `ScalarAggregateOperator::compile_expr()`,
+   `HashAggregateOperator::compile_expr()`) run at plan-compile time, with
+   no `ExecutionContext` in scope at all -- not a missed pass-through, the
+   plumbing to carry a resource/stream there doesn't exist yet. The fourth
+   (`parquet_scan_operator.cpp:285`, partition-column literals) *does*
+   have `context` sitting right there in scope one line above a correct
+   `context.stream, context.memory_resource` use, and still doesn't pass
+   it to `literal_to_scalar()` -- the cheapest of the four to fix.
+
+   **Open question, not resolved this session**: whether `cudf::get_default_stream()`
+   resolves to the CUDA legacy/null stream (which implicitly
+   synchronizes with *every* other stream on the device, including every
+   other concurrent query's fresh per-query stream) or a per-thread
+   default stream, depends on whether the vendored `libcudf` was built
+   with `CUDF_USE_PER_THREAD_DEFAULT_STREAM`. Could not confirm from
+   source in this environment -- `libcudf_cu12`'s pip package ships
+   headers only, no `default_stream.cpp` implementation to read, and RAPIDS'
+   own published packages are believed (not independently source-verified
+   here) to build with that flag OFF. If it resolves to the legacy stream,
+   gap #2 is a real cross-query serialization hazard on top of being a
+   stats-attribution gap -- verify empirically (e.g. compare
+   `stream.value()` against `cudaStreamLegacy`) before relying on "stream
+   isolation is already free" as a blanket statement.
+
+**Practical read**: gap #1 matters for every query (every Parquet scan
+goes through it) but is bytes-scale, not correctness-scale, for memory
+*accounting* -- the real allocator underneath is still the shared
+thread-safe pool, so nothing corrupts, only per-query stats attribution
+is off by however many staging buffers were live during the scan. Gap #2
+is small in bytes (single-value scalars) but is the one that needs the
+stream question resolved before concurrency work proceeds, since it's the
+only place a query's device work could still be implicitly coupled to
+another concurrent query's stream even after per-query streams and
+resources land everywhere else.
+
+**Revised next-session task**: fix gap #1 (thread a stored resource
+through `ObjectStoreDatasource`) and gap #4-of-gap-2 (pass `context.stream,
+context.memory_resource` into `parquet_scan_operator.cpp:285`'s
+`literal_to_scalar()` call) first -- both are small, mechanical, low-risk
+diffs. Then resolve the per-thread-default-stream question empirically.
+Only then does implementing per-query `statistics_resource_adaptor`
+wrappers (dropping the mutex, per the plan in this doc's earlier section)
+become safe to attempt -- and even then, the three compile-time
+`literal_to_scalar()` call sites (no `ExecutionContext` in scope) remain a
+known, accepted gap unless/until compile-time plumbing is added too.
 
 #6 (parallel decode across files) is now de-prioritized based on a real
 prototype (see above) -- the opposite outcome from #3: no reliable win at
