@@ -490,9 +490,62 @@ compression finding rather than competing with it: an
 uncompressed-or-lighter-codec dataset gets *both* less decode work and
 that work overlapped with compute.
 
-#2 (concurrent queries) remains the biggest structural change and should
-wait until there's a concrete reason (observed queueing under real load)
-to take on the RMM-sharing redesign it requires.
+#2 (concurrent queries) remains the biggest structural change, but now
+has both the concrete real-load signal that was missing and a real,
+narrower root-cause finding than "redesign RMM sharing" implied.
+
+**Real signal, confirmed 2026-08-17/18**: `scaling_test.py` run for real
+against a single warm `kernellake-server`, SF1000, cache enabled -- 1
+concurrent client: 73 queries/911s (288/hour, median 12.46s). 4 concurrent
+clients: 76 queries/947s (289/hour, median 49.74s). Throughput is
+identical regardless of client count; per-query latency scales almost
+exactly linearly with client count. `GpuExecutionCoordinator::execute()`
+(`src/server/gpu_execution_coordinator_gpu.cpp`) wraps the entire
+`engine.execute()` call in a plain `std::mutex` -- confirmed for real,
+not just from reading the code, that this fully serializes GPU execution
+today regardless of concurrent Flight SQL connections.
+
+**Root cause is narrower than "the whole RMM stack isn't thread-safe"**:
+read `rmm_environment.cpp` and RMM's own `per_device_resource.hpp`
+directly rather than guessing. The actual device memory allocator
+(`cuda_async_memory_resource`/`pool_memory_resource`) is RMM's own
+generally-thread-safe concurrent-allocation machinery -- not the blocker.
+The genuinely unsafe piece is much narrower:
+`RmmEnvironment::track_query()` calls `impl_->stats.push_counters()` /
+`pop_counters()` -- RMM's `statistics_resource_adaptor` push/pop is a
+single shared stack, designed for sequential nested scoping. Two threads
+calling `track_query()` concurrently would interleave pushes/pops against
+that one stack, corrupting per-query peak/current memory attribution
+(silently wrong `QueryResult::peak_gpu_memory_bytes`, not a crash) --
+that's the actual, narrow correctness gap, not GPU memory-allocation
+safety in general.
+
+**Confirmed real constraint, not guessed**: `rmm::mr::set_current_device_resource()`
+installs into a `std::map<device_id, resource>` (RMM's
+`per_device_resource.hpp`, read directly from the vendored source) -- one
+resource per device, process-wide, not per-thread or per-call. So a
+naive "just don't share the stats object" fix can't simply install a
+different resource per query via that API.
+
+**A real path forward, not yet audited**: this codebase already threads
+an explicit `context.memory_resource` through the operator tree (e.g.
+`hash_join_operator.cpp`'s spill path passes it explicitly to cudf
+calls, not relying on the implicit global "current" resource). If every
+GPU allocation in `execution_gpu/` consistently uses that explicit
+per-call resource, each concurrent query's `ExecutionContext` could carry
+its own `statistics_resource_adaptor` (correct per-query memory
+attribution) layered over the *same* shared limiter/pool underneath --
+without touching the single global per-device slot, which would stay
+fixed to the shared base resource for the process's whole lifetime.
+
+**Next session's actual task**: audit every `cudf::`/allocation call site
+in `execution_gpu/` to confirm none silently fall through to the
+implicit global current-device resource instead of the explicit
+`context.memory_resource` -- if even one path does, that's a real
+correctness gap for concurrent execution, not just a missing feature.
+Only after that audit is clean does implementing per-query stats
+wrappers (dropping the mutex, replacing it with per-query resource
+isolation) become safe to attempt.
 
 #6 (parallel decode across files) is now de-prioritized based on a real
 prototype (see above) -- the opposite outcome from #3: no reliable win at
