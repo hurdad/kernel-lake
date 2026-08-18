@@ -420,28 +420,46 @@ down immediately after.
 
 `scaling_test.py` (below) already covers KernelLake, including a cheap
 single-host variant that measures whether one warm server even handles
-concurrent requests at all (real signal: `GpuExecutionCoordinator`
-currently serializes every query behind a mutex). `spark_scaling_test.py`/
-`duckdb_scaling_test.py` cover the other two engines -- see
-`CONCURRENCY_HARNESS_DESIGN.md` for the full design, not yet run against
-real infra. **Cache must be ON for all three** (opposite of every other
-milestone here) -- these tests fire the same query repeatedly against a
-warm connection, so cold/no-cache would measure S3-access contention
-instead of the intended concurrent-execution question; set
-`kernellake_nvme_cache_enabled = true` in `terraform.tfvars` before this
-milestone specifically.
+concurrent requests at all. **Run for real (2026-08-17) against a single
+KernelLake host, SF1000, `--query 6`**: 1 client -> 73 queries in 911s
+(288/hour, median latency 12.46s); 4 clients -> 76 queries in 947s
+(289/hour, median latency 49.74s). Throughput is identical regardless of
+client count and per-query latency scales almost exactly 4x with 4
+clients -- confirms `GpuExecutionCoordinator`'s mutex fully serializes
+GPU execution today, real observed queueing under real load (the
+concrete signal `GPU_OPTIMIZATIONS.md` opportunity #2 was waiting on).
+Two real bugs in `scaling_test.py` itself surfaced and fixed getting this
+number: it defaulted to Spark's `s3a://` scheme (KernelLake's
+`read_parquet()` rejects that outright) and a hardcoded 30s
+in-flight-query grace period, nowhere near enough for a real SF1000 cold
+query (150-280s) -- now `--grace-seconds` (default 300).
+`spark_scaling_test.py`/`duckdb_scaling_test.py` cover the other two
+engines -- see `CONCURRENCY_HARNESS_DESIGN.md` for the full design, not
+yet run against real infra. **Cache must be ON for all three** (opposite
+of every other milestone here) -- these tests fire the same query
+repeatedly against a warm connection, so cold/no-cache would measure
+S3-access contention instead of the intended concurrent-execution
+question; set `kernellake_nvme_cache_enabled = true` in
+`terraform.tfvars` before this milestone specifically.
 
 ```bash
+# KernelLake, single host (real numbers above) -- --duration-seconds needs to be
+# comfortably longer than a handful of SF1000 query times (150-280s cold, much
+# faster once the NVMe cache warms up) to get a meaningful sample count:
+python3 scaling_test.py --kernellake-hosts "$KL_HOST" --s3-bucket "$BUCKET" \
+  --scale-factor 1000 --query 6 --concurrent-clients 4 --duration-seconds 900 \
+  --output "$RUN_DIR/scaling-1host.json"
+
 # DuckDB (on the DuckDB host, after scp'ing duckdb_scaling_test.py alongside duckdb_query_loop.py):
 python3 duckdb_scaling_test.py --s3-bucket "$BUCKET" --scale-factor 1000 \
-  --query 6 --concurrent-clients 8 --duration-seconds 120 \
+  --query 6 --concurrent-clients 8 --duration-seconds 900 \
   --output "$RUN_DIR/scaling-duckdb.json"
 
 # PySpark (start the Thrift server on the Spark host first -- see
 # spark_scaling_test.py's own docstring for the exact start-thriftserver.sh
 # invocation, FAIR scheduling included -- then run from the orchestrator):
 python3 spark_scaling_test.py --thrift-host "$SPARK_HOST_IP" --s3-bucket "$BUCKET" \
-  --scale-factor 1000 --query 6 --concurrent-clients 8 --duration-seconds 120 \
+  --scale-factor 1000 --query 6 --concurrent-clients 8 --duration-seconds 900 \
   --output "$RUN_DIR/scaling-pyspark.json"
 ```
 

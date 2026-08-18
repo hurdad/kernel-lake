@@ -53,7 +53,8 @@ def worker(host: str, port: int, query_number: int, globs: dict, stop_event: thr
 
 
 def run_scaling_test(
-    hosts: list[str], port: int, query_number: int, globs: dict, concurrent_clients: int, duration_seconds: float
+    hosts: list[str], port: int, query_number: int, globs: dict, concurrent_clients: int, duration_seconds: float,
+    grace_seconds: float,
 ) -> dict:
     latencies: list = []
     lock = threading.Lock()
@@ -68,7 +69,15 @@ def run_scaling_test(
         start = time.monotonic()
         time.sleep(duration_seconds)
         stop_event.set()
-        for f in as_completed(futures, timeout=30):
+        # grace_seconds, not a hardcoded 30 -- a query already in flight
+        # when stop_event fires still has to finish before its worker
+        # thread notices and exits, and at real SF1000 scale a single cold
+        # query can take 150-280s on its own (confirmed for real: 30s
+        # wasn't enough, raised a bare TimeoutError with the very first
+        # single-client run this was tried against). --grace-seconds needs
+        # to comfortably exceed one query's own worst-case wall time, not
+        # just be "a bit of slack".
+        for f in as_completed(futures, timeout=grace_seconds):
             f.result()  # surfaces any worker-thread exception that isn't the expected per-query one above
         actual_duration = time.monotonic() - start
 
@@ -98,23 +107,38 @@ def main() -> int:
     parser.add_argument("--query", type=int, default=6, help="A single-table query (1 or 6) keeps this test's SQL simple/uniform across all replicas")
     parser.add_argument("--concurrent-clients", type=int, default=None, help="Default: 2x replica count, so demand always exceeds replica capacity")
     parser.add_argument("--duration-seconds", type=float, default=120.0)
+    parser.add_argument("--grace-seconds", type=float, default=300.0,
+                         help="How long to wait for an already-in-flight query to finish after duration-seconds "
+                              "elapses -- must comfortably exceed one query's own worst-case wall time (SF1000 "
+                              "queries commonly take 150-280s cold), not just be a small buffer")
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
 
     hosts = args.kernellake_hosts.split(",")
     concurrent_clients = args.concurrent_clients or (2 * len(hosts))
-    globs = {"data": s3_data_glob(args.s3_bucket, args.scale_factor, "lineitem")}
+    # scheme="s3", not s3_data_glob()'s own default ("s3a", sized for
+    # Spark's Hadoop connector) -- this script is KernelLake-only (see
+    # module docstring), and read_parquet() rejects "s3a://" outright
+    # (confirmed for real: a live adbc OperationalError, "unsupported URI
+    # scheme 's3a'").
+    globs = {"data": s3_data_glob(args.s3_bucket, args.scale_factor, "lineitem", scheme="s3")}
 
     print(f"=== Concurrency test: {len(hosts)} replica(s), {concurrent_clients} concurrent clients, "
           f"{args.duration_seconds}s ===", file=sys.stderr)
-    result = run_scaling_test(hosts, args.kernellake_port, args.query, globs, concurrent_clients, args.duration_seconds)
+    result = run_scaling_test(
+        hosts, args.kernellake_port, args.query, globs, concurrent_clients, args.duration_seconds, args.grace_seconds
+    )
     result["hosts"] = hosts
     result["query"] = args.query
     result["scale_factor"] = args.scale_factor
 
     Path(args.output).write_text(json.dumps(result, indent=2))
-    print(f"Wrote {args.output}: {result['queries_completed']} queries, "
-          f"{result['queries_per_hour']:.0f}/hour, median latency {result['latency_median_seconds']:.3f}s", file=sys.stderr)
+    if result["latency_median_seconds"] is not None:
+        print(f"Wrote {args.output}: {result['queries_completed']} queries, "
+              f"{result['queries_per_hour']:.0f}/hour, median latency {result['latency_median_seconds']:.3f}s",
+              file=sys.stderr)
+    else:
+        print(f"Wrote {args.output}: 0 queries completed", file=sys.stderr)
     print("Combine this with cost_model.py's compute_run_cost() (this run's own real instance-hours) "
           "for cost-per-completed-query at this concurrency level -- the actual headline number.", file=sys.stderr)
     return 0
