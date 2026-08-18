@@ -418,6 +418,13 @@ The most expensive single step (up to 8x simultaneous GPU-instance-hours,
 at whichever `kernellake_instance_type` is configured) -- time-boxed, torn
 down immediately after.
 
+`scaling_test.py` (below) already covers KernelLake, including a cheap
+single-host variant that measures whether one warm server even handles
+concurrent requests at all (real signal: `GpuExecutionCoordinator`
+currently serializes every query behind a mutex). PySpark/DuckDB
+equivalents are designed but not yet built -- see
+`CONCURRENCY_HARNESS_DESIGN.md`.
+
 ```bash
 python3 ../scripts/estimate_cost.py --milestone m4
 # Review, then re-provision with more replicas:
