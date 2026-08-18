@@ -23,6 +23,34 @@ under real load").
 
 No PySpark/DuckDB equivalent exists yet. This is the design for both.
 
+## Cache should be ON for this test -- the opposite of the single-query benchmark
+
+Every latency benchmark this session ran deliberately cold/no-cache
+(worst case: every query hits genuinely fresh, uncached S3 data). The
+concurrency test is structurally different and needs the opposite
+setting: each worker fires the *same* query repeatedly against one warm
+connection/session for the whole test duration, so after the first
+iteration every repeat is against data a real system would obviously have
+cached by then.
+
+Running this test cold would measure "does concurrent *cold S3 access*
+scale" -- a real but different question, and one already confounded by
+the shared-S3-bandwidth-contention effect documented below, which would
+swamp the actual signal this test exists to surface (does concurrent
+*execution* scale -- i.e. does `GpuExecutionCoordinator`'s mutex, Spark's
+scheduler, or DuckDB's shared thread pool serialize concurrent queries).
+Warm/cached isolates that question properly.
+
+Concretely: `duckdb_scaling_test.py` passes `enable_cache=True` to
+`new_duckdb_connection()` (opposite of `duckdb_query_loop.py`'s own
+cold-benchmark default). On the KernelLake side, this means
+`kernellake-server.yaml`'s `storage.cache.enabled` needs to be `true` for
+this test specifically -- a deployment-time config choice
+`scaling_test.py` itself has no control over, unlike the disabled-cache
+setup this session used for every cold-latency run. Spark has no
+separate cache toggle to flip; whatever benefit it gets from repeat reads
+comes from the OS page cache naturally, nothing to configure.
+
 ## Common shape
 
 Same worker pattern as `scaling_test.py`: each worker thread opens its
@@ -81,13 +109,17 @@ multiple readers share the same bucket/endpoint. A concurrency test
 deliberately maximizes sustained throughput, so this confound would bite
 harder here than it did on the plain latency benchmark that surfaced it.
 
-## Not yet built
+## Built, not yet run for real
 
-Both `spark_scaling_test.py` and `duckdb_scaling_test.py` are designed
-above, not written. Building either is now unblocked (no open design
-questions) whenever a session has AWS budget for it -- see
-`RUNBOOK.md`'s M4 section for the existing KernelLake-only version's real
-cost profile (up to 8x simultaneous GPU-instance-hours) as a sizing
-reference; the Spark/DuckDB single-host versions are much cheaper (one
-instance each, no replica sweep needed to answer "does concurrency work
-at all").
+`runner/spark_scaling_test.py` and `runner/duckdb_scaling_test.py` exist
+now, matching the design above (reuse each engine's existing query-loop
+script's helpers rather than duplicating them; DuckDB caps
+`SET threads TO <cores/N>` per connection to avoid oversubscription;
+Spark registers real external tables over the Thrift connection since its
+Python client can't reach the DataFrame API). Neither has been run
+against real infra yet -- see `RUNBOOK.md`'s M4 section for the exact
+invocations once budget allows. See `RUNBOOK.md`'s M4 section for the
+existing KernelLake-only version's real cost profile (up to 8x
+simultaneous GPU-instance-hours) as a sizing reference; the Spark/DuckDB
+single-host versions are much cheaper (one instance each, no replica
+sweep needed to answer "does concurrency work at all").

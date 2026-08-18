@@ -120,11 +120,21 @@ def median_stats(samples: list) -> dict:
     }
 
 
-def new_duckdb_connection(region: str):
+def new_duckdb_connection(region: str, enable_cache: bool = False):
     """httpfs for s3:// reads, plus the aws extension's CREDENTIAL_CHAIN
     provider so it resolves this host's own IAM instance profile the same
     way boto3/the AWS SDK would -- consistent with how kernellake-server/
-    Spark authenticate to S3 elsewhere in this harness."""
+    Spark authenticate to S3 elsewhere in this harness.
+
+    enable_cache defaults False for this script's own worst-case/no-cache
+    cold benchmarking (2026-08-15, see below) -- duckdb_scaling_test.py
+    passes True instead: its concurrency test fires the *same* query
+    repeatedly against one warm connection for the whole test duration, so
+    disabling caching there would measure "does concurrent cold S3 access
+    scale" (a real but different, and already-confounded-by-shared-
+    bandwidth-contention, question -- see
+    docs/CONCURRENCY_HARNESS_DESIGN.md) instead of the intended "does
+    concurrent execution scale" question."""
     import duckdb
 
     con = duckdb.connect()
@@ -134,19 +144,20 @@ def new_duckdb_connection(region: str):
     con.load_extension("aws")
     con.sql("CREATE OR REPLACE SECRET (TYPE S3, PROVIDER CREDENTIAL_CHAIN)")
     con.sql(f"SET s3_region = '{region}'")
-    # Worst-case/no-cache cold benchmarking (2026-08-15): duckdb.connect()
-    # with no path is already an in-memory database with no local
-    # disk-backed cache in the S3 read path (httpfs streams straight into
-    # this connection's own buffer pool, never through a local file Linux's
-    # page cache could intercept), so the fresh-connection-per-cold-rep
-    # reset above is the real cache-clearing mechanism, not an OS-level
-    # cache drop. These two SETs are belt-and-suspenders on top of that:
-    # DuckDB's own object/HTTP-metadata caches default on and are otherwise
-    # scoped to the connection's lifetime anyway (already cleared by the
-    # reconnect), but disabling them explicitly removes any doubt that a
-    # within-connection cache could still be doing something.
-    con.sql("SET enable_object_cache = false")
-    con.sql("SET enable_http_metadata_cache = false")
+    if not enable_cache:
+        # Worst-case/no-cache cold benchmarking (2026-08-15): duckdb.connect()
+        # with no path is already an in-memory database with no local
+        # disk-backed cache in the S3 read path (httpfs streams straight into
+        # this connection's own buffer pool, never through a local file Linux's
+        # page cache could intercept), so the fresh-connection-per-cold-rep
+        # reset above is the real cache-clearing mechanism, not an OS-level
+        # cache drop. These two SETs are belt-and-suspenders on top of that:
+        # DuckDB's own object/HTTP-metadata caches default on and are otherwise
+        # scoped to the connection's lifetime anyway (already cleared by the
+        # reconnect), but disabling them explicitly removes any doubt that a
+        # within-connection cache could still be doing something.
+        con.sql("SET enable_object_cache = false")
+        con.sql("SET enable_http_metadata_cache = false")
     return con
 
 

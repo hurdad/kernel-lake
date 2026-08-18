@@ -421,9 +421,29 @@ down immediately after.
 `scaling_test.py` (below) already covers KernelLake, including a cheap
 single-host variant that measures whether one warm server even handles
 concurrent requests at all (real signal: `GpuExecutionCoordinator`
-currently serializes every query behind a mutex). PySpark/DuckDB
-equivalents are designed but not yet built -- see
-`CONCURRENCY_HARNESS_DESIGN.md`.
+currently serializes every query behind a mutex). `spark_scaling_test.py`/
+`duckdb_scaling_test.py` cover the other two engines -- see
+`CONCURRENCY_HARNESS_DESIGN.md` for the full design, not yet run against
+real infra. **Cache must be ON for all three** (opposite of every other
+milestone here) -- these tests fire the same query repeatedly against a
+warm connection, so cold/no-cache would measure S3-access contention
+instead of the intended concurrent-execution question; set
+`kernellake_nvme_cache_enabled = true` in `terraform.tfvars` before this
+milestone specifically.
+
+```bash
+# DuckDB (on the DuckDB host, after scp'ing duckdb_scaling_test.py alongside duckdb_query_loop.py):
+python3 duckdb_scaling_test.py --s3-bucket "$BUCKET" --scale-factor 1000 \
+  --query 6 --concurrent-clients 8 --duration-seconds 120 \
+  --output "$RUN_DIR/scaling-duckdb.json"
+
+# PySpark (start the Thrift server on the Spark host first -- see
+# spark_scaling_test.py's own docstring for the exact start-thriftserver.sh
+# invocation, FAIR scheduling included -- then run from the orchestrator):
+python3 spark_scaling_test.py --thrift-host "$SPARK_HOST_IP" --s3-bucket "$BUCKET" \
+  --scale-factor 1000 --query 6 --concurrent-clients 8 --duration-seconds 120 \
+  --output "$RUN_DIR/scaling-pyspark.json"
+```
 
 ```bash
 python3 ../scripts/estimate_cost.py --milestone m4
