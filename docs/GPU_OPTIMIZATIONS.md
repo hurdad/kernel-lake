@@ -494,38 +494,44 @@ cheapest/most-proven first:
    compute (or with other queries' compute) for SMs at all -- would
    directly bear on the concurrency-mutex plan below. Not checked.
 
-   **Candidate hardware identified (2026-08-17), not yet tested.** NVIDIA's
-   Hopper architecture (H100/H200 -- AWS `p5*`/`p5en*` families) is
-   documented (NVIDIA's own Hopper architecture whitepaper, recalled here,
-   not verified against this repo's vendored `cudf`/`nvCOMP` v26.06.00)
-   to include a dedicated hardware **Decompression Engine** separate from
-   the SMs, marketed specifically for RAPIDS/Spark-style Snappy/LZ4/
-   Deflate decompression -- a categorically different fix than "more
-   SMs," since it wouldn't contend with compute at all if actually
-   engaged. Every other GPU in this project's range (L4/`g6*`, L40S/
-   `g6e*`, A10G/`g5*`, A100/`p4d*`) is Ampere/Ada or older -- no such
-   engine, decompression runs as ordinary SM kernels, consistent with
-   opt #6's measured contention.
+   **Candidate hardware identified (2026-08-17), corrected same day.**
+   Originally mis-attributed to Hopper (H100/H200) -- corrected: it's
+   **Blackwell** (B200/B300) that has the dedicated hardware
+   **Decompression Engine**, not Hopper. (Still recalled from NVIDIA's
+   own architecture materials, not verified against this repo's vendored
+   `cudf`/`nvCOMP` v26.06.00 -- whether that build actually dispatches
+   Parquet Snappy decode through it remains open regardless of which
+   generation has the hardware.) Every GPU in this project's range so far
+   (L4/`g6*`, L40S/`g6e*`, A10G/`g5*`, A100/`p4d*`, H100/H200/`p5*`) is
+   Hopper or older -- no such engine, decompression runs as ordinary SM
+   kernels, consistent with opt #6's measured contention. `p5.4xlarge`
+   (H100, $6.88/hr) is therefore **not** a Decompression-Engine test after
+   all -- still potentially useful as a bigger-GPU data point, but not
+   evidence about the hardware-offload hypothesis.
 
-   Real, confirmed via AWS EC2/Pricing API (not guessed): a *single-GPU*
-   Hopper instance exists and is affordable for a bounded one-time test --
-   `p5.4xlarge` (1x H100, 16 vCPU) at **$6.88/hr**, vs. `g6.4xlarge`'s
-   $1.32/hr. Open question this doc cannot resolve without running it:
-   whether the vendored cudf/nvCOMP build actually dispatches Parquet
-   Snappy decode through that hardware path, or still uses the generic
-   SM-kernel path regardless of GPU generation.
+   **Real constraint found (2026-08-17, via AWS EC2/Pricing API, not
+   guessed): no affordable way to test this on AWS right now.** Unlike
+   Hopper's single-GPU `p5.4xlarge`, Blackwell has no equivalent small
+   SKU in this account/region -- only `p6-b200.48xlarge` and
+   `p6-b300.48xlarge`, both fixed at **8x GPU**. Real on-demand price:
+   **$113.93/hr** for `p6-b200.48xlarge`. That's not a bounded
+   validation-test cost anymore -- a different category of spend than
+   this investigation's other real-hardware checks, and not something to
+   provision without an explicit decision to spend at that level.
 
-   **Planned test (not yet run -- deferred, see below):**
-   1. Cheap first: re-run the opt #6 N-concurrent-decode-stream prototype
-      on `g6.4xlarge` itself (production instance type -- opt #6 only
-      ever ran on the dev box's desktop RTX 5060 Ti under WSL2, never on
-      the real production GPU). Confirms whether the contention is real
-      in production or a desktop/WSL2 artifact.
-   2. Only if #1 confirms real contention: same prototype on `p5.4xlarge`
-      as a genuine hardware A/B. Contention shrinking/disappearing is
-      real evidence the Hopper DE is engaged for this codec; no change
-      means it isn't (or doesn't help), and the extra $/hr isn't
-      justified going forward.
+   **Revised plan:** still worth running step 1 below on the cheap,
+   already-planned instance -- it validates whether the contention is
+   real in production at all, independent of any hardware-offload
+   question. Step 2 (a genuine Decompression-Engine A/B) is blocked until
+   either a smaller Blackwell SKU becomes available or there's a specific
+   decision to spend at the 8x-B200 price point.
+   1. Re-run the opt #6 N-concurrent-decode-stream prototype on
+      `g6.4xlarge` itself (production instance type -- opt #6 only ever
+      ran on the dev box's desktop RTX 5060 Ti under WSL2, never on the
+      real production GPU). Confirms whether the contention is real in
+      production or a desktop/WSL2 artifact. Cheap, do this regardless.
+   2. A genuine hardware A/B against Blackwell -- on hold pending a
+      smaller/cheaper SKU or an explicit spend decision at $113.93/hr.
 6. **CPU-side decompression offload.** Bigger, more invasive: decompress
    on host cores (measured well under saturation on the AWS network-
    instance investigation) and DMA only the decompressed bytes to the
