@@ -524,9 +524,60 @@ the single most concrete, actionable lever this whole investigation found:
 no architecture change needed, just a codec choice -- worth surfacing as an
 explicit, documented tradeoff (query speed vs. storage footprint) for
 anyone generating or choosing Parquet data for KernelLake to read, rather
-than defaulting to Snappy without discussion. Whether it's worth *changing*
-the default depends on a tradeoff this doc can't resolve alone: storage/
-transfer cost (especially over S3, not measured here) vs. decode speed.
+than defaulting to Snappy without discussion.
+
+**Storage/transfer-cost side of the tradeoff, finished (2026-08-17).**
+Previously left open ("depends on a tradeoff this doc can't resolve
+alone"). Resolved using the already-measured file-size/decode-time table
+above (the 20M-row synthetic test -- none 745.9 MB/0.0733s, snappy 662.3
+MB/0.0896s, zstd 560.5 MB/0.1038s) plus real current AWS S3 pricing (`aws
+pricing get-products --service-code AmazonS3`, us-east-1, confirmed live
+via the Pricing API, not assumed: **$0.023/GB-month**, first-50TB tier --
+the relevant one at this project's data scale).
+
+*Storage cost*: negligible at any scale this project tests. Using the
+measured 1.126x size ratio (none/snappy), SF1000's already-documented
+168.8GB snappy `lineitem` alone would grow to ~190GB uncompressed -- ~21GB
+extra, **~$0.49/month**. One EC2 instance-hour in this project's own
+benchmark fleet ($1.32-$1.39/hr) costs more than two and a half months of
+that storage delta. Storage was never the load-bearing part of this
+tradeoff.
+
+*Transfer-time cost* (the side that actually matters -- same-region S3->EC2
+data transfer isn't billed, but the extra bytes still take wall-clock time
+to move, which is what's actually being paid for via instance-hours):
+solving for the S3 throughput at which uncompressed's transfer-time
+penalty exactly cancels its decode-time saving, using the same paired
+file-size/decode-time numbers above --
+
+| Comparison | extra bytes (larger file) | decode time saved (smaller file's cost) | crossover throughput |
+|---|---|---|---|
+| none vs. snappy | 83.6 MB | 0.0163s | **~5.0 GB/s** |
+| none vs. zstd | 185.4 MB | 0.0305s | **~5.9 GB/s** |
+| snappy vs. zstd | 101.8 MB | 0.0142s | **~7.0 GB/s** |
+
+Below its crossover throughput, the *smaller* (more compressed) file wins
+on total wall-clock time (transfer + decode combined), not just decode
+time alone -- above it, the bigger/less-compressed file wins. Every real
+throughput number this project has ever measured is far below all three
+crossovers: even the best-case *local* NVMe scan throughput this
+investigation found (1.5-2.7 GB/s, opt #3/#6 sections above) doesn't clear
+the lowest crossover (~5.0 GB/s vs. snappy), and real S3 throughput was
+measured slower than local in every case tested here (0.07-0.17 GB/s
+pre-fix, several-x faster post the `device_read` fix but not stated as a
+clean GB/s figure in that writeup -- see "Real-S3 scan throughput fixed"
+above). No realistic near-term improvement to this project's S3 client
+gets within range of ~5 GB/s per query.
+
+**Conclusion: keep Snappy as the default. Don't switch to uncompressed,
+and zstd is confirmed *not* worth its extra decode cost either** (its own
+crossover vs. snappy, ~7.0 GB/s, is even further out of reach) --
+KernelLake's existing default already comes out ahead on both storage
+*and* transfer-adjusted wall-clock cost, not just "acceptable," among the
+three codecs actually tested. This closes out the previously-open item;
+revisit only if a future S3-client change is independently measured to
+push real per-query scan throughput into multi-GB/s territory, which
+nothing in this investigation's history suggests is close.
 
 #3 (decode/compute overlap) is now implemented for real (`c1f98f9`), not
 just prototyped -- an 8-12% real wall-time reduction confirmed end-to-end
