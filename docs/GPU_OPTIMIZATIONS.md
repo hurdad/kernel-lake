@@ -1332,3 +1332,126 @@ anyway. **Still open**: whether there's a sweet spot *between* auto's
 ~5.3GB and some larger explicit value, or whether it plateaus once passes
 are "big enough" -- would need a query/dataset where auto-sizing's actual
 peak usage gets closer to its own ceiling to test meaningfully.
+
+## S3 vs. local NVMe: quantifying how much of "cold" wall time is network, not compute (2026-08-18/19)
+
+Motivated directly by the SF1000 v3/v4 finding that the cold/S3
+benchmark methodology is "S3-request-latency-bound, not compute-bound"
+(sustained S3 RX 250-700MB/s, GPU bursty 4-99% never pegged, CPU never
+above ~8% -- see `project_sf1000_v3_benchmark.md`). Rather than continue
+reasoning about this qualitatively, staged the real SF1000 S3 dataset
+(181.25GB, confirmed via `aws s3 ls --summarize`) onto a `g6.4xlarge`'s
+own local NVMe instance-store (`/opt/dlami/nvme`, already unconditionally
+bind-mounted to the container's `/cache` regardless of the cache
+*feature* flag -- an existing fix from the SF1000 v3 run, see
+`kernellake-host-init.sh`) via `aws s3 sync` (8m22s, same-region, no
+transfer cost), then re-ran the same 5 queries pointed at the local path
+instead of `s3://`.
+
+**Result -- S3-cold vs. local-NVMe-cold, same queries, same data, `event_loop_threads=4` baseline:**
+
+| Query | S3 (v4 baseline) | Local NVMe | Speedup |
+|---|---|---|---|
+| Q1 | 180.6s | 57.2s | 3.2x |
+| Q6 | 163.9s | **9.5s** | **17.3x** |
+| Q12 | 236.7s | 40.3s | 5.9x |
+| Q14 | 227.7s | 79.6s | 2.9x |
+| Q19 | 214.1s | 81.1s | 2.6x |
+
+Confirms and quantifies the qualitative "S3-latency-bound" hypothesis --
+S3 request/network latency is the majority of cold wall time, not GPU
+decode/compute, for every query tested. Q6 is the extreme case: 163.9s
+over S3 collapses to 9.5s locally, meaning **~94% of KernelLake's S3-cold
+wall time on Q6 was pure network wait**, not GPU work at all -- consistent
+with Q6 being the query earlier profiling flagged as almost pure
+scan+decode (65-77% of wall time), the shape with the least other
+CPU-side work to hide network latency behind.
+
+**Same test run for DuckDB and PySpark on the identical machine/disk/data**
+(not a separate CPU instance -- see below for why), giving a genuine
+same-hardware three-way comparison with S3 removed entirely:
+
+| Query | KernelLake | DuckDB | PySpark (`local[*]`) |
+|---|---|---|---|
+| Q1 | 57.2s | 49.0s | 207.8s |
+| Q6 | **9.5s** | 36.8s | 34.2s |
+| Q12 | 40.3s | 45.8s | 118.4s |
+| Q14 | 79.6s | 68.2s | 92.3s |
+| Q19 | 81.1s | 67.1s | 71.7s |
+
+With S3 removed, the head-to-head **flips from "DuckDB wins every query"
+(the S3-bound v3/v4 result) to a mixed picture**: KernelLake wins Q6
+(3.9x) and Q12 (12%) decisively; DuckDB wins Q1, Q14, Q19 by a real but
+modest 10-17% margin. PySpark's single-JVM `local[*]` mode is clearly the
+weakest of the three (3-4x slower than the other two on Q1 especially) --
+not a real multi-executor cluster, so not necessarily representative of
+Spark's best possible showing, just what's comparable on identical
+hardware.
+
+**DuckDB's own S3-vs-local speedup is much smaller than KernelLake's**
+(computed from the same clean v4 DuckDB S3 numbers: Q1 164.7s, Q6 147.5s,
+Q12 207.7s, Q14 236.6s, Q19 250.0s): DuckDB's Q6 speedup going local is
+4.0x vs. KernelLake's 17.3x. This makes sense given the mechanism above --
+KernelLake's real GPU compute time for Q6 is so fast (9.5s) that S3 wait
+dominated its S3-cold number almost completely, while DuckDB's slower CPU
+compute (36.8s) was already a bigger fraction of its own S3-cold wall
+time, so removing S3 recovers proportionally less.
+
+**Why this matters beyond just "S3 is slow": it changes what "the DuckDB
+gap" actually means.** The earlier S3-bound v3/v4 result (DuckDB wins
+5/5) was measuring mostly network latency, not either engine's query
+execution quality -- a real result for that specific cold/no-cache/S3
+methodology, but not evidence about which engine computes faster. The
+local-NVMe result above is the first real, clean measurement of that
+question, and it says KernelLake's actual query execution beats DuckDB's
+on 2/5 tested queries and trails by only 10-17% on the other 3 -- a much
+smaller and more mixed gap than the S3-bound numbers implied.
+
+### Hardware notes gathered alongside this test
+
+**GPU instance (`g6.4xlarge`) real specs, confirmed not assumed:**
+AMD EPYC 7R13 (AWS's own custom Milan variant), 1 socket / 8 physical
+cores / 16 threads, ~3.6GHz observed, AVX2 (no AVX-512), single 600GB
+NVMe instance-store disk. Real `fio` sequential read (`iodepth=32`,
+`numjobs=4`, `ioengine=libaio`, `direct=1`, 1M blocks -- a naive
+`iodepth=1` single-job run badly undersells modern NVMe, real number
+needs queue depth): **1072 MiB/s (1124 MB/s)**.
+
+**Went looking for a same-price/same-spec CPU-only instance for a fair
+NVMe comparison, found real constraints along the way**: `r6in.4xlarge`
+(this project's existing CPU-engine instance type) has **no local
+instance store at all** (`InstanceStorageInfo: null`, confirmed via the
+EC2 API) -- it's EBS-only, not a fair "local NVMe" comparison target.
+`r5d.4xlarge` (closest price match, $1.152/hr) has real local NVMe but as
+**two** 279GB disks, not one 600GB disk like `g6.4xlarge` -- single-disk
+`fio` read there measured 548 MiB/s (574 MB/s), about half of the GPU
+instance's number, but understates what RAID-0'ing both disks would give.
+No CPU-only instance type in the whole current-generation catalog has an
+exact single 600GB disk -- confirmed by querying every instance type with
+`Disks[0].Count==1`, that specific size is GPU-family-specific (g6/g6e/
+g4ad only); closest single-disk CPU match is ~474-480GB
+(`m6id.2xlarge`/`r6id.2xlarge`/`i3.large`).
+
+**Found the real "g6.4xlarge minus the GPU" equivalent**: `m5ad.4xlarge`
+-- confirmed via `ProcessorInfo.Manufacturer` that `g6.4xlarge` is
+AMD-based (matches the `/proc/cpuinfo` EPYC 7R13 read above), and
+`m5ad.4xlarge` matches vCPU (16), RAM (64GB) exactly, same 600GB total
+NVMe capacity (though still 2x300GB disks, not 1x600GB), same AMD
+lineage, at $0.824/hr (62% of `g6.4xlarge`'s price -- roughly what the L4
+GPU itself costs on top). Not provisioned/tested this session -- a real
+candidate for a future fair CPU-vs-GPU comparison if one is needed again.
+
+**Ultimately used a simpler, confound-free design instead of any separate
+CPU instance**: ran DuckDB and PySpark directly on the GPU instance's own
+16 real vCPUs, reading the identical already-staged local NVMe data --
+eliminates the entire "is CPU-instance NVMe comparable to GPU-instance
+NVMe" question by construction (one physical disk, both engines). This is
+the three-way table above. The separate-CPU-instance research (previous
+two paragraphs) remains useful groundwork if a *dedicated*, unshared CPU
+benchmark host is ever wanted again, but wasn't necessary for this
+specific comparison.
+
+**Infra**: fully torn down via `teardown.sh` (no `--purge-data`) --
+confirmed via `describe-instances` (no running/stopped/pending instances)
+and via the expected `BucketNotEmpty` teardown error, confirming the S3
+bucket (real SF1000 data, 181.25GB/1586 objects) survived intact.
