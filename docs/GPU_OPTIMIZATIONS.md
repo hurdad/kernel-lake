@@ -465,6 +465,38 @@ datacenter GPU with more/dedicated decompression engines behaves
 differently, but that would need its own real measurement, not an
 assumption, before revisiting this.)
 
+**Re-verified for real on AWS `g6.4xlarge`'s NVIDIA L4 (2026-08-19), not
+just assumed to generalize.** The prototype's original source was never
+committed (scratch file) -- reconstructed from this section's own
+documented methodology, cross-checked locally first (reproduced the same
+qualitative degradation pattern on the dev box before trusting it), then
+the compiled binary + its shared-library dependencies (`libcudf.so`,
+`libnvcomp.so.5`, `librapids_logger.so`, `libcudart.so.12` -- copied
+directly rather than rebuilt on the instance, since the dev box's
+already-compiled artifacts run fine against the L4's newer driver via
+standard CUDA forward compatibility) were copied to a real `g6.4xlarge`
+and run against the same SF10 `lineitem` data. Real result, 2 clean reps
+after rep 0's expected cold-start noise:
+
+| N streams | rep 1 | rep 2 |
+|---|---|---|
+| 2 | -49.8% | -48.7% |
+| 4 | -59.6% | -52.1% |
+| 8 | -103.4% | -105.7% |
+| 16 | -193.7% | -191.3% |
+
+**Same monotonic degradation pattern holds on real datacenter hardware --
+if anything, more severe and more consistent than the dev box.** N=2 was
+noisy enough to straddle zero on the RTX 5060 Ti; on the L4 it's a clean,
+unambiguous ~49% regression in both reps. This closes off the "maybe
+it's a desktop/WSL2 artifact, a real datacenter GPU might behave
+differently" open question from above -- it doesn't. The shared
+decompression/copy-engine contention is real on production hardware too,
+not something a bigger/better GPU sidesteps on its own. Directly bears on
+the concurrency-mutex plan (see "Root cause is narrower..." section
+above): decode-heavy concurrent queries should be expected to hit this
+same contention, not just theorized to.
+
 ## Getting around decompression-bound decode (2026-08-17 discussion, not yet tested)
 
 Given decode is confirmed decompression-bound (above) and, separately, that
