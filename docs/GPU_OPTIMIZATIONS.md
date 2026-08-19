@@ -1487,3 +1487,135 @@ specific comparison.
 confirmed via `describe-instances` (no running/stopped/pending instances)
 and via the expected `BucketNotEmpty` teardown error, confirming the S3
 bucket (real SF1000 data, 181.25GB/1586 objects) survived intact.
+
+## CPU decode offload: real-scale investigation (2026-08-19)
+
+Motivated by the decode-bound finding above plus two facts already on
+record: CPU utilization sits near-idle during real cold scans (~8%, SF1000
+v3/v4), and Snappy (this project's default codec) is specifically designed
+to decompress fast on CPU, not just GPU. Investigated whether offloading
+some decode work to the otherwise-idle CPU cores could raise combined
+throughput, via a real `g6.4xlarge` (never assumed from the dev box).
+
+**Warm (page-cache-resident) comparison misleads badly.** Same SF10
+`lineitem` data, same 4 columns (`l_shipdate`, `l_quantity`,
+`l_extendedprice`, `l_discount`, Q6's shape): GPU decode 0.19-0.21s vs.
+`pyarrow` (Python) 0.46-0.48s -- GPU 2.3-2.5x faster. This number does
+**not** hold at real scale or under real cold conditions (see below) --
+it was measuring pure in-memory decompression throughput, not what
+actually matters for a real cold scan.
+
+**Real SF1000 cold-scale comparison, same instance, same data, 3 clean
+reps each (after rep-0 cold-start noise, same pattern as every other
+`--stats` cold measurement this project uses):**
+
+| | rep 1 | rep 2 | rep 3 |
+|---|---|---|---|
+| GPU (`cudf`, `kernellake benchmark tpch --mode cold`) | 53.406s | 53.415s | 53.404s |
+| CPU, `pyarrow` (Python, streamed via `iter_batches`) | 54.209s | 54.212s | 54.211s |
+| CPU, native `libarrow`/`libparquet` (C++, same streaming discipline) | 54.227s | 54.218s | 54.256s |
+
+**CPU is within ~1.5% of GPU at real scale -- essentially tied**, a world
+away from the warm test's 2.3-2.5x GPU win. Confirmed the mechanism, not
+just the number: native C++ (eliminating all Python-layer overhead) shows
+the *same* ~1.5% gap as `pyarrow`, so none of it was Python overhead --
+it's a small, genuine CPU-vs-GPU decode-speed difference specifically
+under real cold-disk conditions. The warm test's advantage for GPU
+disappears once disk I/O dominates wall time: when threads spend most of
+their time blocked in a `read()` syscall (which releases the GIL, and by
+extension hides most language-layer overhead behind the wait), the
+critical path becomes the NVMe device's own aggregate service time, not
+CPU-side bookkeeping -- same principle as this project's own
+decode/compute stream-overlap architecture (`ParquetScanOperator::prefetch_loop()`),
+just operating between disk I/O and CPU compute instead of GPU decode and
+GPU compute.
+
+**Real bug found and fixed along the way, worth keeping in mind for any
+future CPU-side prototyping**: `pyarrow.parquet.ParquetDataset(...).read()`
+materializes the *entire* result table in host RAM at once. A first
+attempt at the cold SF1000 test OOM-killed (`dmesg` confirmed:
+`anon-rss:62122300kB` on a 60GB-RAM `g6.4xlarge`) -- SF1000 `lineitem`'s
+~6B rows across 4 columns doesn't fit as a single materialized table.
+Fixed by streaming per-file via `ParquetFile.iter_batches()`, discarding
+each batch after counting -- the same bounded-memory discipline `cudf`'s
+own `chunked_parquet_reader` already uses (`has_next()`/`read_chunk()`
+passes, never the whole table at once). Any real hybrid-decode
+implementation needs this same discipline on the CPU side, not a naive
+whole-table read.
+
+### Concurrent GPU+CPU decode: real contention, not free parallelism
+
+Given CPU and GPU decode are now confirmed near-equal at real scale, the
+natural next question: does running them *concurrently* on independent
+subsets of data actually deliver combined throughput, or is there hidden
+contention (echoing opt #6's GPU-side finding above)? Split 1200 real
+`lineitem` files in half, decoded each half on GPU (`half-a`) and CPU
+(`half-b`) at the same time.
+
+**On real disk**: GPU half (600 files) -- 26.25s, essentially exactly
+proportional to solo (53.4s / 2 = 26.7s expected), no apparent slowdown.
+CPU half (600 files) -- 35.09s, vs. ~27s expected if scaling proportionally
+from solo -- a real ~30% slowdown. Asymmetric: GPU unaffected, CPU
+degrades.
+
+**Isolated whether NVMe bandwidth was the cause, per a real suggestion to
+test on a RAM disk instead of real disk** -- 35GB `tmpfs` mounted inside
+the already-bind-mounted `/cache` tree (real Docker lesson hit here too:
+a tmpfs mounted *after* a container starts does not propagate into that
+container's existing bind mount, even though the host-side path is
+identical -- confirmed via `/proc/mounts` inside the container still
+showing the underlying `ext4`, not the new `tmpfs`; fixed by
+`docker compose up -d --force-recreate` so the container's mount
+namespace re-resolves against current host mount state). With 200 files
+(100 each) copied as real bytes (not symlinks -- relative symlinks
+crossing a narrower bind-mount boundary was a second real bug hit and
+fixed along the way, resolved by mounting the shared parent directory
+instead of just the target subdirectory) into the ramdisk:
+
+| | Solo (ramdisk) | Concurrent (ramdisk) | Change |
+|---|---|---|---|
+| GPU | 0.862s | 0.870s | +0.9% |
+| CPU | 1.238s | 1.502s | **+21%** |
+
+**Contention persists even with disk I/O completely eliminated, same
+asymmetric shape.** This rules out NVMe bandwidth as the sole
+explanation -- there is no disk involved at all here. Root-caused via a
+fact already on record from the earlier cuFile/GDS investigation: this
+GPU is confirmed stuck in cuFile *compat mode* (`gdscheck`, both the dev
+box and real `g6.4xlarge` -- see "GPU concurrency mutex" section above),
+meaning GPU decode already routes through real host CPU threads for its
+bounce-buffer copy (`execution.max_io_threads`, default 4) -- "GPU
+decode" on this hardware was never purely GPU-side work to begin with.
+
+**Tested whether reducing that thread count recovers the lost CPU
+throughput -- it does not.** Built a custom `cufile.json`
+(`max_io_threads: 1`, bind-mounted into a recreated container) and
+re-ran the same ramdisk concurrent test:
+
+| `max_io_threads` | Solo CPU | Concurrent CPU | Slowdown |
+|---|---|---|---|
+| 4 (default) | 1.238s | 1.502s | +21% |
+| 1 | 1.193s | 1.432s | +20% |
+
+**Essentially identical degradation regardless of thread count** -- the
+hypothesis that this is thread/core-scheduling contention is wrong.
+Better explanation, consistent with what didn't change: **host memory
+bandwidth**, not thread count. GPU's compat-mode path moves real bytes
+through host RAM (the bounce-buffer copy) regardless of how many threads
+do it -- one thread saturating memory bandwidth contends with CPU
+decompression's own memory-bandwidth-heavy work (read compressed, write
+decompressed, all through RAM) just as much as four threads would. This
+is a physical resource constraint, not a tunable config value.
+
+**Practical implication for any future hybrid-decode work**: the
+achievable ceiling is not the naively-hoped-for ~2x from "two independent
+resources" -- it's bounded by shared host memory bandwidth, with CPU
+paying a real but bounded ~20-21% tax whenever it runs concurrently with
+GPU's own compat-mode I/O. Still very likely a net positive (CPU
+near-parity with GPU minus a ~20% tax under contention is still
+meaningfully better than GPU decode alone), but the design target should
+be that real number, not an idealized one -- and the memory-bandwidth
+constraint is not something a `max_io_threads`-style config knob can fix.
+
+**Infra**: torn down via `teardown.sh` (no `--purge-data`) after this
+investigation, S3 data confirmed to survive.
