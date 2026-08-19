@@ -1619,3 +1619,65 @@ constraint is not something a `max_io_threads`-style config knob can fix.
 
 **Infra**: torn down via `teardown.sh` (no `--purge-data`) after this
 investigation, S3 data confirmed to survive.
+
+### Decompression-only cost, isolated from disk I/O, confirmed at real scale (2026-08-19)
+
+Motivated by a real design question raised while evaluating a possible
+decoded-result cache (see below): how much of the ~54s real cold-scale
+decode number above is genuinely decompression *compute*, versus disk
+I/O wait? Answers this directly rather than inferring it from the
+CPU-vs-GPU convergence alone. Method: read every file's raw bytes into an
+in-memory `arrow::Buffer` first (untimed -- real disk I/O happens here,
+once), then time *only* the Parquet decode step running against
+`arrow::io::BufferReader` (in-memory, zero syscalls in the timed portion
+at all).
+
+**Real bug hit and fixed along the way, same class as the earlier
+`pyarrow.read()` OOM**: the first attempt read whole files (all ~16
+`lineitem` columns) into memory rather than just the 4 columns actually
+needed -- at real SF1000 scale that's the full ~169GB table, and the
+process was killed (`exit 137`) approaching the 60GB RAM ceiling before
+even reaching the timed phase. Fixed by testing against a 300-file
+subset (1/4 of the full 1200-file dataset, ~34GB of whole-file bytes --
+comfortably inside the RAM budget) and scaling the result, rather than
+building the more complex column-projected-byte-range version this
+session didn't have time for.
+
+**Real result**: 300 files, 1.5B rows, decode-only (in-memory) = **2.886s**.
+Scaled 4x for the full dataset: **~11.5s** decode-only, against the real
+full-dataset cold combined time of ~53.4-54.2s (GPU and CPU converged
+there, see above) -- **~21-22% decompression compute, ~78-79% disk I/O
+wait**. Closely matches a same-night SF10-based extrapolation (~24%/76%)
+made before this real-scale confirmation, validating that the linear
+scaling assumption held up -- this is now a measured number at real
+scale, not a projection.
+
+**Why this matters for a decoded-result cache design (discussed the same
+night, not yet built)**: a cache storing decoded results on *disk* would
+save at most that ~21-22% decompression-compute slice, while making I/O
+*worse* (decoded data is larger than compressed, by construction) -- very
+likely a net loss for repeated cold-disk reads, not a win. A cache
+storing decoded results in *host RAM* instead eliminates both the
+decompression compute *and* the disk I/O wait, targeting the ~79% that
+actually dominates real decode cost, not the ~21% sliver. This is a real,
+now evidence-backed reason to prefer a RAM-tier cache design over a
+disk-tier one for this specific workload, not just an architectural
+preference.
+
+A concrete candidate for such a cache, discussed but not built this
+session: `payload-manager` (a separate project,
+github.com/hurdad/payload-manager) -- its C++ client has explicit
+`TIER_RAM`/`TIER_GPU` allocation, tight native `arrow::Buffer` integration
+(`buffer->data()`/`mutable_data()` are literally `arrow::Buffer`'s own
+API), and lease-based concurrent-read safety. Real gaps found by reading
+its actual example code (not just documentation): no semantic-key lookup
+(payloads are server-generated UUIDs; KernelLake would need its own
+file+row-group+columns -> UUID index), no chunked/incremental write for a
+single large payload (cache at row-group/file granularity instead, which
+fits `cudf`'s own chunking discipline anyway), and automatic
+tier-eviction-under-pressure is claimed in the README but not confirmed
+in the examples reviewed. None of these are disqualifying, but worth
+confirming before committing engineering time.
+
+**Infra**: torn down via `teardown.sh` again after this follow-up test,
+S3 data confirmed to survive.
