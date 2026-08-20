@@ -1681,3 +1681,103 @@ confirming before committing engineering time.
 
 **Infra**: torn down via `teardown.sh` again after this follow-up test,
 S3 data confirmed to survive.
+
+## Real GDS via FSx for Lustre + EFA: tested for real, found a real kernel-level ceiling (2026-08-19/20)
+
+Follow-up to the compat-mode findings above. NVIDIA's own GDS docs state
+cloud environments generally run in compat mode, but call out one
+specific AWS-certified real-GDS path: Amazon FSx for Lustre with EFA
+(Elastic Fabric Adapter), not local instance-store NVMe at all -- a
+categorically different mechanism (RDMA over the network to a remote
+Lustre server, bypassing host memory on the client end) than the
+local-disk DMA path `g6.4xlarge`'s compat-mode result was about. Tested
+this directly rather than staying at the docs-reading stage.
+
+**Real setup, built manually via AWS CLI (not terraform -- kept
+exploratory)**: `aws_fsx_lustre_file_system`-equivalent via `aws fsx
+create-file-system`, `PERSISTENT_2` deployment, `EfaEnabled=true`,
+`ImportPath` linked to the real SF1000 S3 data; `g6.4xlarge`, our
+existing GPU class, is not EFA-capable (confirmed via the API --
+`EfaSupported: false`) -- `g6.8xlarge` (same L4, 32 vCPU, `$2.01/hr`) is
+the smallest EFA-capable option on this GPU class, launched with an
+explicit `InterfaceType: efa` network interface.
+
+**Real, load-bearing minimum-size constraint found**: EFA-enabled Lustre
+filesystems have a fixed minimum *aggregate throughput floor* (~4.7 GB/s,
+confirmed empirically -- AWS's own creation-time validation rejected
+1200 GiB with "minimum storage capacity ... is 19200" at
+`PerUnitStorageThroughput=250`, and rejected again at 4800 with
+`PerUnitStorageThroughput=1000` before finally accepting), independent of
+the general 1200 GiB minimum that applies to non-EFA filesystems. Real
+minimum for an EFA-enabled filesystem: **4800 GiB, ~4687.5 MB/s
+provisioned throughput** -- roughly $4.29/hr for FSx alone (storage +
+throughput), on top of `g6.8xlarge`'s $2.01/hr.
+
+**Real infra bugs found and fixed en route** (same pattern as every other
+live AWS session this project has run):
+- FSx creation failed with `InvalidNetworkSettings` until the security
+  group had an explicit *self-referencing, all-protocol* (not just TCP)
+  inbound *and* outbound rule -- the existing security group's broad
+  `0.0.0.0/0` egress wasn't sufficient; EFA specifically requires the
+  self-reference.
+- **Ubuntu 26.04 (this project's current AMI baseline) doesn't support
+  the Lustre client at all** -- AWS's own client-repo docs only list
+  16.04/18.04/20.04/22.04. Confirmed for real: `apt-get update` against a
+  freshly-added FSx-Lustre apt repo hung indefinitely for a codename
+  ("resolute") the repo doesn't carry packages for. Fixed by switching
+  this one test instance to the Ubuntu 22.04 Deep Learning AMI (published
+  2 days prior) -- the GDS question doesn't care which Ubuntu version,
+  only this one client-install step does.
+- Requesting `InterfaceType: efa` at launch only provisions the
+  *hardware* interface -- the EFA *software* stack (kernel driver,
+  libfabric, RDMA userspace bits) needs the separate
+  `aws-efa-installer` package, confirmed via a real
+  `fi_pingpong` test showing actual data transfer post-install.
+- No `/etc/cufile.json` exists by default on any instance tested this
+  project (same finding as the compat-mode investigation) -- cuFile has
+  no RDMA device configured to even attempt loading
+  `libcufile_rdma.so` against. Fixed by finding the real device name via
+  `ibv_devices` (`rdmap47s0` on this instance) and setting
+  `rdma_dev_addr_list` in a real `/etc/cufile.json` -- flipped
+  `--rdma devices` from "Not configured" to "Configured" (tried both the
+  raw device name and the interface's IP address, `10.90.1.78` -- same
+  result either way, ruling out a naming-format issue specifically).
+
+**Real, final result: a genuine kernel-level ceiling, not a config gap.**
+Even with RDMA devices "Configured", `gdscheck` still reported
+`--rdma_device_status: Up: 0 Down: 1` and `use_compat_mode: true`.
+`dmesg` gave the real, concrete root cause:
+```
+efa 0000:2f:00.0 rdmap47s0: Failed to process command REG_MR (opcode 7) err -22
+efa 0000:2f:00.0 rdmap47s0: Failed to register mr [-22]
+efa: Acquired peer memory using P2P
+```
+`err -22` is `EINVAL`. The sequence is telling: peer-memory *acquisition*
+of the GPU's pages succeeds (`Acquired peer memory using P2P`), but the
+actual hardware *memory-region registration* with the EFA NIC fails
+immediately after -- the same failure the EFA installer's own
+`fi_pingpong` smoke test had already flagged
+(`Failed to register CUDA buffer with the EFA device`). `ulimit -l` was
+confirmed `unlimited`, ruling out the classic locked-memory RDMA gotcha.
+
+**This is consistent with something under-weighted earlier**: AWS's own
+docs specifically validate GDS-over-FSx-for-Lustre-EFA for **P5, Trn1,
+and Hpc7a** -- not "any EFA-capable GPU instance." `g6.8xlarge` genuinely
+has EFA hardware (confirmed via the API), but L4 may not be validated for
+the GPU-memory-region-registration path this needs the way H100 (on
+`p5`) is. This reframes the earlier "EFA doesn't work with 4xlarge"
+observation -- it's not about instance size, it's that AWS's own
+supported list was the real constraint the whole time, and this session
+independently, empirically reproduced *why* (a real kernel-level REG_MR
+failure) rather than just citing the docs.
+
+**Not yet tested**: `p5.4xlarge` (H100, real EFA support, on AWS's
+validated list, $6.88/hr, fits the current 32 vCPU quota) -- the natural
+next test of this same hypothesis if it's ever revisited, now with a
+concrete, reproducible failure signature (`REG_MR err -22` in `dmesg`) to
+check against rather than a blank `use_compat_mode: true`.
+
+**Infra**: FSx filesystem and EFA-enabled EC2 instance both created via
+raw AWS CLI (deliberately not terraform, per explicit instruction, to
+keep this exploratory work out of the shared benchmark module) --
+torn down after this investigation.
