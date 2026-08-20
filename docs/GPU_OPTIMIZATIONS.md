@@ -1781,3 +1781,21 @@ check against rather than a blank `use_compat_mode: true`.
 raw AWS CLI (deliberately not terraform, per explicit instruction, to
 keep this exploratory work out of the shared benchmark module) --
 torn down after this investigation.
+
+**Attempted same night: re-test on `p5.4xlarge` (H100, on AWS's
+validated GDS list) -- inconclusive, blocked on real capacity, not a
+technical finding.** Real `InsufficientInstanceCapacity` errors across
+repeated attempts in both `us-east-1a` and `us-east-1b` over ~30+ minutes
+(a background retry loop alternating both AZs every 45s, ~18+ rounds,
+consistently failed) -- AWS's own error messages listed *different*
+"available" AZs on nearly every retry, suggesting genuinely volatile,
+fast-moving H100 demand region-wide rather than a stable per-AZ gap. Cut
+losses on 2 real FSx-filesystem create/delete cycles chasing AZs the
+error messages claimed had capacity, before switching to a
+launch-first/FSx-second retry strategy (still unsuccessful) -- worth
+remembering next time: check instance launch succeeds *before*
+committing to an FSx filesystem in that AZ, and expect `p5.4xlarge`
+specifically to need real patience or off-peak timing, not something to
+assume is readily available on-demand. Not a finding about GDS itself --
+whether H100 actually clears the `REG_MR` failure L4 hit is still
+genuinely open.
