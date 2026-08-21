@@ -147,6 +147,22 @@ document what was actually done and measured.
      Not worth taking on any of that complexity given the prototype's
      result.
 
+7. ~~Real GPUDirect Storage (GDS) instead of cuFile's compat-mode
+   bounce-buffer copy.~~ **Closed out 2026-08-21 -- not viable on any
+   instance type this project has tested or can realistically afford.**
+   Tested for real across three attempts (`g6.8xlarge`/L4,
+   `p5.4xlarge`/H100, `g7e.12xlarge`/RTX PRO 6000 Blackwell) -- see "Real
+   GDS via FSx for Lustre + EFA" and "GDS take 3" below for the full
+   investigation. Root cause found in AWS's own official client-setup
+   tooling (`configure-efa-fsx-lustre-client.py`), not guessed: the real,
+   authoritative supported-instance list is hardcoded as
+   `p5.48xlarge`/`p5e.48xlarge`/`p5en.48xlarge`/`p6-b200.48xlarge` only --
+   full 8-GPU sizes exclusively, contradicting both the smaller instances
+   tried and the G7e product page's GDS claim. Not revisiting without an
+   explicit decision to provision one of those four (all far more
+   expensive, and still gated on real EC2 capacity plus a currently-0
+   P-family on-demand vCPU quota).
+
 ## Profiling results (2026-08-08, local RTX 5060 Ti)
 
 Caveat on the first two tables below, called out already in
@@ -1799,3 +1815,206 @@ specifically to need real patience or off-peak timing, not something to
 assume is readily available on-demand. Not a finding about GDS itself --
 whether H100 actually clears the `REG_MR` failure L4 hit is still
 genuinely open.
+
+**Final capacity-chase result (2026-08-20): confirmed sustained,
+region-wide shortage across all three US regions that offer
+`p5.4xlarge`, not a transient blip.** Two more retry loops, run in
+parallel:
+
+- `us-east-1`, all 6 AZs (`1a`-`1f`), full EFA-enabled launch config
+  (the actual test config): 60 rounds x 6 AZs = 360 attempts total,
+  **zero successes**, every single one `InsufficientInstanceCapacity`.
+  This exhausted the retry budget completely -- a definitive result, not
+  an inconclusive one.
+- `us-east-2` + `us-west-2` (the only other two US regions offering
+  `p5.4xlarge`; checked via `describe-instance-type-offerings` across all
+  AWS regions -- it's also offered in `eu-west-2`, `ap-south-1`,
+  `ap-northeast-1`, `ap-southeast-2`, `sa-east-1`, not tested), all 7 AZs
+  combined, plain-launch capacity probe (no EFA, just checking raw
+  availability): stopped by user request at round 18/60, also zero
+  successes.
+
+Conclusion: as of 2026-08-20, `p5.4xlarge` (H100) capacity is
+genuinely scarce across all of `us-east-1`/`us-east-2`/`us-west-2`
+simultaneously, not just one region having a bad day. Whether H100
+clears the L4 `REG_MR err -22` failure remains untested and open --
+this was purely an availability problem, never reached the point of
+running the actual GDS test. If revisited, worth trying non-US regions
+(offered but unchecked) or an on-demand-capacity-reservation /
+EC2 Capacity Blocks approach instead of spot-checking `RunInstances`.
+
+Leftover AWS state from this chase (all empty/no cost beyond the
+control-plane resources themselves, not yet torn down): `us-east-1`
+VPC `vpc-0cefd9a0c17162a9c` (6 subnets, 1 security group, 1 IAM
+instance profile) from the original EFA-config attempt, plus new
+probe VPCs `vpc-04b0de8b7d171e6e9` (`us-east-2`, 3 subnets) and
+`vpc-05221f4b6e3df1737` (`us-west-2`, 4 subnets). No FSx filesystem
+or running EC2 instances exist from this round.
+
+**Round 2, same night: re-run in full, same result -- confirms this
+isn't a transient blip.** Both loops re-launched against the same
+existing infra (same VPCs/subnets/AMIs). `us-east-1`: full 60-round x
+6-AZ budget again, 360/360 attempts, zero successes. `us-east-2` +
+`us-west-2`: full 60-round x 7-AZ budget this time (round 1 was
+user-stopped early at round 18 previously), 420/420 attempts, zero
+successes. Two consecutive full-budget exhaustions across all three
+US regions offering `p5.4xlarge` now on record. Still untested: the 5
+non-US regions that also offer it (`eu-west-2`, `ap-south-1`,
+`ap-northeast-1`, `ap-southeast-2`, `sa-east-1`), and EC2 Capacity
+Blocks / On-Demand Capacity Reservations as an alternative to
+spot-checking `RunInstances`.
+
+## Real GDS via FSx for Lustre + EFA, take 2: `g7e.12xlarge` (RTX PRO 6000 Blackwell), different failure mode (2026-08-21)
+
+While `p5.4xlarge` stayed capacity-blocked, AWS's new `g7e` family
+(NVIDIA RTX PRO 6000 Blackwell Server Edition, launched ~2026-01)
+turned out to also support real GDS via FSx+EFA on its multi-GPU
+sizes -- confirmed via AWS's own product page, not guessed. Smallest
+capable size, `g7e.12xlarge` (2 GPU, 48 vCPU, 400 Gbps EFA,
+$8.29/hr), is offered in the same three regions
+(`us-east-1`/`us-east-2`/`us-west-2`) the `p5.4xlarge` chase already
+had infra in. Needed a G/VT vCPU quota bump first (48 > the
+then-current 32 cap) -- the pending request from the earlier
+`p5.4xlarge` capacity investigation (case `178718106100494`, desired
+64) turned out to already cover this once approved (closed
+2026-08-21, quota now 64).
+
+**Real capacity found on the first launch attempt** (`us-east-1b`,
+after `us-east-1a` rejected the instance type outright as
+region/AZ-unsupported, not a capacity error -- a different, cheaper
+failure mode than anything hit chasing `p5.4xlarge`). Real hardware
+confirmed: 2x RTX PRO 6000 Blackwell (97.9 GiB each), driver
+595.91.07, CUDA 13.2, Ubuntu 22.04.5 with **kernel 6.8** out of the
+box -- exactly meeting FSx Lustre's stated EFA/GDS kernel floor
+(22.04+/6.8+), unlike the `g6.8xlarge` test which needed an AMI swap
+to dodge a kernel-compat gap. Lustre client, EFA installer (clean
+`fi_pingpong: SUCCESS!`), and FSx creation (`fs-06467cd654a539d1c`,
+same `PERSISTENT_2`/`EfaEnabled=true`/4800 GiB config as before) all
+went smoothly -- no repeat of any of the 5 infra blockers from the
+`g6.8xlarge` test.
+
+**Result: still compat mode, but a genuinely different, better-
+characterized cause than the L4 test's kernel `REG_MR` failure.**
+No kernel-level RDMA registration error this time -- instead,
+`cufile.log` names the exact gap: `nvidia_peermem.ko is not loaded.
+Disabling UserSpace RDMA access.` cuFile's RDMA library
+(`libcufile_rdma.so`) hard-requires the legacy `nvidia_peermem`
+kernel module, which registers GPU memory via Mellanox OFED's
+`ib_peer_mem` symbols -- AWS's EFA driver stack ships its own
+`efa_nv_peermem` module instead and never exports those symbols, so
+`modprobe nvidia_peermem` fails with `EINVAL` even after unloading
+`efa_nv_peermem` to free the registration slot (confirmed against
+NVIDIA's own developer forums: this is a known, general
+Mellanox-OFED-symbol-missing failure mode, not something specific to
+this instance). Real GDS I/O against actual FSx-mounted SF1000
+`lineitem` data ran successfully via `gdsio`, just through the
+host-memory bounce buffer (~27-840 MB/s depending on transfer size,
+no crash) rather than true zero-copy RDMA.
+
+**Confirmed this isn't a stale-package issue**: upgraded GDS in place
+from the AMI's bundled 13.2 (`gdscheck` release `1.13.1.3`) to the
+latest available, 13.3.1 (`gdscheck` release `1.18.1.6`) -- identical
+`nvidia_peermem.ko is not loaded` result, byte-for-byte, on the newer
+version too. NVIDIA's own GDS troubleshooting guide only documents
+`nvidia_peermem` as required for WekaFS/IBM SpectrumScale, not
+Lustre, but empirically `libcufile_rdma.so` requires it universally
+regardless of backing filesystem.
+
+**Conclusion**: this is a real, version-independent architectural gap
+between AWS's EFA driver stack and cuFile's current RDMA
+implementation on general-purpose DLAMIs -- consistent with why
+NVIDIA/AWS's validated FSx+EFA+GDS list names only P5/Trn1/Hpc7a
+specifically (those combinations likely carry AWS-internal driver
+support this AMI doesn't have). Not something a GDS/cuFile version
+bump, a `cufile.json` tweak, or more debugging on this AMI is likely
+to fix -- would need either an AWS-provided GDS-validated AMI for
+P5/Trn1/Hpc7a (not tried -- the `g6.8xlarge`/`p5.4xlarge` attempts
+both used a general Ubuntu 22.04 DLAMI) or direct AWS/NVIDIA support
+engagement to go further. Instance and FSx torn down after this
+investigation.
+
+## GDS take 3: found AWS's real, authoritative supported-instance list -- neither `g7e.12xlarge` nor `p5.4xlarge` were ever eligible (2026-08-21)
+
+Went looking for why `g7e.12xlarge` still hit `nvidia_peermem.ko is not
+loaded` despite a clean setup, on the theory that the manual FSx-client
+configuration (raw `mount -t lustre ...@tcp:/...`) skipped a required
+step. It had: AWS's official client setup is a two-part process
+(`install-fsx-lustre-client.sh`, then
+`configure-efa-fsx-lustre-client.sh --optimized-for-gds`) documented at
+[Configuring EFA clients](https://docs.aws.amazon.com/fsx/latest/LustreGuide/configure-efa-clients.html)
+-- the second script's job is specifically to add the EFA interface to
+Lustre's LNet routing layer (`lnetctl net add --net efa --if <device>
+--peer-credits 32`). The manual mount used in both this session's GDS
+tests never did this -- Lustre traffic was routed over plain TCP the
+whole time, not EFA, on both the `g6.8xlarge` and first `g7e.12xlarge`
+attempts. (The doc also confirms Deep Learning AMIs -- what both tests
+used -- ship the Lustre client, EFA driver, and GDS driver
+pre-installed; verified true on the re-tested `g7e.12xlarge` instance,
+packages held at image-build time, matching kernel.)
+
+Re-ran the whole `g7e.12xlarge` + FSx setup from scratch (new instance
+`i-0f391da068ea50a5d`, new filesystem, `us-east-1d` after `us-east-1b`
+came back capacity-constrained this time) specifically to run the
+official `configure-efa-fsx-lustre-client.sh --optimized-for-gds`
+script this time instead of a manual mount.
+
+**Definitive result: AWS's own script hard-rejects `g7e.12xlarge`
+before doing anything else.** `RuntimeError: Error: Instance type
+g7e.12xlarge does not support Lustre GDS.` Not a driver gap, not a
+config issue -- reading the script's source
+(`bin/configure-efa-fsx-lustre-client.py`) shows the real,
+authoritative supported-instance list, hardcoded, independent of
+anything in FSx/EC2 marketing pages:
+
+```python
+GDS_SUPPORTED_INSTANNCES = [
+    "p5.48xlarge",
+    "p5e.48xlarge",
+    "p5en.48xlarge",
+    "p6-b200.48xlarge",
+]
+```
+
+This retroactively resolves several open threads from this
+investigation at once:
+
+- **`g7e.12xlarge` is genuinely, officially unsupported for GDS**,
+  contradicting the G7e product page's "multi-GPU G7e instances
+  support NVIDIA GPUDirect Storage with FSx for Lustre" claim. The
+  `nvidia_peermem.ko` gap found in the first `g7e.12xlarge` attempt was
+  real but moot -- this list rules it out before that would ever
+  matter.
+- **`p5.4xlarge` -- this whole session's original capacity-chase
+  target -- was never on the real list either.** Only the full 8-GPU
+  `p5.48xlarge` is validated, not the smaller `.4xlarge`/`.8xlarge`
+  sizes. Every AZ/region/spot retry loop earlier in this investigation
+  was chasing an instance size that would have failed this same
+  official check even if AWS capacity had appeared. The
+  `REG_MR err -22` kernel failure found on `g6.8xlarge`/L4 was real and
+  correctly diagnosed, but the broader lesson -- check the *official*
+  `GDS_SUPPORTED_INSTANNCES` list (or run the actual configure script
+  in `--configure-once` mode as a cheap eligibility check) before
+  provisioning any FSx/EFA infra for a candidate instance type -- would
+  have short-circuited both the `g6.8xlarge` and every `p5.4xlarge`
+  attempt immediately, at zero cost.
+- `p6-b300.48xlarge` is notably **not** on the list (only
+  `p6-b200.48xlarge` is), despite both carrying the Blackwell
+  Decompression Engine -- a separate, real constraint on that
+  unrelated investigation thread if it's ever revisited.
+- Trn1/Hpc7a (named in AWS's EFA-throughput announcement blog) don't
+  appear here either, consistent with them being non-GPU instances --
+  GDS doesn't apply to them at all, EFA's general throughput benefit is
+  a separate claim from GDS eligibility.
+
+**Bottom line for any future GDS attempt on this project**: the only
+real path forward is `p5.48xlarge` (8x H100, full-size) or
+`p6-b200.48xlarge` (8x B200) -- both fixed at 8 GPUs, both far more
+expensive than anything tried this session ($6.88/hr x-many for
+p5.48xlarge scaling, ~$113.93/hr territory for p6-b200 per the earlier
+Decompression Engine pricing check) and both would still need to clear
+real capacity *and* the P-family on-demand quota (currently 0, see the
+earlier quota-gap note) before even reaching the point of testing
+actual GDS behavior. Given the cost/complexity, this line of
+investigation is being closed out here rather than continued further
+without an explicit decision to spend at that level. Instance and FSx
+torn down after this test.

@@ -4046,6 +4046,37 @@ log` is the authoritative chronology if that ordering ever matters.
   either way, so this entry is left as an open, not-fully-explained
   historical incident rather than marked resolved.
 
+- **Multi-GPU scaling plan** -- prompted by the GDS investigation
+  (`docs/GPU_OPTIMIZATIONS.md`) landing on two real GDS-validated
+  instance types (`p5.48xlarge`, `p6-b200.48xlarge`) that are both
+  fixed 8-GPU boxes, raising the question of whether KernelLake should
+  do anything with GPUs 2-8 rather than leave them idle. Full plan
+  (not started, no code changes) in `docs/MULTI_GPU_SCALING.md`, three
+  tiers:
+  - *Tier 1, cheap*: concurrent queries across a node's GPUs (each
+    gets its own `RmmEnvironment`, `GpuExecutionCoordinator` picks a
+    free device per query instead of mutex-serializing onto device 0).
+    Mostly the already-scoped opt #2 mutex-removal work
+    (`GPU_OPTIMIZATIONS.md`) plus a device dimension -- a natural MVP
+    scope extension, not a reversal of anything declared below.
+  - *Tier 2, expensive*: one query's operators (join/aggregate)
+    partitioned across a node's GPUs via a new exchange operator,
+    building on `HashJoinOperator`'s existing hash-partition-and-spill
+    path as prior art. Falls outside today's single-GPU-per-query
+    execution model.
+  - *Tier 3, multi-node*: scale-out across instances -- needs a
+    coordinator/worker split `flight_sql_server.cpp` doesn't have
+    today, cross-node NCCL/UCX over EFA, and locality-aware scan
+    scheduling.
+  Tiers 2 and 3 are explicitly what "distributed execution,
+  multi-node/multi-GPU scheduling" in the non-goals section just below
+  already excludes from the MVP -- this plan exists as pre-work for if
+  that's ever revisited on its own merits, not a commitment to build
+  it now. Tier 1 doesn't carry that same exclusion (it's
+  single-node, single-query-per-GPU, no distributed anything) and is
+  the only one of the three worth prioritizing without a separate
+  scope decision first.
+
 ## Explicit non-goals for the MVP
 
 Distributed execution, multi-node/multi-GPU scheduling, a Kubernetes
