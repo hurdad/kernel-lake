@@ -27,11 +27,12 @@ TEST(RmmEnvironment, ConstructsWithNonAsyncPoolAllocator) {
   RmmEnvironment env(config);
 
   constexpr std::size_t kBytes = 1024 * 1024;  // 1 MiB
-  const MemoryUsage usage = env.track_query([&] {
-    rmm::device_buffer buffer(kBytes, rmm::cuda_stream_view{});
+  QueryMemoryTracker tracker = env.make_query_tracker();
+  {
+    rmm::device_buffer buffer(kBytes, rmm::cuda_stream_view{}, tracker.resource_ref());
     EXPECT_EQ(buffer.size(), kBytes);
-  });
-  EXPECT_GE(usage.peak_bytes, static_cast<std::int64_t>(kBytes));
+    EXPECT_GE(tracker.current_usage().peak_bytes, static_cast<std::int64_t>(kBytes));
+  }
 }
 
 TEST(RmmEnvironment, TracksBytesAllocatedDuringQuery) {
@@ -39,15 +40,15 @@ TEST(RmmEnvironment, TracksBytesAllocatedDuringQuery) {
   RmmEnvironment env(config);
 
   constexpr std::size_t kBytes = 1024 * 1024;  // 1 MiB
-  const MemoryUsage usage = env.track_query([&] {
-    rmm::device_buffer buffer(kBytes, rmm::cuda_stream_view{});
+  QueryMemoryTracker tracker = env.make_query_tracker();
+  {
+    rmm::device_buffer buffer(kBytes, rmm::cuda_stream_view{}, tracker.resource_ref());
     EXPECT_EQ(buffer.size(), kBytes);
-  });
-
-  EXPECT_GE(usage.peak_bytes, static_cast<std::int64_t>(kBytes));
-  // The buffer was freed before track_query returned, so current usage
-  // within that bracket should have dropped back towards zero.
-  EXPECT_LT(usage.current_bytes, static_cast<std::int64_t>(kBytes));
+    EXPECT_GE(tracker.current_usage().peak_bytes, static_cast<std::int64_t>(kBytes));
+  }
+  // The buffer was freed above (out of scope), so current usage now should
+  // have dropped back towards zero.
+  EXPECT_LT(tracker.current_usage().current_bytes, static_cast<std::int64_t>(kBytes));
 }
 
 TEST(RmmEnvironment, RespectsConfiguredQueryMemoryLimit) {
@@ -75,29 +76,38 @@ TEST(RmmEnvironment, QueryMemoryLimitBytesAccessorReflectsExplicitConfig) {
   EXPECT_EQ(env.query_memory_limit_bytes(), 12345u);
 }
 
-// Regression coverage for track_query()'s own doc comment: query() throwing
-// must still run pop_counters() (via the try/catch), or the push/pop stack
-// goes permanently unbalanced, corrupting peak/current byte accounting for
-// the rest of this RmmEnvironment's lifetime. Confirmed here by forcing a
-// throw with no real allocation at all (the stack-balance bug wouldn't
-// depend on whether real device memory was involved), then proving a
-// *subsequent* track_query() call still reports sane byte counts --
-// mirroring TracksBytesAllocatedDuringQuery's own assertions -- rather
-// than inheriting corrupted state from the failed call before it.
-TEST(RmmEnvironment, TrackQueryLeavesCountersBalancedAfterAnException) {
+// Regression coverage for make_query_tracker()'s own doc comment: unlike
+// the old track_query(std::function)'s shared push/pop counter stack (one
+// query throwing mid-flight could leave a *different*, later query's
+// accounting corrupted -- the exact bug class this design change exists to
+// rule out, see RmmEnvironment::make_query_tracker()'s own comment), each
+// QueryMemoryTracker is a genuinely separate object. Confirmed here: a
+// tracker whose associated work throws mid-flight has no way to affect a
+// second, independently-constructed tracker's own counters -- there is no
+// shared structure between them at all, not just careful exception
+// handling around a shared one.
+TEST(RmmEnvironment, AQueryTrackerThrowingDoesNotAffectAnotherTracker) {
   EngineConfig config = default_config();
   RmmEnvironment env(config);
 
-  EXPECT_THROW((void)(env.track_query([&] { throw std::runtime_error("simulated query failure"); })),
-               std::runtime_error);
+  {
+    QueryMemoryTracker failing_tracker = env.make_query_tracker();
+    EXPECT_THROW(
+        ([&] {
+          rmm::device_buffer buffer(1024, rmm::cuda_stream_view{}, failing_tracker.resource_ref());
+          throw std::runtime_error("simulated query failure");
+        })(),
+        std::runtime_error);
+  }
 
   constexpr std::size_t kBytes = 1024 * 1024;  // 1 MiB
-  const MemoryUsage usage = env.track_query([&] {
-    rmm::device_buffer buffer(kBytes, rmm::cuda_stream_view{});
+  QueryMemoryTracker tracker = env.make_query_tracker();
+  {
+    rmm::device_buffer buffer(kBytes, rmm::cuda_stream_view{}, tracker.resource_ref());
     EXPECT_EQ(buffer.size(), kBytes);
-  });
-  EXPECT_GE(usage.peak_bytes, static_cast<std::int64_t>(kBytes));
-  EXPECT_LT(usage.current_bytes, static_cast<std::int64_t>(kBytes));
+    EXPECT_GE(tracker.current_usage().peak_bytes, static_cast<std::int64_t>(kBytes));
+  }
+  EXPECT_LT(tracker.current_usage().current_bytes, static_cast<std::int64_t>(kBytes));
 }
 
 TEST(RmmEnvironment, QueryMemoryLimitBytesAccessorAutoDetectsWhenConfigIsZero) {

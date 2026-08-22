@@ -55,7 +55,7 @@ class SortOperator final : public PhysicalOperator {
     bool ascending = true;
   };
 
-  [[nodiscard]] CompiledKey compile_key(const LogicalSort::Key& key);
+  [[nodiscard]] CompiledKey compile_key(const LogicalSort::Key& key, ExecutionContext& context);
 
   OperatorId id_;
   std::unique_ptr<PhysicalOperator> child_;

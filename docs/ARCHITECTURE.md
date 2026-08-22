@@ -443,11 +443,19 @@ by
 `execute(const PhysicalPlanPtr&, RmmEnvironment&) -> QueryResult`, which
 takes an **externally owned** `RmmEnvironment` instead of building its own.
 A long-lived caller should construct exactly one `RmmEnvironment` at
-startup, reuse it across every request, and serialize calls to this split
-`execute()` through a single-flight queue (only the GPU-touching phase
-needs serializing; planning stays fully concurrent). `execute(sql)` itself
-is implemented in terms of this split pair -- it is not two independent
-code paths to keep in sync.
+startup and reuse it across every request. `GpuExecutionCoordinator`
+(`kernellake/server/`) is that caller for the Flight SQL server: it bounds
+concurrent calls to this split `execute()` via a semaphore
+(`EngineSection::max_concurrent_gpu_queries`, default 2) rather than the
+single-flight mutex this used to be -- see
+`docs/GPU_OPTIMIZATIONS.md`'s "Opt #2 implemented" section for why bounded
+rather than unbounded (real memory-budget oversubscription and GPU
+decode-contention risks, not just an arbitrary cap), and
+`RmmEnvironment::make_query_tracker()`/`QueryMemoryTracker`
+(`kernellake/memory/`) for how each concurrent call gets its own isolated
+memory-usage reporting layered over the same shared, thread-safe limiter.
+`execute(sql)` itself is implemented in terms of this split pair -- it is
+not two independent code paths to keep in sync.
 
 The split entry point cannot honestly populate
 `QueryResult::metadata_inspection_seconds` (planning already happened
@@ -1439,11 +1447,13 @@ and tears down its own `RmmEnvironment` per call -- a real
 use-after-free race under concurrent gRPC handler threads, per the
 Concurrency notes above); instead `GpuExecutionCoordinator`
 (`include/kernellake/server/gpu_execution_coordinator.hpp`) owns one
-`RmmEnvironment` for the server's whole lifetime and serializes GPU
-`execute()` calls behind a single mutex (single-flight -- sufficient given
-this project's existing "one query executes on the GPU at a time" MVP
-simplification; a real request queue is a reasonable future refinement).
-Split into `gpu_execution_coordinator_{gpu,stub}.cpp`, selected by
+`RmmEnvironment` for the server's whole lifetime and bounds concurrent GPU
+`execute()` calls via a `std::counting_semaphore` sized from
+`engine.max_concurrent_gpu_queries` (default 2) -- not single-flight
+anymore; see `docs/GPU_OPTIMIZATIONS.md`'s "Opt #2 implemented" section
+for the real-hardware throughput numbers and why a bounded semaphore was
+chosen over unconditional removal. Split into
+`gpu_execution_coordinator_{gpu,stub}.cpp`, selected by
 `KERNELLAKE_WITH_CUDA` exactly like `query_engine_execute_{gpu,stub}.cpp`,
 so `server-dev` (CPU-only) needs no CUDA/RMM at all; requesting `backend:
 gpu` against such a build fails fast at server startup with a

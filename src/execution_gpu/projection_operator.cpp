@@ -33,18 +33,19 @@ ProjectionOperator::ProjectionOperator(OperatorId id, std::unique_ptr<PhysicalOp
       items_(std::move(items)),
       output_schema_(build_output_schema(items_)) {}
 
-ProjectionOperator::CompiledValue ProjectionOperator::compile_value(const Expression& expr) {
+ProjectionOperator::CompiledValue ProjectionOperator::compile_value(const Expression& expr,
+                                                                    ExecutionContext& context) {
   if (const auto* column_ref = dynamic_cast<const ColumnExpression*>(&expr)) {
     return CompiledValue{static_cast<cudf::size_type>(column_ref->column_index()), nullptr, nullptr, nullptr,
                          nullptr};
   }
   if (const auto* literal = dynamic_cast<const LiteralExpression*>(&expr)) {
-    return CompiledValue{std::nullopt, literal_to_scalar(*literal), nullptr, nullptr, nullptr};
+    return CompiledValue{std::nullopt, literal_to_scalar(*literal, context), nullptr, nullptr, nullptr};
   }
   if (const auto* cast_expr = dynamic_cast<const CastExpression*>(&expr);
       cast_expr != nullptr && cast_expr->result_type().id == TypeId::Decimal) {
     auto decimal_cast = std::make_shared<CompiledDecimalCast>();
-    decimal_cast->operand = compile_value(*cast_expr->operand());
+    decimal_cast->operand = compile_value(*cast_expr->operand(), context);
     decimal_cast->target_type = cast_expr->result_type();
     CompiledValue value;
     value.decimal_cast = std::move(decimal_cast);
@@ -52,7 +53,7 @@ ProjectionOperator::CompiledValue ProjectionOperator::compile_value(const Expres
   }
   if (const auto* like_expr = dynamic_cast<const LikeExpression*>(&expr)) {
     auto compiled_like = std::make_shared<CompiledLike>();
-    compiled_like->value = compile_value(*like_expr->value());
+    compiled_like->value = compile_value(*like_expr->value(), context);
     compiled_like->pattern = like_expr->pattern();
     compiled_like->negated = like_expr->negated();
     CompiledValue value;
@@ -61,28 +62,29 @@ ProjectionOperator::CompiledValue ProjectionOperator::compile_value(const Expres
   }
   if (const auto* extract_expr = dynamic_cast<const ExtractExpression*>(&expr)) {
     auto compiled_extract = std::make_shared<CompiledExtract>();
-    compiled_extract->operand = compile_value(*extract_expr->operand());
+    compiled_extract->operand = compile_value(*extract_expr->operand(), context);
     compiled_extract->part = extract_expr->part();
     CompiledValue value;
     value.extract_expr = std::move(compiled_extract);
     return value;
   }
-  return CompiledValue{std::nullopt, nullptr, &compiler_.compile(expr), nullptr, nullptr, nullptr};
+  return CompiledValue{std::nullopt, nullptr, &compiler_.compile(expr, context), nullptr, nullptr, nullptr};
 }
 
-ProjectionOperator::CompiledItem ProjectionOperator::compile_item(const Expression& expr) {
+ProjectionOperator::CompiledItem ProjectionOperator::compile_item(const Expression& expr,
+                                                                  ExecutionContext& context) {
   const auto* case_expr = dynamic_cast<const CaseExpression*>(&expr);
-  if (case_expr == nullptr) return CompiledItem{compile_value(expr), nullptr};
+  if (case_expr == nullptr) return CompiledItem{compile_value(expr, context), nullptr};
 
   auto compiled_case = std::make_unique<CompiledCase>();
   compiled_case->result_type = case_expr->result_type();
   compiled_case->branches.reserve(case_expr->when_then().size());
   for (const CaseExpression::WhenThen& branch : case_expr->when_then()) {
     compiled_case->branches.push_back(
-        CompiledCaseBranch{compile_value(*branch.condition), compile_value(*branch.result)});
+        CompiledCaseBranch{compile_value(*branch.condition, context), compile_value(*branch.result, context)});
   }
   if (case_expr->else_branch() != nullptr) {
-    compiled_case->else_value = compile_value(*case_expr->else_branch());
+    compiled_case->else_value = compile_value(*case_expr->else_branch(), context);
   }
   return CompiledItem{CompiledValue{}, std::move(compiled_case)};
 }
@@ -90,7 +92,7 @@ ProjectionOperator::CompiledItem ProjectionOperator::compile_item(const Expressi
 void ProjectionOperator::open(ExecutionContext& context) {
   child_->open(context);
   compiled_items_.reserve(items_.size());
-  for (const NamedExpression& item : items_) compiled_items_.push_back(compile_item(*item.expr));
+  for (const NamedExpression& item : items_) compiled_items_.push_back(compile_item(*item.expr, context));
 }
 
 std::unique_ptr<cudf::column> ProjectionOperator::materialize_value(const CompiledValue& value,

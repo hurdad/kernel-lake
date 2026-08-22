@@ -5,7 +5,6 @@
 #include <rmm/mr/limiting_resource_adaptor.hpp>
 #include <rmm/mr/per_device_resource.hpp>
 #include <rmm/mr/pool_memory_resource.hpp>
-#include <rmm/mr/statistics_resource_adaptor.hpp>
 #include <spdlog/spdlog.h>
 
 #include "kernellake/common/errors.hpp"
@@ -60,15 +59,21 @@ std::uint64_t resolve_query_memory_limit_bytes(const EngineConfig& config) {
 struct RmmEnvironment::Impl {
   std::uint64_t query_memory_limit_bytes;
   cuda::mr::any_resource<cuda::mr::device_accessible> base_resource;
-  rmm::mr::statistics_resource_adaptor stats;
+  // SHARED across every concurrently in-flight query -- deliberately not
+  // one per query. This is the real, physical memory ceiling for the whole
+  // device; splitting it per-query would let N concurrent queries each
+  // think they have the *full* ceiling to themselves, collectively
+  // oversubscribing one real GPU's memory (query_engine_execute_gpu.cpp's
+  // pass_read_limit_bytes/build_side_budget_bytes are each sized as a
+  // fraction of this value for exactly one query's use). Already
+  // thread-safe (atomics-based, per RMM's own header) -- safe to share.
   rmm::mr::limiting_resource_adaptor limiter;
   // Outermost layer: every allocation actually issued through
   // set_current_device_resource() below passes through this first (and its
   // deallocations last) -- see TrackingMemoryResource's own doc comment for
   // why that position matters (it sees limiter rejections, not just genuine
   // CUDA OOM). Feeds GpuMemoryMetricsRegistry, a process-wide counter store
-  // independent of this Impl's own lifetime -- see that registry's comment
-  // on why `stats` above (scoped to this instance) isn't reused for that.
+  // independent of this Impl's own lifetime.
   TrackingMemoryResource tracking;
   cuda::mr::any_resource<cuda::mr::device_accessible> previous_resource;
 
@@ -76,8 +81,7 @@ struct RmmEnvironment::Impl {
        cuda::mr::any_resource<cuda::mr::device_accessible> previous)
       : query_memory_limit_bytes(resolve_query_memory_limit_bytes(config)),
         base_resource(std::move(base)),
-        stats(base_resource),
-        limiter(stats, query_memory_limit_bytes),
+        limiter(base_resource, query_memory_limit_bytes),
         tracking(cuda::mr::any_resource<cuda::mr::device_accessible>{limiter}, config.engine.device_id),
         previous_resource(std::move(previous)) {}
 };
@@ -107,8 +111,8 @@ RmmEnvironment::RmmEnvironment(const EngineConfig& config) {
   cuda::mr::any_resource<cuda::mr::device_accessible> base = build_base_resource(config.memory);
   // set_current_device_resource returns the *previous* resource so it can
   // be restored on destruction; construct our Impl in two steps since the
-  // limiter needs `stats`, which needs `base`, all before we know what the
-  // previous global resource was.
+  // limiter needs `base`, all before we know what the previous global
+  // resource was.
   RmmEnvironment::Impl* raw = new Impl(config, base, cuda::mr::any_resource<cuda::mr::device_accessible>{});
   impl_.reset(raw);
   impl_->previous_resource = rmm::mr::set_current_device_resource(impl_->tracking);
@@ -148,30 +152,13 @@ RmmEnvironment::~RmmEnvironment() {
   }
 }
 
-MemoryUsage RmmEnvironment::track_query(const std::function<void()>& query) {
-  impl_->stats.push_counters();
-  // query() throwing (e.g. the memory limiter's own OutOfMemoryError, or a
-  // GPU operator's own exception) must not skip pop_counters(): without
-  // this try/catch, the push/pop stack goes permanently unbalanced after
-  // the first failing query, corrupting peak/current byte accounting
-  // (current_usage()) for the rest of this RmmEnvironment's lifetime --
-  // exactly the kind of failure kernellake-server's own per-query
-  // exception handling (flight_sql_server.cpp) is designed to survive and
-  // keep serving after.
-  try {
-    query();
-  } catch (...) {
-    impl_->stats.pop_counters();
-    throw;
-  }
-  const auto [bytes, allocations] = impl_->stats.pop_counters();
-  (void)allocations;
-  return MemoryUsage{bytes.value, bytes.peak};
-}
-
-MemoryUsage RmmEnvironment::current_usage() const {
-  const rmm::mr::statistics_resource_adaptor::counter bytes = impl_->stats.get_bytes_counter();
-  return MemoryUsage{bytes.value, bytes.peak};
+QueryMemoryTracker RmmEnvironment::make_query_tracker() {
+  // Wraps the shared limiter, not base_resource directly -- every query's
+  // allocations must still count against the one real, shared device
+  // ceiling (see Impl::limiter's own comment), just reported through this
+  // call's own independent statistics_resource_adaptor instance rather
+  // than a stack shared with any other concurrently-running query.
+  return QueryMemoryTracker(cuda::mr::any_resource<cuda::mr::device_accessible>{impl_->limiter});
 }
 
 std::uint64_t RmmEnvironment::query_memory_limit_bytes() const {

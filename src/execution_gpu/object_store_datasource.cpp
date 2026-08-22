@@ -4,6 +4,7 @@
 #include <arrow/io/interfaces.h>
 #include <fmt/format.h>
 
+#include <cuda/memory_resource>
 #include <rmm/device_buffer.hpp>
 
 #include "kernellake/common/errors.hpp"
@@ -46,8 +47,9 @@ class DeviceBufferDatasourceBuffer final : public cudf::io::datasource::buffer {
 
 }  // namespace
 
-ObjectStoreDatasource::ObjectStoreDatasource(std::unique_ptr<RandomAccessObject> object)
-    : object_(std::move(object)) {}
+ObjectStoreDatasource::ObjectStoreDatasource(std::unique_ptr<RandomAccessObject> object,
+                                             rmm::device_async_resource_ref mr)
+    : object_(std::move(object)), mr_(mr) {}
 
 std::size_t ObjectStoreDatasource::size() const {
   return static_cast<std::size_t>(object_->size());
@@ -108,7 +110,18 @@ std::future<std::size_t> ObjectStoreDatasource::host_read_async(std::size_t offs
 
 std::unique_ptr<cudf::io::datasource::buffer> ObjectStoreDatasource::device_read(
     std::size_t offset, std::size_t size, rmm::cuda_stream_view stream) {
-  rmm::device_buffer buffer(size, stream);
+  // mr_ explicitly, not the (size, stream) overload's implicit default
+  // resource -- see this class's own constructor comment for why.
+  // device_buffer's mr parameter is a cuda::mr::any_resource (owning,
+  // type-erased), not a device_async_resource_ref (non-owning) like mr_
+  // itself -- wrapping mr_ in any_resource here type-erases a *copy of
+  // the reference* (cheap: a vtable pointer + object pointer, same as
+  // rmm_environment.cpp's own any_resource<...>{limiter} pattern, just
+  // wrapping a reference-to-a-resource here instead of a resource
+  // directly), not a copy of whatever it points to -- every allocate/
+  // deallocate call through it still reaches the real, single upstream
+  // resource mr_ was constructed from.
+  rmm::device_buffer buffer(size, stream, cuda::mr::any_resource<cuda::mr::device_accessible>{mr_});
   const std::size_t bytes_read = device_read(offset, size, static_cast<std::uint8_t*>(buffer.data()), stream);
   if (bytes_read != size) {
     // A short read (offset+size ran past the real object size -- callers do

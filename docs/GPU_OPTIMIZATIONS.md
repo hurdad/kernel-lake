@@ -59,13 +59,20 @@ document what was actually done and measured.
      resource than pool device memory -- over-allocating it hurts the whole
      system (host RAM pressure, page-lock limits), not just this process.
 
-2. **Drop the single-query mutex in `GpuExecutionCoordinator`.** The server
-   currently serializes on one query at a time, so multi-stream async
-   execution never gets to overlap across queries.
-   - Tradeoff: `RmmEnvironment` is one shared pool/stats/limiter for the
-     whole process. True concurrency needs either per-query sub-pools or a
-     thread-safe stream-ordered suballocator -- a real architecture change,
-     not a tweak.
+2. ~~Drop the single-query mutex in `GpuExecutionCoordinator`.~~ **Implemented
+   for real, 2026-08-21 -- see "Opt #2 implemented: bounded concurrent GPU
+   queries" below.** Real measured result on this dev box's GPU: 2
+   concurrent clients get 25% more throughput than 1 (25,806 -> 32,291
+   queries/hour), a genuine improvement over the old mutex's confirmed-flat
+   baseline (2026-08-17: identical throughput regardless of client count).
+   Deliberately bounded (a bounded semaphore, `max_concurrent_gpu_queries`,
+   not unconditional removal) rather than the originally-scoped unbounded
+   version -- see that section for why.
+   - Original tradeoff assumption (RmmEnvironment needing either per-query
+     sub-pools or a thread-safe suballocator) was half right: the pool/
+     limiter were already thread-safe (RMM's own documented guarantee,
+     confirmed from source); the real, narrower blocker was
+     `statistics_resource_adaptor`'s shared push/pop stack -- see below.
 
 3. **Overlap Parquet decode with compute across multiple streams** for
    multi-file/multi-fragment scans. Everything currently funnels through
@@ -818,6 +825,140 @@ by opportunity #4 (`pass_read_limit_bytes` retuning -- confirmed real
 below, don't shrink it below auto-sizing) or by the memory-pressure
 findings in the SF1000 Q3 OOM section above than by a decode-parallelism
 gap.
+
+## Opt #2 implemented: bounded concurrent GPU queries (2026-08-21)
+
+Follow-up to the 2026-08-17 investigation above -- implements the "revised
+next-session task" it ended on, plus one more real gap that investigation's
+own audit missed.
+
+**Design decision made before touching code: bounded, not unbounded
+concurrency.** The original opt #2 framing ("drop the mutex") implied
+unconditional removal. Two real risks argued against that: (1)
+`pass_read_limit_bytes`/`build_side_budget_bytes`
+(`query_engine_execute_gpu.cpp`) are each sized as a fraction of the
+*entire* device memory ceiling for one query -- N unbounded concurrent
+queries can collectively demand up to N times that against one real,
+shared GPU budget; (2) the opt #6 prototype (above) already found
+concurrent decode streams on this GPU degrade past ~N=2 (up to -190% at
+N=16) -- more concurrency isn't automatically more throughput here.
+Landed on a configurable semaphore (`EngineSection::max_concurrent_gpu_queries`,
+default 2) instead -- real concurrency, but capped.
+
+**Root cause re-verified directly against vendored RMM/cudf source before
+implementing** (not re-trusting the 2026-08-17 finding blind):
+`rmm::mr::statistics_resource_adaptor` maintains one shared,
+**non-thread-local** counter stack (confirmed from its own header:
+`read_lock_t`/`write_lock_t` protect *the* stack, singular) -- concurrent
+`push_counters()`/`pop_counters()` calls from different query threads
+would race and pop the wrong frame. `rmm::mr::limiting_resource_adaptor`
+(atomics-based) and `rmm::mr::pool_memory_resource`/`cuda_async_memory_resource`
+are both already documented thread-safe -- confirmed, not the blocker,
+exactly as 2026-08-17 found.
+
+**Fix: keep the memory *ceiling* global/shared, make only per-query
+*reporting* independent.** New `QueryMemoryTracker`
+(`kernellake/memory/query_memory_tracker.hpp`) is a small RAII type
+wrapping a **fresh** `statistics_resource_adaptor` per query, layered over
+`RmmEnvironment`'s existing, already-thread-safe `limiting_resource_adaptor`
+-- no shared stack, no push/pop, each query's counters are a genuinely
+separate object. `RmmEnvironment::make_query_tracker()` (replacing
+`track_query(std::function)`) hands one out per call. This was already a
+partially-scaffolded idea: `ExecutionContext::memory_tracker` existed as a
+forward-declared-but-never-defined `QueryMemoryTracker*` field before this
+change -- filled in for real, not new API surface.
+`GpuExecutionCoordinator`'s `std::mutex` became a `std::counting_semaphore`
+sized from the new config field, with a small local RAII guard (the
+standard library has no `std::lock_guard` equivalent for semaphores).
+
+**The 2026-08-17 audit's gap #1 (`ObjectStoreDatasource::device_read()`)
+fixed exactly as scoped**: threaded a `rmm::device_async_resource_ref`
+into its constructor (both real construction sites in
+`parquet_scan_operator.cpp` already had `context.memory_resource` in
+scope), passed explicitly into the one `rmm::device_buffer` allocation
+that was missing it.
+
+**Gap #2 (literal-scalar construction) turned out less structural than
+2026-08-17 assessed.** That investigation's own audit said 3 of 4
+`literal_to_scalar()` call sites "run at plan-compile time, with no
+`ExecutionContext` in scope at all -- not a missed pass-through, the
+plumbing to carry a resource/stream there doesn't exist yet." Re-checked
+directly this session: all three (`ProjectionOperator::compile_value()`,
+`HashAggregateOperator::compile_expr()`, `ScalarAggregateOperator::compile_expr()`)
+are in fact called from each operator's own `open(ExecutionContext&
+context)` -- `context` *was* in scope one level up the whole time. The
+real gap was narrower than described: `compile_value()`/`compile_expr()`'s
+own signatures (and their private recursive CASE/CAST/LIKE/EXTRACT
+helpers) just didn't thread it through. Fixed by adding `ExecutionContext&
+context` to `literal_to_scalar()`, `make_decimal_scalar()`, and every one
+of these functions' signatures, passing `context.stream`/
+`context.memory_resource` into every `cudf::scalar` constructor call
+(confirmed from vendored `cudf/scalar/scalar.hpp`: every one --
+`numeric_scalar`, `string_scalar`, `timestamp_scalar`, `fixed_point_scalar`
+-- defaults both when not passed).
+
+**A third, real gap the 2026-08-17 audit missed entirely, found while
+fixing the above**: `ExpressionCompiler::make_literal()`
+(`expression_compiler.cpp`) is a *second*, independent literal-scalar
+construction path -- used by `FilterOperator`/`SortOperator`/
+`HashAggregateOperator`/`ScalarAggregateOperator`/`ProjectionOperator` for
+`cudf::ast::literal` nodes, entirely separate from `cudf_adapter.cpp`'s
+`literal_to_scalar()`. Same bug: every scalar constructor call in its
+13-case type-dispatch switch omitted `stream`/`mr`. The audit's "16 files
+in `execution_gpu/`... two real, concrete gaps found" undercounted by one
+-- `ExpressionCompiler::compile()` and its 6 private
+`compile_column`/`compile_literal`/`compile_binary`/`compile_unary`/
+`compile_between`/`compile_cast` helpers all needed the same
+`ExecutionContext&` threading, plus updating all 5 operators' own call
+sites (`SortOperator::compile_key()` needed the identical treatment, one
+level up again).
+
+**The 2026-08-17 "open question" (does `cudf::get_default_stream()`
+resolve to the legacy/null stream, a potential cross-query serialization
+hazard) is now moot rather than answered.** Every call site that used to
+rely on that default (all of the above) now passes `context.stream`
+explicitly -- there's no code path left in `execution_gpu/` that still
+depends on what the default resolves to. Not resolved as a general cudf
+fact, just eliminated as a concern for this codebase specifically.
+
+**Verification**: full build + test suite (145/145 GPU tests, 772/772
+relevant unit tests -- 1 pre-existing, unrelated OTel-log-bridge test
+ordering flake, confirmed via `git diff` showing zero changes to that
+file and the test passing cleanly in isolation) all pass. New regression
+test, `GpuExecutionCoordinatorConcurrencyTest.ConcurrentQueriesDoNotMixResultsOrMemoryAccountingAcrossThreads`
+(`tests/unit/gpu_execution_coordinator_test.cpp`, `KERNELLAKE_WITH_CUDA`-gated):
+4 real concurrent threads (2x the configured `max_concurrent_gpu_queries=2`,
+forcing real semaphore queueing) against a real local `GpuExecutionCoordinator`
+and real GPU, half filtering `region='A'` (expected SUM 35.0) and half
+`region='B'` (expected SUM 110.0) -- confirms zero cross-thread result
+mixing and every result's `peak_gpu_memory_bytes` independently sane, the
+exact bug class the old shared push/pop stack was vulnerable to.
+
+**Real-hardware throughput confirmed, not just unit-test correctness**:
+local `kernellake-server` + real SF10 data + real gRPC Flight SQL clients
+on this dev box's GPU (`build/gpu-dev-wsl`), TPC-H Q6, 20s per run:
+
+| Concurrent clients | Queries completed | Queries/hour | Median latency |
+|---|---|---|---|
+| 1 | 144 | 25,806 | 0.136s |
+| 2 | 180 | 32,291 (**+25%**) | 0.219s |
+| 4 | 182 | 32,158 (flat) | 0.440s |
+
+Real, positive throughput gain at `N=2` -- a genuine improvement over the
+old mutex's confirmed-flat baseline (2026-08-17: 288 vs. 289 queries/hour,
+1 vs. 4 clients, effectively zero gain). `N=4` correctly plateaus rather
+than climbing further (`max_concurrent_gpu_queries=2` doing its job -- the
+extra two threads queue on the semaphore, showing up as roughly doubled
+median latency rather than more completed queries), confirming the bound
+is real and working as designed, not just present in config. The
+sub-2x gain at `N=2` (not a naive-hoped linear 2x) is consistent with opt
+#6's own finding that concurrent GPU decode work contends for shared
+decompression/copy-engine capacity -- exactly the risk that motivated
+choosing a conservative bounded default over assuming free linear
+scaling. Whether a larger `max_concurrent_gpu_queries` value nets out
+better or worse on this hardware wasn't tested this session -- worth a
+follow-up sweep (3, 4, 8) if concurrent-query throughput becomes a live
+tuning question.
 
 ## Follow-up: GPU memory growing across benchmark runs
 

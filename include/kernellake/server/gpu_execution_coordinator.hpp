@@ -37,8 +37,13 @@ class GpuExecutionCoordinator {
   GpuExecutionCoordinator(const GpuExecutionCoordinator&) = delete;
   GpuExecutionCoordinator& operator=(const GpuExecutionCoordinator&) = delete;
 
-  // Serializes concurrent calls (single-flight over one shared
-  // RmmEnvironment) -- see the class comment above.
+  // Runs concurrent calls against the one shared RmmEnvironment, bounded
+  // to at most EngineSection::max_concurrent_gpu_queries at a time (a
+  // semaphore, not the single-flight mutex this used to be -- see that
+  // config field's own comment for why bounded rather than unbounded, and
+  // RmmEnvironment::make_query_tracker() for how per-query GPU memory
+  // reporting stays correctly isolated once more than one call can be
+  // in-flight here at once).
   [[nodiscard]] QueryResult execute(const QueryEngine& engine, const PhysicalPlanPtr& physical);
 
  private:

@@ -193,7 +193,7 @@ class HashAggregateOperator final : public PhysicalOperator {
 
   [[nodiscard]] static std::unique_ptr<cudf::groupby_aggregation> make_physical_aggregation(
       PhysicalAggKind kind);
-  [[nodiscard]] CompiledExpr compile_expr(const Expression& expr);
+  [[nodiscard]] CompiledExpr compile_expr(const Expression& expr, ExecutionContext& context);
   [[nodiscard]] std::unique_ptr<cudf::column> materialize(const CompiledExpr& compiled,
                                                           const DeviceBatch& batch,
                                                           ExecutionContext& context);

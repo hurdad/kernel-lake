@@ -7,6 +7,7 @@
 
 #include <memory>
 
+#include "kernellake/execution_gpu/execution_context.hpp"
 #include "kernellake/expression/expression.hpp"
 #include "kernellake/types/schema.hpp"
 
@@ -39,19 +40,30 @@ namespace kernellake {
 // through the AST path at all, even though a string literal is perfectly
 // valid as an intermediate AST node (e.g. one side of `region = 'A'`). See
 // docs/ARCHITECTURE.md.
-[[nodiscard]] std::unique_ptr<cudf::scalar> literal_to_scalar(const LiteralExpression& expr);
+//
+// `context` is threaded through to every cudf::scalar constructor call
+// (context.stream/context.memory_resource) rather than letting them fall
+// back to their own defaults (cudf::get_default_stream()/
+// cudf::get_current_device_resource_ref()) -- those defaults mean "the
+// process-wide ambient stream/resource," not "this query's own," which
+// only happened to be harmless while KernelLake only ever ran one query at
+// a time (see GpuExecutionCoordinator's own comment on why that's no
+// longer true).
+[[nodiscard]] std::unique_ptr<cudf::scalar> literal_to_scalar(const LiteralExpression& expr,
+                                                               ExecutionContext& context);
 
 // Builds a cudf::fixed_point_scalar<decimal32/64/128> (width chosen by
 // `type.precision`) from a literal's underlying double/int64 value, shifted
-// to `type.scale` digits after the decimal point. Shared by
-// literal_to_scalar() (materializing a DECIMAL literal directly) and
-// expression_compiler.cpp's make_literal() (wrapping one in a
-// cudf::ast::literal node) -- both need the exact same raw-value/scale
-// construction. The literal's value only ever has double precision to begin
-// with (see LiteralStorage), so this cannot represent more significant
-// digits than a double can; a documented limitation, not a bug.
+// to `type.scale` digits after the decimal point. Used by
+// literal_to_scalar() (materializing a DECIMAL literal directly) for the
+// exact raw-value/scale construction a DECIMAL literal needs. The literal's
+// value only ever has double precision to begin with (see LiteralStorage),
+// so this cannot represent more significant digits than a double can; a
+// documented limitation, not a bug. Same `context` rationale as
+// literal_to_scalar() above.
 [[nodiscard]] std::unique_ptr<cudf::scalar> make_decimal_scalar(const DataType& type,
-                                                                const LiteralStorage& value, bool is_valid);
+                                                                const LiteralStorage& value, bool is_valid,
+                                                                ExecutionContext& context);
 
 // The raw (already-shifted) integer representation and cudf type_id
 // (DECIMAL32/64/128) make_decimal_scalar() would build a scalar from --

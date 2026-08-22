@@ -121,7 +121,7 @@ class ScalarAggregateOperator final : public PhysicalOperator {
     std::int64_t running_count = 0;
   };
 
-  [[nodiscard]] CompiledExpr compile_expr(const Expression& expr);
+  [[nodiscard]] CompiledExpr compile_expr(const Expression& expr, ExecutionContext& context);
   [[nodiscard]] std::unique_ptr<cudf::column> materialize(const CompiledExpr& compiled,
                                                           const DeviceBatch& batch,
                                                           ExecutionContext& context);

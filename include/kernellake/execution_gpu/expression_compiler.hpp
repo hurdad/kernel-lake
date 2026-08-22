@@ -6,6 +6,7 @@
 #include <memory>
 #include <vector>
 
+#include "kernellake/execution_gpu/execution_context.hpp"
 #include "kernellake/expression/expression.hpp"
 
 namespace kernellake {
@@ -31,17 +32,24 @@ namespace kernellake {
 // miscompiling.
 class ExpressionCompiler {
  public:
-  [[nodiscard]] const cudf::ast::expression& compile(const Expression& expr);
+  // `context` is threaded down to every literal-scalar construction
+  // (make_literal() and its callers below) so those cudf::scalar
+  // allocations use this query's own stream/memory_resource rather than
+  // cudf's process-wide ambient defaults -- see cudf_adapter.hpp's
+  // literal_to_scalar() for the same rationale, which applies identically
+  // here.
+  [[nodiscard]] const cudf::ast::expression& compile(const Expression& expr, ExecutionContext& context);
 
  private:
   const cudf::ast::expression& compile_column(const ColumnExpression& expr);
-  const cudf::ast::expression& compile_literal(const LiteralExpression& expr);
-  const cudf::ast::expression& compile_binary(const BinaryExpression& expr);
-  const cudf::ast::expression& compile_unary(const UnaryExpression& expr);
-  const cudf::ast::expression& compile_between(const BetweenExpression& expr);
-  const cudf::ast::expression& compile_cast(const CastExpression& expr);
+  const cudf::ast::expression& compile_literal(const LiteralExpression& expr, ExecutionContext& context);
+  const cudf::ast::expression& compile_binary(const BinaryExpression& expr, ExecutionContext& context);
+  const cudf::ast::expression& compile_unary(const UnaryExpression& expr, ExecutionContext& context);
+  const cudf::ast::expression& compile_between(const BetweenExpression& expr, ExecutionContext& context);
+  const cudf::ast::expression& compile_cast(const CastExpression& expr, ExecutionContext& context);
 
-  const cudf::ast::expression& make_literal(const DataType& type, const LiteralStorage& value, bool is_valid);
+  const cudf::ast::expression& make_literal(const DataType& type, const LiteralStorage& value, bool is_valid,
+                                            ExecutionContext& context);
 
   cudf::ast::tree tree_;
   std::vector<std::unique_ptr<cudf::scalar>> scalars_;

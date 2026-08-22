@@ -2,10 +2,10 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <functional>
 #include <memory>
 
 #include "kernellake/common/config.hpp"
+#include "kernellake/memory/query_memory_tracker.hpp"
 
 namespace kernellake {
 
@@ -30,14 +30,6 @@ namespace kernellake {
 // disagree whenever auto-detection is in effect.
 [[nodiscard]] std::uint64_t resolve_query_memory_limit_bytes(const EngineConfig& config);
 
-// Query-scoped GPU memory usage: current and peak bytes allocated through
-// the tracked resource since the tracker was created (see
-// RmmEnvironment::track_query()).
-struct MemoryUsage {
-  std::int64_t current_bytes = 0;
-  std::int64_t peak_bytes = 0;
-};
-
 // Owns KernelLake's RMM device memory resource stack for the process, built
 // from EngineConfig's memory/engine sections, and installs it as the
 // current CUDA device's default resource for the lifetime of this object
@@ -48,19 +40,21 @@ struct MemoryUsage {
 // GpuMemoryMetricsRegistry -- see kernellake/memory/gpu_memory_metrics.hpp;
 // deliberately outermost so it also sees limiter rejections, not just
 // genuine CUDA OOM) -> limiting_resource_adaptor
-// (engine.query_memory_limit_bytes) -> statistics_resource_adaptor
-// (current/peak/allocation tracking *scoped to this instance* -- see
-// track_query()/current_usage(); a separate concern from
-// GpuMemoryMetricsRegistry's process-wide counters, which survive this
-// instance's own destruction) -> either cuda_async_memory_resource
-// (memory.use_async_allocator: true) or pool_memory_resource over
-// cuda_memory_resource, sized by memory.pool_initial_bytes/pool_max_bytes.
+// (engine.query_memory_limit_bytes, SHARED across every concurrently
+// in-flight query -- see make_query_tracker() below for why the ceiling
+// itself stays global while only reporting is per-query) -> either
+// cuda_async_memory_resource (memory.use_async_allocator: true) or
+// pool_memory_resource over cuda_memory_resource, sized by
+// memory.pool_initial_bytes/pool_max_bytes. Every layer here is already
+// documented thread-safe by RMM itself (limiting_resource_adaptor: atomics;
+// pool_memory_resource/cuda_async_memory_resource: safe for concurrent
+// allocate/deallocate by design) -- see make_query_tracker()'s own comment
+// for the one layer that wasn't safe to share (per-query statistics) and
+// how that's handled instead.
 //
 // Avoids global mutable execution state beyond what CUDA/RMM themselves
 // require (a single current-device-resource slot per process) -- see
-// docs/ARCHITECTURE.md's "Concurrency" notes for why a single shared
-// statistics/limiting stack is an acceptable MVP simplification given
-// KernelLake executes one query at a time.
+// docs/ARCHITECTURE.md's "Concurrency" notes.
 class RmmEnvironment {
  public:
   explicit RmmEnvironment(const EngineConfig& config);
@@ -69,13 +63,18 @@ class RmmEnvironment {
   RmmEnvironment(const RmmEnvironment&) = delete;
   RmmEnvironment& operator=(const RmmEnvironment&) = delete;
 
-  // Pushes a fresh set of statistics counters, runs `query`, pops them, and
-  // returns the usage attributable to just that call -- this is how
-  // per-query current/peak GPU memory (QueryResult::peak_gpu_memory_bytes)
-  // is measured without needing a separate resource per query.
-  MemoryUsage track_query(const std::function<void()>& query);
-
-  [[nodiscard]] MemoryUsage current_usage() const;
+  // Returns a fresh, independent QueryMemoryTracker for one query, wrapping
+  // this instance's shared limiting_resource_adaptor as upstream -- safe to
+  // call concurrently from multiple threads (each call constructs its own
+  // statistics_resource_adaptor instance; nothing here is shared between
+  // them beyond the already-thread-safe limiter/pool underneath). Replaces
+  // the old track_query(std::function)/current_usage() pair, which pushed/
+  // popped a *single shared* statistics_resource_adaptor stack -- safe for
+  // one query at a time, but not for concurrent callers: RMM's own stack is
+  // one structure, not thread-local, so two threads' push/pop calls could
+  // race and pop each other's frame. A fresh instance per query sidesteps
+  // that class of bug entirely rather than trying to synchronize around it.
+  [[nodiscard]] QueryMemoryTracker make_query_tracker();
 
   // The byte count actually enforced by this instance's
   // limiting_resource_adaptor -- resolved once, at construction, via

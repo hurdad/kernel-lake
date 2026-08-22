@@ -43,6 +43,23 @@ struct EngineSection {
   // a code change + rebuild; making it config-driven means the next scale
   // bump is a YAML edit + restart instead.
   std::uint64_t max_distinct_keys = 0;
+  // Caps how many queries GpuExecutionCoordinator (kernellake/server) lets
+  // run concurrently against the shared GPU -- deliberately bounded, not
+  // unbounded, even though the underlying RMM allocator/limiter are both
+  // already thread-safe and could technically support any number at once.
+  // Two real, previously-measured risks make an unbounded value unsafe to
+  // default to: (1) pass_read_limit_bytes/build_side_budget_bytes
+  // (query_engine_execute_gpu.cpp) are each sized as a fraction of the
+  // *entire* device memory ceiling for a single query -- N concurrent
+  // queries can therefore collectively demand up to N times that against
+  // one real, shared GPU budget, a genuine oversubscription risk with no
+  // guard today. (2) the opt #6 parallel-decode prototype
+  // (docs/GPU_OPTIMIZATIONS.md) found concurrent decode streams on one GPU
+  // degrade past ~N=2 (up to -190% at N=16) -- more concurrency is not
+  // automatically more throughput on this hardware. 2 is a conservative
+  // starting point pending a real scaling_test.py re-run to tune it
+  // per-deployment, not a value assumed to be optimal everywhere.
+  int max_concurrent_gpu_queries = 2;
 };
 
 struct MemorySection {

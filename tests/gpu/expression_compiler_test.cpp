@@ -5,10 +5,25 @@
 #include <cudf/scalar/scalar_factories.hpp>
 #include <cudf/transform.hpp>
 
+#include "kernellake/execution_gpu/cuda_utils.hpp"
 #include "kernellake/execution_gpu/expression_compiler.hpp"
+#include "kernellake/memory/rmm_environment.hpp"
 
 namespace kernellake {
 namespace {
+
+// Minimal real ExecutionContext for ExpressionCompiler::compile()'s
+// stream/mr threading -- these tests evaluate against real GPU columns but
+// don't need a full operator tree, just a valid stream/memory_resource
+// pair. See cudf_adapter_test.cpp's identical helper for the same
+// rationale.
+struct TestContext {
+  EngineConfig config = default_config();
+  RmmEnvironment env{config};
+  CudaStream stream;
+  QueryMemoryTracker tracker = env.make_query_tracker();
+  ExecutionContext context{"test-query", 0, stream.get(), tracker.resource_ref(), nullptr, nullptr, &tracker};
+};
 
 template <typename T>
 std::vector<T> copy_to_host(const cudf::column_view& view) {
@@ -47,8 +62,9 @@ TEST(ExpressionCompiler, ComparisonProducesCorrectBooleanColumn) {
   auto three = std::make_shared<LiteralExpression>(LiteralExpression::make_int64(3));
   BinaryExpression greater(BinaryOperator::Greater, a_as_int64, three, boolean_type(false));
 
+  TestContext ctx;
   ExpressionCompiler compiler;
-  const cudf::ast::expression& compiled = compiler.compile(greater);
+  const cudf::ast::expression& compiled = compiler.compile(greater, ctx.context);
   std::unique_ptr<cudf::column> result = cudf::compute_column(table.view(), compiled);
 
   ASSERT_EQ(result->type().id(), cudf::type_id::BOOL8);
@@ -85,8 +101,10 @@ TEST(ExpressionCompiler, CompilesTpchQ6FilterShapeAndArithmetic) {
 
   BinaryExpression predicate(BinaryOperator::And, between, quantity_cmp, boolean_type(false));
 
+  TestContext ctx;
   ExpressionCompiler filter_compiler;
-  std::unique_ptr<cudf::column> mask = cudf::compute_column(table.view(), filter_compiler.compile(predicate));
+  std::unique_ptr<cudf::column> mask =
+      cudf::compute_column(table.view(), filter_compiler.compile(predicate, ctx.context));
   EXPECT_EQ(mask->type().id(), cudf::type_id::BOOL8);
   EXPECT_EQ(mask->size(), 10);
 
@@ -95,7 +113,7 @@ TEST(ExpressionCompiler, CompilesTpchQ6FilterShapeAndArithmetic) {
 
   ExpressionCompiler projection_compiler;
   std::unique_ptr<cudf::column> revenue =
-      cudf::compute_column(table.view(), projection_compiler.compile(revenue_expr));
+      cudf::compute_column(table.view(), projection_compiler.compile(revenue_expr, ctx.context));
   ASSERT_EQ(revenue->type().id(), cudf::type_id::FLOAT64);
 
   cudaDeviceSynchronize();
@@ -123,8 +141,10 @@ TEST(ExpressionCompiler, CastingNegativeInt64ToUInt64SilentlyWrapsAround) {
   auto col = std::make_shared<ColumnExpression>("signed_col", 0, int64_type(false));
   auto cast_expr = std::make_shared<CastExpression>(col, uint64_type(false));
 
+  TestContext ctx;
   ExpressionCompiler compiler;
-  std::unique_ptr<cudf::column> result = cudf::compute_column(table.view(), compiler.compile(*cast_expr));
+  std::unique_ptr<cudf::column> result =
+      cudf::compute_column(table.view(), compiler.compile(*cast_expr, ctx.context));
   ASSERT_EQ(result->type().id(), cudf::type_id::UINT64);
 
   cudaDeviceSynchronize();
@@ -151,8 +171,10 @@ TEST(ExpressionCompiler, UnaryNegateOnUnsignedColumnSilentlyWrapsAround) {
   auto col = std::make_shared<ColumnExpression>("u", 0, uint32_type(false));
   auto negate_expr = std::make_shared<UnaryExpression>(UnaryOperator::Negate, col, uint32_type(false));
 
+  TestContext ctx;
   ExpressionCompiler compiler;
-  std::unique_ptr<cudf::column> result = cudf::compute_column(table.view(), compiler.compile(*negate_expr));
+  std::unique_ptr<cudf::column> result =
+      cudf::compute_column(table.view(), compiler.compile(*negate_expr, ctx.context));
   ASSERT_EQ(result->type().id(), cudf::type_id::UINT32);
 
   cudaDeviceSynchronize();

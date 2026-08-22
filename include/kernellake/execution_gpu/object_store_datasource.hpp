@@ -3,6 +3,7 @@
 #include <cudf/io/datasource.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
+#include <rmm/resource_ref.hpp>
 
 #include <future>
 #include <memory>
@@ -51,7 +52,16 @@ namespace kernellake {
 // lifetime is never at risk even though the copy is issued "async".
 class ObjectStoreDatasource final : public cudf::io::datasource {
  public:
-  explicit ObjectStoreDatasource(std::unique_ptr<RandomAccessObject> object);
+  // `mr` is the calling query's own memory resource (ExecutionContext::
+  // memory_resource) -- device_read()'s buffer-returning overload below
+  // needs it explicitly rather than falling back to cudf's default
+  // (cudf::get_current_device_resource_ref(), the ambient process-wide
+  // resource): harmless when only one query ever runs at a time, but once
+  // GpuExecutionCoordinator can run several concurrently (see that
+  // class's own comment), the ambient default no longer means "this
+  // query's resource" -- it means "whatever's globally current right
+  // now," which could belong to any of them.
+  ObjectStoreDatasource(std::unique_ptr<RandomAccessObject> object, rmm::device_async_resource_ref mr);
 
   [[nodiscard]] std::size_t size() const override;
   [[nodiscard]] std::unique_ptr<datasource::buffer> host_read(std::size_t offset, std::size_t size) override;
@@ -74,6 +84,7 @@ class ObjectStoreDatasource final : public cudf::io::datasource {
 
  private:
   std::unique_ptr<RandomAccessObject> object_;
+  rmm::device_async_resource_ref mr_;
 };
 
 }  // namespace kernellake

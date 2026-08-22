@@ -118,8 +118,8 @@ class ProjectionOperator final : public PhysicalOperator {
     std::unique_ptr<CompiledCase> case_expr;
   };
 
-  [[nodiscard]] CompiledValue compile_value(const Expression& expr);
-  [[nodiscard]] CompiledItem compile_item(const Expression& expr);
+  [[nodiscard]] CompiledValue compile_value(const Expression& expr, ExecutionContext& context);
+  [[nodiscard]] CompiledItem compile_item(const Expression& expr, ExecutionContext& context);
   [[nodiscard]] std::unique_ptr<cudf::column> materialize_value(const CompiledValue& value,
                                                                 const cudf::table_view& batch,
                                                                 ExecutionContext& context);

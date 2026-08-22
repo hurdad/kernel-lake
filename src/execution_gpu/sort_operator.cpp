@@ -15,17 +15,17 @@ SortOperator::SortOperator(OperatorId id, std::unique_ptr<PhysicalOperator> chil
                            std::vector<LogicalSort::Key> keys, std::optional<std::int64_t> limit)
     : id_(id), child_(std::move(child)), keys_(std::move(keys)), limit_(limit) {}
 
-SortOperator::CompiledKey SortOperator::compile_key(const LogicalSort::Key& key) {
+SortOperator::CompiledKey SortOperator::compile_key(const LogicalSort::Key& key, ExecutionContext& context) {
   if (const auto* column_ref = dynamic_cast<const ColumnExpression*>(key.expr.get())) {
     return CompiledKey{static_cast<cudf::size_type>(column_ref->column_index()), nullptr, key.ascending};
   }
-  return CompiledKey{std::nullopt, &compiler_.compile(*key.expr), key.ascending};
+  return CompiledKey{std::nullopt, &compiler_.compile(*key.expr, context), key.ascending};
 }
 
 void SortOperator::open(ExecutionContext& context) {
   child_->open(context);
   compiled_keys_.reserve(keys_.size());
-  for (const LogicalSort::Key& key : keys_) compiled_keys_.push_back(compile_key(key));
+  for (const LogicalSort::Key& key : keys_) compiled_keys_.push_back(compile_key(key, context));
 }
 
 std::optional<DeviceBatch> SortOperator::next(ExecutionContext& context) {

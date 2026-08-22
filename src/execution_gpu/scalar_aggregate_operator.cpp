@@ -41,7 +41,8 @@ ScalarAggregateOperator::ScalarAggregateOperator(OperatorId id, std::unique_ptr<
 
 // Mirrors HashAggregateOperator::compile_expr exactly -- see that
 // function's own comments for why each fast path exists.
-ScalarAggregateOperator::CompiledExpr ScalarAggregateOperator::compile_expr(const Expression& expr) {
+ScalarAggregateOperator::CompiledExpr ScalarAggregateOperator::compile_expr(const Expression& expr,
+                                                                           ExecutionContext& context) {
   if (const auto* column_ref = dynamic_cast<const ColumnExpression*>(&expr)) {
     CompiledExpr compiled;
     compiled.source_column_index = static_cast<cudf::size_type>(column_ref->column_index());
@@ -49,7 +50,7 @@ ScalarAggregateOperator::CompiledExpr ScalarAggregateOperator::compile_expr(cons
   }
   if (const auto* literal = dynamic_cast<const LiteralExpression*>(&expr)) {
     CompiledExpr compiled;
-    compiled.literal_scalar = literal_to_scalar(*literal);
+    compiled.literal_scalar = literal_to_scalar(*literal, context);
     return compiled;
   }
   if (const auto* case_expr = dynamic_cast<const CaseExpression*>(&expr)) {
@@ -57,11 +58,11 @@ ScalarAggregateOperator::CompiledExpr ScalarAggregateOperator::compile_expr(cons
     compiled_case->result_type = case_expr->result_type();
     compiled_case->branches.reserve(case_expr->when_then().size());
     for (const CaseExpression::WhenThen& branch : case_expr->when_then()) {
-      compiled_case->branches.push_back(
-          CompiledCaseBranch{compile_expr(*branch.condition), compile_expr(*branch.result)});
+      compiled_case->branches.push_back(CompiledCaseBranch{compile_expr(*branch.condition, context),
+                                                            compile_expr(*branch.result, context)});
     }
     if (case_expr->else_branch() != nullptr) {
-      compiled_case->else_value = compile_expr(*case_expr->else_branch());
+      compiled_case->else_value = compile_expr(*case_expr->else_branch(), context);
     }
     CompiledExpr compiled;
     compiled.case_expr = std::move(compiled_case);
@@ -70,7 +71,7 @@ ScalarAggregateOperator::CompiledExpr ScalarAggregateOperator::compile_expr(cons
   if (const auto* cast_expr = dynamic_cast<const CastExpression*>(&expr);
       cast_expr != nullptr && cast_expr->result_type().id == TypeId::Decimal) {
     auto decimal_cast = std::make_shared<CompiledDecimalCast>();
-    decimal_cast->operand = compile_expr(*cast_expr->operand());
+    decimal_cast->operand = compile_expr(*cast_expr->operand(), context);
     decimal_cast->target_type = cast_expr->result_type();
     CompiledExpr compiled;
     compiled.decimal_cast = std::move(decimal_cast);
@@ -78,7 +79,7 @@ ScalarAggregateOperator::CompiledExpr ScalarAggregateOperator::compile_expr(cons
   }
   if (const auto* like_expr = dynamic_cast<const LikeExpression*>(&expr)) {
     auto compiled_like = std::make_shared<CompiledLike>();
-    compiled_like->value = compile_expr(*like_expr->value());
+    compiled_like->value = compile_expr(*like_expr->value(), context);
     compiled_like->pattern = like_expr->pattern();
     compiled_like->negated = like_expr->negated();
     CompiledExpr compiled;
@@ -87,14 +88,14 @@ ScalarAggregateOperator::CompiledExpr ScalarAggregateOperator::compile_expr(cons
   }
   if (const auto* extract_expr = dynamic_cast<const ExtractExpression*>(&expr)) {
     auto compiled_extract = std::make_shared<CompiledExtract>();
-    compiled_extract->operand = compile_expr(*extract_expr->operand());
+    compiled_extract->operand = compile_expr(*extract_expr->operand(), context);
     compiled_extract->part = extract_expr->part();
     CompiledExpr compiled;
     compiled.extract_expr = std::move(compiled_extract);
     return compiled;
   }
   CompiledExpr compiled;
-  compiled.expr = &compiler_.compile(expr);
+  compiled.expr = &compiler_.compile(expr, context);
   return compiled;
 }
 
@@ -184,7 +185,7 @@ void ScalarAggregateOperator::open(ExecutionContext& context) {
     state.function = aggregate->function();
     state.result_type = aggregate->result_type();
     if (aggregate->argument() != nullptr) {
-      state.compiled_argument = compile_expr(*aggregate->argument());
+      state.compiled_argument = compile_expr(*aggregate->argument(), context);
     }
     states_.push_back(std::move(state));
   }

@@ -95,7 +95,7 @@ DecimalRawValue decimal_raw_value(const DataType& type, const LiteralStorage& va
 }
 
 std::unique_ptr<cudf::scalar> make_decimal_scalar(const DataType& type, const LiteralStorage& value,
-                                                  bool is_valid) {
+                                                  bool is_valid, ExecutionContext& context) {
   const DecimalRawValue raw_value = decimal_raw_value(type, value);
   const numeric::scale_type scale{raw_value.cudf_scale};
   // binder.cpp's cast_if_needed() already rejects an out-of-range literal
@@ -110,53 +110,59 @@ std::unique_ptr<cudf::scalar> make_decimal_scalar(const DataType& type, const Li
         throw PlanningError("DECIMAL literal value out of range for its declared precision (internal error)");
       }
       return std::make_unique<cudf::fixed_point_scalar<numeric::decimal32>>(
-          static_cast<std::int32_t>(raw_value.raw), scale, is_valid);
+          static_cast<std::int32_t>(raw_value.raw), scale, is_valid, context.stream, context.memory_resource);
     case cudf::type_id::DECIMAL64:
       if (raw_value.raw < std::numeric_limits<std::int64_t>::min() ||
           raw_value.raw > std::numeric_limits<std::int64_t>::max()) {
         throw PlanningError("DECIMAL literal value out of range for its declared precision (internal error)");
       }
       return std::make_unique<cudf::fixed_point_scalar<numeric::decimal64>>(
-          static_cast<std::int64_t>(raw_value.raw), scale, is_valid);
+          static_cast<std::int64_t>(raw_value.raw), scale, is_valid, context.stream, context.memory_resource);
     default:
-      return std::make_unique<cudf::fixed_point_scalar<numeric::decimal128>>(raw_value.raw, scale, is_valid);
+      return std::make_unique<cudf::fixed_point_scalar<numeric::decimal128>>(
+          raw_value.raw, scale, is_valid, context.stream, context.memory_resource);
   }
 }
 
-std::unique_ptr<cudf::scalar> literal_to_scalar(const LiteralExpression& expr) {
+std::unique_ptr<cudf::scalar> literal_to_scalar(const LiteralExpression& expr, ExecutionContext& context) {
   const bool is_valid = !expr.is_null();
   const LiteralStorage& value = expr.value();
   switch (expr.result_type().id) {
     case TypeId::Boolean:
       return std::make_unique<cudf::numeric_scalar<bool>>(
-          std::holds_alternative<bool>(value) && std::get<bool>(value), is_valid);
+          std::holds_alternative<bool>(value) && std::get<bool>(value), is_valid, context.stream,
+          context.memory_resource);
     case TypeId::Int32:
       return std::make_unique<cudf::numeric_scalar<std::int32_t>>(
-          static_cast<std::int32_t>(literal_as_int64(value)), is_valid);
+          static_cast<std::int32_t>(literal_as_int64(value)), is_valid, context.stream, context.memory_resource);
     case TypeId::Int64:
-      return std::make_unique<cudf::numeric_scalar<std::int64_t>>(literal_as_int64(value), is_valid);
+      return std::make_unique<cudf::numeric_scalar<std::int64_t>>(literal_as_int64(value), is_valid,
+                                                                  context.stream, context.memory_resource);
     case TypeId::UInt32:
       return std::make_unique<cudf::numeric_scalar<std::uint32_t>>(
-          static_cast<std::uint32_t>(literal_as_int64(value)), is_valid);
+          static_cast<std::uint32_t>(literal_as_int64(value)), is_valid, context.stream, context.memory_resource);
     case TypeId::UInt64:
       return std::make_unique<cudf::numeric_scalar<std::uint64_t>>(
-          static_cast<std::uint64_t>(literal_as_int64(value)), is_valid);
+          static_cast<std::uint64_t>(literal_as_int64(value)), is_valid, context.stream, context.memory_resource);
     case TypeId::Float32:
       return std::make_unique<cudf::numeric_scalar<float>>(static_cast<float>(literal_as_double(value)),
-                                                           is_valid);
+                                                           is_valid, context.stream, context.memory_resource);
     case TypeId::Float64:
-      return std::make_unique<cudf::numeric_scalar<double>>(literal_as_double(value), is_valid);
+      return std::make_unique<cudf::numeric_scalar<double>>(literal_as_double(value), is_valid, context.stream,
+                                                            context.memory_resource);
     case TypeId::String:
       return std::make_unique<cudf::string_scalar>(
-          std::holds_alternative<std::string>(value) ? std::get<std::string>(value) : "", is_valid);
+          std::holds_alternative<std::string>(value) ? std::get<std::string>(value) : "", is_valid,
+          context.stream, context.memory_resource);
     case TypeId::Date32:
       return std::make_unique<cudf::timestamp_scalar<cudf::timestamp_D>>(
-          cudf::duration_D{static_cast<std::int32_t>(literal_as_int64(value))}, is_valid);
+          cudf::duration_D{static_cast<std::int32_t>(literal_as_int64(value))}, is_valid, context.stream,
+          context.memory_resource);
     case TypeId::Timestamp:
       return std::make_unique<cudf::timestamp_scalar<cudf::timestamp_us>>(
-          cudf::duration_us{literal_as_int64(value)}, is_valid);
+          cudf::duration_us{literal_as_int64(value)}, is_valid, context.stream, context.memory_resource);
     case TypeId::Decimal:
-      return make_decimal_scalar(expr.result_type(), value, is_valid);
+      return make_decimal_scalar(expr.result_type(), value, is_valid, context);
   }
   throw PlanningError("unreachable: unknown KernelLake TypeId");
 }

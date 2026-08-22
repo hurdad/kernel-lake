@@ -78,7 +78,8 @@ std::unique_ptr<cudf::groupby_aggregation> HashAggregateOperator::make_physical_
   throw ExecutionError("unreachable: unknown PhysicalAggKind");
 }
 
-HashAggregateOperator::CompiledExpr HashAggregateOperator::compile_expr(const Expression& expr) {
+HashAggregateOperator::CompiledExpr HashAggregateOperator::compile_expr(const Expression& expr,
+                                                                       ExecutionContext& context) {
   if (const auto* column_ref = dynamic_cast<const ColumnExpression*>(&expr)) {
     CompiledExpr compiled;
     compiled.source_column_index = static_cast<cudf::size_type>(column_ref->column_index());
@@ -86,7 +87,7 @@ HashAggregateOperator::CompiledExpr HashAggregateOperator::compile_expr(const Ex
   }
   if (const auto* literal = dynamic_cast<const LiteralExpression*>(&expr)) {
     CompiledExpr compiled;
-    compiled.literal_scalar = literal_to_scalar(*literal);
+    compiled.literal_scalar = literal_to_scalar(*literal, context);
     return compiled;
   }
   if (const auto* case_expr = dynamic_cast<const CaseExpression*>(&expr)) {
@@ -94,11 +95,11 @@ HashAggregateOperator::CompiledExpr HashAggregateOperator::compile_expr(const Ex
     compiled_case->result_type = case_expr->result_type();
     compiled_case->branches.reserve(case_expr->when_then().size());
     for (const CaseExpression::WhenThen& branch : case_expr->when_then()) {
-      compiled_case->branches.push_back(
-          CompiledCaseBranch{compile_expr(*branch.condition), compile_expr(*branch.result)});
+      compiled_case->branches.push_back(CompiledCaseBranch{compile_expr(*branch.condition, context),
+                                                            compile_expr(*branch.result, context)});
     }
     if (case_expr->else_branch() != nullptr) {
-      compiled_case->else_value = compile_expr(*case_expr->else_branch());
+      compiled_case->else_value = compile_expr(*case_expr->else_branch(), context);
     }
     CompiledExpr compiled;
     compiled.case_expr = std::move(compiled_case);
@@ -107,7 +108,7 @@ HashAggregateOperator::CompiledExpr HashAggregateOperator::compile_expr(const Ex
   if (const auto* cast_expr = dynamic_cast<const CastExpression*>(&expr);
       cast_expr != nullptr && cast_expr->result_type().id == TypeId::Decimal) {
     auto decimal_cast = std::make_shared<CompiledDecimalCast>();
-    decimal_cast->operand = compile_expr(*cast_expr->operand());
+    decimal_cast->operand = compile_expr(*cast_expr->operand(), context);
     decimal_cast->target_type = cast_expr->result_type();
     CompiledExpr compiled;
     compiled.decimal_cast = std::move(decimal_cast);
@@ -115,7 +116,7 @@ HashAggregateOperator::CompiledExpr HashAggregateOperator::compile_expr(const Ex
   }
   if (const auto* like_expr = dynamic_cast<const LikeExpression*>(&expr)) {
     auto compiled_like = std::make_shared<CompiledLike>();
-    compiled_like->value = compile_expr(*like_expr->value());
+    compiled_like->value = compile_expr(*like_expr->value(), context);
     compiled_like->pattern = like_expr->pattern();
     compiled_like->negated = like_expr->negated();
     CompiledExpr compiled;
@@ -124,14 +125,14 @@ HashAggregateOperator::CompiledExpr HashAggregateOperator::compile_expr(const Ex
   }
   if (const auto* extract_expr = dynamic_cast<const ExtractExpression*>(&expr)) {
     auto compiled_extract = std::make_shared<CompiledExtract>();
-    compiled_extract->operand = compile_expr(*extract_expr->operand());
+    compiled_extract->operand = compile_expr(*extract_expr->operand(), context);
     compiled_extract->part = extract_expr->part();
     CompiledExpr compiled;
     compiled.extract_expr = std::move(compiled_extract);
     return compiled;
   }
   CompiledExpr compiled;
-  compiled.expr = &compiler_.compile(expr);
+  compiled.expr = &compiler_.compile(expr, context);
   return compiled;
 }
 
@@ -237,7 +238,9 @@ void HashAggregateOperator::open(ExecutionContext& context) {
   child_->open(context);
 
   compiled_group_by_.reserve(group_by_.size());
-  for (const NamedExpression& item : group_by_) compiled_group_by_.push_back(compile_expr(*item.expr));
+  for (const NamedExpression& item : group_by_) {
+    compiled_group_by_.push_back(compile_expr(*item.expr, context));
+  }
 
   compiled_aggregate_args_.reserve(aggregates_.size());
   value_column_kind_.reserve(aggregates_.size());
@@ -255,7 +258,7 @@ void HashAggregateOperator::open(ExecutionContext& context) {
       case AggregateFunction::Sum:
       case AggregateFunction::Min:
       case AggregateFunction::Max:
-        compiled_aggregate_args_.push_back(compile_expr(*aggregate->argument()));
+        compiled_aggregate_args_.push_back(compile_expr(*aggregate->argument(), context));
         value_column_kind_.push_back(ValueColumnKind::Expression);
         physical_agg_kind_.push_back(aggregate->function() == AggregateFunction::Sum ? PhysicalAggKind::Sum
                                      : aggregate->function() == AggregateFunction::Min
@@ -275,7 +278,7 @@ void HashAggregateOperator::open(ExecutionContext& context) {
         break;
 
       case AggregateFunction::Count:
-        compiled_aggregate_args_.push_back(compile_expr(*aggregate->argument()));
+        compiled_aggregate_args_.push_back(compile_expr(*aggregate->argument(), context));
         value_column_kind_.push_back(ValueColumnKind::CountColumnOnes);
         physical_agg_kind_.push_back(PhysicalAggKind::Sum);
         aggregate_output_kind_.push_back(AggregateOutputKind::Direct);
@@ -287,7 +290,7 @@ void HashAggregateOperator::open(ExecutionContext& context) {
         // pair (both accumulated via the SUM-of-ones trick, in genuine
         // INT64/argument-native precision) instead of requesting cudf's
         // native MEAN aggregation.
-        const CompiledExpr compiled_argument = compile_expr(*aggregate->argument());
+        const CompiledExpr compiled_argument = compile_expr(*aggregate->argument(), context);
 
         compiled_aggregate_args_.push_back(compiled_argument);
         value_column_kind_.push_back(ValueColumnKind::Expression);

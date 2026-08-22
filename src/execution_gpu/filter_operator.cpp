@@ -58,12 +58,12 @@ void FilterOperator::open(ExecutionContext& context) {
     if (const auto* column = dynamic_cast<const ColumnExpression*>(like->value().get())) {
       compiled.value_column_index = static_cast<cudf::size_type>(column->column_index());
     } else {
-      compiled.value_expr = &compiler_.compile(*like->value());
+      compiled.value_expr = &compiler_.compile(*like->value(), context);
     }
     compiled_like_conjuncts_.push_back(std::move(compiled));
   }
   if (!ast_conjuncts.empty()) {
-    compiled_ast_conjuncts_ = &compiler_.compile(*and_together(std::move(ast_conjuncts)));
+    compiled_ast_conjuncts_ = &compiler_.compile(*and_together(std::move(ast_conjuncts)), context);
   }
 }
 

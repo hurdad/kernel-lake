@@ -2,7 +2,6 @@
 // (KERNELLAKE_WITH_CUDA=ON) builds. Mutually exclusive with
 // query_engine_execute_stub.cpp -- see that file's comment.
 #include <fmt/format.h>
-#include <rmm/mr/per_device_resource.hpp>
 
 #include <chrono>
 #include <filesystem>
@@ -88,11 +87,22 @@ QueryResult QueryEngine::execute(const PhysicalPlanPtr& physical, RmmEnvironment
   const CudaDeviceGuard device_guard(config_.engine.device_id);
   const CudaStream stream;
 
+  // Per-query, not the process-wide ambient default -- see
+  // RmmEnvironment::make_query_tracker()'s own comment for why this
+  // matters once GpuExecutionCoordinator can run more than one query
+  // concurrently: rmm::mr::get_current_device_resource_ref() (this
+  // context's memory_resource before this change) points at whatever's
+  // globally current for the whole process, shared by every concurrently
+  // in-flight query alike -- fine for tracking/limiting purposes (the
+  // limiter underneath is deliberately shared, see that same comment),
+  // but wrong for this query's own peak_gpu_memory_bytes reporting below.
+  QueryMemoryTracker memory_tracker = rmm_environment.make_query_tracker();
+
   MetricsRegistry metrics;
-  ExecutionContext context{make_query_id(), config_.engine.device_id,
-                           stream.get(),    rmm::mr::get_current_device_resource_ref(),
-                           nullptr,         &metrics,
-                           nullptr};
+  ExecutionContext context{make_query_id(),       config_.engine.device_id,
+                           stream.get(),          memory_tracker.resource_ref(),
+                           nullptr,               &metrics,
+                           &memory_tracker};
 
   // A quarter of the *actually enforced* memory ceiling --
   // rmm_environment.query_memory_limit_bytes() (the exact value this
@@ -192,17 +202,23 @@ QueryResult QueryEngine::execute(const PhysicalPlanPtr& physical, RmmEnvironment
   double device_to_host_seconds = 0.0;
   const auto gpu_execution_start = std::chrono::steady_clock::now();
 
-  const MemoryUsage usage = rmm_environment.track_query([&] {
-    root->open(context);
-    while (std::optional<DeviceBatch> batch = root->next(context)) {
-      rows_returned += static_cast<std::int64_t>(batch->row_count());
-      const auto d2h_start = std::chrono::steady_clock::now();
-      result.batches.push_back(to_arrow_record_batch(*batch, context.stream, context.memory_resource));
-      device_to_host_seconds +=
-          std::chrono::duration<double>(std::chrono::steady_clock::now() - d2h_start).count();
-    }
-    root->close(context);
-  });
+  // No push/pop-stack protection needed here the way the old
+  // rmm_environment.track_query(lambda) had: memory_tracker above is this
+  // call's own, unshared QueryMemoryTracker instance, not a frame on a
+  // structure any other concurrently-running query could also be touching
+  // -- if the block below throws, memory_tracker's destructor just runs
+  // normally during unwind, same as any other local RAII object, and the
+  // exception propagates exactly as it did before.
+  root->open(context);
+  while (std::optional<DeviceBatch> batch = root->next(context)) {
+    rows_returned += static_cast<std::int64_t>(batch->row_count());
+    const auto d2h_start = std::chrono::steady_clock::now();
+    result.batches.push_back(to_arrow_record_batch(*batch, context.stream, context.memory_resource));
+    device_to_host_seconds +=
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - d2h_start).count();
+  }
+  root->close(context);
+  const MemoryUsage usage = memory_tracker.current_usage();
   result.gpu_execution_seconds =
       std::chrono::duration<double>(std::chrono::steady_clock::now() - gpu_execution_start).count();
   result.device_to_host_seconds = device_to_host_seconds;

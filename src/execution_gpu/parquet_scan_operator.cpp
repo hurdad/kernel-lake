@@ -82,7 +82,8 @@ void ParquetScanOperator::open(ExecutionContext& context) {
       std::vector<std::unique_ptr<cudf::io::datasource>> sources;
       sources.reserve(fragments_.size());
       for (const PhysicalFileFragment& fragment : fragments_) {
-        sources.push_back(std::make_unique<ObjectStoreDatasource>(store_.open(fragment.file)));
+        sources.push_back(
+            std::make_unique<ObjectStoreDatasource>(store_.open(fragment.file), context.memory_resource));
       }
 
       cudf::io::parquet_reader_options options =
@@ -117,7 +118,8 @@ void ParquetScanOperator::open_current_fragment(ExecutionContext& context) {
           /*chunk_read_limit=*/0, pass_read_limit_bytes_, options, context.stream, context.memory_resource);
     } else {
       std::vector<std::unique_ptr<cudf::io::datasource>> sources;
-      sources.push_back(std::make_unique<ObjectStoreDatasource>(store_.open(fragment.file)));
+      sources.push_back(
+          std::make_unique<ObjectStoreDatasource>(store_.open(fragment.file), context.memory_resource));
 
       cudf::io::parquet_reader_options options =
           cudf::io::parquet_reader_options::builder()
@@ -282,7 +284,7 @@ std::optional<DeviceBatch> ParquetScanOperator::next(ExecutionContext& context) 
     const PhysicalFileFragment& fragment = fragments_[current_fragment_index_];
     for (std::size_t i = 0; i < partition_columns_.size(); ++i) {
       const LiteralExpression literal(fragment.partition_values[i], partition_columns_[i].type);
-      const std::unique_ptr<cudf::scalar> scalar = literal_to_scalar(literal);
+      const std::unique_ptr<cudf::scalar> scalar = literal_to_scalar(literal, context);
       columns.push_back(
           cudf::make_column_from_scalar(*scalar, num_rows, context.stream, context.memory_resource));
     }

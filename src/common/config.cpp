@@ -114,6 +114,8 @@ EngineConfig parse_config(const std::string& yaml_text) {
       read_or(engine, "query_memory_limit_bytes", config.engine.query_memory_limit_bytes);
   config.engine.backend = read_or(engine, "backend", config.engine.backend);
   config.engine.max_distinct_keys = read_or(engine, "max_distinct_keys", config.engine.max_distinct_keys);
+  config.engine.max_concurrent_gpu_queries =
+      read_or(engine, "max_concurrent_gpu_queries", config.engine.max_concurrent_gpu_queries);
 
   const YAML::Node memory = root["memory"];
   config.memory.pool_initial_bytes = read_or(memory, "pool_initial_bytes", config.memory.pool_initial_bytes);
@@ -375,6 +377,10 @@ void validate_config(const EngineConfig& config) {
   }
   if (config.engine.result_batch_rows == 0) {
     throw ConfigurationError("engine.result_batch_rows must be > 0");
+  }
+  if (config.engine.max_concurrent_gpu_queries <= 0) {
+    throw ConfigurationError(fmt::format("engine.max_concurrent_gpu_queries must be > 0, got {}",
+                                         config.engine.max_concurrent_gpu_queries));
   }
   // 0 is a real, meaningful value here ("auto-detect from GPU VRAM" -- see
   // EngineSection::query_memory_limit_bytes's own comment), not an error;
