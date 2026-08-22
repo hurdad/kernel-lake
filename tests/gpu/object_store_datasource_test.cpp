@@ -42,7 +42,7 @@ class ObjectStoreDatasourceTest : public ::testing::Test {
 
   void TearDown() override { fs::remove_all(dir_); }
 
-  std::unique_ptr<ObjectStoreDatasource> open_datasource(rmm::device_async_resource_ref mr) {
+  std::unique_ptr<ObjectStoreDatasource> open_datasource(const rmm::device_async_resource_ref& mr) {
     return std::make_unique<ObjectStoreDatasource>(store_.open(Uri(path_)), mr);
   }
 
@@ -54,7 +54,8 @@ class ObjectStoreDatasourceTest : public ::testing::Test {
 
 TEST_F(ObjectStoreDatasourceTest, DeviceReadIntoDestinationBufferMatchesHostRead) {
   RmmEnvironment env(default_config());
-  std::unique_ptr<ObjectStoreDatasource> datasource = open_datasource(rmm::mr::get_current_device_resource_ref());
+  std::unique_ptr<ObjectStoreDatasource> datasource =
+      open_datasource(rmm::mr::get_current_device_resource_ref());
 
   constexpr std::size_t kOffset = 5;
   constexpr std::size_t kSize = 10;  // "56789ABCDE"
@@ -71,7 +72,8 @@ TEST_F(ObjectStoreDatasourceTest, DeviceReadIntoDestinationBufferMatchesHostRead
 
 TEST_F(ObjectStoreDatasourceTest, DeviceReadAsyncBufferOverloadMatchesHostRead) {
   RmmEnvironment env(default_config());
-  std::unique_ptr<ObjectStoreDatasource> datasource = open_datasource(rmm::mr::get_current_device_resource_ref());
+  std::unique_ptr<ObjectStoreDatasource> datasource =
+      open_datasource(rmm::mr::get_current_device_resource_ref());
 
   constexpr std::size_t kOffset = 0;
   constexpr std::size_t kSize = 5;  // "01234"
@@ -88,7 +90,8 @@ TEST_F(ObjectStoreDatasourceTest, DeviceReadAsyncBufferOverloadMatchesHostRead) 
 
 TEST_F(ObjectStoreDatasourceTest, DeviceReadAsyncFutureCompletesWithCorrectByteCount) {
   RmmEnvironment env(default_config());
-  std::unique_ptr<ObjectStoreDatasource> datasource = open_datasource(rmm::mr::get_current_device_resource_ref());
+  std::unique_ptr<ObjectStoreDatasource> datasource =
+      open_datasource(rmm::mr::get_current_device_resource_ref());
 
   constexpr std::size_t kOffset = 20;
   constexpr std::size_t kSize = 8;

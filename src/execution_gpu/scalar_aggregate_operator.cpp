@@ -42,7 +42,7 @@ ScalarAggregateOperator::ScalarAggregateOperator(OperatorId id, std::unique_ptr<
 // Mirrors HashAggregateOperator::compile_expr exactly -- see that
 // function's own comments for why each fast path exists.
 ScalarAggregateOperator::CompiledExpr ScalarAggregateOperator::compile_expr(const Expression& expr,
-                                                                           ExecutionContext& context) {
+                                                                            ExecutionContext& context) {
   if (const auto* column_ref = dynamic_cast<const ColumnExpression*>(&expr)) {
     CompiledExpr compiled;
     compiled.source_column_index = static_cast<cudf::size_type>(column_ref->column_index());
@@ -59,7 +59,7 @@ ScalarAggregateOperator::CompiledExpr ScalarAggregateOperator::compile_expr(cons
     compiled_case->branches.reserve(case_expr->when_then().size());
     for (const CaseExpression::WhenThen& branch : case_expr->when_then()) {
       compiled_case->branches.push_back(CompiledCaseBranch{compile_expr(*branch.condition, context),
-                                                            compile_expr(*branch.result, context)});
+                                                           compile_expr(*branch.result, context)});
     }
     if (case_expr->else_branch() != nullptr) {
       compiled_case->else_value = compile_expr(*case_expr->else_branch(), context);

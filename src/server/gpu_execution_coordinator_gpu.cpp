@@ -18,7 +18,9 @@ namespace {
 // std::lock_guard<std::mutex> gave for free.
 class SemaphoreGuard {
  public:
-  explicit SemaphoreGuard(std::counting_semaphore<>& semaphore) : semaphore_(semaphore) { semaphore_.acquire(); }
+  explicit SemaphoreGuard(std::counting_semaphore<>& semaphore) : semaphore_(semaphore) {
+    semaphore_.acquire();
+  }
   ~SemaphoreGuard() { semaphore_.release(); }
 
   SemaphoreGuard(const SemaphoreGuard&) = delete;

@@ -50,7 +50,9 @@ class QueryMemoryTracker {
   // belongs to -- every allocation issued through it counts against this
   // instance's own counters and, one layer further upstream, the shared
   // process-wide limiter.
-  [[nodiscard]] rmm::device_async_resource_ref resource_ref() { return rmm::device_async_resource_ref{stats_}; }
+  [[nodiscard]] rmm::device_async_resource_ref resource_ref() {
+    return rmm::device_async_resource_ref{stats_};
+  }
 
   // Usage so far -- safe to call mid-query, not just after close().
   [[nodiscard]] MemoryUsage current_usage() const {

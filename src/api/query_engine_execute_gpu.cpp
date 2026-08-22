@@ -99,10 +99,9 @@ QueryResult QueryEngine::execute(const PhysicalPlanPtr& physical, RmmEnvironment
   QueryMemoryTracker memory_tracker = rmm_environment.make_query_tracker();
 
   MetricsRegistry metrics;
-  ExecutionContext context{make_query_id(),       config_.engine.device_id,
-                           stream.get(),          memory_tracker.resource_ref(),
-                           nullptr,               &metrics,
-                           &memory_tracker};
+  ExecutionContext context{
+      make_query_id(), config_.engine.device_id, stream.get(), memory_tracker.resource_ref(), nullptr,
+      &metrics,        &memory_tracker};
 
   // A quarter of the *actually enforced* memory ceiling --
   // rmm_environment.query_memory_limit_bytes() (the exact value this

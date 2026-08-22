@@ -134,22 +134,25 @@ std::unique_ptr<cudf::scalar> literal_to_scalar(const LiteralExpression& expr, E
           context.memory_resource);
     case TypeId::Int32:
       return std::make_unique<cudf::numeric_scalar<std::int32_t>>(
-          static_cast<std::int32_t>(literal_as_int64(value)), is_valid, context.stream, context.memory_resource);
+          static_cast<std::int32_t>(literal_as_int64(value)), is_valid, context.stream,
+          context.memory_resource);
     case TypeId::Int64:
       return std::make_unique<cudf::numeric_scalar<std::int64_t>>(literal_as_int64(value), is_valid,
                                                                   context.stream, context.memory_resource);
     case TypeId::UInt32:
       return std::make_unique<cudf::numeric_scalar<std::uint32_t>>(
-          static_cast<std::uint32_t>(literal_as_int64(value)), is_valid, context.stream, context.memory_resource);
+          static_cast<std::uint32_t>(literal_as_int64(value)), is_valid, context.stream,
+          context.memory_resource);
     case TypeId::UInt64:
       return std::make_unique<cudf::numeric_scalar<std::uint64_t>>(
-          static_cast<std::uint64_t>(literal_as_int64(value)), is_valid, context.stream, context.memory_resource);
+          static_cast<std::uint64_t>(literal_as_int64(value)), is_valid, context.stream,
+          context.memory_resource);
     case TypeId::Float32:
       return std::make_unique<cudf::numeric_scalar<float>>(static_cast<float>(literal_as_double(value)),
                                                            is_valid, context.stream, context.memory_resource);
     case TypeId::Float64:
-      return std::make_unique<cudf::numeric_scalar<double>>(literal_as_double(value), is_valid, context.stream,
-                                                            context.memory_resource);
+      return std::make_unique<cudf::numeric_scalar<double>>(literal_as_double(value), is_valid,
+                                                            context.stream, context.memory_resource);
     case TypeId::String:
       return std::make_unique<cudf::string_scalar>(
           std::holds_alternative<std::string>(value) ? std::get<std::string>(value) : "", is_valid,

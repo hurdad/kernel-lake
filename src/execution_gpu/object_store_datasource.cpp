@@ -48,7 +48,7 @@ class DeviceBufferDatasourceBuffer final : public cudf::io::datasource::buffer {
 }  // namespace
 
 ObjectStoreDatasource::ObjectStoreDatasource(std::unique_ptr<RandomAccessObject> object,
-                                             rmm::device_async_resource_ref mr)
+                                             const rmm::device_async_resource_ref& mr)
     : object_(std::move(object)), mr_(mr) {}
 
 std::size_t ObjectStoreDatasource::size() const {

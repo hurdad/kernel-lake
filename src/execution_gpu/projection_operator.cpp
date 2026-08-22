@@ -80,8 +80,8 @@ ProjectionOperator::CompiledItem ProjectionOperator::compile_item(const Expressi
   compiled_case->result_type = case_expr->result_type();
   compiled_case->branches.reserve(case_expr->when_then().size());
   for (const CaseExpression::WhenThen& branch : case_expr->when_then()) {
-    compiled_case->branches.push_back(
-        CompiledCaseBranch{compile_value(*branch.condition, context), compile_value(*branch.result, context)});
+    compiled_case->branches.push_back(CompiledCaseBranch{compile_value(*branch.condition, context),
+                                                         compile_value(*branch.result, context)});
   }
   if (case_expr->else_branch() != nullptr) {
     compiled_case->else_value = compile_value(*case_expr->else_branch(), context);

@@ -50,7 +50,7 @@ namespace kernellake {
 // a time (see GpuExecutionCoordinator's own comment on why that's no
 // longer true).
 [[nodiscard]] std::unique_ptr<cudf::scalar> literal_to_scalar(const LiteralExpression& expr,
-                                                               ExecutionContext& context);
+                                                              ExecutionContext& context);
 
 // Builds a cudf::fixed_point_scalar<decimal32/64/128> (width chosen by
 // `type.precision`) from a literal's underlying double/int64 value, shifted

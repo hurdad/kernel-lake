@@ -92,12 +92,11 @@ TEST(RmmEnvironment, AQueryTrackerThrowingDoesNotAffectAnotherTracker) {
 
   {
     QueryMemoryTracker failing_tracker = env.make_query_tracker();
-    EXPECT_THROW(
-        ([&] {
-          rmm::device_buffer buffer(1024, rmm::cuda_stream_view{}, failing_tracker.resource_ref());
-          throw std::runtime_error("simulated query failure");
-        })(),
-        std::runtime_error);
+    EXPECT_THROW(([&] {
+                   rmm::device_buffer buffer(1024, rmm::cuda_stream_view{}, failing_tracker.resource_ref());
+                   throw std::runtime_error("simulated query failure");
+                 })(),
+                 std::runtime_error);
   }
 
   constexpr std::size_t kBytes = 1024 * 1024;  // 1 MiB

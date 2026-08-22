@@ -79,7 +79,7 @@ std::unique_ptr<cudf::groupby_aggregation> HashAggregateOperator::make_physical_
 }
 
 HashAggregateOperator::CompiledExpr HashAggregateOperator::compile_expr(const Expression& expr,
-                                                                       ExecutionContext& context) {
+                                                                        ExecutionContext& context) {
   if (const auto* column_ref = dynamic_cast<const ColumnExpression*>(&expr)) {
     CompiledExpr compiled;
     compiled.source_column_index = static_cast<cudf::size_type>(column_ref->column_index());
@@ -96,7 +96,7 @@ HashAggregateOperator::CompiledExpr HashAggregateOperator::compile_expr(const Ex
     compiled_case->branches.reserve(case_expr->when_then().size());
     for (const CaseExpression::WhenThen& branch : case_expr->when_then()) {
       compiled_case->branches.push_back(CompiledCaseBranch{compile_expr(*branch.condition, context),
-                                                            compile_expr(*branch.result, context)});
+                                                           compile_expr(*branch.result, context)});
     }
     if (case_expr->else_branch() != nullptr) {
       compiled_case->else_value = compile_expr(*case_expr->else_branch(), context);

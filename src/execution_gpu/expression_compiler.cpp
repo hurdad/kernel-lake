@@ -32,7 +32,8 @@ const cudf::ast::expression& ExpressionCompiler::compile(const Expression& expr,
   if (const auto* literal = dynamic_cast<const LiteralExpression*>(&expr)) {
     return compile_literal(*literal, context);
   }
-  if (const auto* binary = dynamic_cast<const BinaryExpression*>(&expr)) return compile_binary(*binary, context);
+  if (const auto* binary = dynamic_cast<const BinaryExpression*>(&expr))
+    return compile_binary(*binary, context);
   if (const auto* unary = dynamic_cast<const UnaryExpression*>(&expr)) return compile_unary(*unary, context);
   if (const auto* between = dynamic_cast<const BetweenExpression*>(&expr)) {
     return compile_between(*between, context);
@@ -50,12 +51,14 @@ const cudf::ast::expression& ExpressionCompiler::compile_column(const ColumnExpr
   return tree_.emplace<cudf::ast::column_reference>(static_cast<cudf::size_type>(expr.column_index()));
 }
 
-const cudf::ast::expression& ExpressionCompiler::make_literal(const DataType& type, const LiteralStorage& value,
-                                                              bool is_valid, ExecutionContext& context) {
+const cudf::ast::expression& ExpressionCompiler::make_literal(const DataType& type,
+                                                              const LiteralStorage& value, bool is_valid,
+                                                              ExecutionContext& context) {
   switch (type.id) {
     case TypeId::Boolean: {
       auto scalar = std::make_unique<cudf::numeric_scalar<bool>>(
-          std::holds_alternative<bool>(value) && std::get<bool>(value), is_valid, context.stream, context.memory_resource);
+          std::holds_alternative<bool>(value) && std::get<bool>(value), is_valid, context.stream,
+          context.memory_resource);
       auto& ref = *scalar;
       scalars_.push_back(std::move(scalar));
       return tree_.emplace<cudf::ast::literal>(ref);
@@ -68,7 +71,8 @@ const cudf::ast::expression& ExpressionCompiler::make_literal(const DataType& ty
       return tree_.emplace<cudf::ast::literal>(ref);
     }
     case TypeId::Int64: {
-      auto scalar = std::make_unique<cudf::numeric_scalar<std::int64_t>>(as_int64(value), is_valid, context.stream, context.memory_resource);
+      auto scalar = std::make_unique<cudf::numeric_scalar<std::int64_t>>(
+          as_int64(value), is_valid, context.stream, context.memory_resource);
       auto& ref = *scalar;
       scalars_.push_back(std::move(scalar));
       return tree_.emplace<cudf::ast::literal>(ref);
@@ -88,28 +92,31 @@ const cudf::ast::expression& ExpressionCompiler::make_literal(const DataType& ty
       return tree_.emplace<cudf::ast::literal>(ref);
     }
     case TypeId::Float32: {
-      auto scalar =
-          std::make_unique<cudf::numeric_scalar<float>>(static_cast<float>(as_double(value)), is_valid, context.stream, context.memory_resource);
+      auto scalar = std::make_unique<cudf::numeric_scalar<float>>(
+          static_cast<float>(as_double(value)), is_valid, context.stream, context.memory_resource);
       auto& ref = *scalar;
       scalars_.push_back(std::move(scalar));
       return tree_.emplace<cudf::ast::literal>(ref);
     }
     case TypeId::Float64: {
-      auto scalar = std::make_unique<cudf::numeric_scalar<double>>(as_double(value), is_valid, context.stream, context.memory_resource);
+      auto scalar = std::make_unique<cudf::numeric_scalar<double>>(as_double(value), is_valid, context.stream,
+                                                                   context.memory_resource);
       auto& ref = *scalar;
       scalars_.push_back(std::move(scalar));
       return tree_.emplace<cudf::ast::literal>(ref);
     }
     case TypeId::String: {
       const std::string text = std::holds_alternative<std::string>(value) ? std::get<std::string>(value) : "";
-      auto scalar = std::make_unique<cudf::string_scalar>(text, is_valid, context.stream, context.memory_resource);
+      auto scalar =
+          std::make_unique<cudf::string_scalar>(text, is_valid, context.stream, context.memory_resource);
       auto& ref = *scalar;
       scalars_.push_back(std::move(scalar));
       return tree_.emplace<cudf::ast::literal>(ref);
     }
     case TypeId::Date32: {
       auto scalar = std::make_unique<cudf::timestamp_scalar<cudf::timestamp_D>>(
-          cudf::duration_D{static_cast<std::int32_t>(as_int64(value))}, is_valid, context.stream, context.memory_resource);
+          cudf::duration_D{static_cast<std::int32_t>(as_int64(value))}, is_valid, context.stream,
+          context.memory_resource);
       auto& ref = *scalar;
       scalars_.push_back(std::move(scalar));
       return tree_.emplace<cudf::ast::literal>(ref);
@@ -133,21 +140,23 @@ const cudf::ast::expression& ExpressionCompiler::make_literal(const DataType& ty
       switch (raw_value.type_id) {
         case cudf::type_id::DECIMAL32: {
           auto scalar = std::make_unique<cudf::fixed_point_scalar<numeric::decimal32>>(
-              static_cast<std::int32_t>(raw_value.raw), scale, is_valid, context.stream, context.memory_resource);
+              static_cast<std::int32_t>(raw_value.raw), scale, is_valid, context.stream,
+              context.memory_resource);
           auto& ref = *scalar;
           scalars_.push_back(std::move(scalar));
           return tree_.emplace<cudf::ast::literal>(ref);
         }
         case cudf::type_id::DECIMAL64: {
           auto scalar = std::make_unique<cudf::fixed_point_scalar<numeric::decimal64>>(
-              static_cast<std::int64_t>(raw_value.raw), scale, is_valid, context.stream, context.memory_resource);
+              static_cast<std::int64_t>(raw_value.raw), scale, is_valid, context.stream,
+              context.memory_resource);
           auto& ref = *scalar;
           scalars_.push_back(std::move(scalar));
           return tree_.emplace<cudf::ast::literal>(ref);
         }
         default: {
-          auto scalar =
-              std::make_unique<cudf::fixed_point_scalar<numeric::decimal128>>(raw_value.raw, scale, is_valid, context.stream, context.memory_resource);
+          auto scalar = std::make_unique<cudf::fixed_point_scalar<numeric::decimal128>>(
+              raw_value.raw, scale, is_valid, context.stream, context.memory_resource);
           auto& ref = *scalar;
           scalars_.push_back(std::move(scalar));
           return tree_.emplace<cudf::ast::literal>(ref);

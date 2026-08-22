@@ -121,7 +121,7 @@ class GpuExecutionCoordinatorConcurrencyTest : public ::testing::Test {
 };
 
 TEST_F(GpuExecutionCoordinatorConcurrencyTest,
-      ConcurrentQueriesDoNotMixResultsOrMemoryAccountingAcrossThreads) {
+       ConcurrentQueriesDoNotMixResultsOrMemoryAccountingAcrossThreads) {
   EngineConfig config = default_config();
   config.engine.backend = "gpu";
   // Small on purpose: with 4 threads below, this forces real queueing
@@ -151,8 +151,8 @@ TEST_F(GpuExecutionCoordinatorConcurrencyTest,
     const std::string region = is_region_a ? "A" : "B";
     results[i].expected_total = is_region_a ? 35.0 : 110.0;
     threads.emplace_back([&, i, region] {
-      const std::string sql = "SELECT SUM(amount) AS total FROM read_parquet('" + path_ +
-                              "') WHERE region = '" + region + "'";
+      const std::string sql =
+          "SELECT SUM(amount) AS total FROM read_parquet('" + path_ + "') WHERE region = '" + region + "'";
       const PhysicalPlanPtr physical = engine.explain(sql);
       results[i].result = coordinator.execute(engine, physical);
     });

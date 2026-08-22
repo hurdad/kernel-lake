@@ -61,7 +61,7 @@ class ObjectStoreDatasource final : public cudf::io::datasource {
   // class's own comment), the ambient default no longer means "this
   // query's resource" -- it means "whatever's globally current right
   // now," which could belong to any of them.
-  ObjectStoreDatasource(std::unique_ptr<RandomAccessObject> object, rmm::device_async_resource_ref mr);
+  ObjectStoreDatasource(std::unique_ptr<RandomAccessObject> object, const rmm::device_async_resource_ref& mr);
 
   [[nodiscard]] std::size_t size() const override;
   [[nodiscard]] std::unique_ptr<datasource::buffer> host_read(std::size_t offset, std::size_t size) override;
