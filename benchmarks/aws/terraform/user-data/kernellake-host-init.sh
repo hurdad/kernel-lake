@@ -23,6 +23,10 @@ echo "=== KernelLake host init starting $(date -u) ==="
 # kernellake_ami_id ends up pointing at a *plain* Ubuntu 26.04 image
 # instead (no NVIDIA driver/CUDA/Docker/nvidia-container-toolkit
 # pre-baked), this installs all four from scratch rather than failing.
+# Also handles a DL-AMI host whose pre-baked driver is present but too
+# old for the runtime-gpu image's CUDA 13 base (see the driver-version
+# check below) -- "nvidia-smi exists" alone no longer means this host is
+# ready.
 export DEBIAN_FRONTEND=noninteractive
 
 if ! command -v docker >/dev/null 2>&1; then
@@ -45,16 +49,25 @@ if ! docker compose version >/dev/null 2>&1; then
   apt-get update && apt-get install -y --no-install-recommends docker-compose-plugin
 fi
 
-if ! command -v nvidia-smi >/dev/null 2>&1; then
-  echo "NVIDIA driver not found -- installing from scratch (plain-AMI fallback path)"
+# Minimum driver for docker/Dockerfile's runtime-gpu image
+# (nvidia/cuda:13.3.1-devel-ubuntu26.04, libcudart.so.13): per NVIDIA's
+# CUDA 13.3 Update 1 toolkit release notes (Table 3, "CUDA Toolkit and
+# Corresponding Driver Versions"), >=610.43.02. This is well past what
+# AWS's Deep Learning Base AMI (CUDA-12.x-era, per ami.tf's own comment)
+# ships pre-baked -- so nvidia-smi being present isn't sufficient on its
+# own any more, unlike when this host booted an apt-toolkit-based
+# (CUDA 12.4) runtime-gpu image.
+KERNELLAKE_MIN_NVIDIA_DRIVER="610.43.02"
+
+kernellake_install_nvidia_driver() {
   apt-get update
-  apt-get install -y --no-install-recommends build-essential linux-headers-$(uname -r)
+  apt-get install -y --no-install-recommends build-essential "linux-headers-$(uname -r)"
   # ubuntu-drivers-common's `ubuntu-drivers install` picks the recommended
   # driver for the detected GPU (the L4 here) automatically, avoiding a
   # hardcoded driver-version pin that would drift out of date.
   apt-get install -y --no-install-recommends ubuntu-drivers-common
   ubuntu-drivers install
-  echo "NVIDIA driver installed -- this instance needs a reboot to load it."
+  echo "NVIDIA driver installed/upgraded -- this instance needs a reboot to load it."
   echo "Re-running the rest of this script after reboot via a systemd unit."
   cat > /etc/systemd/system/kernellake-host-init-resume.service <<'EOF'
 [Unit]
@@ -73,6 +86,17 @@ EOF
   systemctl enable kernellake-host-init-resume.service
   reboot
   exit 0
+}
+
+if ! command -v nvidia-smi >/dev/null 2>&1; then
+  echo "NVIDIA driver not found -- installing from scratch (plain-AMI fallback path)"
+  kernellake_install_nvidia_driver
+else
+  installed_driver="$(nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -n1)"
+  if ! dpkg --compare-versions "$installed_driver" ge "$KERNELLAKE_MIN_NVIDIA_DRIVER"; then
+    echo "NVIDIA driver $installed_driver is older than the required $KERNELLAKE_MIN_NVIDIA_DRIVER (CUDA 13.3) -- upgrading"
+    kernellake_install_nvidia_driver
+  fi
 fi
 
 if ! docker info 2>/dev/null | grep -qi nvidia; then

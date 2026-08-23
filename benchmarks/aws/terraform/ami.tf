@@ -14,7 +14,13 @@
 # to a plain Ubuntu 26.04 AMI (e.g. `data.aws_ami.ubuntu_26_04.id` below).
 # Either way, kernellake-host-init.sh's own NVIDIA-driver-and-toolkit
 # install step is a real, working fallback (not just a warning) for
-# exactly this case -- see that script's own comment.
+# exactly this case -- see that script's own comment. That fallback now
+# also covers a second case introduced by the CUDA 13 Docker migration
+# (2026-08-23): this AMI's driver is CUDA-12.x-vintage, which is too old
+# for runtime-gpu's new nvidia/cuda:13.3.1-devel-ubuntu26.04 base
+# (needs driver >=610.43.02) -- kernellake-host-init.sh checks the
+# pre-baked driver's version, not just whether nvidia-smi exists at all,
+# and upgrades it if it's below that minimum.
 data "aws_ami" "deep_learning_base" {
   count       = var.kernellake_ami_id == null ? 1 : 0
   most_recent = true
