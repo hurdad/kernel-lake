@@ -340,14 +340,24 @@ jobs:
           load: true
           tags: kernellake-build-base:ci
           cache-from: type=gha,scope=build-base
-      # See clang-tidy job's own identical step for the full rationale.
-      - name: Restore ccache
-        uses: actions/cache@v4
-        with:
-          path: ~/.ccache
-          key: ccache-coverage-${{ github.sha }}
-          restore-keys: ccache-coverage-
       - name: Configure, build, test, and generate coverage report
+        # No ccache here (unlike cpu-build-test's identical-looking build)
+        # -- real bug found 2026-08-23: a coverage build's whole point is
+        # measuring exact per-line hit counts, but ccache restoring a
+        # cached object for a --coverage-instrumented compile has to also
+        # restore that compile's side-effect .gcno file (the line-mapping
+        # gcov reads), and a stale .gcno from an earlier commit's cache
+        # entry silently produces WRONG line counts/coverage for a file
+        # that changed since -- while ctest still reports 100% passing,
+        # since the cached .o itself is behaviorally correct. Caught by
+        # comparing this job's live Codecov upload (~47%) against two
+        # from-scratch local reproductions of this exact command on the
+        # same commit (85%+) with mismatched per-file line counts, which
+        # only a stale .gcno can explain, not a real coverage gap. A
+        # coverage job already accepts a full rebuild's cost every run
+        # (no incremental build directory reuse either) -- ccache's speed
+        # win here isn't worth this correctness risk.
+        #
         # Restricted to src/ and include/ -- vendored third-party code
         # (build/cpu-coverage/_deps) and the tests themselves are never
         # part of the numerator or denominator; a test file covering
@@ -375,12 +385,10 @@ jobs:
         # non-Docker steps (the Codecov/artifact uploads) that read it
         # back outside the container.
         run: |
-          mkdir -p ~/.ccache
-          docker run --rm -u "$(id -u):$(id -g)" -v "$PWD:/workspace" -v "$HOME/.ccache:/ccache" \
-            -e CCACHE_DIR=/ccache -e CCACHE_MAXSIZE=1G -w /workspace \
+          docker run --rm -u "$(id -u):$(id -g)" -v "$PWD:/workspace" -w /workspace \
             kernellake-build-base:ci \
             bash -c "
-              cmake --preset cpu-coverage -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache &&
+              cmake --preset cpu-coverage &&
               cmake --build --preset cpu-coverage &&
               ctest --preset cpu-coverage --output-on-failure &&
               gcovr --root . \
@@ -618,24 +626,31 @@ jobs:
         # --test-dir scopes ctest to just that one CMake subdirectory's own
         # registered tests, which only depends on kernellake_gpu_tests
         # having been built.
-        # ccache matters more here than in gpu-build-test's own identical
-        # addition: the step above wipes build/gpu-coverage every run (the
-        # .gcda staleness requirement), throwing away ninja's own
-        # incremental-rebuild benefit on purpose -- ccache caches at the
-        # compiler-invocation level, independent of the build directory,
-        # so it still skips real recompilation for unchanged files even
-        # though the directory itself starts fresh every time. Local path
-        # (own scope, separate from gpu-build-test's own
-        # ~/.ccache-gpu-build-test), not actions/cache -- same persistent-
-        # runner reasoning as that job's identical step.
+        # No ccache here (removed 2026-08-23, unlike gpu-build-test's own
+        # identical-looking build) -- real bug found by comparing this
+        # job's live Codecov upload (~48%) against two from-scratch local
+        # reproductions of this exact command on the same commit (85%+,
+        # including one run inside this exact Docker image), with
+        # mismatched per-file line counts that only a stale coverage
+        # artifact can explain, not a real coverage gap. Root cause: a
+        # coverage build's whole point is measuring exact per-line hit
+        # counts, but ccache restoring a cached object for a
+        # --coverage-instrumented compile has to also restore that
+        # compile's side-effect .gcno file (the line-mapping gcov reads)
+        # -- a stale .gcno from an earlier commit's cache entry silently
+        # produces wrong line counts/coverage for a file that changed
+        # since, while ctest still reports 100% passing (the cached .o
+        # itself is behaviorally correct, just mismeasured). This step
+        # already wipes build/gpu-coverage every run and throws away
+        # ninja's own incremental-rebuild benefit on purpose (the .gcda
+        # staleness requirement) -- ccache's speed win on top of that
+        # isn't worth this correctness risk for a job whose only output is
+        # the coverage number itself.
         run: |
-          mkdir -p ~/.ccache-gpu-coverage
-          docker run --rm --gpus all -u "$(id -u):$(id -g)" -v "$PWD:/workspace" \
-            -v "$HOME/.ccache-gpu-coverage:/ccache" -e CCACHE_DIR=/ccache -e CCACHE_MAXSIZE=1G -w /workspace \
+          docker run --rm --gpus all -u "$(id -u):$(id -g)" -v "$PWD:/workspace" -w /workspace \
             kernellake-gpu-build-base:ci \
             bash -c "
-              cmake --preset gpu-coverage \
-                -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache &&
+              cmake --preset gpu-coverage &&
               cmake --build --preset gpu-coverage --target kernellake_gpu_tests &&
               ctest --test-dir build/gpu-coverage/tests/gpu --output-on-failure &&
               gcovr --root . \
