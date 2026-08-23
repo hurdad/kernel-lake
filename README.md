@@ -2,8 +2,6 @@
 
 [![CI](https://github.com/hurdad/kernel-lake/actions/workflows/ci.yml/badge.svg)](https://github.com/hurdad/kernel-lake/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/hurdad/kernel-lake/branch/main/graph/badge.svg)](https://codecov.io/gh/hurdad/kernel-lake)
-[![codecov-cpu](https://codecov.io/gh/hurdad/kernel-lake/branch/main/graph/badge.svg?flag=cpu)](https://codecov.io/gh/hurdad/kernel-lake/flags)
-[![codecov-gpu](https://codecov.io/gh/hurdad/kernel-lake/branch/main/graph/badge.svg?flag=gpu)](https://codecov.io/gh/hurdad/kernel-lake/flags)
 
 **GPU-native analytics for the open lakehouse.**
 
