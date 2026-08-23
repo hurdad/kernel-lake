@@ -539,6 +539,29 @@ jobs:
           target: gpu-build-base
           load: true
           tags: kernellake-gpu-build-base:ci
+      - name: Verify build toolchain matches the current Dockerfile
+        # Diagnostic, added 2026-08-23: a real local reproduction of this
+        # exact job (same image target, same commands, same commit, real
+        # GPU) measured 85.2% line coverage for the gpu-flagged files, but
+        # this runner's own uploaded gpu-coverage.xml has been reporting
+        # ~48% -- and per-file *line counts* differ too (e.g.
+        # arrow_bridge.cpp: 35 lines locally vs 32 lines as uploaded),
+        # which can't come from different code paths being exercised, only
+        # from a different gcc/gcov actually producing the instrumentation.
+        # This runner is a persistent machine with Docker's own local
+        # layer cache (no GHA cache-from/cache-to here, see the build step
+        # above) -- the leading theory is a stale `kernellake-gpu-build-
+        # base:ci` image surviving from before the CUDA 13 Docker
+        # migration (b34af33), whose gcc/gcov version wouldn't match this
+        # Dockerfile's current nvidia/cuda:13.3.1-devel-ubuntu26.04 base.
+        # `docker image inspect`'s Created timestamp is the tell: if it
+        # predates this migration, the build step above silently reused a
+        # stale image instead of rebuilding.
+        run: |
+          docker image inspect kernellake-gpu-build-base:ci --format 'image Created: {{.Created}}'
+          docker run --rm kernellake-gpu-build-base:ci cat /etc/os-release
+          docker run --rm kernellake-gpu-build-base:ci gcc --version
+          docker run --rm kernellake-gpu-build-base:ci gcov --version
       - name: Verify GPU passthrough into containers works
         # A separate, real concern from the host-level check above: the
         # NVIDIA Container Toolkit has to be installed and configured with
