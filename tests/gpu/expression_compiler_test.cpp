@@ -5,6 +5,7 @@
 #include <cudf/scalar/scalar_factories.hpp>
 #include <cudf/transform.hpp>
 
+#include "kernellake/common/errors.hpp"
 #include "kernellake/execution_gpu/cuda_utils.hpp"
 #include "kernellake/execution_gpu/expression_compiler.hpp"
 #include "kernellake/memory/rmm_environment.hpp"
@@ -150,6 +151,222 @@ TEST(ExpressionCompiler, CastingNegativeInt64ToUInt64SilentlyWrapsAround) {
   cudaDeviceSynchronize();
   const std::vector<std::uint64_t> host = copy_to_host<std::uint64_t>(result->view());
   EXPECT_EQ(host[0], 18446744073709551611ULL);  // 2^64 - 5, not an error and not saturated to 0.
+}
+
+// make_literal()'s switch has one case per KernelLake TypeId -- every
+// existing test above only ever constructs Int64/Float64 literals (via
+// LiteralExpression::make_int64/make_float64), leaving every other
+// concrete numeric/temporal/decimal case unexercised. LiteralExpression's
+// own two-argument constructor (value, type) is the general-purpose API
+// the make_* factories are just convenience wrappers over, so building one
+// directly with an explicit non-default type is the natural way to reach
+// these, not a contrived workaround.
+TEST(ExpressionCompiler, BooleanLiteralCompilesToCorrectValue) {
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(filled_int32_column(0, 5));
+  cudf::table table(std::move(columns));
+
+  LiteralExpression true_literal(true, boolean_type(false));
+  TestContext ctx;
+  ExpressionCompiler compiler;
+  std::unique_ptr<cudf::column> result =
+      cudf::compute_column(table.view(), compiler.compile(true_literal, ctx.context));
+  ASSERT_EQ(result->type().id(), cudf::type_id::BOOL8);
+
+  cudaDeviceSynchronize();
+  for (unsigned char value : copy_to_host<unsigned char>(result->view())) EXPECT_TRUE(value != 0);
+}
+
+TEST(ExpressionCompiler, Int32TypedLiteralCompilesToCorrectValue) {
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(filled_int32_column(0, 5));
+  cudf::table table(std::move(columns));
+
+  LiteralExpression literal(std::int64_t{7}, int32_type(false));
+  TestContext ctx;
+  ExpressionCompiler compiler;
+  std::unique_ptr<cudf::column> result =
+      cudf::compute_column(table.view(), compiler.compile(literal, ctx.context));
+  ASSERT_EQ(result->type().id(), cudf::type_id::INT32);
+
+  cudaDeviceSynchronize();
+  for (std::int32_t value : copy_to_host<std::int32_t>(result->view())) EXPECT_EQ(value, 7);
+}
+
+TEST(ExpressionCompiler, UInt64TypedLiteralCompilesToCorrectValue) {
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(filled_int32_column(0, 5));
+  cudf::table table(std::move(columns));
+
+  LiteralExpression literal(std::int64_t{9}, uint64_type(false));
+  TestContext ctx;
+  ExpressionCompiler compiler;
+  std::unique_ptr<cudf::column> result =
+      cudf::compute_column(table.view(), compiler.compile(literal, ctx.context));
+  ASSERT_EQ(result->type().id(), cudf::type_id::UINT64);
+
+  cudaDeviceSynchronize();
+  for (std::uint64_t value : copy_to_host<std::uint64_t>(result->view())) EXPECT_EQ(value, 9u);
+}
+
+TEST(ExpressionCompiler, Float32TypedLiteralCompilesToCorrectValue) {
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(filled_int32_column(0, 5));
+  cudf::table table(std::move(columns));
+
+  LiteralExpression literal(2.5, float32_type(false));
+  TestContext ctx;
+  ExpressionCompiler compiler;
+  std::unique_ptr<cudf::column> result =
+      cudf::compute_column(table.view(), compiler.compile(literal, ctx.context));
+  ASSERT_EQ(result->type().id(), cudf::type_id::FLOAT32);
+
+  cudaDeviceSynchronize();
+  for (float value : copy_to_host<float>(result->view())) EXPECT_FLOAT_EQ(value, 2.5F);
+}
+
+TEST(ExpressionCompiler, TimestampLiteralCompilesToCorrectValue) {
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(filled_int32_column(0, 5));
+  cudf::table table(std::move(columns));
+
+  const LiteralExpression literal = LiteralExpression::make_timestamp(1'700'000'000'000'000LL);
+  TestContext ctx;
+  ExpressionCompiler compiler;
+  std::unique_ptr<cudf::column> result =
+      cudf::compute_column(table.view(), compiler.compile(literal, ctx.context));
+  ASSERT_EQ(result->type().id(), cudf::type_id::TIMESTAMP_MICROSECONDS);
+
+  cudaDeviceSynchronize();
+  for (std::int64_t value : copy_to_host<std::int64_t>(result->view()))
+    EXPECT_EQ(value, 1'700'000'000'000'000LL);
+}
+
+// decimal_raw_value() (cudf_adapter.cpp) picks cudf's DECIMAL32/64/128
+// storage width from the DataType's own precision (<=9, <=18, >18) --
+// exercising all three needs a decimal literal at each precision tier, not
+// just one.
+TEST(ExpressionCompiler, DecimalLiteralsCompileAtEachCudfStorageWidth) {
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(filled_int32_column(0, 1));
+  cudf::table table(std::move(columns));
+  TestContext ctx;
+
+  {
+    LiteralExpression literal(12.34, decimal_type(/*precision=*/5, /*scale=*/2, false));
+    ExpressionCompiler compiler;
+    std::unique_ptr<cudf::column> result =
+        cudf::compute_column(table.view(), compiler.compile(literal, ctx.context));
+    EXPECT_EQ(result->type().id(), cudf::type_id::DECIMAL32);
+  }
+  {
+    LiteralExpression literal(12.34, decimal_type(/*precision=*/15, /*scale=*/2, false));
+    ExpressionCompiler compiler;
+    std::unique_ptr<cudf::column> result =
+        cudf::compute_column(table.view(), compiler.compile(literal, ctx.context));
+    EXPECT_EQ(result->type().id(), cudf::type_id::DECIMAL64);
+  }
+  {
+    LiteralExpression literal(12.34, decimal_type(/*precision=*/30, /*scale=*/2, false));
+    ExpressionCompiler compiler;
+    std::unique_ptr<cudf::column> result =
+        cudf::compute_column(table.view(), compiler.compile(literal, ctx.context));
+    EXPECT_EQ(result->type().id(), cudf::type_id::DECIMAL128);
+  }
+}
+
+// compile()'s dedicated AggregateExpression check (as opposed to falling
+// through to the generic "unrecognized expression type" case) exists so a
+// misplaced aggregate produces a specific, actionable error message --
+// only reachable by calling the row-wise compiler directly on an
+// AggregateExpression, since the real planner never routes one here.
+TEST(ExpressionCompiler, CompilingAggregateExpressionThrowsSpecificError) {
+  auto count_star =
+      std::make_shared<AggregateExpression>(AggregateFunction::CountStar, nullptr, int64_type(false));
+  TestContext ctx;
+  ExpressionCompiler compiler;
+  EXPECT_THROW({ (void)compiler.compile(*count_star, ctx.context); }, ExecutionError);
+}
+
+// to_ast_operator()/compile_binary(): every existing test above only
+// exercises Add/Multiply/Greater/Less/And -- the other half of
+// BinaryOperator's enumerators (used by real queries just as often, e.g.
+// `<>`/`<=`/`OR`) had no coverage of their own mapping to cudf::ast.
+TEST(ExpressionCompiler, RemainingBinaryOperatorsMapToCorrectCudfOperator) {
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(filled_int32_column(6, 4));
+  cudf::table table(std::move(columns));
+  auto a = std::make_shared<ColumnExpression>("a", 0, int32_type(false));
+  auto a_as_int64 = std::make_shared<CastExpression>(a, int64_type(false));
+  auto three = std::make_shared<LiteralExpression>(LiteralExpression::make_int64(3));
+  TestContext ctx;
+
+  for (const BinaryOperator op :
+       {BinaryOperator::Divide, BinaryOperator::NotEqual, BinaryOperator::LessEqual, BinaryOperator::Or}) {
+    BinaryExpression expr(op, a_as_int64, three, boolean_type(false));
+    ExpressionCompiler compiler;
+    std::unique_ptr<cudf::column> result =
+        cudf::compute_column(table.view(), compiler.compile(expr, ctx.context));
+    EXPECT_EQ(result->size(), 4) << "operator " << static_cast<int>(op);
+  }
+}
+
+// compile_unary(): Negate is the only UnaryOperator any existing test
+// exercises. Not/IsNull/IsNotNull are the other three real cases the real
+// binder produces (`NOT x`, `x IS NULL`, `x IS NOT NULL`).
+TEST(ExpressionCompiler, NotIsNullIsNotNullUnaryOperatorsProduceCorrectResults) {
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(filled_int32_column(0, 3));
+  cudf::table table(std::move(columns));
+  auto a = std::make_shared<ColumnExpression>("a", 0, int32_type(false));
+  auto a_as_int64 = std::make_shared<CastExpression>(a, int64_type(false));
+  auto three = std::make_shared<LiteralExpression>(LiteralExpression::make_int64(3));
+  auto is_three =
+      std::make_shared<BinaryExpression>(BinaryOperator::Equal, a_as_int64, three, boolean_type(false));
+  TestContext ctx;
+
+  {
+    UnaryExpression not_expr(UnaryOperator::Not, is_three, boolean_type(false));
+    ExpressionCompiler compiler;
+    std::unique_ptr<cudf::column> result =
+        cudf::compute_column(table.view(), compiler.compile(not_expr, ctx.context));
+    ASSERT_EQ(result->type().id(), cudf::type_id::BOOL8);
+    cudaDeviceSynchronize();
+    // a == 0 for every row, three-literal is 3 -> `a == 3` is false ->
+    // `NOT (a == 3)` is true for every row.
+    for (unsigned char value : copy_to_host<unsigned char>(result->view())) EXPECT_TRUE(value != 0);
+  }
+  {
+    UnaryExpression is_null_expr(UnaryOperator::IsNull, a_as_int64, boolean_type(false));
+    ExpressionCompiler compiler;
+    std::unique_ptr<cudf::column> result =
+        cudf::compute_column(table.view(), compiler.compile(is_null_expr, ctx.context));
+    ASSERT_EQ(result->type().id(), cudf::type_id::BOOL8);
+    cudaDeviceSynchronize();
+    // Column has no nulls (filled_int32_column has no null mask).
+    for (unsigned char value : copy_to_host<unsigned char>(result->view())) EXPECT_TRUE(value == 0);
+  }
+  {
+    UnaryExpression is_not_null_expr(UnaryOperator::IsNotNull, a_as_int64, boolean_type(false));
+    ExpressionCompiler compiler;
+    std::unique_ptr<cudf::column> result =
+        cudf::compute_column(table.view(), compiler.compile(is_not_null_expr, ctx.context));
+    ASSERT_EQ(result->type().id(), cudf::type_id::BOOL8);
+    cudaDeviceSynchronize();
+    for (unsigned char value : copy_to_host<unsigned char>(result->view())) EXPECT_TRUE(value != 0);
+  }
+}
+
+// compile_cast()'s default case: cudf::ast only supports widening casts to
+// INT64/UINT64/FLOAT64 (its own comment) -- casting to anything else (e.g.
+// back down to a narrower/non-numeric type) must fail with a clear error
+// rather than silently doing the wrong thing.
+TEST(ExpressionCompiler, CastToUnsupportedTargetTypeThrows) {
+  auto a = std::make_shared<ColumnExpression>("a", 0, int32_type(false));
+  auto cast_to_bool = std::make_shared<CastExpression>(a, boolean_type(false));
+  TestContext ctx;
+  ExpressionCompiler compiler;
+  EXPECT_THROW({ (void)compiler.compile(*cast_to_bool, ctx.context); }, ExecutionError);
 }
 
 TEST(ExpressionCompiler, UnaryNegateOnUnsignedColumnSilentlyWrapsAround) {

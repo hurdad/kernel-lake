@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <arrow/api.h>
+#include <arrow/array/builder_time.h>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/filling.hpp>
 #include <cudf/scalar/scalar.hpp>
@@ -68,6 +69,26 @@ TEST(ArrowBridge, ArrowToDeviceBatchRoundTripsValues) {
   for (int64_t i = 0; i < int_array->length(); ++i) {
     EXPECT_EQ(int_array->Value(i), i * 2);
   }
+}
+
+// cudf::from_arrow throws for Arrow types it has no matching column type
+// for (cudf has no interval type at all) -- exercises
+// from_arrow_record_batch's catch(...) block, which must release both C
+// Data Interface structs before rethrowing (ExportRecordBatch handed this
+// function ownership of them; leaking on the error path would be a real
+// bug, not just a missed line).
+TEST(ArrowBridge, FromArrowRecordBatchWithUnsupportedTypeThrowsAndCleansUp) {
+  arrow::MonthDayNanoIntervalBuilder builder;
+  ASSERT_TRUE(builder.Append(arrow::MonthDayNanoIntervalType::MonthDayNanos{1, 2, 3}).ok());
+  std::shared_ptr<arrow::Array> array;
+  ASSERT_TRUE(builder.Finish(&array).ok());
+  const auto arrow_schema = arrow::schema({arrow::field("a", arrow::month_day_nano_interval(), false)});
+  const auto record_batch = arrow::RecordBatch::Make(arrow_schema, 1, {array});
+
+  EXPECT_ANY_THROW({
+    [[maybe_unused]] const DeviceBatch batch =
+        from_arrow_record_batch(*record_batch, std::make_shared<const Schema>(one_int_column_schema()));
+  });
 }
 
 }  // namespace

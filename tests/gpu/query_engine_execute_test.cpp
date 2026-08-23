@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <array>
 #include <filesystem>
+#include <fstream>
 #include <map>
 #include <utility>
 
@@ -641,6 +642,67 @@ TEST_F(QueryEngineExecuteTest, CpuBackendMatchesGpuBackendForOrderByLimit) {
   const arrow::RecordBatch& cpu_batch = *cpu_result.batches.front();
   expect_string_columns_match(gpu_batch, cpu_batch, "region");
   expect_double_columns_match(gpu_batch, cpu_batch, "amount");
+}
+
+// operator_builder.cpp's LimitNode case fuses into a single SortOperator
+// only when the LIMIT's direct child is a SortNode (see build()'s own
+// comment on why) -- every other existing LIMIT test in this file pairs it
+// with ORDER BY, so the plain (unfused) LimitOperator construction path
+// had never been exercised through the real planner.
+TEST_F(QueryEngineExecuteTest, PlainLimitWithoutOrderByReturnsExactlyNRows) {
+  const QueryResult result =
+      engine_.execute("SELECT region, amount FROM read_parquet('" + path_ + "') LIMIT 2");
+
+  ASSERT_EQ(result.rows_returned, 2);
+  ASSERT_EQ(result.batches.size(), 1u);
+  EXPECT_EQ(result.batches.front()->num_rows(), 2);
+}
+
+// EngineSection::max_distinct_keys (0 = unset) forwards to
+// HashAggregateOperator's explicit-limit constructor overload instead of
+// its default -- operator_builder.cpp's build() has to resolve the "0
+// means default" convention itself since HashAggregateOperator's own
+// default argument only applies when the parameter is omitted entirely,
+// not when an explicit 0 is passed through. A large-enough limit here
+// must not change the real (small, 2-group) result at all.
+TEST_F(QueryEngineExecuteTest, ExplicitMaxDistinctKeysConfigStillProducesCorrectGroupedTotals) {
+  EngineConfig config = default_config();
+  config.engine.max_distinct_keys = 1000;
+  const QueryEngine engine_with_limit(config);
+
+  const QueryResult result = engine_with_limit.execute(
+      "SELECT region, SUM(amount) AS total FROM read_parquet('" + path_ + "') GROUP BY region");
+
+  ASSERT_EQ(result.rows_returned, 2);
+  ASSERT_EQ(result.batches.size(), 1u);
+  const std::shared_ptr<arrow::RecordBatch>& batch = result.batches.front();
+  const auto region_column = std::static_pointer_cast<arrow::StringArray>(batch->GetColumnByName("region"));
+  const auto total_column = std::static_pointer_cast<arrow::DoubleArray>(batch->GetColumnByName("total"));
+  std::map<std::string, double> totals_by_region;
+  for (std::int64_t i = 0; i < batch->num_rows(); ++i) {
+    totals_by_region[region_column->GetString(i)] = total_column->Value(i);
+  }
+  EXPECT_DOUBLE_EQ(totals_by_region.at("A"), 35.0);   // 10+20+5
+  EXPECT_DOUBLE_EQ(totals_by_region.at("B"), 110.0);  // 100+7+3
+}
+
+// Regression coverage for InstrumentedOperator::open()'s own catch block
+// (operator_builder.cpp) -- every existing exception-during-execution test
+// (RealOperatorExceptionDuringExecutionPropagatesCleanly above) fails
+// inside next(), never open() itself. A syntactically-valid-looking but
+// structurally corrupt Parquet file passes any earlier file-existence/
+// bind-time checks (it exists, and its extension/glob match), but
+// chunked_parquet_reader's own constructor -- called directly inside
+// ParquetScanOperator::open() -- throws when it can't parse the footer,
+// which is exactly the kind of real operator-level open() failure this
+// path exists to handle.
+TEST_F(QueryEngineExecuteTest, CorruptParquetFileFailsCleanlyDuringOpenNotNext) {
+  const std::string corrupt_path = (dir_ / "corrupt.parquet").string();
+  {
+    std::ofstream out(corrupt_path, std::ios::binary);
+    out << "not a real parquet file";
+  }
+  EXPECT_THROW((void)(engine_.execute("SELECT * FROM read_parquet('" + corrupt_path + "')")), std::exception);
 }
 
 TEST_F(QueryEngineExecuteTest, SplitExecutionPathLeavesMetadataInspectionSecondsNull) {

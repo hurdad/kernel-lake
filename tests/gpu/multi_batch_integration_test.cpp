@@ -199,6 +199,14 @@ TEST_F(MultiBatchIntegrationTest, FullPipelineCorrectAcrossMultipleBatchesAndMis
   // conditions instead of the common case of one batch per file.
   const std::unique_ptr<PhysicalOperator> root =
       build_operator_tree(physical, store, /*pass_read_limit_bytes=*/256);
+
+  // build_operator_tree() always wraps its root in operator_builder.cpp's
+  // own InstrumentedOperator (see build()'s instrument() lambda) -- name()/
+  // id() must forward to the wrapped ArrowResultOperator unchanged, since
+  // callers (tracing, metrics) rely on the wrapper being transparent.
+  EXPECT_EQ(root->name(), "ArrowResult");
+  EXPECT_GT(root->id(), 0u);
+
   root->open(context);
   std::map<std::string, std::pair<double, std::int64_t>> totals_by_region;
   std::int64_t rows_returned = 0;
