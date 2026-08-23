@@ -480,7 +480,7 @@ jobs:
             -v "$HOME/.ccache-gpu-build-test:/ccache" -e CCACHE_DIR=/ccache -e CCACHE_MAXSIZE=1G -w /workspace \
             kernellake-gpu-build-base:ci \
             bash -c "
-              cmake --preset gpu-dev -DCMAKE_CUDA_COMPILER=/usr/bin/nvcc \
+              cmake --preset gpu-dev \
                 -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache &&
               cmake --build --preset gpu-dev &&
               ctest --preset gpu-dev --output-on-failure --output-junit /workspace/test-results-gpu.xml
@@ -559,12 +559,13 @@ jobs:
         # nothing else here provides it for free.
         run: rm -rf build/gpu-coverage
       - name: Configure, build, test, and generate coverage report
-        # CMAKE_CUDA_COMPILER overridden explicitly: gpu-dev (which
-        # gpu-coverage inherits) hardcodes /usr/local/cuda/bin/nvcc for
-        # NVIDIA's own installer layout, but gpu-build-base installs CUDA
-        # via apt's nvidia-cuda-toolkit instead (Debian packaging
-        # convention: /usr/bin/nvcc) -- same override docker/Dockerfile's
-        # own gpu-release stage already uses for the identical reason.
+        # No CMAKE_CUDA_COMPILER override needed: gpu-dev (which
+        # gpu-coverage inherits) already hardcodes /usr/local/cuda/bin/nvcc,
+        # which now matches reality -- gpu-build-base installs CUDA from
+        # NVIDIA's own nvidia/cuda image (see docker/Dockerfile's own
+        # comment), not apt's nvidia-cuda-toolkit (Debian packaging
+        # convention: /usr/bin/nvcc, which needed this override -- no
+        # longer the case).
         #
         # Scoped to only the files that actually require
         # KERNELLAKE_WITH_CUDA=ON to compile/execute at all -- unlike the
@@ -609,7 +610,7 @@ jobs:
             -v "$HOME/.ccache-gpu-coverage:/ccache" -e CCACHE_DIR=/ccache -e CCACHE_MAXSIZE=1G -w /workspace \
             kernellake-gpu-build-base:ci \
             bash -c "
-              cmake --preset gpu-coverage -DCMAKE_CUDA_COMPILER=/usr/bin/nvcc \
+              cmake --preset gpu-coverage \
                 -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache &&
               cmake --build --preset gpu-coverage --target kernellake_gpu_tests &&
               ctest --test-dir build/gpu-coverage/tests/gpu --output-on-failure &&

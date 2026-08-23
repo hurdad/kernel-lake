@@ -1263,41 +1263,56 @@ session (not inferred from package metadata alone):
   exporter (the connection-refused errors in that test are expected --
   no collector was listening -- not build failures).
 
-**CUDA: apt's `nvidia-cuda-toolkit`, not NVIDIA's `nvidia/cuda` image.**
-This was the original motivation for considering Ubuntu 26.04 at all
-(installing CUDA as a normal apt package rather than pinning a specific
-`nvidia/cuda:<version>-<devel|runtime>-ubuntu<version>` Docker tag).
-Two apt-level facts made this concrete rather than aspirational:
+**CUDA in `docker/Dockerfile`: NVIDIA's own `nvidia/cuda:${CUDA_VERSION}-devel-ubuntu26.04` image (2026-08-23), not apt's `nvidia-cuda-toolkit`.**
+The apt-toolkit path was the original choice here, specifically to dodge
+a CUDA 12->13 major-version bump: NVIDIA only publishes `ubuntu26.04`-
+tagged images starting at CUDA 13.3, and switching would have forced a
+`-cu13` RAPIDS re-vendor alongside it -- considered and rejected at the
+time as a materially bigger, differently-risky change than staying on
+apt's CUDA 12.4.1.
 
-- `nvidia-cuda-toolkit` on Ubuntu 26.04 is version **12.4.1** -- a *minor*
-  step down from the previously-pinned `nvidia/cuda:12.6.3`, not a major
-  version change. `cmake/ThirdPartyRapids.cmake`'s pinned RAPIDS wheels
-  stay exactly as they are (`-cu12`, unchanged) -- no re-vendoring needed.
-  (NVIDIA's own `nvidia/cuda` image, by contrast, only publishes
-  `ubuntu26.04` tags starting at CUDA 13.3 -- taking that path instead
-  would have forced a major CUDA version bump and a `-cu13` RAPIDS
-  re-vendor, a materially bigger and differently-risky change that was
-  considered and rejected in favor of the apt-toolkit path.)
-- `nvidia-cuda-toolkit` does **not** pull in `libcufile-dev` (GPUDirect
-  Storage), which `kvikio` (a libcudf dependency) requires --
-  `kvikio-config.cmake` fails configure outright ("Compiled with cuFile
-  support but cuFile not found") without it. `libcufile-dev` is a separate
-  apt package, but from the same repo at the matching `12.4.1-8` build
-  revision -- not a NVIDIA-repo dependency, still fully apt-native.
+Revisited once that blocker turned out to be smaller than it looked:
+`librmm`/`libkvikio`/`libcudf`/`nvidia-libnvcomp` all publish `-cu13`
+wheels on PyPI at the *exact same versions* `cmake/ThirdPartyRapids.cmake`
+already had pinned for `-cu12` (26.6.0 for the first three, 5.3.0.16 for
+nvcomp) -- a clean CUDA-suffix swap, not also a RAPIDS version bump.
+That file now auto-detects the real installed CUDA major version
+(`CUDAToolkit_VERSION_MAJOR`, populated by `find_package(CUDAToolkit
+REQUIRED)` immediately before it's included) and selects `-cu12`/`-cu13`
+wheels accordingly, with both sets declared side by side -- a non-Docker
+CUDA 12.x dev environment keeps working unchanged, and a future Docker
+CUDA bump within the 13.x line needs zero edits there.
 
-nvcc lands at `/usr/bin/nvcc` under this packaging (Debian convention),
-not `/usr/local/cuda/bin/nvcc` (NVIDIA installer/Docker-image convention).
-`CMakePresets.json`'s `gpu-dev` preset's `CMAKE_CUDA_COMPILER` default
-still points at the NVIDIA-installer path -- a stale assumption from when
-this project's own non-container environment used that convention; now
-that this project's own sandbox is on Ubuntu 26.04 too (see "Ubuntu 26.04
-baseline" above) with apt's `nvidia-cuda-toolkit`, invoking the `gpu-dev`
-preset here also needs an explicit `-DCMAKE_CUDA_COMPILER=/usr/bin/nvcc`
-override, same as `docker/Dockerfile` already does in its own `cmake
---preset gpu-release` invocation. Updating the preset's own default to match is
-a reasonable follow-up, not done here since both current environments work
-fine with the explicit override and neither depends on the preset default
-being correct.
+`docker/Dockerfile`'s `gpu-build-base` stage now builds `FROM
+nvidia/cuda:${CUDA_VERSION}-devel-ubuntu26.04` directly (an `ARG`, default
+`13.3.1`, overridable via `--build-arg` without editing the file) rather
+than `FROM build-base` -- confirmed for real (`docker pull` +
+`docker run` against the bare image) that this also already ships
+GPUDirect Storage dev headers pre-installed (`libcufile-13-3`/
+`libcufile-dev-13-3`, `cufile.h` present under
+`/usr/local/cuda-13.3/targets/x86_64-linux/include/`), so unlike the
+apt-toolkit path, nothing extra needs installing for `kvikio` to find
+cuFile. One real trap found and deliberately avoided: apt's bare
+`libcufile-dev` package name (no version suffix) resolves to Ubuntu's own
+stale, CUDA-12.4-targeted `1.9.1.3~12.4.1-8` from the `multiverse`
+component, not NVIDIA's CUDA-13-matched package already present --
+installing it explicitly would silently mismatch the GDS headers this
+base image already has right.
+
+nvcc lands at `/usr/local/cuda/bin/nvcc` in this image (NVIDIA installer/
+Docker-image convention), matching `CMakePresets.json`'s `gpu-dev`/
+`gpu-release` preset defaults exactly -- the `-DCMAKE_CUDA_COMPILER=
+/usr/bin/nvcc` override `docker/Dockerfile`'s `gpu-release` stage and two
+`.github/workflows/ci.yml` jobs previously needed (to work around apt
+packaging's Debian-convention nvcc path) is gone from all three.
+
+This project's own non-container sandbox environment is unaffected by
+any of this: it's a separate, independent environment (see the
+independence point above) that still uses apt's `nvidia-cuda-toolkit`
+directly on the host (CUDA 12.4, `/usr/bin/nvcc`) -- invoking the
+`gpu-dev` preset there still needs the explicit
+`-DCMAKE_CUDA_COMPILER=/usr/bin/nvcc` override, unchanged. Only
+`docker/Dockerfile`'s GPU build path switched.
 
 `CMAKE_CUDA_ARCHITECTURES` cannot be left at the top-level `CMakeLists.txt`
 default of `native` (which probes an actual device) inside

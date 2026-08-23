@@ -1,4 +1,15 @@
 # syntax=docker/dockerfile:1
+
+# Single place to bump the GPU build's CUDA version -- overridable at
+# `docker build` time via `--build-arg CUDA_VERSION=...` without editing
+# this file. Must be a real published `nvidia/cuda:<version>-devel-
+# ubuntu26.04` tag (NVIDIA only started publishing ubuntu26.04-tagged
+# images at 13.3 -- see docs/ARCHITECTURE.md's "Ubuntu 26.04 baseline"
+# section). Declared before the first FROM so it's in scope for
+# gpu-build-base's own FROM line below; not re-declared in any later
+# stage since nothing past gpu-build-base needs the raw version string
+# again.
+ARG CUDA_VERSION=13.3.1
 # Explicit frontend pin (added 2026-08-17, alongside this file's first use
 # of `RUN --mount=type=cache` in cpu-release/gpu-release below): modern
 # Docker/buildx defaults to a recent-enough frontend that this likely
@@ -63,18 +74,30 @@
 #       --input /data/sf0.01/report.json /data/sf0.1/report.json /data/sf1/report.json \
 #       --output /data/benchmark_report.pdf
 #
-# Base: plain `ubuntu:26.04`, with CUDA (runtime-gpu only) installed via
-# Ubuntu's own apt `nvidia-cuda-toolkit` package (12.4.1) rather than
-# NVIDIA's official `nvidia/cuda` devel/runtime images -- verified by a real
-# `docker build` and `docker run --gpus all` (a full 214/214 test pass on
-# real hardware) in this project's own development session. See
-# docs/ARCHITECTURE.md's "Ubuntu 26.04 baseline" section for why: NVIDIA's
-# apt Flight SQL package doesn't link against Ubuntu 24.04's older system
-# Abseil, otel-cpp has no 24.04 apt package at all, and both work cleanly
-# on 26.04. RAPIDS libcudf/RMM stay on the same `-cu12` pinned wheels
-# (cmake/ThirdPartyRapids.cmake) -- CUDA 12.4 is a minor step down from the
-# previously-pinned 12.6.3, not a major-version change, and needs no
-# re-vendoring.
+# Base: plain `ubuntu:26.04` for the CPU-only build path (`build-base`,
+# `cpu-release`), NVIDIA's official `nvidia/cuda:${CUDA_VERSION}-devel-
+# ubuntu26.04` image for the GPU build path (`gpu-build-base`, built
+# straight from that image rather than from `build-base` -- see that
+# stage's own comment). This project spent one earlier session avoiding
+# NVIDIA's official image in favor of Ubuntu's own apt `nvidia-cuda-
+# toolkit` package specifically to dodge the CUDA 12->13 major-version
+# bump that switching would have forced (NVIDIA only publishes
+# `ubuntu26.04`-tagged images starting at CUDA 13.3) -- see
+# docs/ARCHITECTURE.md's "Ubuntu 26.04 baseline" section for the full
+# history. Revisited once RAPIDS libcudf/RMM/kvikio/nvcomp turned out to
+# publish `-cu13` wheels at the exact same versions already pinned
+# (`cmake/ThirdPartyRapids.cmake`), making the re-vendor a clean
+# CUDA-suffix swap rather than also a RAPIDS version bump. Both CUDA
+# major versions stay supported there (selected automatically from
+# whatever `nvcc` a given configure actually finds, not a second
+# hardcoded setting) so a non-Docker CUDA 12.x dev environment keeps
+# working unchanged.
+#
+# `docs/ARCHITECTURE.md`'s other two Ubuntu-26.04-specific facts (Arrow
+# Flight SQL doesn't link against Ubuntu 24.04's older system Abseil;
+# otel-cpp has no 24.04 apt package at all) are unrelated to this CUDA
+# sub-decision and still apply unchanged -- both build paths stay on
+# Ubuntu 26.04 regardless of where CUDA itself comes from.
 #
 # Phase 3 (docs/ROADMAP.md): also builds and ships kernellake-server
 # (KERNELLAKE_BUILD_SERVER=ON) with OpenTelemetry export enabled
@@ -213,33 +236,72 @@ ENTRYPOINT ["/workspace/build/cpu-release/src/cli/kernellake"]
 CMD ["--help"]
 
 # ---------------------------------------------------------------------------
-# gpu-build-base: build-base plus the CUDA toolkit and gcovr -- everything a
-# GPU build needs *before* the repo is copied in. Not a runnable image on
-# its own. Split out from gpu-release (which used to install CUDA inline)
-# so .github/workflows/ci.yml's gpu-coverage job can build/cache this exact
-# stage and `docker run` its own configure/build/test/coverage steps
-# against a live checkout, without also paying for gpu-release's own baked-
-# in build every time.
+# gpu-build-base: everything a GPU build needs *before* the repo is copied
+# in -- the full toolchain (mirroring build-base's own package list below,
+# duplicated rather than inherited -- see comment on that), plus CUDA and
+# GPUDirect Storage headers from NVIDIA's own image instead of apt. Not a
+# runnable image on its own. Split into its own stage (not inlined into
+# gpu-release) so .github/workflows/ci.yml's gpu-coverage job can build/
+# cache this exact stage and `docker run` its own configure/build/test/
+# coverage steps against a live checkout, without also paying for
+# gpu-release's own baked-in build every time.
+#
+# Built FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu26.04, not FROM
+# build-base -- see the top-of-file "Base:" comment for the full history
+# of this choice. Real, accepted tradeoff: this duplicates build-base's
+# package-install RUN block below (same list, same order, same comment
+# numbering) rather than sharing it -- Docker has no clean way to
+# parameterize a single stage's base image and share a RUN layer across
+# two different FROMs in the same build. If build-base's own package list
+# above ever changes, this block needs the identical change made here too
+# -- nothing enforces that automatically.
 # ---------------------------------------------------------------------------
-FROM build-base AS gpu-build-base
+ARG CUDA_VERSION
+FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu26.04 AS gpu-build-base
 
-# CUDA toolkit + GPUDirect Storage headers, both from Ubuntu's own apt
-# repos. libcufile-dev is not pulled in by nvidia-cuda-toolkit itself but is
-# required by kvikio (a libcudf dependency) -- confirmed by a real
-# configure failure ("Compiled with cuFile support but cuFile not found")
-# before this line was added. gcovr is already present via build-base.
-RUN apt-get update && apt-get install -y --no-install-recommends \
-      nvidia-cuda-toolkit libcufile-dev \
-    && rm -rf /var/lib/apt/lists/*
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Identical to build-base's own RUN block above (see that stage's numbered
+# comment for the full per-package rationale -- not repeated here), minus
+# `nvidia-cuda-toolkit`/`libcufile-dev`: this base image already ships CUDA
+# itself plus GDS/cuFile dev headers pre-installed (confirmed for real --
+# `dpkg -l` on a bare `nvidia/cuda:13.3.1-devel-ubuntu26.04` container
+# already lists `libcufile-13-3`/`libcufile-dev-13-3` and
+# `/usr/local/cuda-13.3/targets/x86_64-linux/include/cufile.h` exists),
+# so there is nothing left to apt-install for either. Deliberately NOT
+# `apt-get install libcufile-dev` (the bare, unsuffixed package name) as a
+# defensive extra step: that resolves to Ubuntu's own multiverse package
+# (`1.9.1.3~12.4.1-8`, CUDA-12.4-targeted, confirmed via `apt-cache
+# policy`), not NVIDIA's CUDA-13-matched `libcufile-dev-13-3` already
+# present -- installing it would silently downgrade/mismatch the GDS
+# headers this image already has right.
+RUN apt-get update && apt-get upgrade -y \
+    && apt-get install -y --no-install-recommends \
+      wget ca-certificates lsb-release gnupg \
+    && wget -O /tmp/arrow-apt-source.deb \
+      "https://packages.apache.org/artifactory/arrow/ubuntu/apache-arrow-apt-source-latest-$(lsb_release --codename --short).deb" \
+    && apt-get install -y -V /tmp/arrow-apt-source.deb \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+         build-essential cmake ninja-build git pkg-config ccache \
+         python3 python3-pip \
+         libgtest-dev libbenchmark-dev libspdlog-dev nlohmann-json3-dev libyaml-cpp-dev \
+         libxml2-dev uuid-dev libavro-dev libcurl4-openssl-dev \
+         libgrpc++-dev protobuf-compiler-grpc opentelemetry-cpp-dev \
+         libarrow-dev=25.0.1-1 libparquet-dev=25.0.1-1 libarrow-dataset-dev=25.0.1-1 \
+         libarrow-flight-dev=25.0.1-1 libarrow-flight-sql-dev=25.0.1-1 \
+         clang-format-18 clang-tidy-18 \
+    && rm -rf /var/lib/apt/lists/* /tmp/arrow-apt-source.deb \
+    && pip install --break-system-packages --no-cache-dir gcovr
 
 # ---------------------------------------------------------------------------
 # gpu-release: full GPU build environment, repo built inside it
 # (`gpu-release` preset -- optimized, RelWithDebInfo -- + BUILD_SERVER/
 # ENABLE_OTEL). Also a complete, runnable image on its own (`--target
-# gpu-release`). Built FROM gpu-build-base (not build-base directly) so
-# that stage's CUDA-toolkit/gcovr layer is shared with, not duplicated for,
-# .github/workflows/ci.yml's gpu-coverage job -- see gpu-build-base's own
-# comment.
+# gpu-release`). Built FROM gpu-build-base (not the NVIDIA CUDA image
+# directly) so that stage's whole toolchain+CUDA+gcovr layer is shared
+# with, not duplicated for, .github/workflows/ci.yml's gpu-coverage job --
+# see gpu-build-base's own comment.
 # ---------------------------------------------------------------------------
 FROM gpu-build-base AS gpu-release
 
@@ -249,25 +311,41 @@ COPY . .
 # RAPIDS libcudf/RMM/kvikio/nvcomp/rapids-logger are vendored automatically
 # by CMake FetchContent on first configure (cmake/ThirdPartyRapids.cmake,
 # pinned PyPI wheels, no conda) -- no separate install step needed here.
+# That file auto-detects the real installed CUDA major version
+# (`CUDAToolkit_VERSION_MAJOR`) and picks matching `-cu12`/`-cu13` wheels
+# accordingly -- nothing to configure here either.
 #
-# CMAKE_CUDA_COMPILER: apt's nvidia-cuda-toolkit installs nvcc at
-# /usr/bin/nvcc (Debian packaging convention), not
-# /usr/local/cuda/bin/nvcc (NVIDIA installer/Docker-image convention,
-# still used by CMakePresets.json's gpu-dev/gpu-release presets for this
-# project's own non-container dev environment) -- overridden here, not in
-# the preset itself, so the two environments' actual toolchains each get
-# their own correct path without either one needing to guess the other's
-# layout.
+# CMAKE_CUDA_COMPILER needs no override here (unlike when this stage
+# installed CUDA via apt's nvidia-cuda-toolkit, which put nvcc at the
+# Debian-convention /usr/bin/nvcc): gpu-build-base's nvidia/cuda image puts
+# it at /usr/local/cuda/bin/nvcc, the NVIDIA installer/Docker-image
+# convention CMakePresets.json's gpu-dev/gpu-release presets already
+# default to for this project's own non-container dev environment -- both
+# environments' toolchains now agree without either one needing an
+# explicit override.
 #
 # CMAKE_CUDA_ARCHITECTURES: no GPU is visible during `docker build` (unlike
 # `docker run --gpus all`), so the top-level CMakeLists.txt's default of
 # "native" (query the actual device) cannot be used here -- it needs a real
-# device to probe. Volta through Hopper (70/75/80/86/89) get real compiled
-# code; Hopper's entry is also left without the "-real" suffix so its PTX
-# is embedded too, letting the driver JIT-compile for newer architectures
-# it doesn't have native code for (this is exactly what let the RTX 5060 Ti
-# used to verify this image, a Blackwell/sm_120 card newer than anything
-# CUDA 12.4's nvcc can target directly, run all 214 tests successfully).
+# device to probe. ARG CUDA_ARCHITECTURES (default below, overridable via
+# `docker build --build-arg CUDA_ARCHITECTURES=...`) instead: Turing through
+# Blackwell (75/80/86/89/90/100) get real compiled code; Blackwell's entry
+# is also left without the "-real" suffix so its PTX is embedded too,
+# letting the driver JIT-compile for newer architectures it doesn't have
+# native code for.
+#
+# The old default here (Volta through Hopper, 70/75/80/86/89) stopped
+# compiling outright once this stage switched to CUDA 13.3 -- confirmed for
+# real (`nvcc fatal: Unsupported gpu architecture 'compute_70'`), not a
+# guess: CUDA 13's nvcc dropped Volta support entirely. Real, current
+# supported range re-checked directly against this exact image
+# (`nvcc --list-gpu-arch` inside `nvidia/cuda:13.3.1-devel-ubuntu26.04`):
+# compute_75/80/86/87/88/89/90/100/103/110/120/121 -- Turing is now the
+# floor, and Blackwell (100/103/110/120/121) is natively supported for the
+# first time (previously only reachable via Hopper's PTX forward-JIT, which
+# is exactly what let the RTX 5060 Ti used to verify this image, a
+# Blackwell/sm_120 card, run all 214 tests successfully under CUDA 12.4's
+# nvcc despite having no native sm_120 support at all).
 #
 # No `ctest` here (unlike cpu-release above): tests/gpu/ needs a real GPU
 # device to run, which `docker build` never has (only `docker run --gpus
@@ -290,10 +368,10 @@ COPY . .
 # ccache namespace separate from cpu-release's. ccache does cache nvcc
 # invocations too (not just gcc/g++), so this covers the CUDA translation
 # units, not just the plain C++ ones.
+ARG CUDA_ARCHITECTURES="75-real;80-real;86-real;89-real;90-real;100-real;120"
 RUN --mount=type=cache,target=/root/.ccache,id=ccache-gpu-release \
     cmake --preset gpu-release \
-      -DCMAKE_CUDA_COMPILER=/usr/bin/nvcc \
-      -DCMAKE_CUDA_ARCHITECTURES="70-real;75-real;80-real;86-real;89" \
+      -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCHITECTURES}" \
       -DKERNELLAKE_BUILD_SERVER=ON \
       -DKERNELLAKE_ENABLE_OTEL=ON \
       -DKERNELLAKE_BUILD_TESTS=OFF \
