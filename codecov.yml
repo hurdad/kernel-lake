@@ -1,26 +1,43 @@
-# Defines a "gpu" component so Codecov reports a real, isolated coverage
-# percentage for GPU-only code instead of blending it against the whole
-# repo's line count.
+# Defines "cpu" and "gpu" components so Codecov reports two real, isolated
+# coverage percentages instead of one flagged (`gpu`) number plus an
+# implicit, unlabeled default bucket for everything else.
 #
-# Real bug this fixes: the `gpu` flag (.github/workflows/ci.yml's
-# gpu-coverage job uploads gpu-coverage.xml under `flags: gpu`) is scoped
-# server-side to a small, deliberate subset of the codebase -- only the
-# files that actually require KERNELLAKE_WITH_CUDA=ON to compile/execute
-# at all (see that job's own gcovr --filter list, mirrored as `paths`
-# below). Without a component explicitly scoping the flag to those same
-# paths, Codecov's own /flags/ API computed that flag's coverage against
-# the *entire* repo's line count as the denominator (8545 lines, most of
-# which the gpu flag never uploads data for at all) instead of just the
-# ~1980 lines it actually covers -- reporting 48.47% when a real local
-# rebuild of the exact same commit, using the exact same gcovr command
-# this job runs, measured 85.3%. Confirmed via Codecov's own component
-# docs: "If both flag_regexes and paths are defined for a component, that
-# filter is AND-style" -- paths alone isn't enough, since without the
-# flag_regexes match a path-only component would also pull in whatever
-# the unflagged CPU session reports for any file that happens to overlap
+# Real bug the `gpu` component fixes: the `gpu` flag (.github/workflows/
+# ci.yml's gpu-coverage job uploads gpu-coverage.xml under `flags: gpu`) is
+# scoped server-side to a small, deliberate subset of the codebase -- only
+# the files that actually require KERNELLAKE_WITH_CUDA=ON to compile/
+# execute at all (see that job's own gcovr --filter list, mirrored as
+# `paths` below). Without a component explicitly scoping the flag to those
+# same paths, Codecov's own /flags/ API computed that flag's coverage
+# against the *entire* repo's line count as the denominator (8545 lines,
+# most of which the gpu flag never uploads data for at all) instead of
+# just the ~1980 lines it actually covers -- reporting 48.47% when a real
+# local rebuild of the exact same commit, using the exact same gcovr
+# command this job runs, measured 85.3%. Confirmed via Codecov's own
+# component docs: "If both flag_regexes and paths are defined for a
+# component, that filter is AND-style" -- paths alone isn't enough, since
+# without the flag_regexes match a path-only component would also pull in
+# whatever the `cpu` session reports for any file that happens to overlap
 # (none currently do, but nothing enforces that staying true).
+#
+# The `cpu` component mirrors this for symmetry: the `coverage` job
+# (.github/workflows/ci.yml) now uploads coverage.xml under `flags: cpu`
+# (previously unflagged -- an "everything not gpu" bucket with no name of
+# its own in Codecov's UI), scoped the same way via gcovr's own
+# `--filter 'src/' --filter 'include/'`. The cpu-coverage preset never
+# compiles the GPU-only files listed under the `gpu` component below (no
+# KERNELLAKE_WITH_CUDA), so the two components' line sets don't overlap in
+# practice -- the paths+flag_regexes AND-filter here is belt-and-suspenders
+# scoping, same rationale as the gpu component's own.
 component_management:
   individual_components:
+    - component_id: cpu
+      name: CPU execution
+      paths:
+        - src/**
+        - include/**
+      flag_regexes:
+        - cpu
     - component_id: gpu
       name: GPU execution
       paths:
@@ -37,9 +54,10 @@ component_management:
 # guard, required because it's the only job here that runs on the
 # self-hosted GPU runner (see that job's own comment on why). That means no
 # pull_request commit ever uploads a report carrying the `gpu` flag, only
-# the unflagged coverage.xml from the `coverage` job (CPU-only, gcovr's own
-# `src/`+`include/` filter there never touches GPU-only files, since
-# cpu-coverage's build doesn't compile them at all).
+# the `cpu`-flagged coverage.xml from the `coverage` job (which runs on
+# every push and PR, no such guard -- gcovr's own `src/`+`include/` filter
+# there never touches GPU-only files, since cpu-coverage's build doesn't
+# compile them at all).
 #
 # Without carryforward, Codecov's PR-vs-base diff would compare that
 # GPU-less PR report against main's own report (which does carry the `gpu`
@@ -49,8 +67,11 @@ component_management:
 # not because anything in the PR actually changed. `carryforward: true`
 # tells Codecov to keep reusing the most recent `gpu`-flagged upload for
 # any commit that doesn't produce a new one itself, so PR comparisons stay
-# apples-to-apples.
+# apples-to-apples. `cpu` needs no such treatment -- it uploads a fresh
+# report on every single commit already.
 flag_management:
   individual_flags:
+    - name: cpu
+      carryforward: false
     - name: gpu
       carryforward: true
