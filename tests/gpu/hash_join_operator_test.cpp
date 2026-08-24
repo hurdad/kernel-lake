@@ -234,5 +234,52 @@ TEST(HashJoinOperator, PartitionedJoinEmptyBuildSideProducesNoRows) {
   op.close(context);
 }
 
+// estimate_row_width_bytes()'s switch had no coverage for TypeId::Boolean
+// (1 byte) or any of the 4-byte types (Int32/UInt32/Float32/Date32) --
+// every existing schema in this file's tests only uses 8-byte numeric
+// columns.
+TEST(HashJoinFreeFunctions, EstimateRowWidthBytesSumsEachFieldsRealWidth) {
+  Schema schema({Field{"flag", boolean_type(false)}, Field{"small", int32_type(false)},
+                 Field{"big", int64_type(false)}, Field{"text", string_type(false)}});
+  // 1 (bool) + 4 (int32) + 8 (int64) + 24 (string heuristic) = 37.
+  EXPECT_EQ(estimate_row_width_bytes(schema), 37u);
+}
+
+// choose_partition_count()'s actual multi-partition sizing math (the
+// safety-factor/ceiling/kMaxPartitions clamp) had no direct coverage --
+// every existing test in this file constructs HashJoinOperator with an
+// explicit partition_count, never through this planner-facing function
+// with inputs deliberately sized to force it past the single-partition
+// fast path.
+TEST(HashJoinFreeFunctions, ChoosePartitionCountReturnsOneWhenEstimateFitsBudget) {
+  Schema schema({Field{"key", int64_type(false)}});
+  EXPECT_EQ(choose_partition_count(/*estimated_build_rows=*/100, schema, /*budget_bytes=*/1'000'000), 1u);
+}
+
+TEST(HashJoinFreeFunctions, ChoosePartitionCountReturnsOneWhenRowsUnknownOrBudgetZero) {
+  Schema schema({Field{"key", int64_type(false)}});
+  EXPECT_EQ(choose_partition_count(/*estimated_build_rows=*/std::nullopt, schema, /*budget_bytes=*/1'000),
+            1u);
+  EXPECT_EQ(choose_partition_count(/*estimated_build_rows=*/100, schema, /*budget_bytes=*/0), 1u);
+  EXPECT_EQ(choose_partition_count(/*estimated_build_rows=*/0, schema, /*budget_bytes=*/1'000), 1u);
+}
+
+TEST(HashJoinFreeFunctions, ChoosePartitionCountScalesWithEstimatedOverageAndClampsToMax) {
+  Schema schema({Field{"key", int64_type(false)}});  // 8 bytes/row.
+  // 10,000,000 rows * 8 bytes/row = 80,000,000 bytes estimated, against a
+  // 1,000,000-byte budget -- comfortably forces the real
+  // safety-factor/ceiling math, not just past the fits-in-budget check.
+  const std::size_t partitions = choose_partition_count(/*estimated_build_rows=*/10'000'000, schema,
+                                                        /*budget_bytes=*/1'000'000);
+  EXPECT_GT(partitions, 1u);
+  EXPECT_LE(partitions, 64u);  // kMaxPartitions.
+
+  // A wildly larger overage must clamp to kMaxPartitions rather than
+  // returning some enormous, degenerate partition count.
+  const std::size_t clamped = choose_partition_count(/*estimated_build_rows=*/1'000'000'000'000, schema,
+                                                     /*budget_bytes=*/1);
+  EXPECT_EQ(clamped, 64u);
+}
+
 }  // namespace
 }  // namespace kernellake

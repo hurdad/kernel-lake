@@ -338,5 +338,198 @@ TEST(HashAggregateOperator, EmptyInputProducesZeroRowResult) {
   op.close(context);
 }
 
+// Constructor's own validation had no coverage: GROUP BY with zero keys is
+// a real planner bug (a scalar aggregate with no GROUP BY clause at all
+// should go through ScalarAggregateOperator instead, never this class),
+// not a user-facing SQL error.
+TEST(HashAggregateOperator, ConstructorThrowsWhenGroupByIsEmpty) {
+  auto amount = std::make_shared<ColumnExpression>("amount", 1, float64_type(false));
+  auto sum_expr = std::make_shared<AggregateExpression>(AggregateFunction::Sum, amount, float64_type(true));
+  std::vector<NamedExpression> aggregates = {NamedExpression{sum_expr, "total"}};
+
+  EXPECT_THROW(
+      {
+        HashAggregateOperator op(1, std::make_unique<VectorSourceOperator>(std::vector<DeviceBatch>{}),
+                                 std::vector<NamedExpression>{}, std::move(aggregates));
+      },
+      PlanningError);
+}
+
+// Same rationale as HashAggregateOperator's own open()-time check --
+// mirrors ScalarAggregateOperator.OpenThrowsWhenAggregateItemIsNotAnAggregateExpression.
+TEST(HashAggregateOperator, OpenThrowsWhenAggregateItemIsNotAnAggregateExpression) {
+  auto region = std::make_shared<ColumnExpression>("region", 0, int32_type(false));
+  std::vector<NamedExpression> group_by = {NamedExpression{region, "region"}};
+  auto amount = std::make_shared<ColumnExpression>("amount", 1, float64_type(false));
+  std::vector<NamedExpression> aggregates = {NamedExpression{amount, "amount"}};
+
+  HashAggregateOperator op(1, std::make_unique<VectorSourceOperator>(std::vector<DeviceBatch>{}),
+                           std::move(group_by), std::move(aggregates));
+  ExecutionContext context = make_context();
+  EXPECT_THROW({ op.open(context); }, ExecutionError);
+}
+
+// AggregateFunction::Count (as opposed to CountStar, which every other
+// COUNT-shaped test in this file uses) had no coverage of its own --
+// open()'s dedicated Count case (ValueColumnKind::CountColumnOnes) is a
+// separate branch from CountStar's.
+TEST(HashAggregateOperator, GroupedCountOfColumnMatchesRowCountPerGroup) {
+  RmmEnvironment env(default_config());
+  std::vector<DeviceBatch> batches;
+  batches.push_back(make_batch({1, 1, 1, 2, 2}, {10.0, 20.0, 5.0, 100.0, 7.0}));
+
+  auto region = std::make_shared<ColumnExpression>("region", 0, int32_type(false));
+  std::vector<NamedExpression> group_by = {NamedExpression{region, "region"}};
+  auto amount = std::make_shared<ColumnExpression>("amount", 1, float64_type(false));
+  auto count_expr = std::make_shared<AggregateExpression>(AggregateFunction::Count, amount, int64_type(true));
+  std::vector<NamedExpression> aggregates = {NamedExpression{count_expr, "n"}};
+
+  HashAggregateOperator op(1, std::make_unique<VectorSourceOperator>(std::move(batches)), std::move(group_by),
+                           std::move(aggregates));
+  ExecutionContext context = make_context();
+  op.open(context);
+  std::optional<DeviceBatch> result = op.next(context);
+  ASSERT_TRUE(result.has_value());
+  EXPECT_EQ(result->row_count(), 2u);
+
+  const std::vector<int32_t> region_values = copy_to_host<int32_t>(result->view().column(0));
+  const std::vector<std::int64_t> counts = copy_to_host<std::int64_t>(result->view().column(1));
+  std::map<int32_t, std::int64_t> counts_by_region;
+  for (std::size_t i = 0; i < region_values.size(); ++i) counts_by_region[region_values[i]] = counts[i];
+  EXPECT_EQ(counts_by_region[1], 3);
+  EXPECT_EQ(counts_by_region[2], 2);
+  op.close(context);
+}
+
+// next()'s AggregateOutputKind::Average finalization (the divide-two-
+// SUM-of-ones-derived-columns path) had no coverage -- open()'s own AVG
+// setup is exercised elsewhere, but no existing test actually calls
+// next() with real data behind a grouped AVG.
+TEST(HashAggregateOperator, GroupedAvgComputesCorrectMeans) {
+  RmmEnvironment env(default_config());
+  std::vector<DeviceBatch> batches;
+  batches.push_back(make_batch({1, 1, 2, 2, 2}, {10.0, 20.0, 3.0, 6.0, 9.0}));
+
+  auto region = std::make_shared<ColumnExpression>("region", 0, int32_type(false));
+  std::vector<NamedExpression> group_by = {NamedExpression{region, "region"}};
+  auto amount = std::make_shared<ColumnExpression>("amount", 1, float64_type(false));
+  auto avg_expr = std::make_shared<AggregateExpression>(AggregateFunction::Avg, amount, float64_type(true));
+  std::vector<NamedExpression> aggregates = {NamedExpression{avg_expr, "avg"}};
+
+  HashAggregateOperator op(1, std::make_unique<VectorSourceOperator>(std::move(batches)), std::move(group_by),
+                           std::move(aggregates));
+  ExecutionContext context = make_context();
+  op.open(context);
+  std::optional<DeviceBatch> result = op.next(context);
+  ASSERT_TRUE(result.has_value());
+  EXPECT_EQ(result->row_count(), 2u);
+
+  const std::vector<int32_t> region_values = copy_to_host<int32_t>(result->view().column(0));
+  const std::vector<double> avgs = copy_to_host<double>(result->view().column(1));
+  std::map<int32_t, double> avg_by_region;
+  for (std::size_t i = 0; i < region_values.size(); ++i) avg_by_region[region_values[i]] = avgs[i];
+  EXPECT_DOUBLE_EQ(avg_by_region[1], 15.0);  // (10+20)/2
+  EXPECT_DOUBLE_EQ(avg_by_region[2], 6.0);   // (3+6+9)/3
+  op.close(context);
+}
+
+// compile_expr()/materialize_case(): a CASE with no ELSE as a GROUP BY
+// value expression had no coverage -- mirrors
+// ScalarAggregateOperator.SumOverCaseWithNoElseTreatsUnmatchedRowsAsNull.
+TEST(HashAggregateOperator, GroupedSumOverCaseWithNoElseTreatsUnmatchedRowsAsNull) {
+  RmmEnvironment env(default_config());
+  std::vector<DeviceBatch> batches;
+  batches.push_back(make_batch({1, 1}, {10.0, 20.0}));
+
+  auto region = std::make_shared<ColumnExpression>("region", 0, int32_type(false));
+  std::vector<NamedExpression> group_by = {NamedExpression{region, "region"}};
+
+  auto amount = std::make_shared<ColumnExpression>("amount", 1, float64_type(false));
+  auto thousand = std::make_shared<LiteralExpression>(LiteralExpression::make_float64(1000.0));
+  auto condition =
+      std::make_shared<BinaryExpression>(BinaryOperator::Greater, amount, thousand, boolean_type(false));
+  CaseExpression::WhenThen branch{condition, amount};
+  auto case_expr = std::make_shared<CaseExpression>(std::vector<CaseExpression::WhenThen>{branch}, nullptr,
+                                                    float64_type(true));
+  auto sum_expr =
+      std::make_shared<AggregateExpression>(AggregateFunction::Sum, case_expr, float64_type(true));
+  std::vector<NamedExpression> aggregates = {NamedExpression{sum_expr, "total"}};
+
+  HashAggregateOperator op(1, std::make_unique<VectorSourceOperator>(std::move(batches)), std::move(group_by),
+                           std::move(aggregates));
+  ExecutionContext context = make_context();
+  op.open(context);
+  std::optional<DeviceBatch> result = op.next(context);
+  ASSERT_TRUE(result.has_value());
+  EXPECT_EQ(result->row_count(), 1u);
+  EXPECT_TRUE(result->view().column(1).null_count() > 0);
+  op.close(context);
+}
+
+// compile_expr()/materialize_extract(): EXTRACT(... FROM ...) as an
+// aggregate's own argument had no coverage.
+TEST(HashAggregateOperator, GroupedMaxOverExtractedYearMatchesExpectedValue) {
+  RmmEnvironment env(default_config());
+  Schema schema({Field{"region", int32_type(false)}, Field{"event_date", date32_type(false)}});
+  std::vector<DeviceBatch> batches;
+  {
+    std::vector<std::int32_t> regions = {1, 1};
+    auto region_column = column_from_host(regions, cudf::type_id::INT32);
+    // 2024-01-01, 2025-06-15 as days-since-epoch.
+    std::vector<std::int32_t> days = {19723, 20254};
+    auto date_column = column_from_host(days, cudf::type_id::TIMESTAMP_DAYS);
+    std::vector<std::unique_ptr<cudf::column>> columns;
+    columns.push_back(std::move(region_column));
+    columns.push_back(std::move(date_column));
+    batches.push_back(DeviceBatch(std::make_unique<cudf::table>(std::move(columns)),
+                                  std::make_shared<const Schema>(schema)));
+  }
+
+  auto region = std::make_shared<ColumnExpression>("region", 0, int32_type(false));
+  std::vector<NamedExpression> group_by = {NamedExpression{region, "region"}};
+  auto event_date = std::make_shared<ColumnExpression>("event_date", 1, date32_type(false));
+  auto extract_year = std::make_shared<ExtractExpression>(DatePart::Year, event_date, int64_type(false));
+  auto max_expr =
+      std::make_shared<AggregateExpression>(AggregateFunction::Max, extract_year, int64_type(true));
+  std::vector<NamedExpression> aggregates = {NamedExpression{max_expr, "latest_year"}};
+
+  HashAggregateOperator op(1, std::make_unique<VectorSourceOperator>(std::move(batches)), std::move(group_by),
+                           std::move(aggregates));
+  ExecutionContext context = make_context();
+  op.open(context);
+  std::optional<DeviceBatch> result = op.next(context);
+  ASSERT_TRUE(result.has_value());
+  EXPECT_EQ(result->row_count(), 1u);
+  EXPECT_EQ(copy_to_host<std::int64_t>(result->view().column(1))[0], 2025);
+  op.close(context);
+}
+
+// compile_expr()/materialize()'s CastExpression-to-Decimal branch had no
+// coverage as a GROUP BY value expression.
+TEST(HashAggregateOperator, GroupedCountOverDecimalCastExpressionCountsEveryRow) {
+  RmmEnvironment env(default_config());
+  std::vector<DeviceBatch> batches;
+  batches.push_back(make_batch({1, 1, 1}, {12.34, 5.0, 9.9}));
+
+  auto region = std::make_shared<ColumnExpression>("region", 0, int32_type(false));
+  std::vector<NamedExpression> group_by = {NamedExpression{region, "region"}};
+  auto amount = std::make_shared<ColumnExpression>("amount", 1, float64_type(false));
+  auto decimal_cast =
+      std::make_shared<CastExpression>(amount, decimal_type(/*precision=*/10, /*scale=*/2, false));
+  auto count_expr =
+      std::make_shared<AggregateExpression>(AggregateFunction::Count, decimal_cast, int64_type(true));
+  std::vector<NamedExpression> aggregates = {NamedExpression{count_expr, "n"}};
+
+  HashAggregateOperator op(1, std::make_unique<VectorSourceOperator>(std::move(batches)), std::move(group_by),
+                           std::move(aggregates));
+  ExecutionContext context = make_context();
+  op.open(context);
+  std::optional<DeviceBatch> result = op.next(context);
+  ASSERT_TRUE(result.has_value());
+  EXPECT_EQ(result->row_count(), 1u);
+  EXPECT_EQ(copy_to_host<std::int64_t>(result->view().column(1))[0], 3);
+  op.close(context);
+}
+
 }  // namespace
 }  // namespace kernellake

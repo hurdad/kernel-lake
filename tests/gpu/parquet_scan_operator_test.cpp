@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <filesystem>
+#include <limits>
 #include <map>
 
 #include "kernellake/execution_gpu/parquet_scan_operator.hpp"
@@ -154,6 +155,85 @@ TEST_F(ParquetScanOperatorTest, MaterializesPartitionColumnsPerFragment) {
   ASSERT_EQ(period_by_id.size(), 10u);
   for (std::int64_t id = 0; id < 5; ++id) EXPECT_EQ(period_by_id.at(id), 100);
   for (std::int64_t id = 5; id < 10; ++id) EXPECT_EQ(period_by_id.at(id), 200);
+}
+
+// Wraps a real LocalObjectStore but strips a fake non-"file" scheme prefix
+// off every Uri before delegating -- lets a test construct a fragment
+// whose Uri::scheme() is something other than "file" (routing open()/
+// open_current_fragment() through their ObjectStoreDatasource branch,
+// never exercised by every other test in this file, which all use plain
+// local paths) while still reading a real, real GPU-decoded file on disk,
+// without needing an actual S3/GCS/Azure backend.
+class FakeSchemeObjectStore final : public ObjectStore {
+ public:
+  explicit FakeSchemeObjectStore(ObjectStore& delegate) : delegate_(delegate) {}
+
+  [[nodiscard]] std::vector<ObjectInfo> list(const Uri& prefix) override {
+    return delegate_.list(strip(prefix));
+  }
+  [[nodiscard]] std::vector<ObjectInfo> list_recursive(const Uri& prefix) override {
+    return delegate_.list_recursive(strip(prefix));
+  }
+  [[nodiscard]] std::unique_ptr<RandomAccessObject> open(const Uri& uri) override {
+    return delegate_.open(strip(uri));
+  }
+
+ private:
+  static Uri strip(const Uri& uri) {
+    constexpr std::string_view kPrefix = "fake://";
+    return Uri(uri.value().substr(kPrefix.size()));
+  }
+
+  ObjectStore& delegate_;
+};
+
+// open()'s non-local (ObjectStoreDatasource) branch had no coverage --
+// every other test in this file uses a plain "file"-scheme Uri, always
+// taking the all-local cudf::io::source_info fast path instead.
+TEST_F(ParquetScanOperatorTest, NonLocalSchemeRoutesThroughObjectStoreDatasource) {
+  RmmEnvironment env(default_config());
+  std::vector<PhysicalFileFragment> fragments = {
+      PhysicalFileFragment{Uri("fake://" + path_), 10, 2, {0, 1}, {}, {}}};
+  Schema schema({Field{"id", int64_type(false)}, Field{"amount", float64_type(false)}});
+
+  LocalObjectStore local_store;
+  FakeSchemeObjectStore store(local_store);
+  ParquetScanOperator scan(1, fragments, {"id", "amount"}, std::make_shared<const Schema>(schema), store);
+  ExecutionContext context = make_context();
+  scan.open(context);
+
+  std::size_t total_rows = 0;
+  while (std::optional<DeviceBatch> batch = scan.next(context)) total_rows += batch->row_count();
+  EXPECT_EQ(total_rows, 10u);
+  scan.close(context);
+}
+
+// open_current_fragment()'s non-local branch (the per-fragment/partitioned
+// mode's own equivalent of the above) had no coverage either.
+TEST_F(ParquetScanOperatorTest, NonLocalSchemeRoutesThroughObjectStoreDatasourceInPerFragmentMode) {
+  RmmEnvironment env(default_config());
+  std::vector<PhysicalFileFragment> fragments = {
+      PhysicalFileFragment{Uri("fake://" + path_), 10, 2, {0, 1}, {}, {}, {std::int64_t{7}}}};
+  std::vector<PartitionColumn> partition_columns = {PartitionColumn{"batch_id", int64_type(false)}};
+  Schema schema({Field{"id", int64_type(false)}, Field{"amount", float64_type(false)},
+                 Field{"batch_id", int64_type(false)}});
+
+  LocalObjectStore local_store;
+  FakeSchemeObjectStore store(local_store);
+  ParquetScanOperator scan(1, fragments, {"id", "amount"}, std::make_shared<const Schema>(schema), store,
+                           /*pass_read_limit_bytes=*/std::numeric_limits<std::size_t>::max(),
+                           partition_columns);
+  ExecutionContext context = make_context();
+  scan.open(context);
+
+  std::size_t total_rows = 0;
+  while (std::optional<DeviceBatch> batch = scan.next(context)) {
+    total_rows += batch->row_count();
+    const std::vector<std::int64_t> batch_ids = copy_to_host<std::int64_t>(batch->view().column(2));
+    for (std::int64_t id : batch_ids) EXPECT_EQ(id, 7);
+  }
+  EXPECT_EQ(total_rows, 10u);
+  scan.close(context);
 }
 
 TEST_F(ParquetScanOperatorTest, EmptyFragmentListProducesNoBatches) {
