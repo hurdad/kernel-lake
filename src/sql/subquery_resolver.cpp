@@ -3,6 +3,7 @@
 #include <memory>
 #include <type_traits>
 #include <utility>
+#include <vector>
 
 namespace kernellake::sql {
 
@@ -13,6 +14,36 @@ AstExprPtr make_expr(Node node, std::optional<std::string> alias) {
   auto result = std::make_shared<AstExpr>();
   result->node = std::move(node);
   result->alias = std::move(alias);
+  return result;
+}
+
+// Flattens top-level AND conjuncts of `expr` into `out`, mirroring
+// optimizer.cpp's/binder.cpp's own identically-shaped conjunct-collecting
+// helpers (each duplicated locally rather than shared -- see those files'
+// own comments -- since they operate on different tree types: this one on
+// the untyped sql::AstExpr, the others on the typed kernellake::Expression
+// post-bind).
+void collect_and_conjuncts(const AstExprPtr& expr, std::vector<AstExprPtr>& out) {
+  if (const auto* binary = std::get_if<AstBinary>(&expr->node);
+      binary != nullptr && binary->op == AstBinaryOp::And) {
+    collect_and_conjuncts(binary->left, out);
+    collect_and_conjuncts(binary->right, out);
+    return;
+  }
+  out.push_back(expr);
+}
+
+// Inverse of collect_and_conjuncts() above: rebuilds a single AND-tree
+// from `conjuncts` (left-associated, in order) -- nullptr if `conjuncts`
+// is empty (i.e. every original WHERE conjunct was rewritten away).
+AstExprPtr rebuild_and(std::vector<AstExprPtr> conjuncts) {
+  if (conjuncts.empty()) {
+    return nullptr;
+  }
+  AstExprPtr result = std::move(conjuncts.front());
+  for (std::size_t i = 1; i < conjuncts.size(); ++i) {
+    result = make_expr(AstBinary{AstBinaryOp::And, result, std::move(conjuncts[i])}, std::nullopt);
+  }
   return result;
 }
 
@@ -168,6 +199,60 @@ AstExprPtr resolve_in_subqueries(
         }
       },
       expr->node);
+}
+
+AstSelectStatement rewrite_exists_subqueries(AstSelectStatement stmt) {
+  // Neither shape has a real "outer alias" to correlate against yet: a
+  // derived table's own alias is never threaded anywhere (see
+  // AstSelectStatement::from_subquery_alias's own comment), and a
+  // single-table FROM with no alias at all has no name a correlation
+  // predicate inside EXISTS could reference. Left completely untouched --
+  // any AstExists conjunct here reaches the binder unresolved, which
+  // rejects it with a clear error.
+  if (stmt.where == nullptr || stmt.from_subquery != nullptr) {
+    return stmt;
+  }
+  if (!stmt.join.has_value() && !stmt.from.alias.has_value()) {
+    return stmt;
+  }
+
+  std::vector<AstExprPtr> conjuncts;
+  collect_and_conjuncts(stmt.where, conjuncts);
+
+  std::vector<AstExprPtr> remaining;
+  std::vector<AstJoinStep> new_steps;
+  remaining.reserve(conjuncts.size());
+  for (AstExprPtr& conjunct : conjuncts) {
+    const auto* exists = std::get_if<AstExists>(&conjunct->node);
+    const AstSelectStatement* sub = exists != nullptr ? exists->subquery.get() : nullptr;
+    const bool rewritable = sub != nullptr && sub->where != nullptr && !sub->join.has_value() &&
+                            sub->from_subquery == nullptr && sub->from.alias.has_value() &&
+                            sub->group_by.empty() && sub->having == nullptr && sub->order_by.empty() &&
+                            !sub->limit.has_value();
+    if (!rewritable) {
+      remaining.push_back(std::move(conjunct));
+      continue;
+    }
+    new_steps.push_back(
+        AstJoinStep{sub->from, sub->where,
+                    exists->negated ? kernellake::JoinType::LeftAnti : kernellake::JoinType::LeftSemi});
+  }
+  if (new_steps.empty()) {
+    // Nothing rewritable found -- return stmt exactly as received (not a
+    // reconstructed-but-equivalent WHERE tree), so an unrelated AND
+    // conjunct's own subtree identity/structure is never disturbed by a
+    // pass that found nothing to do.
+    return stmt;
+  }
+
+  if (!stmt.join.has_value()) {
+    stmt.join = AstJoinClause{stmt.from, {}};
+  }
+  for (AstJoinStep& step : new_steps) {
+    stmt.join->steps.push_back(std::move(step));
+  }
+  stmt.where = rebuild_and(std::move(remaining));
+  return stmt;
 }
 
 }  // namespace kernellake::sql

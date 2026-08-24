@@ -543,6 +543,68 @@ TEST_F(QueryEngineExecuteCpuTest, LeftOuterJoinWithRightSideAuxiliaryPredicateNu
   }
 }
 
+// EXISTS with a correlated subquery, decorrelated into a LEFT SEMI join
+// (sql::rewrite_exists_subqueries()) -- only region 'A' sales rows have a
+// matching regions.parquet row with region_name = 'Alpha' (region 'B'
+// matches 'Beta' instead), so only region 'A' rows survive.
+TEST_F(QueryEngineExecuteCpuTest, ExistsCorrelatedSubqueryFiltersToMatchingRows) {
+  const QueryResult result =
+      engine_.execute("SELECT s.region, s.amount FROM read_parquet('" + path_ +
+                      "') AS s WHERE EXISTS (SELECT * FROM read_parquet('" + regions_path_ +
+                      "') AS r WHERE r.region = s.region AND r.region_name = 'Alpha') ORDER BY s.amount");
+
+  ASSERT_EQ(result.rows_returned, 3);
+  ASSERT_EQ(result.batches.size(), 1u);
+  const std::shared_ptr<arrow::RecordBatch>& batch = result.batches.front();
+  ASSERT_EQ(batch->num_rows(), 3);
+  const auto region_column = std::static_pointer_cast<arrow::StringArray>(batch->GetColumnByName("region"));
+  ASSERT_NE(region_column, nullptr);
+  for (std::int64_t i = 0; i < batch->num_rows(); ++i) {
+    EXPECT_EQ(region_column->GetString(i), "A") << "row " << i;
+  }
+}
+
+// NOT EXISTS, decorrelated into a LEFT ANTI join -- the inverse: only
+// region 'B' sales rows survive (no matching regions row has
+// region_name = 'Alpha').
+TEST_F(QueryEngineExecuteCpuTest, NotExistsCorrelatedSubqueryExcludesMatchingRows) {
+  const QueryResult result =
+      engine_.execute("SELECT s.region, s.amount FROM read_parquet('" + path_ +
+                      "') AS s WHERE NOT EXISTS (SELECT * FROM read_parquet('" + regions_path_ +
+                      "') AS r WHERE r.region = s.region AND r.region_name = 'Alpha') ORDER BY s.amount");
+
+  ASSERT_EQ(result.rows_returned, 3);
+  ASSERT_EQ(result.batches.size(), 1u);
+  const std::shared_ptr<arrow::RecordBatch>& batch = result.batches.front();
+  ASSERT_EQ(batch->num_rows(), 3);
+  const auto region_column = std::static_pointer_cast<arrow::StringArray>(batch->GetColumnByName("region"));
+  ASSERT_NE(region_column, nullptr);
+  for (std::int64_t i = 0; i < batch->num_rows(); ++i) {
+    EXPECT_EQ(region_column->GetString(i), "B") << "row " << i;
+  }
+}
+
+// EXISTS combined with an ordinary GROUP BY/aggregate over the surviving
+// (semi-joined) rows -- exercises the semi-join sitting underneath the
+// rest of a real query's own logical plan, not just a bare filter.
+TEST_F(QueryEngineExecuteCpuTest, ExistsCombinesWithGroupedAggregate) {
+  const QueryResult result =
+      engine_.execute("SELECT s.region, SUM(s.amount) AS total FROM read_parquet('" + path_ +
+                      "') AS s WHERE EXISTS (SELECT * FROM read_parquet('" + regions_path_ +
+                      "') AS r WHERE r.region = s.region AND r.region_name = 'Alpha') GROUP BY s.region");
+
+  ASSERT_EQ(result.rows_returned, 1);
+  ASSERT_EQ(result.batches.size(), 1u);
+  const std::shared_ptr<arrow::RecordBatch>& batch = result.batches.front();
+  ASSERT_EQ(batch->num_rows(), 1);
+  const auto region_column = std::static_pointer_cast<arrow::StringArray>(batch->GetColumnByName("region"));
+  const auto total_column = std::static_pointer_cast<arrow::DoubleArray>(batch->GetColumnByName("total"));
+  ASSERT_NE(region_column, nullptr);
+  ASSERT_NE(total_column, nullptr);
+  EXPECT_EQ(region_column->GetString(0), "A");
+  EXPECT_DOUBLE_EQ(total_column->Value(0), 35.0);  // 10+20+5
+}
+
 // A derived table (`FROM (SELECT ...) AS alias`) as this query's entire
 // FROM clause -- TPC-H Q13's own outer-query shape. Exercises
 // QueryEngine::plan_logical_unoptimized()'s recursive derived-table branch

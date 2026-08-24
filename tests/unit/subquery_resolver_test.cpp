@@ -10,6 +10,7 @@
 // functions directly.
 #include <gtest/gtest.h>
 
+#include "kernellake/sql/parser.hpp"
 #include "kernellake/sql/subquery_resolver.hpp"
 
 namespace kernellake::sql {
@@ -414,6 +415,135 @@ TEST(ResolveInSubqueries, LeafAndSubqueryNodesPassThroughUnchanged) {
   const AstExprPtr result = resolve_in_subqueries(subquery_expr, evaluate);
   EXPECT_TRUE(is_subquery(result));
   EXPECT_EQ(result, subquery_expr);
+}
+
+// ---- rewrite_exists_subqueries() (EXISTS/NOT EXISTS -> join-step
+// rewrite) ---- Uses real parse_sql() output as input (unlike the two
+// suites above): unlike a single-expression tree walk, this function's
+// own job is entirely about *statement*-level structure (WHERE <-> JOIN),
+// so hand-building the equivalent AstSelectStatement tree by hand would
+// be far more code than just parsing real SQL text for it, with no loss
+// of test focus (rewrite_exists_subqueries() itself is still exercised
+// directly, not through a real QueryEngine).
+
+TEST(RewriteExistsSubqueries, SingleExistsConjunctBecomesLeftSemiJoinStep) {
+  AstSelectStatement stmt = parse_sql(
+      "SELECT o.o_orderkey FROM read_parquet('/o.parquet') AS o WHERE o.o_orderkey > 100 AND EXISTS "
+      "(SELECT * FROM read_parquet('/l.parquet') AS l WHERE l.l_orderkey = o.o_orderkey)");
+  const AstSelectStatement rewritten = rewrite_exists_subqueries(std::move(stmt));
+
+  ASSERT_TRUE(rewritten.join.has_value());
+  ASSERT_EQ(rewritten.join->steps.size(), 1u);
+  EXPECT_EQ(rewritten.join->steps[0].join_type, kernellake::JoinType::LeftSemi);
+  EXPECT_EQ(rewritten.join->steps[0].source.paths, std::vector<std::string>{"/l.parquet"});
+  // The outer WHERE's own non-EXISTS conjunct survives, un-touched.
+  ASSERT_NE(rewritten.where, nullptr);
+  const auto* remaining = std::get_if<AstBinary>(&rewritten.where->node);
+  ASSERT_NE(remaining, nullptr);
+  EXPECT_EQ(remaining->op, AstBinaryOp::Gt);
+}
+
+TEST(RewriteExistsSubqueries, WhereThatsPurelyExistsBecomesNullAfterRewrite) {
+  AstSelectStatement stmt = parse_sql(
+      "SELECT o.o_orderkey FROM read_parquet('/o.parquet') AS o WHERE EXISTS "
+      "(SELECT * FROM read_parquet('/l.parquet') AS l WHERE l.l_orderkey = o.o_orderkey)");
+  const AstSelectStatement rewritten = rewrite_exists_subqueries(std::move(stmt));
+  ASSERT_TRUE(rewritten.join.has_value());
+  ASSERT_EQ(rewritten.join->steps.size(), 1u);
+  EXPECT_EQ(rewritten.where, nullptr);
+}
+
+TEST(RewriteExistsSubqueries, NotExistsBecomesLeftAntiJoinStep) {
+  AstSelectStatement stmt = parse_sql(
+      "SELECT o.o_orderkey FROM read_parquet('/o.parquet') AS o WHERE NOT EXISTS "
+      "(SELECT * FROM read_parquet('/l.parquet') AS l WHERE l.l_orderkey = o.o_orderkey)");
+  const AstSelectStatement rewritten = rewrite_exists_subqueries(std::move(stmt));
+  ASSERT_TRUE(rewritten.join.has_value());
+  ASSERT_EQ(rewritten.join->steps.size(), 1u);
+  EXPECT_EQ(rewritten.join->steps[0].join_type, kernellake::JoinType::LeftAnti);
+}
+
+TEST(RewriteExistsSubqueries, AppendsToAnExistingJoinChain) {
+  AstSelectStatement stmt = parse_sql(
+      "SELECT o.o_orderkey FROM read_parquet('/o.parquet') AS o "
+      "JOIN read_parquet('/c.parquet') AS c ON o.o_custkey = c.c_custkey "
+      "WHERE EXISTS (SELECT * FROM read_parquet('/l.parquet') AS l WHERE l.l_orderkey = o.o_orderkey)");
+  const AstSelectStatement rewritten = rewrite_exists_subqueries(std::move(stmt));
+  ASSERT_TRUE(rewritten.join.has_value());
+  ASSERT_EQ(rewritten.join->steps.size(), 2u);
+  EXPECT_EQ(rewritten.join->steps[0].join_type, kernellake::JoinType::Inner);
+  EXPECT_EQ(rewritten.join->steps[1].join_type, kernellake::JoinType::LeftSemi);
+  EXPECT_EQ(rewritten.where, nullptr);
+}
+
+TEST(RewriteExistsSubqueries, TwoExistsConjunctsBothBecomeJoinSteps) {
+  AstSelectStatement stmt = parse_sql(
+      "SELECT o.o_orderkey FROM read_parquet('/o.parquet') AS o WHERE "
+      "EXISTS (SELECT * FROM read_parquet('/l1.parquet') AS l1 WHERE l1.l_orderkey = o.o_orderkey) AND "
+      "EXISTS (SELECT * FROM read_parquet('/l2.parquet') AS l2 WHERE l2.l_orderkey = o.o_orderkey)");
+  const AstSelectStatement rewritten = rewrite_exists_subqueries(std::move(stmt));
+  ASSERT_TRUE(rewritten.join.has_value());
+  ASSERT_EQ(rewritten.join->steps.size(), 2u);
+  EXPECT_EQ(rewritten.join->steps[0].join_type, kernellake::JoinType::LeftSemi);
+  EXPECT_EQ(rewritten.join->steps[1].join_type, kernellake::JoinType::LeftSemi);
+}
+
+TEST(RewriteExistsSubqueries, LeavesExistsInWhereWhenSubqueryHasItsOwnJoin) {
+  AstSelectStatement stmt = parse_sql(
+      "SELECT o.o_orderkey FROM read_parquet('/o.parquet') AS o WHERE EXISTS "
+      "(SELECT * FROM read_parquet('/l.parquet') AS l JOIN read_parquet('/p.parquet') AS p "
+      "ON l.l_partkey = p.p_partkey WHERE l.l_orderkey = o.o_orderkey)");
+  const AstSelectStatement rewritten = rewrite_exists_subqueries(std::move(stmt));
+  EXPECT_FALSE(rewritten.join.has_value());
+  ASSERT_NE(rewritten.where, nullptr);
+  EXPECT_TRUE(std::holds_alternative<AstExists>(rewritten.where->node));
+}
+
+TEST(RewriteExistsSubqueries, LeavesExistsInWhereWhenSubqueryHasGroupBy) {
+  AstSelectStatement stmt = parse_sql(
+      "SELECT o.o_orderkey FROM read_parquet('/o.parquet') AS o WHERE EXISTS "
+      "(SELECT l.l_orderkey FROM read_parquet('/l.parquet') AS l WHERE l.l_orderkey = o.o_orderkey "
+      "GROUP BY l.l_orderkey)");
+  const AstSelectStatement rewritten = rewrite_exists_subqueries(std::move(stmt));
+  EXPECT_FALSE(rewritten.join.has_value());
+  ASSERT_NE(rewritten.where, nullptr);
+  EXPECT_TRUE(std::holds_alternative<AstExists>(rewritten.where->node));
+}
+
+TEST(RewriteExistsSubqueries, LeavesExistsInWhereWhenSubquerySourceIsUnaliased) {
+  AstSelectStatement stmt = parse_sql(
+      "SELECT o.o_orderkey FROM read_parquet('/o.parquet') AS o WHERE EXISTS "
+      "(SELECT * FROM read_parquet('/l.parquet') WHERE l_orderkey = o.o_orderkey)");
+  const AstSelectStatement rewritten = rewrite_exists_subqueries(std::move(stmt));
+  EXPECT_FALSE(rewritten.join.has_value());
+  ASSERT_NE(rewritten.where, nullptr);
+  EXPECT_TRUE(std::holds_alternative<AstExists>(rewritten.where->node));
+}
+
+TEST(RewriteExistsSubqueries, LeavesExistsInWhereWhenOuterFromHasNoAlias) {
+  AstSelectStatement stmt = parse_sql(
+      "SELECT o_orderkey FROM read_parquet('/o.parquet') WHERE EXISTS "
+      "(SELECT * FROM read_parquet('/l.parquet') AS l WHERE l.l_orderkey = o_orderkey)");
+  const AstSelectStatement rewritten = rewrite_exists_subqueries(std::move(stmt));
+  EXPECT_FALSE(rewritten.join.has_value());
+  ASSERT_NE(rewritten.where, nullptr);
+  EXPECT_TRUE(std::holds_alternative<AstExists>(rewritten.where->node));
+}
+
+TEST(RewriteExistsSubqueries, NoWhereClauseIsANoOp) {
+  AstSelectStatement stmt = parse_sql("SELECT o.o_orderkey FROM read_parquet('/o.parquet') AS o");
+  const AstSelectStatement rewritten = rewrite_exists_subqueries(std::move(stmt));
+  EXPECT_FALSE(rewritten.join.has_value());
+  EXPECT_EQ(rewritten.where, nullptr);
+}
+
+TEST(RewriteExistsSubqueries, NoExistsInWhereIsANoOp) {
+  AstSelectStatement stmt =
+      parse_sql("SELECT o.o_orderkey FROM read_parquet('/o.parquet') AS o WHERE o.o_orderkey > 100");
+  const AstSelectStatement rewritten = rewrite_exists_subqueries(std::move(stmt));
+  EXPECT_FALSE(rewritten.join.has_value());
+  ASSERT_NE(rewritten.where, nullptr);
+  EXPECT_TRUE(std::holds_alternative<AstBinary>(rewritten.where->node));
 }
 
 }  // namespace

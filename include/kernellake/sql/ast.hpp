@@ -191,9 +191,39 @@ struct AstSubquery {
   std::shared_ptr<AstSelectStatement> statement;
 };
 
+// `EXISTS (SELECT ...)` / `NOT EXISTS (SELECT ...)` -- only ever legal
+// today as a top-level `WHERE`-clause `AND`-conjunct (TPC-H Q4's shape:
+// `WHERE o_orderdate >= ... AND o_orderdate < ... AND EXISTS (SELECT *
+// FROM lineitem WHERE l_orderkey = o_orderkey AND l_commitdate <
+// l_receiptdate)`), and only when `subquery` is non-correlated beyond a
+// single equality between one column already in the outer query's own
+// scope and one column from `subquery`'s own single `FROM` source, plus
+// (optionally) further conjuncts referencing *only* that source's own
+// columns -- i.e. exactly the shape `sql::rewrite_exists_subqueries()`
+// (run from `QueryEngine::plan_logical()`, before binding, mirroring
+// `resolve_in_subqueries()`'s own place in the pipeline) can rewrite into
+// an ordinary join-chain step with `JoinType::LeftSemi`/`LeftAnti` --
+// see that function's own doc comment for the exact rewrite and its
+// scope limits (no correlated *scalar* subqueries, no correlation
+// predicate referencing both sides at once, no derived-table/multi-source
+// `subquery`). `negated` is `true` for `NOT EXISTS` -- parser.cpp detects
+// the `NOT` wrapping `EXISTS` pattern directly rather than producing a
+// separate `AstUnary{Not, AstExists{...}}` node, so every consumer only
+// ever needs to handle one shape.
+//
+// A node that survives to bind time (i.e. `rewrite_exists_subqueries()`
+// couldn't rewrite it -- appeared somewhere other than a top-level WHERE
+// conjunct, or its own shape fell outside the scope above) is rejected
+// with a clear `BindingError`, the same convention `AstSubquery` already
+// has for a HAVING-only subquery reaching binding unresolved.
+struct AstExists {
+  std::shared_ptr<AstSelectStatement> subquery;
+  bool negated = false;
+};
+
 struct AstExpr {
   std::variant<AstColumnRef, AstStar, AstLiteral, AstBinary, AstUnary, AstBetween, AstAggregate, AstLike,
-               AstIn, AstCase, AstCast, AstExtract, AstSubquery>
+               AstIn, AstCase, AstCast, AstExtract, AstSubquery, AstExists>
       node;
   std::optional<std::string> alias;
 };

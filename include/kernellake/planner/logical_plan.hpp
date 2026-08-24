@@ -115,17 +115,18 @@ class LogicalScan final : public LogicalPlanNode {
 
 // ---------------------------------------------------------------------------
 
-// A two-table INNER or LEFT OUTER JOIN on a single equality key (see
-// BoundJoin in binder.hpp -- this is the only shape currently supported).
-// Its output schema is the plain concatenation of `left`'s and `right`'s
-// output fields, in that order: every ColumnExpression above this node in
-// the bound query already indexes into that combined row (see binder.cpp's
-// two-schema bind_query() overload), so nothing downstream (optimizer
-// column collection, the physical planner's remapping, GPU operators) needs
-// to know a join happened at all except the physical planner's own
-// HashJoinNode conversion. `left_key_index`/`right_key_index` are each into
-// that side's *own* schema (pre-concatenation), matching what
-// HashJoinOperator needs to extract the key column from each side's
+// A two-table INNER, LEFT OUTER, LEFT SEMI, or LEFT ANTI JOIN on a single
+// equality key (see BoundJoin in binder.hpp -- this is the only shape
+// currently supported). For INNER/LEFT OUTER, the output schema is the
+// plain concatenation of `left`'s and `right`'s output fields, in that
+// order: every ColumnExpression above this node in the bound query already
+// indexes into that combined row (see binder.cpp's two-schema bind_query()
+// overload), so nothing downstream (optimizer column collection, the
+// physical planner's remapping, GPU operators) needs to know a join
+// happened at all except the physical planner's own HashJoinNode
+// conversion. `left_key_index`/`right_key_index` are each into that side's
+// *own* schema (pre-concatenation), matching what HashJoinOperator/
+// SemiAntiJoinOperator need to extract the key column from each side's
 // (already pruned/remapped) physical scan.
 //
 // For a LEFT OUTER JOIN, every one of `right`'s fields is widened to
@@ -134,6 +135,18 @@ class LogicalScan final : public LogicalPlanNode {
 // right-side column, so a query reading one downstream must see it as
 // nullable even if the underlying Parquet column itself is NOT NULL. `left`
 // is never widened: LEFT OUTER JOIN always preserves every left row as-is.
+//
+// LEFT SEMI/LEFT ANTI never appear directly in SQL syntax (see JoinType's
+// own comment) -- both are produced only by the EXISTS/NOT EXISTS ->
+// join-step rewrite (sql::rewrite_exists_subqueries()). Their output
+// schema is `left`'s schema *only* -- zero fields from `right` at all, not
+// even the join key -- since a semi/anti join only ever filters `left`'s
+// own rows (keeping ones with/without a match), it never actually produces
+// any row *from* `right`. This is why a join step after a LEFT SEMI/ANTI
+// step in a chain must bind its own column references against the
+// *unchanged* running combined-field-count from before that step (see
+// binder.cpp's own join-step loop) -- unlike INNER/LEFT OUTER, a semi/anti
+// step contributes zero fields to grow that count by.
 class LogicalJoin final : public LogicalPlanNode {
  public:
   LogicalJoin(LogicalPlanPtr left, LogicalPlanPtr right, std::size_t left_key_index,
@@ -161,6 +174,9 @@ class LogicalJoin final : public LogicalPlanNode {
 
  private:
   static Schema build_schema(const Schema& left, const Schema& right, JoinType join_type) {
+    if (join_type == JoinType::LeftSemi || join_type == JoinType::LeftAnti) {
+      return left;  // see this class's own comment: zero fields from right, ever.
+    }
     std::vector<Field> fields = left.fields();
     const std::vector<Field>& right_fields = right.fields();
     if (join_type == JoinType::LeftOuter) {

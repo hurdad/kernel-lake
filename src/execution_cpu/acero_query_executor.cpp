@@ -438,21 +438,37 @@ arrow::acero::Declaration translate(const PhysicalPlanPtr& node, ObjectStore& st
         arrow::acero::RecordBatchReaderSourceNodeOptions{make_streaming_scan_reader(*scan, effective_store)}};
   }
   // Acero's own "hashjoin" node (HashJoinNodeOptions) implements exactly the
-  // two-table INNER/LEFT OUTER equi-join HashJoinNode describes; output_all
-  // defaults to true (all columns from both sides, left fields then right),
-  // matching HashJoinNode::build_schema()'s convention exactly (including
-  // its own right-side nullable widening for LEFT OUTER, which Acero's own
-  // LEFT_OUTER null-extension naturally produces), so no left_output/
-  // right_output list needs to be built here.
+  // two-table INNER/LEFT OUTER/LEFT SEMI/LEFT ANTI equi-join HashJoinNode
+  // describes; output_all defaults to true (all columns from both sides,
+  // left fields then right), matching HashJoinNode::build_schema()'s
+  // convention exactly (including its own right-side nullable widening for
+  // LEFT OUTER, which Acero's own LEFT_OUTER null-extension naturally
+  // produces, and LEFT SEMI/LEFT ANTI's own zero-right-side-columns output,
+  // which Acero's own semi/anti join kinds naturally produce too -- neither
+  // ever gathers anything from the right/build side), so no left_output/
+  // right_output list needs to be built here for any of the four.
   if (const auto* hash_join = dynamic_cast<const HashJoinNode*>(node.get())) {
     // By position (see compile_expression_cpu's identical reasoning): if
     // `hash_join->left()`/`right()` is itself a nested HashJoinNode (a 3+
     // -way join), its own combined schema can already have two same-named
     // columns from its own two children, making a by-name FieldRef here
     // ambiguous too, not just at the outer join.
-    const arrow::acero::JoinType acero_join_type = hash_join->join_type() == JoinType::LeftOuter
-                                                       ? arrow::acero::JoinType::LEFT_OUTER
-                                                       : arrow::acero::JoinType::INNER;
+    arrow::acero::JoinType acero_join_type;
+    switch (hash_join->join_type()) {
+      case JoinType::LeftOuter:
+        acero_join_type = arrow::acero::JoinType::LEFT_OUTER;
+        break;
+      case JoinType::LeftSemi:
+        acero_join_type = arrow::acero::JoinType::LEFT_SEMI;
+        break;
+      case JoinType::LeftAnti:
+        acero_join_type = arrow::acero::JoinType::LEFT_ANTI;
+        break;
+      case JoinType::Inner:
+      default:
+        acero_join_type = arrow::acero::JoinType::INNER;
+        break;
+    }
     return arrow::acero::Declaration{
         "hashjoin",
         {translate(hash_join->left(), store), translate(hash_join->right(), store)},

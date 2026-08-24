@@ -220,6 +220,15 @@ LogicalPlanPtr QueryEngine::plan_logical(std::string_view sql,
 LogicalPlanPtr QueryEngine::plan_logical_unoptimized(sql::AstSelectStatement ast,
                                                      TableSourceResolver& resolver,
                                                      double* metadata_inspection_seconds_out) const {
+  // Structural, not a resolution-via-execution pass like the two below --
+  // see sql::rewrite_exists_subqueries()'s own doc comment. Runs first
+  // since it can change ast.where's own top-level shape (extracting
+  // EXISTS/NOT EXISTS conjuncts out into ast.join entirely); order
+  // relative to the HAVING/IN resolution below doesn't otherwise matter
+  // (neither touches AstExists nodes), this is just the more natural
+  // "structural rewrite before inline resolution" sequence.
+  ast = sql::rewrite_exists_subqueries(std::move(ast));
+
   if (ast.having != nullptr) {
     // Resolved before binding: the binder has no I/O capability of its
     // own (by design, see ast.hpp's own header comment) and can't run a

@@ -325,7 +325,7 @@ Preprocessed preprocess_from_read_parquet(const std::string& sql) {
 }
 
 AstExprPtr wrap(std::variant<AstColumnRef, AstStar, AstLiteral, AstBinary, AstUnary, AstBetween, AstAggregate,
-                             AstLike, AstIn, AstCase, AstCast, AstExtract, AstSubquery>
+                             AstLike, AstIn, AstCase, AstCast, AstExtract, AstSubquery, AstExists>
                     node,
                 std::optional<std::string> alias = std::nullopt) {
   auto expr = std::make_shared<AstExpr>();
@@ -449,7 +449,28 @@ AstExprPtr convert_operator(const hsql::Expr* e, ConversionState& state) {
         in.negated = true;
         return wrap(std::move(in), alias_of(*e));
       }
+      // hsql represents "NOT EXISTS (...)" as NOT(EXISTS(...)) too (see
+      // bison_parser.y's own `exists_expr` rule) -- same recovery as
+      // IS NULL/IN just above, producing AstExists{negated=true} directly
+      // rather than a separate AstUnary{Not, AstExists{...}} node (see
+      // ast.hpp's own comment on why every downstream consumer only ever
+      // needs to handle one shape).
+      if (e->expr != nullptr && e->expr->type == hsql::kExprOperator && e->expr->opType == hsql::kOpExists) {
+        if (e->expr->select == nullptr) {
+          unsupported("malformed EXISTS expression");
+        }
+        auto statement =
+            std::make_shared<AstSelectStatement>(convert_select_statement(e->expr->select, state));
+        return wrap(AstExists{std::move(statement), /*negated=*/true}, alias_of(*e));
+      }
       return wrap(AstUnary{AstUnaryOp::Not, convert_expr(e->expr, state)}, alias_of(*e));
+    }
+    case hsql::kOpExists: {
+      if (e->select == nullptr) {
+        unsupported("malformed EXISTS expression");
+      }
+      auto statement = std::make_shared<AstSelectStatement>(convert_select_statement(e->select, state));
+      return wrap(AstExists{std::move(statement), /*negated=*/false}, alias_of(*e));
     }
     case hsql::kOpLike:
     case hsql::kOpNotLike: {

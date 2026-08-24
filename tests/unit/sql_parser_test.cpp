@@ -242,6 +242,43 @@ TEST(SqlParser, RejectsCommaStyleJoin) {
       SqlError);
 }
 
+TEST(SqlParser, ParsesExistsInWhere) {
+  const auto stmt = parse_sql(
+      "SELECT o.o_orderkey FROM read_parquet('/o.parquet') AS o WHERE EXISTS "
+      "(SELECT * FROM read_parquet('/l.parquet') AS l WHERE l.l_orderkey = o.o_orderkey)");
+  ASSERT_NE(stmt.where, nullptr);
+  const auto* exists = std::get_if<AstExists>(&stmt.where->node);
+  ASSERT_NE(exists, nullptr);
+  EXPECT_FALSE(exists->negated);
+  ASSERT_NE(exists->subquery, nullptr);
+  EXPECT_EQ(exists->subquery->from.paths, std::vector<std::string>{"/l.parquet"});
+  EXPECT_EQ(exists->subquery->from.alias, "l");
+}
+
+// hsql represents "NOT EXISTS (...)" as NOT(EXISTS(...)) -- confirms
+// parser.cpp's own recovery produces AstExists{negated=true} directly,
+// not a separate AstUnary{Not, AstExists{...}} wrapper.
+TEST(SqlParser, ParsesNotExistsInWhere) {
+  const auto stmt = parse_sql(
+      "SELECT o.o_orderkey FROM read_parquet('/o.parquet') AS o WHERE NOT EXISTS "
+      "(SELECT * FROM read_parquet('/l.parquet') AS l WHERE l.l_orderkey = o.o_orderkey)");
+  ASSERT_NE(stmt.where, nullptr);
+  const auto* exists = std::get_if<AstExists>(&stmt.where->node);
+  ASSERT_NE(exists, nullptr);
+  EXPECT_TRUE(exists->negated);
+}
+
+TEST(SqlParser, ExistsCombinesWithOtherWhereConjuncts) {
+  const auto stmt = parse_sql(
+      "SELECT o.o_orderkey FROM read_parquet('/o.parquet') AS o WHERE o.o_orderkey > 100 AND EXISTS "
+      "(SELECT * FROM read_parquet('/l.parquet') AS l WHERE l.l_orderkey = o.o_orderkey)");
+  ASSERT_NE(stmt.where, nullptr);
+  const auto* top = std::get_if<AstBinary>(&stmt.where->node);
+  ASSERT_NE(top, nullptr);
+  EXPECT_EQ(top->op, AstBinaryOp::And);
+  EXPECT_TRUE(std::holds_alternative<AstExists>(top->right->node));
+}
+
 // A 3-way JOIN chain is now supported (see ParsesThreeTableInnerJoinChain
 // above) -- but an excessive number of chained sources is still rejected,
 // as a guard against a pathological number of joined sources driving

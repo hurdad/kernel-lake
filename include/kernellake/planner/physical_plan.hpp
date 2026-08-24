@@ -177,6 +177,9 @@ class HashJoinNode final : public PhysicalPlanNode {
 
  private:
   static Schema build_schema(const Schema& left, const Schema& right, JoinType join_type) {
+    if (join_type == JoinType::LeftSemi || join_type == JoinType::LeftAnti) {
+      return left;  // see LogicalJoin::build_schema()'s own comment: zero fields from right, ever.
+    }
     std::vector<Field> fields = left.fields();
     const std::vector<Field>& right_fields = right.fields();
     if (join_type == JoinType::LeftOuter) {

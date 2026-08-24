@@ -61,4 +61,41 @@ namespace kernellake::sql {
     const AstExprPtr& expr,
     const std::function<std::vector<AstLiteral>(const AstSelectStatement&)>& evaluate);
 
+// Extracts every top-level `WHERE`-clause `AND`-conjunct that's an
+// `AstExists` node (see that type's own comment in ast.hpp for the exact
+// scope) and appends it as a new step onto `stmt`'s own join chain
+// (`JoinType::LeftSemi` for `EXISTS`, `LeftAnti` for `NOT EXISTS`) --
+// creating one, from `stmt.from`, if `stmt` had none yet. The extracted
+// step's `condition` is `subquery`'s own `WHERE` clause, completely
+// unmodified -- it gets resolved by the exact same
+// `extract_join_step_keys()` machinery (binder.cpp) a real `JOIN ... ON`
+// step's own condition already goes through, which is what actually
+// enforces "one correlation equality plus only-the-subquery's-own-columns
+// auxiliary predicates" -- this function does no such resolution itself
+// (it has no schema access, running well before binding), only the
+// purely structural checks below.
+//
+// Unlike resolve_subqueries()/resolve_in_subqueries() above, this is a
+// pure AST-to-AST transform with no I/O/execution dependency at all: an
+// `EXISTS`'s own correlated subquery becomes part of the *outer* query's
+// own join chain, executed by the same physical plan as any other JOIN
+// step -- never run separately beforehand the way a HAVING/IN subquery
+// is. Operates on (and returns) a whole `AstSelectStatement`, not a
+// single expression, since it moves content from `.where` into `.join`.
+//
+// A conjunct that isn't rewritable is left exactly where it is in
+// `.where`, to be rejected later at bind time with a clear, specific
+// error (`Binder::bind_node(const AstExists&, bool)`) -- not rewritable
+// means any of: the outer query is itself a derived table or (with no
+// existing join chain) has no alias on its own `FROM` source; `subquery`
+// has its own `JOIN`/derived-table `FROM`, `GROUP BY`, `HAVING`,
+// `ORDER BY`, or `LIMIT`; `subquery`'s single `FROM` source has no alias;
+// or `subquery` has no `WHERE` clause at all (nothing to become a join
+// condition, and a non-correlated `EXISTS (SELECT ...)` with no
+// correlation key isn't representable as a keyed join step). This
+// function has no opinion on error *messages* -- only on what it can
+// mechanically rewrite; the binder still owns explaining *why* the rest
+// is unsupported.
+[[nodiscard]] AstSelectStatement rewrite_exists_subqueries(AstSelectStatement stmt);
+
 }  // namespace kernellake::sql

@@ -17,6 +17,7 @@
 #include "kernellake/execution_gpu/parquet_scan_operator.hpp"
 #include "kernellake/execution_gpu/projection_operator.hpp"
 #include "kernellake/execution_gpu/scalar_aggregate_operator.hpp"
+#include "kernellake/execution_gpu/semi_anti_join_operator.hpp"
 #include "kernellake/execution_gpu/sort_operator.hpp"
 #include "kernellake/observability/query_tracing.hpp"
 
@@ -141,6 +142,22 @@ std::unique_ptr<PhysicalOperator> build(const PhysicalPlanPtr& node, ObjectStore
         effective_store, pass_read_limit_bytes, scan->partition_columns()));
   }
   if (const auto* join = dynamic_cast<const HashJoinNode*>(node.get())) {
+    // LEFT SEMI/LEFT ANTI (see SemiAntiJoinOperator's own class comment):
+    // a much simpler operator with no partitioned/spilling mode at all
+    // yet, so none of HashJoinOperator's own partition-sizing/budget-
+    // halving machinery below applies -- both children just get the
+    // plain pass_read_limit_bytes every non-join subtree already uses.
+    if (join->join_type() == JoinType::LeftSemi || join->join_type() == JoinType::LeftAnti) {
+      std::unique_ptr<PhysicalOperator> semi_anti_left =
+          build(join->left(), store, pass_read_limit_bytes, next_id, nvtx_enabled, build_side_budget_bytes,
+                spill_directory, max_distinct_keys);
+      std::unique_ptr<PhysicalOperator> semi_anti_right =
+          build(join->right(), store, pass_read_limit_bytes, next_id, nvtx_enabled, build_side_budget_bytes,
+                spill_directory, max_distinct_keys);
+      return instrument(std::make_unique<SemiAntiJoinOperator>(
+          next_id++, std::move(semi_anti_left), std::move(semi_anti_right), join->left_key_index(),
+          join->right_key_index(), std::make_shared<const Schema>(join->output_schema()), join->join_type()));
+    }
     // Computed *before* recursing into children (unlike every other case
     // here): choose_partition_count() only needs the plan node itself
     // (HashJoinNode::estimated_build_rows()/right()->output_schema()), not

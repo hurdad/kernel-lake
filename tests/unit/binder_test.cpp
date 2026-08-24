@@ -707,6 +707,19 @@ TEST(Binder, RejectsSubqueryOutsideHaving) {
   EXPECT_THROW((void)bind_query(stmt, Schema({Field{"a", int64_type(false)}})), BindingError);
 }
 
+TEST(Binder, RejectsUnresolvedExists) {
+  // sql::rewrite_exists_subqueries() (QueryEngine::plan_logical()) is what
+  // actually rewrites a top-level WHERE-clause EXISTS into a join step --
+  // bind_query() alone (as called directly here, bypassing QueryEngine)
+  // never runs that rewrite, so a query whose FROM has no alias at all
+  // (single-table binder mode, where a qualified reference wouldn't even
+  // be legal) reaches bind_node(const AstExists&, bool) unresolved.
+  const auto stmt = sql::parse_sql(
+      "SELECT a FROM read_parquet('/x.parquet') WHERE EXISTS "
+      "(SELECT * FROM read_parquet('/y.parquet') AS b WHERE b.k = a)");
+  EXPECT_THROW((void)bind_query(stmt, Schema({Field{"a", int64_type(false)}})), BindingError);
+}
+
 TEST(Binder, RejectsUnresolvedInSubquery) {
   // sql::resolve_in_subqueries() (QueryEngine::plan_logical()) is what
   // actually resolves an IN-subquery's AstIn::subquery field into a real

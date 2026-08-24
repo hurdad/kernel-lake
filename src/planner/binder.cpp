@@ -21,6 +21,7 @@ using sql::AstBinaryOp;
 using sql::AstCase;
 using sql::AstCast;
 using sql::AstColumnRef;
+using sql::AstExists;
 using sql::AstExpr;
 using sql::AstExprPtr;
 using sql::AstExtract;
@@ -831,6 +832,23 @@ class Binder {
         "'HAVING SUM(x) > (SELECT ...)'), not here");
   }
 
+  // Reached only if an `AstExists` survives all the way to binding -- i.e.
+  // sql::rewrite_exists_subqueries() (QueryEngine::plan_logical(), run
+  // before binding) couldn't rewrite it into a join step. That happens
+  // when it appears somewhere other than a top-level WHERE AND-conjunct,
+  // or its own subquery shape falls outside what that rewrite supports
+  // (single aliased FROM source, exactly one cross-side equality
+  // correlation, any other conjuncts referencing only the subquery's own
+  // columns) -- see AstExists's own comment (ast.hpp) for the exact
+  // scope. Either way, always a real error, never reached for a query
+  // that binds successfully.
+  [[noreturn]] ExpressionPtr bind_node(const AstExists&, bool) {
+    throw BindingError(
+        "EXISTS/NOT EXISTS is only supported as a top-level WHERE AND-conjunct, with a "
+        "non-correlated-beyond-a-single-equality-key subquery over one aliased source (e.g. "
+        "'WHERE ... AND EXISTS (SELECT * FROM b WHERE b.k = a.k AND <predicate over b only>)')");
+  }
+
   const Schema* input_schema_ = nullptr;  // single-table mode
   // JOIN mode: one (alias, schema) pair per FROM-clause source, in
   // left-to-right order -- empty (and input_schema_ non-null) in
@@ -1320,6 +1338,33 @@ BoundQuery bind_query(const sql::AstSelectStatement& stmt, const std::vector<Sch
         extract_join_step_keys(condition, combined_field_count, join_schemas[i + 1].field_count());
     join.steps.push_back(BoundJoinStep{step.source.paths, keys.combined_key_index, keys.source_key_index,
                                        step.join_type, keys.right_prefilter});
+    // Unconditional, even for LeftSemi/LeftAnti (whose actual combined
+    // *output* schema -- see LogicalJoin::build_schema() -- contributes
+    // zero of this step's fields, not source_field_count of them): safe
+    // because a semi/anti step, by construction, is never followed by
+    // another step. sql::rewrite_exists_subqueries() only ever *appends*
+    // LeftSemi/LeftAnti steps (from a WHERE-clause EXISTS/NOT EXISTS),
+    // and SQL syntax itself guarantees WHERE is parsed after every real
+    // JOIN clause, so there is no `join_schemas[i + 2]` whose own
+    // classification this now-too-large `combined_field_count` could ever
+    // incorrectly feed into. `Binder::join_sources_`'s own offset
+    // accounting (used for every *other* column reference in this query --
+    // SELECT list, WHERE, GROUP BY, a later step's condition) has the
+    // identical property for the identical reason: a source's own offset
+    // there is fixed by its position *before* this step is ever reached,
+    // so a semi/anti step's own (over-counted) width never corrupts
+    // anything computed earlier in that same left-to-right accumulation.
+    // Known, deliberately unguarded gap (matches this codebase's existing
+    // "documented narrow gap" convention, e.g. ARCHITECTURE.md's same-
+    // named-columns-after-JOIN note): a query that references a semi/
+    // anti-joined source's own alias *outside* its own step's condition
+    // (e.g. in the outer SELECT list) is not rejected here with a clean
+    // error -- it resolves to an index that doesn't correspond to any
+    // real column in LogicalJoin's actual (left-only) output schema.
+    // TPC-H's own real EXISTS/NOT EXISTS usage never does this (a
+    // semi/anti-joined table's columns are never referenced anywhere but
+    // inside its own correlation predicate), so this has not been worth
+    // the real complexity of restructuring Binder to reject it cleanly.
     combined_field_count += join_schemas[i + 1].field_count();
   }
 

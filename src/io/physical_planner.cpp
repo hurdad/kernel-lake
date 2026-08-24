@@ -552,9 +552,19 @@ PhysicalPlanPtr convert(const LogicalPlanPtr& node, ObjectStore& store, TableSou
       combined_column_map.push_back(index ? std::optional<std::size_t>(original_left_physical_offset + *index)
                                           : std::nullopt);
     }
+    // LeftSemi/LeftAnti: every right-side original index maps to nullopt
+    // unconditionally, regardless of what right_original_map itself says
+    // about pruning within the right subtree -- HashJoinNode::output_schema()
+    // (see its own build_schema()) never includes any right-side column at
+    // all for these join types, not just the ones projection pruning
+    // happened to prune.
+    const bool right_side_never_in_output =
+        join->join_type() == JoinType::LeftSemi || join->join_type() == JoinType::LeftAnti;
     for (const std::optional<std::size_t>& index : right_original_map) {
       combined_column_map.push_back(
-          index ? std::optional<std::size_t>(original_right_physical_offset + *index) : std::nullopt);
+          right_side_never_in_output || !index
+              ? std::nullopt
+              : std::optional<std::size_t>(original_right_physical_offset + *index));
     }
 
     // HashJoinOperator always builds its hash table on the *right* child
