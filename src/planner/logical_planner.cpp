@@ -325,12 +325,26 @@ LogicalPlanPtr build_logical_plan(const BoundQuery& query, const std::vector<Sch
                                                       partition_columns_for(0));
   for (std::size_t i = 0; i < query.join->steps.size(); ++i) {
     const BoundJoinStep& step = query.join->steps[i];
-    auto right_scan =
+    LogicalPlanPtr right_scan =
         std::make_shared<LogicalScan>(step.source_paths, join_schemas[i + 1], partition_columns_for(i + 1));
+    // An auxiliary ON-clause conjunct referencing only this source's own
+    // columns (e.g. TPC-H Q13's `o_comment NOT LIKE '%special%requests%'`)
+    // -- see BoundJoinStep::right_prefilter's own comment for why this is
+    // exact for both INNER and LEFT OUTER JOIN.
+    if (step.right_prefilter != nullptr) {
+      right_scan = std::make_shared<LogicalFilter>(std::move(right_scan), step.right_prefilter);
+    }
     plan = std::make_shared<LogicalJoin>(std::move(plan), std::move(right_scan), step.combined_key_index,
                                          step.source_key_index, step.join_type);
   }
   return finish_logical_plan(std::move(plan), query);
+}
+
+LogicalPlanPtr build_logical_plan(const BoundQuery& query, LogicalPlanPtr source_plan) {
+  if (query.join.has_value()) {
+    throw PlanningError("unreachable: build_logical_plan(source_plan) called for a JOIN query");
+  }
+  return finish_logical_plan(std::move(source_plan), query);
 }
 
 }  // namespace kernellake

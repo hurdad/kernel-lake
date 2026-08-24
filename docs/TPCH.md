@@ -43,11 +43,23 @@ subqueries" section for the full scope), and **Q18** (a three-table
 `IN (SELECT ...)` subquery in `WHERE` -- unlike Q11's HAVING subquery,
 this one may return many rows, resolved into a literal list the same way
 a literal `IN (...)` list already desugars; see `docs/ARCHITECTURE.md`'s
-"`IN (SELECT ...)` subqueries" section). KernelLake supports a chain of
-two or more tables via `INNER JOIN ... ON`, each step a single equality key, on
-both the CPU and GPU execution backends (see `docs/ARCHITECTURE.md`'s
-"Hash joins" section, including its N-way-join generalization, and its
-"CPU execution backend" section for the CPU-side fix); `CASE` inside an
+"`IN (SELECT ...)` subqueries" section), and **Q13** (a `customer`/`orders`
+`LEFT OUTER JOIN` whose own `ON` clause combines the required equality key
+with an extra predicate scoped to just the newly-joined side --
+`o_comment NOT LIKE '%special%requests%'` -- plus a derived table,
+`FROM (SELECT ...) AS c_orders`, whose own inner query's grouped `COUNT`
+output the *outer* query groups by again -- the first query in this
+project needing a `LEFT OUTER JOIN`, an `ON`-clause predicate beyond the
+bare equality key, or a derived table, all three genuinely supported (not
+flattened away); see `docs/ARCHITECTURE.md`'s "Hash joins" section for the
+`LEFT OUTER JOIN`/`ON`-clause-predicate scope and its "Derived tables"
+section for the `FROM`-subquery scope). KernelLake supports a chain of two
+or more tables via `INNER` or `LEFT OUTER JOIN ... ON`, each step a single
+equality key (`LEFT OUTER` additionally allows an `ON`-clause predicate
+scoped to just the newly-joined side), on both the CPU and GPU execution
+backends (see `docs/ARCHITECTURE.md`'s "Hash joins" section, including its
+N-way-join generalization, and its "CPU execution backend" section for the
+CPU-side fix); `CASE` inside an
 aggregate argument (grouped *or* scalar), `LIKE` inside a `CASE` branch,
 and a `SELECT` item that combines multiple aggregates arithmetically
 (Q14's `100.00 * SUM(...) / SUM(...)`, rather than a single bare

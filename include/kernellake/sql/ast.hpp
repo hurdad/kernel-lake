@@ -239,9 +239,37 @@ struct AstJoinClause {
 
 struct AstSelectStatement {
   std::vector<AstExprPtr> select_list;
-  AstParquetSource from;              // single-table FROM; unused when `join` is set
+  // Exactly one of `from` / `join` / `from_subquery` is meaningful for a
+  // given statement, selected by which is set: `from` is the plain
+  // single-table default (`AstParquetSource{}`, unused paths, when
+  // `join` or `from_subquery` is set instead), `join` a
+  // `FROM ... JOIN ... ON ...` chain, `from_subquery` a derived table
+  // (`FROM (SELECT ...) AS alias`).
+  AstParquetSource from;
   std::optional<AstJoinClause> join;  // FROM ... JOIN ... ON ... [JOIN ... ON ...]
-  AstExprPtr where;                   // null if no WHERE clause
+  // `FROM (SELECT ...) AS from_subquery_alias` -- a derived table. Not
+  // itself joined or joinable (this project supports at most one level of
+  // "a derived table is this query's *entire* FROM clause", matching TPC-H
+  // Q13's own shape); a derived table appearing as one side of a JOIN, or
+  // a JOIN inside a derived table's own FROM, is out of scope. `shared_ptr`,
+  // not embedded by value, for the same forward-declaration-cycle reason
+  // as AstSubquery above. QueryEngine::plan_logical() binds/plans this
+  // inner query first (recursively -- it may itself have a derived table,
+  // a JOIN, a HAVING/IN subquery, ...); its own output schema becomes the
+  // "table" the outer query binds against (reusing the plain single-table
+  // bind_query() overload unchanged -- from the outer query's binder's
+  // perspective, a derived table looks exactly like a real Parquet
+  // source's inspected schema), and its own (unoptimized) LogicalPlanPtr
+  // becomes the outer query's source instead of a LogicalScan (see
+  // logical_planner.cpp's build_logical_plan(query, source_plan)
+  // overload). `from_subquery_alias` is required by SQL syntax (parser.cpp
+  // rejects an unaliased derived table) and stored for documentation, but
+  // unused downstream: the outer query's single-table binder mode has no
+  // qualified-column-reference support at all, so a derived table's alias
+  // is never actually referenced.
+  std::shared_ptr<AstSelectStatement> from_subquery;
+  std::optional<std::string> from_subquery_alias;
+  AstExprPtr where;  // null if no WHERE clause
   std::vector<AstExprPtr> group_by;
   // `HAVING <bool expr>` -- null if no HAVING clause. Only legal on a
   // GROUP BY/aggregate query (see binder.cpp); may itself contain an

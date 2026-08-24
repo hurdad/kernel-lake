@@ -22,6 +22,7 @@ class RecordBatch;
 namespace kernellake {
 
 class RmmEnvironment;
+class TableSourceResolver;
 
 // Execution and I/O metrics for one query. Every metric KernelLake cannot
 // yet measure (because execution requires GPU/libcudf, not yet built --
@@ -137,6 +138,31 @@ class QueryEngine {
   // return a QueryResult to put it in.
   [[nodiscard]] LogicalPlanPtr plan_logical(std::string_view sql,
                                             double* metadata_inspection_seconds_out = nullptr) const;
+
+  // The recursive body plan_logical() wraps with a single optimize() call
+  // at the very top. Resolves `ast`'s own HAVING/WHERE-IN subqueries, then
+  // binds+builds (but does not optimize) its logical plan, dispatching on
+  // whether `ast.from` is a plain source, a JOIN chain, or a derived table
+  // (`FROM (SELECT ...) AS alias`) -- the last case recurses into this same
+  // method for the inner query first, whose own (unoptimized)
+  // LogicalPlanPtr becomes the outer query's source and whose own
+  // BoundQuery::output_schema becomes the outer query's "table" to bind
+  // against (see logical_planner.cpp's build_logical_plan(query,
+  // source_plan) overload and binder.hpp's single-table bind_query()
+  // overload, both reused as-is -- a derived table's output looks exactly
+  // like a real source's schema to either). `resolver` is threaded through
+  // rather than constructed fresh per recursive call, so a derived table's
+  // own inner query shares plan_logical()'s one Iceberg/Delta/Unity
+  // Catalog resolver instance instead of building a redundant copy.
+  // Optimization is deliberately deferred to plan_logical() itself (called
+  // exactly once, over the fully assembled tree) rather than run here per
+  // recursive call, both to avoid the question of whether optimize() is
+  // safe to run twice over an already-optimized subtree, and so passes
+  // like predicate pushdown see the whole tree, inner and outer query
+  // alike, at once.
+  [[nodiscard]] LogicalPlanPtr plan_logical_unoptimized(sql::AstSelectStatement ast,
+                                                        TableSourceResolver& resolver,
+                                                        double* metadata_inspection_seconds_out) const;
 
   // Runs `subquery_ast` as a genuinely separate, complete query (bind,
   // logical-plan, optimize, physical-plan, execute) on the CPU (Acero)

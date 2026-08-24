@@ -8,6 +8,7 @@
 #include <cudf/copying.hpp>
 #include <cudf/datetime.hpp>
 #include <cudf/null_mask.hpp>
+#include <cudf/replace.hpp>
 #include <cudf/scalar/scalar_factories.hpp>
 #include <cudf/strings/contains.hpp>
 #include <cudf/strings/strings_column_view.hpp>
@@ -246,6 +247,7 @@ void HashAggregateOperator::open(ExecutionContext& context) {
   value_column_kind_.reserve(aggregates_.size());
   physical_agg_kind_.reserve(aggregates_.size());
   aggregate_output_kind_.reserve(aggregates_.size());
+  is_count_result_.reserve(aggregates_.size());
 
   for (const NamedExpression& item : aggregates_) {
     const auto* aggregate = dynamic_cast<const AggregateExpression*>(item.expr.get());
@@ -265,6 +267,7 @@ void HashAggregateOperator::open(ExecutionContext& context) {
                                          ? PhysicalAggKind::Min
                                          : PhysicalAggKind::Max);
         aggregate_output_kind_.push_back(AggregateOutputKind::Direct);
+        is_count_result_.push_back(false);
         break;
 
       case AggregateFunction::CountStar:
@@ -275,6 +278,7 @@ void HashAggregateOperator::open(ExecutionContext& context) {
         value_column_kind_.push_back(ValueColumnKind::CountStarOnes);
         physical_agg_kind_.push_back(PhysicalAggKind::Sum);
         aggregate_output_kind_.push_back(AggregateOutputKind::Direct);
+        is_count_result_.push_back(true);
         break;
 
       case AggregateFunction::Count:
@@ -282,6 +286,7 @@ void HashAggregateOperator::open(ExecutionContext& context) {
         value_column_kind_.push_back(ValueColumnKind::CountColumnOnes);
         physical_agg_kind_.push_back(PhysicalAggKind::Sum);
         aggregate_output_kind_.push_back(AggregateOutputKind::Direct);
+        is_count_result_.push_back(true);
         break;
 
       case AggregateFunction::Avg: {
@@ -301,6 +306,7 @@ void HashAggregateOperator::open(ExecutionContext& context) {
         physical_agg_kind_.push_back(PhysicalAggKind::Sum);
 
         aggregate_output_kind_.push_back(AggregateOutputKind::Average);
+        is_count_result_.push_back(false);
         break;
       }
     }
@@ -449,10 +455,21 @@ std::optional<DeviceBatch> HashAggregateOperator::next(ExecutionContext& context
   }
 
   std::size_t value_index = group_by_.size();
-  for (AggregateOutputKind kind : aggregate_output_kind_) {
-    if (kind == AggregateOutputKind::Direct) {
-      final_columns.push_back(std::move(accumulated_columns[value_index]));
+  for (std::size_t i = 0; i < aggregate_output_kind_.size(); ++i) {
+    if (aggregate_output_kind_[i] == AggregateOutputKind::Direct) {
+      std::unique_ptr<cudf::column> column = std::move(accumulated_columns[value_index]);
       ++value_index;
+      // COUNT(argument)/COUNT(*) must never surface NULL -- see
+      // is_count_result_'s own comment for why the underlying SUM-of-ones
+      // physical mechanism can produce one here (a group whose argument is
+      // NULL in every one of its rows, e.g. a LEFT OUTER JOIN's own
+      // null-extended row), and why 0 is the correct replacement.
+      if (is_count_result_[i] && column->has_nulls()) {
+        const std::unique_ptr<cudf::scalar> zero =
+            cudf::make_fixed_width_scalar<std::int64_t>(0, context.stream, context.memory_resource);
+        column = cudf::replace_nulls(column->view(), *zero, context.stream, context.memory_resource);
+      }
+      final_columns.push_back(std::move(column));
       continue;
     }
 

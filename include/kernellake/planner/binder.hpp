@@ -37,6 +37,18 @@ struct BoundJoinStep {
   std::size_t combined_key_index;
   std::size_t source_key_index;
   JoinType join_type = JoinType::Inner;
+  // Non-null when this step's ON clause had additional AND-conjuncts beyond
+  // the required equality key, all referencing only this step's own new
+  // source (e.g. TPC-H Q13's `ON c_custkey = o_custkey AND o_comment NOT
+  // LIKE '%special%requests%'`) -- already rebased to that source's own
+  // 0-based schema (indices into `source_paths`' own schema, not the
+  // combined row). logical_planner.cpp applies it as a LogicalFilter
+  // directly on that source's scan, before it becomes this step's join
+  // child -- see extract_join_step_keys() (binder.cpp) for why this is
+  // exact (not an approximation) for both INNER and LEFT OUTER JOIN, and
+  // why a left-side-referencing conjunct is rejected at bind time instead
+  // of ever reaching here.
+  ExpressionPtr right_prefilter;
 };
 
 // The bound form of a `JOIN ... ON` chain (see sql::AstJoinClause):

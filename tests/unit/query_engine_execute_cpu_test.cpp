@@ -490,6 +490,121 @@ TEST_F(QueryEngineExecuteCpuTest, TwoTableInnerJoinMatchesExpectedTotals) {
   EXPECT_DOUBLE_EQ(totals_by_name.at("Beta"), 110.0);  // 100+7+3
 }
 
+// TPC-H Q13's own ON-clause shape: the required equality key plus an extra
+// predicate referencing only the newly-joined (right) source, pushed down
+// as a pre-filter on that source before the join runs (see binder.cpp's
+// extract_join_step_keys()). Only region 'A' (whose regions.parquet row has
+// region_name = 'Alpha') has anything left to match against in the
+// pre-filtered build side; region 'B' (region_name = 'Beta') has none, so
+// an INNER JOIN drops it entirely.
+TEST_F(QueryEngineExecuteCpuTest,
+       JoinOnConditionWithRightSideAuxiliaryPredicateFiltersBuildSideBeforeMatching) {
+  const QueryResult result = engine_.execute(
+      "SELECT s.region, SUM(s.amount) AS total FROM read_parquet('" + path_ + "') AS s JOIN read_parquet('" +
+      regions_path_ + "') AS r ON s.region = r.region AND r.region_name = 'Alpha' GROUP BY s.region");
+
+  ASSERT_EQ(result.rows_returned, 1);
+  ASSERT_EQ(result.batches.size(), 1u);
+  const std::shared_ptr<arrow::RecordBatch>& batch = result.batches.front();
+  ASSERT_EQ(batch->num_rows(), 1);
+  const auto region_column = std::static_pointer_cast<arrow::StringArray>(batch->GetColumnByName("region"));
+  const auto total_column = std::static_pointer_cast<arrow::DoubleArray>(batch->GetColumnByName("total"));
+  ASSERT_NE(region_column, nullptr);
+  ASSERT_NE(total_column, nullptr);
+  EXPECT_EQ(region_column->GetString(0), "A");
+  EXPECT_DOUBLE_EQ(total_column->Value(0), 35.0);  // 10+20+5
+}
+
+// Same ON-clause shape as above but LEFT OUTER: region 'B' rows must still
+// appear (null-extended on region_name), not disappear, since the
+// auxiliary predicate only restricts which right rows are eligible to
+// *match* -- it never touches which left rows LEFT OUTER JOIN preserves.
+TEST_F(QueryEngineExecuteCpuTest, LeftOuterJoinWithRightSideAuxiliaryPredicateNullExtendsFilteredOutRows) {
+  const QueryResult result = engine_.execute("SELECT s.region, r.region_name FROM read_parquet('" + path_ +
+                                             "') AS s LEFT JOIN read_parquet('" + regions_path_ +
+                                             "') AS r ON s.region = r.region AND r.region_name = 'Alpha'");
+
+  ASSERT_EQ(result.rows_returned, 6);
+  ASSERT_EQ(result.batches.size(), 1u);
+  const std::shared_ptr<arrow::RecordBatch>& batch = result.batches.front();
+  ASSERT_EQ(batch->num_rows(), 6);
+  const auto region_column = std::static_pointer_cast<arrow::StringArray>(batch->GetColumnByName("region"));
+  const auto name_column =
+      std::static_pointer_cast<arrow::StringArray>(batch->GetColumnByName("region_name"));
+  ASSERT_NE(region_column, nullptr);
+  ASSERT_NE(name_column, nullptr);
+  for (std::int64_t i = 0; i < batch->num_rows(); ++i) {
+    if (region_column->GetString(i) == "A") {
+      ASSERT_FALSE(name_column->IsNull(i)) << "row " << i;
+      EXPECT_EQ(name_column->GetString(i), "Alpha");
+    } else {
+      EXPECT_TRUE(name_column->IsNull(i)) << "row " << i;
+    }
+  }
+}
+
+// A derived table (`FROM (SELECT ...) AS alias`) as this query's entire
+// FROM clause -- TPC-H Q13's own outer-query shape. Exercises
+// QueryEngine::plan_logical_unoptimized()'s recursive derived-table branch
+// end to end: the inner query (its own WHERE + a plain projection, no
+// aggregate) is bound/built first, its output schema becomes what the
+// outer query's GROUP BY/aggregate binds against, and finish_logical_plan()
+// runs on top of the inner query's own already-built LogicalPlanPtr instead
+// of a LogicalScan.
+TEST_F(QueryEngineExecuteCpuTest, DerivedTableAsSoleFromSourceMatchesExpectedTotals) {
+  const QueryResult result = engine_.execute(
+      "SELECT region, SUM(amount) AS total FROM "
+      "(SELECT region, amount FROM read_parquet('" +
+      path_ + "') WHERE amount > 5) AS s GROUP BY region");
+
+  ASSERT_EQ(result.rows_returned, 2);
+  const std::shared_ptr<arrow::RecordBatch>& batch = result.batches.front();
+  const auto region_column = std::static_pointer_cast<arrow::StringArray>(batch->GetColumnByName("region"));
+  const auto total_column = std::static_pointer_cast<arrow::DoubleArray>(batch->GetColumnByName("total"));
+  ASSERT_NE(region_column, nullptr);
+  ASSERT_NE(total_column, nullptr);
+
+  std::map<std::string, double> totals_by_region;
+  for (std::int64_t i = 0; i < batch->num_rows(); ++i) {
+    totals_by_region[region_column->GetString(i)] = total_column->Value(i);
+  }
+  ASSERT_EQ(totals_by_region.size(), 2u);
+  EXPECT_DOUBLE_EQ(totals_by_region.at("A"), 30.0);   // 10+20 (5 excluded by amount > 5)
+  EXPECT_DOUBLE_EQ(totals_by_region.at("B"), 107.0);  // 100+7 (3 excluded by amount > 5)
+}
+
+// TPC-H Q13's full outer-query shape: the derived table's own inner query
+// is itself a GROUP BY (SUM(amount) per region, aliased as "total" here in
+// place of Q13's c_count), and the *outer* query GROUP BYs *that* aggregate
+// column -- exactly Q13's "count how many customers have each c_count"
+// pattern (here: "how many regions share each rounded total"), which only
+// works if the derived table's inner LogicalAggregate's own output schema
+// is what the outer bind_query() call actually sees.
+TEST_F(QueryEngineExecuteCpuTest, DerivedTableOverAggregateAllowsOuterQueryToGroupByTheAggregateColumn) {
+  const QueryResult result = engine_.execute(
+      "SELECT total, COUNT(*) AS region_count FROM "
+      "(SELECT region, CAST(SUM(amount) AS BIGINT) AS total FROM read_parquet('" +
+      path_ + "') GROUP BY region) AS r GROUP BY total");
+
+  // region A totals 35, region B totals 110 -- two distinct totals, one
+  // region each.
+  ASSERT_EQ(result.rows_returned, 2);
+  const std::shared_ptr<arrow::RecordBatch>& batch = result.batches.front();
+  const auto total_column = std::static_pointer_cast<arrow::Int64Array>(batch->GetColumnByName("total"));
+  const auto count_column =
+      std::static_pointer_cast<arrow::Int64Array>(batch->GetColumnByName("region_count"));
+  ASSERT_NE(total_column, nullptr);
+  ASSERT_NE(count_column, nullptr);
+
+  std::map<std::int64_t, std::int64_t> region_count_by_total;
+  for (std::int64_t i = 0; i < batch->num_rows(); ++i) {
+    region_count_by_total[total_column->Value(i)] = count_column->Value(i);
+  }
+  ASSERT_EQ(region_count_by_total.size(), 2u);
+  EXPECT_EQ(region_count_by_total.at(35), 1);
+  EXPECT_EQ(region_count_by_total.at(110), 1);
+}
+
 // Regression test: a 3+-way JOIN chain used to be rejected outright at
 // parse time ("KernelLake supports at most two read_parquet(...)
 // sources"), even though the underlying hsql SQL parser already builds a

@@ -107,7 +107,11 @@ on the structured plan/expression trees, never on SQL text.
 SELECT <items> FROM read_parquet('path' [, 'path2', ...])
   [WHERE <expr>] [GROUP BY <cols>] [ORDER BY <cols>] [LIMIT <n>]
 
-SELECT <items> FROM read_parquet(...) AS a JOIN read_parquet(...) AS b ON <a.col = b.col>
+SELECT <items> FROM read_parquet(...) AS a [INNER | LEFT [OUTER]] JOIN read_parquet(...) AS b
+    ON <a.col = b.col> [AND <predicate over b's own columns only>]
+  [WHERE <expr>] [GROUP BY <cols>] [ORDER BY <cols>] [LIMIT <n>]
+
+SELECT <items> FROM (SELECT ...) AS alias
   [WHERE <expr>] [GROUP BY <cols>] [ORDER BY <cols>] [LIMIT <n>]
 ```
 
@@ -184,9 +188,13 @@ Catalog server and a real MinIO, not just reasoned about: see
 - `DECIMAL(p, s)` columns and literals -- see "DECIMAL support" below
 - Aggregates: `SUM`, `COUNT`, `COUNT(*)`, `MIN`, `MAX`, `AVG` (`AVG` does
   not support a `DECIMAL` argument; see "DECIMAL support")
-- A chain of two or more tables via `INNER JOIN ... ON`, each step a single
-  equality key (see "Hash joins" below for the full scope, including the
-  N-way generalization)
+- A chain of two or more tables via `INNER` or `LEFT [OUTER] JOIN ... ON`,
+  each step a single equality key plus, optionally, an extra predicate
+  scoped to just the newly-joined side (see "Hash joins" below for the
+  full scope, including the N-way generalization)
+- A single derived table (`FROM (SELECT ...) AS alias`) as a query's
+  entire FROM clause -- not itself joined or joinable, not correlated
+  (see "Derived tables" below)
 - `EXTRACT(field FROM expr)`, `field` one of `YEAR`/`MONTH`/`DAY` only --
   `expr` must be `DATE`/`TIMESTAMP`. `HOUR`/`MINUTE`/`SECOND` are rejected
   outright, not just unimplemented: no generated table has a time-of-day
@@ -973,15 +981,30 @@ would fail on an implementation detail unrelated to correctness.
 ### Hash joins
 
 - **Scope**: a chain of two or more `read_parquet(...)` sources, all
-  explicitly aliased, joined with `INNER JOIN ... ON <a.col = b.col>` per
-  step -- a single equality between one plain column already in scope and
-  one plain column from the newly-joined source, of identical type.
-  Comma-style joins (`FROM a, b WHERE a.k = b.k`), `LEFT`/`RIGHT`/`FULL`/
-  `CROSS` JOIN, and multi-key/non-equality conditions all fail clearly at
-  parse or bind time rather than being silently reinterpreted; a chain
-  longer than `kMaxJoinSources` (12, in `parser.cpp`, generous relative to
-  any real query -- TPC-H's own deepest join, Q8, needs 7) is rejected the
-  same way, purely as a guard against pathological input. For each step,
+  explicitly aliased, joined with `INNER JOIN ... ON <a.col = b.col>` or
+  `LEFT [OUTER] JOIN ... ON <a.col = b.col>` per step -- a single equality
+  between one plain column already in scope (`a`, the *left*/*probe* side)
+  and one plain column from the newly-joined source (`b`, the
+  *right*/*build* side), of identical type. `RIGHT`/`FULL`/`CROSS` JOIN and
+  comma-style joins (`FROM a, b WHERE a.k = b.k`) still fail clearly at
+  parse time. The `ON` clause may combine that required equality key with
+  additional `AND`-conjuncts, but only ones that reference *exclusively*
+  the newly-joined (right) source's own columns (TPC-H Q13's own
+  `o_comment NOT LIKE '%special%requests%'`) -- these are pushed down as a
+  `LogicalFilter` directly on that source's scan, before the join runs
+  (`extract_join_step_keys()`, `binder.cpp`), which is exact (not an
+  approximation) for both `INNER` and `LEFT OUTER JOIN` since it only ever
+  restricts which right-side rows are eligible to match, never which left
+  rows a `LEFT OUTER JOIN` preserves. A conjunct referencing the
+  already-joined (left) side at all -- alone, or mixed with the right
+  side -- is rejected: unlike the right-side-only case, a `LEFT OUTER
+  JOIN`'s own left-side `ON` conjunct has different semantics (a left row
+  failing it must still appear once, null-extended, not be dropped like a
+  pre-filter would) that isn't implemented. Any other non-equality or
+  multi-column condition still fails clearly at bind time; a chain longer
+  than `kMaxJoinSources` (12, in `parser.cpp`, generous relative to any
+  real query -- TPC-H's own deepest join, Q8, needs 7) is rejected the same
+  way, purely as a guard against pathological input. For each step,
   the *build* side (materialized in full before probing begins) is now
   chosen by size, not always the newly-joined (right-hand) table -- see
   "Size-aware build-side selection" below.
@@ -1000,7 +1023,13 @@ would fail on an implementation detail unrelated to correctness.
   estimate is smaller -- since `HashJoinOperator` (GPU) and Acero's
   `"hashjoin"` (CPU) both always materialize their *right* child, this
   puts the actually-smaller table there regardless of which side a query
-  wrote first. Still not real cardinality estimation (no histograms, no
+  wrote first. **`INNER JOIN` only**: swapping is disabled outright for
+  `LEFT OUTER JOIN`, since `HashJoinOperator`'s `left`/`right` convention
+  is not just "whichever's smaller" but load-bearing for correctness --
+  `left` is always the preserved/probe side, `right` the nullable/build
+  side, and swapping which SQL-level side lands in each would silently
+  invert which side gets preserved vs. null-extended. Still not real
+  cardinality estimation (no histograms, no
   join-selectivity modeling, row-group pruning itself isn't reflected --
   see `estimate_row_count()`'s own comment on why most TPC-H-derived
   predicates here don't prune row groups at all), and it's a
@@ -1137,10 +1166,17 @@ would fail on an implementation detail unrelated to correctness.
   below, or all at/above, the join's `left()` child's field count) and
   pushes each one down as a new `LogicalFilter` directly above that
   child -- `sigma_p(A JOIN B) = sigma_p(A) JOIN B`, unconditionally valid
-  since this engine only supports INNER joins (no null-extension
-  semantics to worry about). Recurses through `rewrite_plan()`, so it
-  telescopes through an entire N-way left-deep join chain one level at a
-  time. A conjunct referencing columns from both sides (or a constant)
+  for the left side of any join (`INNER` or `LEFT OUTER`, since a
+  left-side-only `WHERE` predicate can only ever drop or keep a whole left
+  row, the same thing `LEFT OUTER JOIN`'s own null-extension already does
+  to a non-matching row) but valid for the *right* side only when the join
+  is `INNER` -- pushing a right-side-only `WHERE` predicate below a `LEFT
+  OUTER JOIN` would change which left rows count as "matched" for
+  null-extension purposes, so `push_predicate_through_join()` leaves such
+  a conjunct where it was (applied post-join) instead. Recurses through
+  `rewrite_plan()`, so it telescopes through an entire N-way left-deep
+  join chain one level at a time. A conjunct referencing columns from both
+  sides (or a constant)
   is left exactly where it was, still applied post-join via a
   `LogicalFilter` directly above the join. Once a predicate lands
   directly on a `LogicalFilter(LogicalScan, ...)` shape, it flows into
@@ -1171,12 +1207,59 @@ would fail on an implementation detail unrelated to correctness.
   builds its hash table once, up front, from a single `cudf::table_view`
   (the same "consume child to exhaustion, concatenate into one table"
   shape `SortOperator` uses, for an analogous reason). The *probe* side
-  streams through normally, one `inner_join()` call per incoming batch,
-  gathering matching rows from both the probe batch and the persistent
-  build table. A build side with zero rows short-circuits without ever
-  constructing a `cudf::hash_join` (an INNER JOIN against no rows can never
-  match anything); this is a real gap for LEFT JOIN outer rows should that
-  ever be added, but is correct for INNER JOIN's current scope.
+  streams through normally, one `inner_join()`/`left_join()` call per
+  incoming batch (`join_type_`-selected), gathering matching rows from
+  both the probe batch and the persistent build table -- `left_join()`'s
+  own `JoinNoMatch` sentinel for an unmatched probe row is gathered with
+  `out_of_bounds_policy::NULLIFY`, producing real NULLs for the build
+  side's columns. A build side with zero rows short-circuits without ever
+  constructing a `cudf::hash_join`: correct outright for `INNER JOIN` (can
+  never match anything), and for `LEFT OUTER JOIN` handled by
+  `null_extend_batch()` instead -- every probe row still appears, NULL-
+  extended, built directly from `output_schema_`'s own right-side field
+  types since there is no build-side schema to gather from at all.
+
+### Derived tables
+
+`FROM (SELECT ...) AS alias` -- a single derived table as a query's
+*entire* FROM clause (TPC-H Q13's own outer-query shape), not itself
+joined or joinable, and not correlated (the inner query cannot reference
+the outer query's columns -- there's no outer query yet when the inner one
+binds). A derived table nested inside a JOIN, or a JOIN inside a derived
+table's own FROM, is out of scope; both fail clearly (the parser only
+recognizes `kTableSelect` at a statement's own top-level FROM position,
+and `flatten_join_chain()`/`convert_join_source()` never look for one).
+
+`QueryEngine::plan_logical_unoptimized()` is where this is actually
+resolved: a genuinely recursive private helper (the same shape
+`resolve_subqueries()`/`resolve_in_subqueries()` already use for HAVING/
+`IN` subqueries, extended to a case where the nested query's *rows*, not
+just one resolved scalar/list, matter) that `plan_logical()` calls once at
+the top and wraps in a single `optimize()` call. When `ast.from_subquery`
+is set, it recurses into itself for the inner query first, producing that
+inner query's own (unoptimized) `LogicalPlanPtr` -- everything from its
+own `LogicalScan`/`LogicalJoin` up through its own WHERE/GROUP BY/
+HAVING/ORDER BY/LIMIT, exactly as if it had been the whole query. That
+`LogicalPlanPtr`'s own `output_schema()` then becomes what the *outer*
+query binds against, via the ordinary single-table `bind_query()`
+overload, completely unchanged -- from that binder's perspective, a
+derived table's output schema is indistinguishable from a real
+`read_parquet(...)` source's inspected one (this is also why a derived
+table's alias, though required by SQL syntax and parsed, is never actually
+threaded anywhere: single-table binder mode has no qualified-column
+support to begin with, so the alias would have nothing to qualify). The
+outer query's own logical plan is then built directly on top of the
+inner query's finished `LogicalPlanPtr` (`build_logical_plan(query,
+source_plan)`, `logical_planner.cpp` -- no `LogicalScan` involved at all,
+just `finish_logical_plan()` run against an already-fully-built subtree),
+so a derived table over a `GROUP BY` (Q13's own shape: the outer query
+groups by the inner query's own aggregate output column) needs no special
+handling anywhere in physical planning or either execution backend --
+both already handle an arbitrary node stacking (e.g. `LogicalFilter` whose
+child is a `LogicalAggregate` whose child is a `LogicalJoin`) for a
+plain single-statement query with `WHERE` + `JOIN` + `GROUP BY` all
+together; a derived table just means that whole subtree was built by a
+separate, earlier recursive call instead of inline.
 
 ### GPU dependency vendoring (no conda)
 

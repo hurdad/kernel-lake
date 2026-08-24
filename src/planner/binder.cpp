@@ -1027,48 +1027,248 @@ BoundQuery bind_query_common(const sql::AstSelectStatement& stmt, Binder& binder
   return result;
 }
 
-// Validates that `condition` is exactly `<column> = <column>`, one column
-// already in the accumulated combined schema so far (index in
-// [0, combined_field_count)) and one column from the new source being
-// joined at this step (index in [combined_field_count, combined_field_count
-// + source_field_count)), of identical type -- the only shape
-// HashJoinOperator's cudf::hash_join can consume directly, with no
-// pre-join casting step. Returns (combined_key_index, source_key_index):
-// the former into the accumulated schema so far, the latter into the new
-// source's *own* schema.
-std::pair<std::size_t, std::size_t> extract_join_step_keys(const ExpressionPtr& condition,
-                                                           std::size_t combined_field_count,
-                                                           std::size_t source_field_count) {
-  const auto* binary = dynamic_cast<const BinaryExpression*>(condition.get());
-  if (binary == nullptr || binary->op() != BinaryOperator::Equal) {
+// Flattens top-level AND conjuncts of a bound JOIN ON condition into a flat
+// list -- e.g. TPC-H Q13's `c_custkey = o_custkey AND o_comment NOT LIKE
+// '%special%requests%'` becomes two conjuncts, one of which is the
+// required equality key and the other an auxiliary predicate (see
+// extract_join_step_keys()'s own comment). Mirrors optimizer.cpp's own
+// collect_conjuncts(), duplicated rather than shared across translation
+// units for a few lines of recursive AND-splitting.
+void collect_join_condition_conjuncts(const ExpressionPtr& condition, std::vector<ExpressionPtr>& out) {
+  if (const auto* binary = dynamic_cast<const BinaryExpression*>(condition.get());
+      binary != nullptr && binary->op() == BinaryOperator::And) {
+    collect_join_condition_conjuncts(binary->left(), out);
+    collect_join_condition_conjuncts(binary->right(), out);
+    return;
+  }
+  out.push_back(condition);
+}
+
+// Recursively collects every ColumnExpression's column_index() referenced
+// anywhere in `expr` -- used by extract_join_step_keys() below to classify
+// a JOIN ON auxiliary conjunct (anything beyond the required equality key)
+// as referencing only the newly-joined source's own columns, only the
+// already-joined side's, or a mix of both. AggregateExpression is
+// deliberately absent: JOIN ON conditions are always bound with
+// allow_aggregates=false, so one can never appear here.
+void collect_column_indices(const ExpressionPtr& expr, std::vector<std::size_t>& out) {
+  if (const auto* column = dynamic_cast<const ColumnExpression*>(expr.get())) {
+    out.push_back(column->column_index());
+  } else if (const auto* binary = dynamic_cast<const BinaryExpression*>(expr.get())) {
+    collect_column_indices(binary->left(), out);
+    collect_column_indices(binary->right(), out);
+  } else if (const auto* unary = dynamic_cast<const UnaryExpression*>(expr.get())) {
+    collect_column_indices(unary->operand(), out);
+  } else if (const auto* cast = dynamic_cast<const CastExpression*>(expr.get())) {
+    collect_column_indices(cast->operand(), out);
+  } else if (const auto* extract = dynamic_cast<const ExtractExpression*>(expr.get())) {
+    collect_column_indices(extract->operand(), out);
+  } else if (const auto* between = dynamic_cast<const BetweenExpression*>(expr.get())) {
+    collect_column_indices(between->value(), out);
+    collect_column_indices(between->lower(), out);
+    collect_column_indices(between->upper(), out);
+  } else if (const auto* like = dynamic_cast<const LikeExpression*>(expr.get())) {
+    // `pattern` is required to bind to a string literal (see
+    // LikeExpression's own contract), never a column.
+    collect_column_indices(like->value(), out);
+  } else if (const auto* case_expr = dynamic_cast<const CaseExpression*>(expr.get())) {
+    for (const CaseExpression::WhenThen& branch : case_expr->when_then()) {
+      collect_column_indices(branch.condition, out);
+      collect_column_indices(branch.result, out);
+    }
+    if (case_expr->else_branch() != nullptr) {
+      collect_column_indices(case_expr->else_branch(), out);
+    }
+  }
+  // LiteralExpression (and any other leaf): no columns referenced.
+}
+
+// Rebuilds `expr` (already confirmed via collect_column_indices() to
+// reference only the newly-joined source's own columns) with every
+// ColumnExpression's index shifted from combined-row space
+// ([combined_field_count, combined_field_count+source_field_count)) down
+// to that source's own 0-based schema space -- what a LogicalFilter placed
+// directly on the source's LogicalScan (before it becomes a join child,
+// see logical_planner.cpp) needs. Structurally mirrors
+// logical_planner.cpp's rewrite_aggregate_refs() (recursive rebuild across
+// every Expression variant), minus AggregateExpression for the same reason
+// collect_column_indices() above omits it.
+ExpressionPtr rebase_to_source_schema(const ExpressionPtr& expr, std::size_t combined_field_count) {
+  if (const auto* column = dynamic_cast<const ColumnExpression*>(expr.get())) {
+    return std::make_shared<ColumnExpression>(column->name(), column->column_index() - combined_field_count,
+                                              column->result_type());
+  }
+  if (const auto* binary = dynamic_cast<const BinaryExpression*>(expr.get())) {
+    return std::make_shared<BinaryExpression>(
+        binary->op(), rebase_to_source_schema(binary->left(), combined_field_count),
+        rebase_to_source_schema(binary->right(), combined_field_count), binary->result_type());
+  }
+  if (const auto* unary = dynamic_cast<const UnaryExpression*>(expr.get())) {
+    return std::make_shared<UnaryExpression>(
+        unary->op(), rebase_to_source_schema(unary->operand(), combined_field_count), unary->result_type());
+  }
+  if (const auto* cast = dynamic_cast<const CastExpression*>(expr.get())) {
+    return std::make_shared<CastExpression>(rebase_to_source_schema(cast->operand(), combined_field_count),
+                                            cast->result_type());
+  }
+  if (const auto* extract = dynamic_cast<const ExtractExpression*>(expr.get())) {
+    return std::make_shared<ExtractExpression>(
+        extract->part(), rebase_to_source_schema(extract->operand(), combined_field_count),
+        extract->result_type());
+  }
+  if (const auto* between = dynamic_cast<const BetweenExpression*>(expr.get())) {
+    return std::make_shared<BetweenExpression>(
+        rebase_to_source_schema(between->value(), combined_field_count),
+        rebase_to_source_schema(between->lower(), combined_field_count),
+        rebase_to_source_schema(between->upper(), combined_field_count));
+  }
+  if (const auto* like = dynamic_cast<const LikeExpression*>(expr.get())) {
+    return std::make_shared<LikeExpression>(rebase_to_source_schema(like->value(), combined_field_count),
+                                            like->pattern(), like->negated());
+  }
+  if (const auto* case_expr = dynamic_cast<const CaseExpression*>(expr.get())) {
+    std::vector<CaseExpression::WhenThen> when_then;
+    when_then.reserve(case_expr->when_then().size());
+    for (const CaseExpression::WhenThen& branch : case_expr->when_then()) {
+      when_then.push_back(
+          CaseExpression::WhenThen{rebase_to_source_schema(branch.condition, combined_field_count),
+                                   rebase_to_source_schema(branch.result, combined_field_count)});
+    }
+    ExpressionPtr else_branch = case_expr->else_branch() != nullptr
+                                    ? rebase_to_source_schema(case_expr->else_branch(), combined_field_count)
+                                    : nullptr;
+    return std::make_shared<CaseExpression>(std::move(when_then), std::move(else_branch),
+                                            case_expr->result_type());
+  }
+  return expr;  // LiteralExpression: no columns to rebase.
+}
+
+struct JoinStepKeys {
+  std::size_t combined_key_index;
+  std::size_t source_key_index;
+  // Non-null when the ON clause had additional AND-conjuncts beyond the
+  // required equality key, all referencing only this step's newly-joined
+  // source's own columns (already rebased to that source's own 0-based
+  // schema) -- see extract_join_step_keys()'s own comment. Applied by
+  // logical_planner.cpp as a LogicalFilter directly on that source's scan,
+  // before it becomes this step's join child.
+  ExpressionPtr right_prefilter;
+};
+
+// Splits `condition` (already bound, allow_aggregates=false) into: exactly
+// one top-level AND-conjunct that is a plain `<column> = <column>` equality
+// between one column already in the running combined schema and one column
+// from the newly-joined source, of identical type (no implicit cast) -- the
+// only shape HashJoinOperator's cudf::hash_join can consume directly, with
+// no pre-join casting step -- required, this function throws if no such
+// conjunct exists or more than one does. Any *other* AND-conjuncts (e.g.
+// TPC-H Q13's `ON c_custkey = o_custkey AND o_comment NOT LIKE
+// '%special%requests%'`) must *all* reference only the newly-joined
+// source's own columns; those are ANDed together and returned (rebased to
+// that source's own schema) as `right_prefilter`.
+//
+// Applying such a conjunct as a pre-filter on the newly-joined (right/build)
+// source, before the join even runs, is exact -- not an approximation --
+// for both INNER and LEFT OUTER JOIN: it only ever restricts which right-
+// side rows are eligible to match at all, identical to what the ON clause's
+// own standard SQL semantics already mean by "and this predicate too", and
+// a LEFT OUTER JOIN's own preserved-left-row guarantee is untouched by
+// shrinking the pool of rows it can match against.
+//
+// A conjunct that references the already-joined (left) side at all --
+// alone, or mixed with the new source's columns -- is rejected outright,
+// unconditionally (even for INNER JOIN, where a left-side pre-filter would
+// actually be safe too): unlike the right-side-only case, a LEFT OUTER
+// JOIN's own left-side ON conjunct has a genuinely different semantics (a
+// left row failing it must still appear exactly once, null-extended -- it
+// is *not* equivalent to pre-filtering the left side, which would drop the
+// row entirely instead) that this project does not implement yet. Keeping
+// the restriction unconditional keeps this one function's contract simple
+// regardless of join_type, and avoids a footgun if a step's join_type is
+// ever changed from Inner to LeftOuter later without this function being
+// revisited.
+JoinStepKeys extract_join_step_keys(const ExpressionPtr& condition, std::size_t combined_field_count,
+                                    std::size_t source_field_count) {
+  std::vector<ExpressionPtr> conjuncts;
+  collect_join_condition_conjuncts(condition, conjuncts);
+  const std::size_t combined_end = combined_field_count + source_field_count;
+
+  std::optional<std::size_t> key_conjunct_index;
+  std::size_t combined_key_index = 0;
+  std::size_t source_key_index = 0;
+  for (std::size_t i = 0; i < conjuncts.size(); ++i) {
+    const auto* binary = dynamic_cast<const BinaryExpression*>(conjuncts[i].get());
+    if (binary == nullptr || binary->op() != BinaryOperator::Equal) {
+      continue;
+    }
+    const auto* left_operand = dynamic_cast<const ColumnExpression*>(binary->left().get());
+    const auto* right_operand = dynamic_cast<const ColumnExpression*>(binary->right().get());
+    // A common way for a plain-looking `a.key = b.key` to land here without
+    // matching: the two columns have different (but numerically
+    // comparable) types, e.g. INT32 vs INT64 -- combine_binary() then wraps
+    // one side in an implicit CastExpression, which is no longer a bare
+    // ColumnExpression. Mixed-type JOIN keys are not supported; this
+    // conjunct is simply not a key candidate and falls through to the
+    // right_prefilter classification below (where, being cross-side, it
+    // will be rejected there instead, with a less specific but still clear
+    // error).
+    if (left_operand == nullptr || right_operand == nullptr) {
+      continue;
+    }
+    const std::size_t left_idx = left_operand->column_index();
+    const std::size_t right_idx = right_operand->column_index();
+    std::size_t candidate_combined = 0;
+    std::size_t candidate_source = 0;
+    if (left_idx < combined_field_count && right_idx >= combined_field_count && right_idx < combined_end) {
+      candidate_combined = left_idx;
+      candidate_source = right_idx - combined_field_count;
+    } else if (right_idx < combined_field_count && left_idx >= combined_field_count &&
+               left_idx < combined_end) {
+      candidate_combined = right_idx;
+      candidate_source = left_idx - combined_field_count;
+    } else {
+      continue;
+    }
+    if (key_conjunct_index.has_value()) {
+      throw BindingError(
+          "JOIN ON condition must contain exactly one equality key comparing the two sides, found more "
+          "than one");
+    }
+    key_conjunct_index = i;
+    combined_key_index = candidate_combined;
+    source_key_index = candidate_source;
+  }
+  if (!key_conjunct_index.has_value()) {
     throw BindingError(
-        "JOIN ON condition must be a single equality between one column from each side, e.g. "
+        "JOIN ON condition must include exactly one equality, of identical type (no implicit cast), "
+        "between one column already joined so far and one column from the newly-joined source, e.g. "
         "a.key = b.key");
   }
-  const auto* left_operand = dynamic_cast<const ColumnExpression*>(binary->left().get());
-  const auto* right_operand = dynamic_cast<const ColumnExpression*>(binary->right().get());
-  if (left_operand == nullptr || right_operand == nullptr) {
-    // The common way to land here without a typo: the two columns have
-    // different (but numerically comparable) types, e.g. INT32 vs INT64 --
-    // combine_binary() then wraps one side in an implicit CastExpression,
-    // which is no longer a bare ColumnExpression. Mixed-type JOIN keys are
-    // not supported yet; make both sides the same type.
-    throw BindingError(
-        "JOIN ON condition must directly compare two columns of identical type (one from each "
-        "side), not a computed expression or a comparison across different types");
+
+  ExpressionPtr right_prefilter;
+  for (std::size_t i = 0; i < conjuncts.size(); ++i) {
+    if (i == *key_conjunct_index) {
+      continue;
+    }
+    std::vector<std::size_t> referenced;
+    collect_column_indices(conjuncts[i], referenced);
+    const bool right_only = std::all_of(referenced.begin(), referenced.end(), [&](std::size_t idx) {
+      return idx >= combined_field_count && idx < combined_end;
+    });
+    if (!right_only) {
+      throw BindingError(
+          "JOIN ON condition may only combine the required equality key with additional predicates that "
+          "reference just the newly-joined source's own columns (e.g. TPC-H Q13's `o_comment NOT LIKE "
+          "'%special%requests%'`) -- a predicate referencing the already-joined side is not supported");
+    }
+    ExpressionPtr rebased = rebase_to_source_schema(conjuncts[i], combined_field_count);
+    right_prefilter = right_prefilter == nullptr
+                          ? rebased
+                          : std::make_shared<BinaryExpression>(BinaryOperator::And, right_prefilter, rebased,
+                                                               boolean_type(false));
   }
-  const std::size_t left_idx = left_operand->column_index();
-  const std::size_t right_idx = right_operand->column_index();
-  const std::size_t combined_end = combined_field_count + source_field_count;
-  if (left_idx < combined_field_count && right_idx >= combined_field_count && right_idx < combined_end) {
-    return {left_idx, right_idx - combined_field_count};
-  }
-  if (right_idx < combined_field_count && left_idx >= combined_field_count && left_idx < combined_end) {
-    return {right_idx, left_idx - combined_field_count};
-  }
-  throw BindingError(
-      "JOIN ON condition must compare one column already joined so far with one column from the "
-      "newly-joined source, not two columns from the same side");
+
+  return JoinStepKeys{combined_key_index, source_key_index, right_prefilter};
 }
 
 }  // namespace
@@ -1116,10 +1316,10 @@ BoundQuery bind_query(const sql::AstSelectStatement& stmt, const std::vector<Sch
   for (std::size_t i = 0; i < stmt.join->steps.size(); ++i) {
     const sql::AstJoinStep& step = stmt.join->steps[i];
     const ExpressionPtr condition = binder.bind(step.condition, /*allow_aggregates=*/false);
-    const auto [combined_key_index, source_key_index] =
+    const JoinStepKeys keys =
         extract_join_step_keys(condition, combined_field_count, join_schemas[i + 1].field_count());
-    join.steps.push_back(
-        BoundJoinStep{step.source.paths, combined_key_index, source_key_index, step.join_type});
+    join.steps.push_back(BoundJoinStep{step.source.paths, keys.combined_key_index, keys.source_key_index,
+                                       step.join_type, keys.right_prefilter});
     combined_field_count += join_schemas[i + 1].field_count();
   }
 

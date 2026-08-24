@@ -507,6 +507,63 @@ TEST(Binder, JoinRejectsMismatchedKeyTypes) {
                BindingError);
 }
 
+TEST(Binder, JoinOnConditionWithRightSideOnlyAuxiliaryPredicateIsAcceptedAndRebased) {
+  // TPC-H Q13's own shape: an ON clause combining the required equality key
+  // with an extra predicate that references only the newly-joined (right)
+  // source's own columns -- must still resolve the key normally, and the
+  // extra predicate must come back as right_prefilter, rebased to the
+  // customers source's own 0-based schema (name is index 1 there, not the
+  // combined row's index 4).
+  const auto stmt = sql::parse_sql(
+      "SELECT o.order_id FROM read_parquet('/o.parquet') AS o "
+      "JOIN read_parquet('/c.parquet') AS c ON o.customer_id = c.customer_id AND c.name = 'Bob'");
+  const BoundQuery bound = bind_query(stmt, std::vector<Schema>{orders_schema(), customers_schema()});
+  ASSERT_TRUE(bound.join.has_value());
+  ASSERT_EQ(bound.join->steps.size(), 1u);
+  EXPECT_EQ(bound.join->steps[0].combined_key_index, 1u);
+  EXPECT_EQ(bound.join->steps[0].source_key_index, 0u);
+
+  ASSERT_NE(bound.join->steps[0].right_prefilter, nullptr);
+  const auto* prefilter = dynamic_cast<const BinaryExpression*>(bound.join->steps[0].right_prefilter.get());
+  ASSERT_NE(prefilter, nullptr);
+  EXPECT_EQ(prefilter->op(), BinaryOperator::Equal);
+  const auto* name_column = dynamic_cast<const ColumnExpression*>(prefilter->left().get());
+  ASSERT_NE(name_column, nullptr);
+  EXPECT_EQ(name_column->column_index(), 1u);  // customers_schema()'s own "name" index, not 4.
+}
+
+TEST(Binder, JoinOnConditionWithLeftSideAuxiliaryPredicateIsRejected) {
+  // `o.amount` (already-joined/left side) in an auxiliary ON conjunct: not
+  // equivalent to a right-side pre-filter (a LEFT OUTER JOIN would need to
+  // null-extend, not drop, a left row failing it) -- rejected unconditionally
+  // regardless of join type, see extract_join_step_keys()'s own comment.
+  const auto stmt = sql::parse_sql(
+      "SELECT o.order_id FROM read_parquet('/o.parquet') AS o "
+      "JOIN read_parquet('/c.parquet') AS c ON o.customer_id = c.customer_id AND o.amount > 100");
+  EXPECT_THROW((void)(bind_query(stmt, std::vector<Schema>{orders_schema(), customers_schema()})),
+               BindingError);
+}
+
+TEST(Binder, JoinOnConditionWithCrossSideAuxiliaryPredicateIsRejected) {
+  // `o.order_id > c.customer_id` spans both sides -- neither a valid
+  // second equality key nor a single-side-only auxiliary predicate.
+  const auto stmt = sql::parse_sql(
+      "SELECT o.order_id FROM read_parquet('/o.parquet') AS o "
+      "JOIN read_parquet('/c.parquet') AS c ON o.customer_id = c.customer_id AND o.order_id > c.customer_id");
+  EXPECT_THROW((void)(bind_query(stmt, std::vector<Schema>{orders_schema(), customers_schema()})),
+               BindingError);
+}
+
+TEST(Binder, JoinOnConditionWithTwoCandidateEqualityKeysIsRejected) {
+  // Two different cross-side equalities ANDed together -- ambiguous, since
+  // HashJoinOperator's cudf::hash_join needs exactly one equality key.
+  const auto stmt = sql::parse_sql(
+      "SELECT o.order_id FROM read_parquet('/o.parquet') AS o "
+      "JOIN read_parquet('/c.parquet') AS c ON o.customer_id = c.customer_id AND o.order_id = c.customer_id");
+  EXPECT_THROW((void)(bind_query(stmt, std::vector<Schema>{orders_schema(), customers_schema()})),
+               BindingError);
+}
+
 TEST(Binder, JoinStarExpandsBothSidesInOrder) {
   // Deliberately non-colliding field names on both sides: SELECT * would
   // otherwise hit the ordinary "duplicate output column name" check twice

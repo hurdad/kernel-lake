@@ -769,11 +769,26 @@ AstSelectStatement convert_select_statement(const hsql::SelectStatement* stmt, C
     }
   } else if (stmt->fromTable != nullptr && stmt->fromTable->type == hsql::kTableJoin) {
     out.join = flatten_join_chain(stmt->fromTable, state);
+  } else if (stmt->fromTable != nullptr && stmt->fromTable->type == hsql::kTableSelect) {
+    if (stmt->fromTable->select == nullptr) {
+      unsupported("malformed derived table (subquery in FROM)");
+    }
+    if (stmt->fromTable->alias == nullptr || stmt->fromTable->alias->name == nullptr) {
+      unsupported("a derived table (subquery in FROM) must be aliased, e.g. FROM (SELECT ...) AS a");
+    }
+    // Recurses through the exact same conversion this whole function
+    // already applies to the outer statement -- same pattern convert_expr()'s
+    // kExprSelect case (a HAVING subquery) already uses, see this
+    // function's own header comment for why `state` (one Preprocessed/
+    // consumed pair for the whole raw SQL text) is shared across every
+    // nested SELECT within one parse_sql() call.
+    out.from_subquery =
+        std::make_shared<AstSelectStatement>(convert_select_statement(stmt->fromTable->select, state));
+    out.from_subquery_alias = std::string(stmt->fromTable->alias->name);
   } else {
     unsupported(
         "joins and subqueries (only a single FROM read_parquet(...)/read_iceberg(...)/read_delta(...) "
-        "source, or a "
-        "two-table JOIN, is supported)");
+        "source, a two-table JOIN, or a single derived table `FROM (SELECT ...) AS alias`, is supported)");
   }
 
   if (stmt->selectList == nullptr || stmt->selectList->empty()) {

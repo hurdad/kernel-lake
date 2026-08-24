@@ -398,6 +398,63 @@ TEST_F(HashJoinQueryTest, LeftOuterJoinNullExtendsUnmatchedLeftRows) {
   EXPECT_TRUE(name_column->IsNull(4));  // order 5's unmatched customer_id=99.
 }
 
+// TPC-H Q13's own ON-clause shape: the required equality key plus an extra
+// predicate referencing only the newly-joined (right/build) source, pushed
+// down as a pre-filter on that source before the join runs (see binder.cpp's
+// extract_join_step_keys()). `c.name <> 'Bob'` filters customer 20 (Bob) out
+// of the build side entirely, so order 3 (customer_id=20) has no match left
+// -- an INNER JOIN drops it, same as order 5 (customer_id=99, never had a
+// match) already does.
+TEST_F(HashJoinQueryTest, InnerJoinWithRightSideAuxiliaryPredicateFiltersBuildSideBeforeMatching) {
+  const QueryResult result = engine_.execute(
+      "SELECT o.order_id, c.name " + join_clause("o.customer_id = c.customer_id AND c.name <> 'Bob'") +
+      " ORDER BY o.order_id");
+  ASSERT_EQ(result.batches.size(), 1u);
+  const std::shared_ptr<arrow::RecordBatch>& batch = result.batches.front();
+  ASSERT_EQ(batch->num_rows(), 3);  // orders 1, 2, 4 -- 3 (Bob) and 5 (no match) both excluded.
+
+  const auto order_id_column =
+      std::static_pointer_cast<arrow::Int64Array>(batch->GetColumnByName("order_id"));
+  const auto name_column = std::static_pointer_cast<arrow::StringArray>(batch->GetColumnByName("name"));
+  ASSERT_NE(order_id_column, nullptr);
+  ASSERT_NE(name_column, nullptr);
+  const std::vector<std::int64_t> expected_order_ids = {1, 2, 4};
+  const std::vector<std::string> expected_names = {"Alice", "Alice", "Carol"};
+  for (std::int64_t i = 0; i < batch->num_rows(); ++i) {
+    EXPECT_EQ(order_id_column->Value(i), expected_order_ids[static_cast<std::size_t>(i)]);
+    EXPECT_EQ(name_column->GetString(i), expected_names[static_cast<std::size_t>(i)]);
+  }
+}
+
+// Same ON-clause shape but LEFT OUTER: order 3 (customer_id=20, filtered
+// out of the build side by `c.name <> 'Bob'`) must still appear,
+// null-extended -- exactly like order 5's always-unmatched customer_id=99
+// -- since the auxiliary predicate only restricts which right rows are
+// eligible to *match*, never which left rows LEFT OUTER JOIN preserves.
+TEST_F(HashJoinQueryTest, LeftOuterJoinWithRightSideAuxiliaryPredicateNullExtendsFilteredOutRows) {
+  const QueryResult result = engine_.execute(
+      "SELECT o.order_id, c.name " + left_join_clause("o.customer_id = c.customer_id AND c.name <> 'Bob'") +
+      " ORDER BY o.order_id");
+  ASSERT_EQ(result.batches.size(), 1u);
+  const std::shared_ptr<arrow::RecordBatch>& batch = result.batches.front();
+  ASSERT_EQ(batch->num_rows(), 5);
+
+  const auto order_id_column =
+      std::static_pointer_cast<arrow::Int64Array>(batch->GetColumnByName("order_id"));
+  const auto name_column = std::static_pointer_cast<arrow::StringArray>(batch->GetColumnByName("name"));
+  ASSERT_NE(order_id_column, nullptr);
+  ASSERT_NE(name_column, nullptr);
+  const std::vector<std::int64_t> expected_order_ids = {1, 2, 3, 4, 5};
+  for (std::int64_t i = 0; i < batch->num_rows(); ++i) {
+    EXPECT_EQ(order_id_column->Value(i), expected_order_ids[static_cast<std::size_t>(i)]);
+  }
+  EXPECT_EQ(name_column->GetString(0), "Alice");
+  EXPECT_EQ(name_column->GetString(1), "Alice");
+  EXPECT_TRUE(name_column->IsNull(2));  // order 3: customer 20 (Bob) filtered from the build side.
+  EXPECT_EQ(name_column->GetString(3), "Carol");
+  EXPECT_TRUE(name_column->IsNull(4));  // order 5: customer_id=99, never had a match at all.
+}
+
 TEST_F(HashJoinQueryTest, LeftOuterJoinCpuBackendMatchesGpuBackend) {
   const std::string sql =
       "SELECT o.order_id, c.name, o.amount " + left_join_clause() + " ORDER BY o.order_id";
@@ -489,6 +546,102 @@ TEST_F(HashJoinQueryTest, LeftOuterJoinWithEntirelyEmptyBuildSideNullExtendsEver
   for (std::int64_t i = 0; i < batch->num_rows(); ++i) {
     EXPECT_TRUE(name_column->IsNull(i)) << "row " << i;
   }
+}
+
+// TPC-H Q13's full shape, end to end on real GPU hardware: a derived table
+// (`FROM (SELECT ...) AS alias`) whose own inner query is a LEFT OUTER JOIN
+// with an ON-clause auxiliary right-side predicate
+// (`o_comment NOT LIKE '%special%requests%'`) feeding a grouped COUNT, and
+// an *outer* query that GROUP BYs that inner aggregate's own output column
+// -- exercising every feature this session added together in the one real
+// combination TPC-H Q13 actually needs: LEFT OUTER JOIN, the ON-clause
+// right-side pre-filter, and a derived table sitting on top of a
+// LogicalAggregate (not just a plain scan).
+//
+// Fixture: customers 10/20/30/40 (c_custkey), orders against a fresh
+// customers/orders pair scoped to this test alone (not the class fixture's
+// own orders_path_/customers_path_, whose fixed data every other test in
+// this file already depends on). Orders: two non-special orders for
+// customer 10, one special-flagged order for customer 10 (excluded by the
+// ON-clause pre-filter), one non-special order each for customers 20/30,
+// and customer 40 has no orders at all (exercises LEFT JOIN's own
+// null-extension feeding COUNT(nullable-column), which must count 0, not
+// NULL, for a customer with zero real orders).
+TEST_F(HashJoinQueryTest, Q13ShapeDerivedTableOverLeftJoinWithAuxiliaryPredicateAndDoubleGroupBy) {
+  const std::string q13_customers_path = (dir_ / "q13_customers.parquet").string();
+  const std::string q13_orders_path = (dir_ / "q13_orders.parquet").string();
+  {
+    arrow::Int64Builder customer_id_builder;
+    const std::vector<std::int64_t> customer_ids = {10, 20, 30, 40};
+    for (const std::int64_t id : customer_ids) {
+      ASSERT_TRUE(customer_id_builder.Append(id).ok());
+    }
+    std::shared_ptr<arrow::Array> customer_id_array;
+    ASSERT_TRUE(customer_id_builder.Finish(&customer_id_array).ok());
+    const auto schema = arrow::schema({arrow::field("customer_id", arrow::int64(), false)});
+    const auto table = arrow::Table::Make(schema, {customer_id_array});
+    auto sink = arrow::io::FileOutputStream::Open(q13_customers_path).ValueOrDie();
+    ASSERT_TRUE(
+        parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), sink, /*chunk_size=*/4).ok());
+  }
+  {
+    arrow::Int64Builder order_id_builder;
+    arrow::Int64Builder customer_id_builder;
+    arrow::StringBuilder comment_builder;
+    const std::vector<std::int64_t> order_ids = {1, 2, 3, 4, 5};
+    const std::vector<std::int64_t> customer_ids = {10, 10, 10, 20, 30};
+    const std::vector<std::string> comments = {"normal order", "special requests here", "normal order",
+                                               "normal order", "normal order"};
+    for (std::size_t i = 0; i < order_ids.size(); ++i) {
+      ASSERT_TRUE(order_id_builder.Append(order_ids[i]).ok());
+      ASSERT_TRUE(customer_id_builder.Append(customer_ids[i]).ok());
+      ASSERT_TRUE(comment_builder.Append(comments[i]).ok());
+    }
+    std::shared_ptr<arrow::Array> order_id_array, customer_id_array, comment_array;
+    ASSERT_TRUE(order_id_builder.Finish(&order_id_array).ok());
+    ASSERT_TRUE(customer_id_builder.Finish(&customer_id_array).ok());
+    ASSERT_TRUE(comment_builder.Finish(&comment_array).ok());
+    const auto schema = arrow::schema({arrow::field("order_id", arrow::int64(), false),
+                                       arrow::field("customer_id", arrow::int64(), false),
+                                       arrow::field("comment", arrow::utf8(), false)});
+    const auto table = arrow::Table::Make(schema, {order_id_array, customer_id_array, comment_array});
+    auto sink = arrow::io::FileOutputStream::Open(q13_orders_path).ValueOrDie();
+    ASSERT_TRUE(
+        parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), sink, /*chunk_size=*/5).ok());
+  }
+
+  // Expected inner c_orders (c_custkey, c_count):
+  //   10 -> 2 (orders 1,3; order 2 excluded by the comment pre-filter)
+  //   20 -> 1 (order 4)
+  //   30 -> 1 (order 5)
+  //   40 -> 0 (no orders at all -- LEFT JOIN null-extends, COUNT(NULL) = 0)
+  // Expected outer (c_count, custdist): (2,1), (1,2), (0,1).
+  const QueryResult result = engine_.execute(
+      "SELECT c_count, COUNT(*) AS custdist FROM ("
+      "SELECT c.customer_id AS c_custkey, COUNT(o.order_id) AS c_count "
+      "FROM read_parquet('" +
+      q13_customers_path + "') AS c LEFT JOIN read_parquet('" + q13_orders_path +
+      "') AS o ON c.customer_id = o.customer_id AND o.comment NOT LIKE '%special%requests%' "
+      "GROUP BY c.customer_id"
+      ") AS c_orders GROUP BY c_count");
+
+  ASSERT_EQ(result.batches.size(), 1u);
+  const std::shared_ptr<arrow::RecordBatch>& batch = result.batches.front();
+  ASSERT_EQ(batch->num_rows(), 3);
+  const auto c_count_column = std::static_pointer_cast<arrow::Int64Array>(batch->GetColumnByName("c_count"));
+  const auto custdist_column =
+      std::static_pointer_cast<arrow::Int64Array>(batch->GetColumnByName("custdist"));
+  ASSERT_NE(c_count_column, nullptr);
+  ASSERT_NE(custdist_column, nullptr);
+
+  std::map<std::int64_t, std::int64_t> custdist_by_c_count;
+  for (std::int64_t i = 0; i < batch->num_rows(); ++i) {
+    custdist_by_c_count[c_count_column->Value(i)] = custdist_column->Value(i);
+  }
+  ASSERT_EQ(custdist_by_c_count.size(), 3u);
+  EXPECT_EQ(custdist_by_c_count.at(2), 1);
+  EXPECT_EQ(custdist_by_c_count.at(1), 2);
+  EXPECT_EQ(custdist_by_c_count.at(0), 1);
 }
 
 // Regression coverage for LEFT OUTER JOIN through the *partitioned*

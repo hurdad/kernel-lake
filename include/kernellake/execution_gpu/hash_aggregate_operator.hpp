@@ -254,6 +254,30 @@ class HashAggregateOperator final : public PhysicalOperator {
   // finalize() how many consecutive physical result columns that aggregate
   // consumed and how to combine them into its single output column.
   std::vector<AggregateOutputKind> aggregate_output_kind_;
+  // Parallel to aggregate_output_kind_: true for AggregateFunction::Count/
+  // CountStar, false otherwise -- only consulted when the corresponding
+  // aggregate_output_kind_ entry is Direct (Avg's own Average-kind entries
+  // never read this). COUNT(argument)'s physical result, per group, is
+  // SUM(argument's own null mask copied onto an all-1s column) -- see
+  // ValueColumnKind::CountColumnOnes above -- so a group whose argument is
+  // NULL in *every* one of its rows (a real, reachable case: a customer
+  // with zero matching orders after a LEFT OUTER JOIN, null-extended to
+  // exactly one row with a NULL order key, still forms its own one-row
+  // GROUP BY group) makes that physical SUM itself come back NULL, cudf's
+  // correct "sum of zero non-null values" answer -- correct for a genuine
+  // SUM, but not for COUNT, whose own zero-non-null-values answer is 0,
+  // never NULL, per SQL. next() coerces exactly these NULL results back to
+  // 0 post-hoc rather than trying to avoid producing them in the first
+  // place, since the underlying SUM-of-ones physical mechanism (chosen so
+  // COUNT/AVG can be merged incrementally across batches via the same
+  // associative SUM every real SUM/MIN/MAX already uses -- see this
+  // class's own header comment) has no cheaper way to distinguish "0 valid
+  // rows" from "SUM saw nothing to add" at the physical-aggregation layer
+  // itself. CountStar can never actually need the coercion (its own ones
+  // column is never null-masked -- COUNT(*) has no argument to be null),
+  // included here anyway for a simpler, defensively-correct condition
+  // rather than asserting CountStar never triggers it.
+  std::vector<bool> is_count_result_;
 
   // The running partial-aggregate result, folded in by flush_pending() --
   // null until the first flush (see the class comment). Column layout:

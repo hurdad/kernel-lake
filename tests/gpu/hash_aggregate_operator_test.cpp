@@ -629,5 +629,64 @@ TEST(HashAggregateOperator, GroupedCountOfNullableColumnExcludesNulls) {
   op.close(context);
 }
 
+// Regression test: COUNT(argument) is physically SUM(argument's own null
+// mask copied onto an all-1s column) -- see
+// HashAggregateOperator::is_count_result_'s own comment for why. A group
+// whose argument is NULL in *every* one of its rows (region 2 here, a
+// single all-NULL row -- reachable for real via a LEFT OUTER JOIN's own
+// null-extended row, e.g. a customer with zero matching orders) used to
+// make that physical SUM come back NULL for the whole group -- correct for
+// a genuine SUM, but not for COUNT, whose zero-non-null-values answer is
+// 0, never NULL, per SQL. Region 1 (one valid, one NULL row) exercises the
+// ordinary non-degenerate case in the same result, so a fix that merely
+// forced every COUNT output to 0 unconditionally would still fail this.
+TEST(HashAggregateOperator, GroupedCountOfEntirelyNullGroupReturnsZeroNotNull) {
+  RmmEnvironment env(default_config());
+  const std::shared_ptr<const Schema> schema = std::make_shared<const Schema>(
+      Schema({Field{"region", int32_type(false)}, Field{"amount", float64_type(true)}}));
+
+  arrow::Int32Builder region_builder;
+  arrow::DoubleBuilder amount_builder;
+  ASSERT_TRUE(region_builder.Append(1).ok());
+  ASSERT_TRUE(amount_builder.Append(10.0).ok());
+  ASSERT_TRUE(region_builder.Append(1).ok());
+  ASSERT_TRUE(amount_builder.AppendNull().ok());
+  ASSERT_TRUE(region_builder.Append(2).ok());
+  ASSERT_TRUE(amount_builder.AppendNull().ok());
+  std::shared_ptr<arrow::Array> region_array, amount_array;
+  ASSERT_TRUE(region_builder.Finish(&region_array).ok());
+  ASSERT_TRUE(amount_builder.Finish(&amount_array).ok());
+  const auto arrow_schema = arrow::schema(
+      {arrow::field("region", arrow::int32(), false), arrow::field("amount", arrow::float64(), true)});
+  const auto arrow_batch = arrow::RecordBatch::Make(arrow_schema, 3, {region_array, amount_array});
+
+  std::vector<DeviceBatch> batches;
+  batches.push_back(from_arrow_record_batch(*arrow_batch, schema));
+
+  auto region = std::make_shared<ColumnExpression>("region", 0, int32_type(false));
+  std::vector<NamedExpression> group_by = {NamedExpression{region, "region"}};
+  auto amount = std::make_shared<ColumnExpression>("amount", 1, float64_type(true));
+  auto count_expr = std::make_shared<AggregateExpression>(AggregateFunction::Count, amount, int64_type(true));
+  std::vector<NamedExpression> aggregates = {NamedExpression{count_expr, "n"}};
+
+  HashAggregateOperator op(1, std::make_unique<VectorSourceOperator>(std::move(batches)), std::move(group_by),
+                           std::move(aggregates));
+  ExecutionContext context = make_context();
+  op.open(context);
+  std::optional<DeviceBatch> result = op.next(context);
+  ASSERT_TRUE(result.has_value());
+  ASSERT_EQ(result->row_count(), 2u);
+
+  const std::vector<std::int32_t> regions = copy_to_host<std::int32_t>(result->view().column(0));
+  const cudf::column_view count_view = result->view().column(1);
+  ASSERT_EQ(count_view.null_count(), 0);  // never NULL, regardless of region.
+  const std::vector<std::int64_t> counts = copy_to_host<std::int64_t>(count_view);
+  std::map<std::int32_t, std::int64_t> count_by_region;
+  for (std::size_t i = 0; i < regions.size(); ++i) count_by_region[regions[i]] = counts[i];
+  EXPECT_EQ(count_by_region.at(1), 1);  // one valid, one NULL row.
+  EXPECT_EQ(count_by_region.at(2), 0);  // entirely NULL -- 0, not NULL.
+  op.close(context);
+}
+
 }  // namespace
 }  // namespace kernellake

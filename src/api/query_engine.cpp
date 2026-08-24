@@ -197,6 +197,29 @@ std::vector<sql::AstLiteral> QueryEngine::evaluate_list_subquery(
 LogicalPlanPtr QueryEngine::plan_logical(std::string_view sql,
                                          double* metadata_inspection_seconds_out) const {
   sql::AstSelectStatement ast = sql::parse_sql(sql);
+  // Constructed fresh per call -- see IcebergSourceResolver's/
+  // DeltaSourceResolver's/UnityCatalogSourceResolver's own comments on why
+  // none of the three caches its backing client(s) across queries yet.
+  // Cheap regardless: just copies of config_.iceberg's/config_.unity_catalog's
+  // catalog maps and config_.delta's/config_.storage.s3's single sections.
+  // Shared across every recursive plan_logical_unoptimized() call this one
+  // top-level call makes (a derived table's own inner query included), not
+  // rebuilt per level.
+  iceberg::IcebergSourceResolver iceberg_resolver(config_.iceberg);
+  delta::DeltaSourceResolver delta_resolver(config_.delta);
+  unitycatalog::UnityCatalogSourceResolver unity_catalog_resolver(
+      config_.unity_catalog, config_.delta, config_.storage.s3, config_.storage.gcs, config_.storage.azure,
+      &unity_catalog_token_cache_);
+  CompositeSourceResolver resolver(iceberg_resolver, delta_resolver, unity_catalog_resolver);
+
+  // optimize() runs exactly once, here, over the whole assembled tree --
+  // see plan_logical_unoptimized()'s own comment for why.
+  return optimize(plan_logical_unoptimized(std::move(ast), resolver, metadata_inspection_seconds_out));
+}
+
+LogicalPlanPtr QueryEngine::plan_logical_unoptimized(sql::AstSelectStatement ast,
+                                                     TableSourceResolver& resolver,
+                                                     double* metadata_inspection_seconds_out) const {
   if (ast.having != nullptr) {
     // Resolved before binding: the binder has no I/O capability of its
     // own (by design, see ast.hpp's own header comment) and can't run a
@@ -218,17 +241,6 @@ LogicalPlanPtr QueryEngine::plan_logical(std::string_view sql,
     ast.where = sql::resolve_in_subqueries(
         ast.where, [this](const sql::AstSelectStatement& sub) { return evaluate_list_subquery(sub); });
   }
-  // Constructed fresh per call -- see IcebergSourceResolver's/
-  // DeltaSourceResolver's/UnityCatalogSourceResolver's own comments on why
-  // none of the three caches its backing client(s) across queries yet.
-  // Cheap regardless: just copies of config_.iceberg's/config_.unity_catalog's
-  // catalog maps and config_.delta's/config_.storage.s3's single sections.
-  iceberg::IcebergSourceResolver iceberg_resolver(config_.iceberg);
-  delta::DeltaSourceResolver delta_resolver(config_.delta);
-  unitycatalog::UnityCatalogSourceResolver unity_catalog_resolver(
-      config_.unity_catalog, config_.delta, config_.storage.s3, config_.storage.gcs, config_.storage.azure,
-      &unity_catalog_token_cache_);
-  CompositeSourceResolver resolver(iceberg_resolver, delta_resolver, unity_catalog_resolver);
 
   if (ast.join.has_value()) {
     std::vector<Schema> join_schemas;
@@ -246,15 +258,20 @@ LogicalPlanPtr QueryEngine::plan_logical(std::string_view sql,
       partition_columns_per_source.push_back(resolved.partition_columns);
     }
     const BoundQuery bound = bind_query(ast, join_schemas);
-    LogicalPlanPtr logical = build_logical_plan(bound, join_schemas, std::move(partition_columns_per_source));
-    return optimize(logical);
+    return build_logical_plan(bound, join_schemas, std::move(partition_columns_per_source));
+  }
+
+  if (ast.from_subquery != nullptr) {
+    LogicalPlanPtr inner =
+        plan_logical_unoptimized(*ast.from_subquery, resolver, metadata_inspection_seconds_out);
+    const BoundQuery bound = bind_query(ast, inner->output_schema());
+    return build_logical_plan(bound, std::move(inner));
   }
 
   const ResolvedTable resolved =
       inspect_source(store_, ast.from.paths, &resolver, metadata_inspection_seconds_out);
   const BoundQuery bound = bind_query(ast, resolved.schema);
-  LogicalPlanPtr logical = build_logical_plan(bound, resolved.schema, resolved.partition_columns);
-  return optimize(logical);
+  return build_logical_plan(bound, resolved.schema, resolved.partition_columns);
 }
 
 LogicalPlanPtr QueryEngine::explain_logical(std::string_view sql) const {
