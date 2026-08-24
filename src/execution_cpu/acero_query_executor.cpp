@@ -438,9 +438,11 @@ arrow::acero::Declaration translate(const PhysicalPlanPtr& node, ObjectStore& st
         arrow::acero::RecordBatchReaderSourceNodeOptions{make_streaming_scan_reader(*scan, effective_store)}};
   }
   // Acero's own "hashjoin" node (HashJoinNodeOptions) implements exactly the
-  // two-table INNER equi-join HashJoinNode describes; output_all defaults to
-  // true (all columns from both sides, left fields then right), matching
-  // HashJoinNode::build_schema()'s convention exactly, so no left_output/
+  // two-table INNER/LEFT OUTER equi-join HashJoinNode describes; output_all
+  // defaults to true (all columns from both sides, left fields then right),
+  // matching HashJoinNode::build_schema()'s convention exactly (including
+  // its own right-side nullable widening for LEFT OUTER, which Acero's own
+  // LEFT_OUTER null-extension naturally produces), so no left_output/
   // right_output list needs to be built here.
   if (const auto* hash_join = dynamic_cast<const HashJoinNode*>(node.get())) {
     // By position (see compile_expression_cpu's identical reasoning): if
@@ -448,10 +450,13 @@ arrow::acero::Declaration translate(const PhysicalPlanPtr& node, ObjectStore& st
     // -way join), its own combined schema can already have two same-named
     // columns from its own two children, making a by-name FieldRef here
     // ambiguous too, not just at the outer join.
+    const arrow::acero::JoinType acero_join_type = hash_join->join_type() == JoinType::LeftOuter
+                                                       ? arrow::acero::JoinType::LEFT_OUTER
+                                                       : arrow::acero::JoinType::INNER;
     return arrow::acero::Declaration{
         "hashjoin",
         {translate(hash_join->left(), store), translate(hash_join->right(), store)},
-        arrow::acero::HashJoinNodeOptions{arrow::acero::JoinType::INNER,
+        arrow::acero::HashJoinNodeOptions{acero_join_type,
                                           {arrow::FieldRef(static_cast<int>(hash_join->left_key_index()))},
                                           {arrow::FieldRef(static_cast<int>(hash_join->right_key_index()))}}};
   }

@@ -1118,7 +1118,8 @@ BoundQuery bind_query(const sql::AstSelectStatement& stmt, const std::vector<Sch
     const ExpressionPtr condition = binder.bind(step.condition, /*allow_aggregates=*/false);
     const auto [combined_key_index, source_key_index] =
         extract_join_step_keys(condition, combined_field_count, join_schemas[i + 1].field_count());
-    join.steps.push_back(BoundJoinStep{step.source.paths, combined_key_index, source_key_index});
+    join.steps.push_back(
+        BoundJoinStep{step.source.paths, combined_key_index, source_key_index, step.join_type});
     combined_field_count += join_schemas[i + 1].field_count();
   }
 

@@ -195,9 +195,40 @@ TEST(SqlParser, ParsesThreeTableInnerJoinChain) {
   EXPECT_EQ(*second_left_ref->table, "b");
 }
 
-TEST(SqlParser, RejectsNonInnerJoin) {
+TEST(SqlParser, ParsesTwoTableLeftOuterJoin) {
+  const auto stmt = parse_sql("SELECT a.x, b.y FROM read_parquet('/x.parquet') AS a "
+                              "LEFT JOIN read_parquet('/y.parquet') AS b ON a.order_id = b.order_id");
+  ASSERT_TRUE(stmt.join.has_value());
+  ASSERT_EQ(stmt.join->steps.size(), 1u);
+  EXPECT_EQ(stmt.join->steps[0].join_type, JoinType::LeftOuter);
+}
+
+// `LEFT OUTER JOIN` (the explicit spelling) and plain `LEFT JOIN` are the
+// same SQL construct -- hsql itself normalizes both to kJoinLeft, so this
+// just confirms this project's own conversion doesn't accidentally depend
+// on which spelling was used.
+TEST(SqlParser, ParsesLeftOuterJoinExplicitSpelling) {
+  const auto stmt = parse_sql("SELECT a.x, b.y FROM read_parquet('/x.parquet') AS a "
+                              "LEFT OUTER JOIN read_parquet('/y.parquet') AS b ON a.order_id = b.order_id");
+  ASSERT_TRUE(stmt.join.has_value());
+  ASSERT_EQ(stmt.join->steps.size(), 1u);
+  EXPECT_EQ(stmt.join->steps[0].join_type, JoinType::LeftOuter);
+}
+
+TEST(SqlParser, PlainInnerJoinDefaultsToInnerJoinType) {
+  const auto stmt = parse_sql("SELECT a.x, b.y FROM read_parquet('/x.parquet') AS a "
+                              "JOIN read_parquet('/y.parquet') AS b ON a.order_id = b.order_id");
+  ASSERT_TRUE(stmt.join.has_value());
+  ASSERT_EQ(stmt.join->steps.size(), 1u);
+  EXPECT_EQ(stmt.join->steps[0].join_type, JoinType::Inner);
+}
+
+TEST(SqlParser, RejectsRightAndFullJoin) {
   EXPECT_THROW((void)(parse_sql("SELECT a.x FROM read_parquet('/x.parquet') AS a "
-                                "LEFT JOIN read_parquet('/y.parquet') AS b ON a.order_id = b.order_id")),
+                                "RIGHT JOIN read_parquet('/y.parquet') AS b ON a.order_id = b.order_id")),
+               SqlError);
+  EXPECT_THROW((void)(parse_sql("SELECT a.x FROM read_parquet('/x.parquet') AS a "
+                                "FULL JOIN read_parquet('/y.parquet') AS b ON a.order_id = b.order_id")),
                SqlError);
 }
 

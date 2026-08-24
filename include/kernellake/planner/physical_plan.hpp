@@ -114,25 +114,28 @@ class ParquetScanNode final : public PhysicalPlanNode {
   std::shared_ptr<ObjectStore> owned_store_;
 };
 
-// A two-table INNER equi-join (see LogicalJoin). `left_key_index`/
-// `right_key_index` are into each side's *own already-narrowed* physical
-// scan schema (unlike LogicalJoin's, which are into the original,
-// pre-pruning logical schema) -- the physical planner translates via each
-// side's own original_column_map() when converting a LogicalJoin, since
-// narrowing can shift a column's position. Output schema is the plain
-// concatenation of the two children's (already narrowed) schemas, in that
-// order, matching exactly what HashJoinOperator gathers into its output
-// batch.
+// A two-table INNER or LEFT OUTER equi-join (see LogicalJoin).
+// `left_key_index`/`right_key_index` are into each side's *own already-
+// narrowed* physical scan schema (unlike LogicalJoin's, which are into the
+// original, pre-pruning logical schema) -- the physical planner translates
+// via each side's own original_column_map() when converting a LogicalJoin,
+// since narrowing can shift a column's position. Output schema is the
+// plain concatenation of the two children's (already narrowed) schemas, in
+// that order (right widened to nullable for LEFT OUTER, same as
+// LogicalJoin's own build_schema()), matching exactly what
+// HashJoinOperator gathers into its output batch.
 class HashJoinNode final : public PhysicalPlanNode {
  public:
   HashJoinNode(PhysicalPlanPtr left, PhysicalPlanPtr right, std::size_t left_key_index,
                std::size_t right_key_index, std::vector<std::optional<std::size_t>> original_column_map = {},
-               std::optional<std::int64_t> estimated_build_rows = std::nullopt)
+               std::optional<std::int64_t> estimated_build_rows = std::nullopt,
+               JoinType join_type = JoinType::Inner)
       : left_(std::move(left)),
         right_(std::move(right)),
         left_key_index_(left_key_index),
         right_key_index_(right_key_index),
-        schema_(build_schema(left_->output_schema(), right_->output_schema())),
+        join_type_(join_type),
+        schema_(build_schema(left_->output_schema(), right_->output_schema(), join_type_)),
         original_column_map_(std::move(original_column_map)),
         estimated_build_rows_(estimated_build_rows) {}
 
@@ -140,6 +143,7 @@ class HashJoinNode final : public PhysicalPlanNode {
   [[nodiscard]] const PhysicalPlanPtr& right() const noexcept { return right_; }
   [[nodiscard]] std::size_t left_key_index() const noexcept { return left_key_index_; }
   [[nodiscard]] std::size_t right_key_index() const noexcept { return right_key_index_; }
+  [[nodiscard]] JoinType join_type() const noexcept { return join_type_; }
   // Rough, pre-filter row-count estimate of the *build* (right) side --
   // exactly the value physical_planner.cpp's own estimate_row_count()
   // already computes to decide which side to build on (see that
@@ -155,7 +159,7 @@ class HashJoinNode final : public PhysicalPlanNode {
   [[nodiscard]] std::string_view node_name() const noexcept override { return "HashJoin"; }
   [[nodiscard]] std::vector<PhysicalPlanPtr> children() const override { return {left_, right_}; }
   [[nodiscard]] std::vector<std::pair<std::string, std::string>> explain_attributes() const override {
-    return {{"type", "INNER"},
+    return {{"type", std::string(kernellake::to_string(join_type_))},
             {"left_key", left_->output_schema().field(left_key_index_).name},
             {"right_key", right_->output_schema().field(right_key_index_).name}};
   }
@@ -172,10 +176,19 @@ class HashJoinNode final : public PhysicalPlanNode {
   }
 
  private:
-  static Schema build_schema(const Schema& left, const Schema& right) {
+  static Schema build_schema(const Schema& left, const Schema& right, JoinType join_type) {
     std::vector<Field> fields = left.fields();
     const std::vector<Field>& right_fields = right.fields();
-    fields.insert(fields.end(), right_fields.begin(), right_fields.end());
+    if (join_type == JoinType::LeftOuter) {
+      fields.reserve(fields.size() + right_fields.size());
+      for (const Field& field : right_fields) {
+        Field widened = field;
+        widened.type.nullable = true;
+        fields.push_back(std::move(widened));
+      }
+    } else {
+      fields.insert(fields.end(), right_fields.begin(), right_fields.end());
+    }
     return Schema(std::move(fields));
   }
 
@@ -183,6 +196,7 @@ class HashJoinNode final : public PhysicalPlanNode {
   PhysicalPlanPtr right_;
   std::size_t left_key_index_;
   std::size_t right_key_index_;
+  JoinType join_type_;
   Schema schema_;
   std::vector<std::optional<std::size_t>> original_column_map_;
   std::optional<std::int64_t> estimated_build_rows_;

@@ -523,7 +523,17 @@ PhysicalPlanPtr convert(const LogicalPlanPtr& node, ObjectStore& store, TableSou
     // correct either way.
     const std::optional<std::int64_t> left_estimate = estimate_row_count(left_child);
     const std::optional<std::int64_t> right_estimate = estimate_row_count(right_child);
-    const bool swap_for_build_side = left_estimate && right_estimate && *left_estimate < *right_estimate;
+    // Only safe for INNER JOIN, which is symmetric (swapping which side is
+    // "build" vs "probe" never changes the result set, just which table
+    // gets materialized into device memory). A LEFT OUTER JOIN is not
+    // symmetric: HashJoinOperator's own LEFT JOIN implementation always
+    // treats its "left" (probe) side as the preserved side and "right"
+    // (build) side as the one that gets NULL-extended on no match --
+    // swapping which SQL-level side lands in each physical slot here would
+    // silently invert that, preserving the wrong side. See
+    // docs/ARCHITECTURE.md's "Hash joins" section.
+    const bool swap_for_build_side = join->join_type() == JoinType::Inner && left_estimate && right_estimate &&
+                                     *left_estimate < *right_estimate;
     // Whichever side ends up in the *build* (right) slot after the swap
     // decision below -- persisted on HashJoinNode so HashJoinOperator can
     // size its partition count against it (see choose_partition_count() in
@@ -560,7 +570,7 @@ PhysicalPlanPtr convert(const LogicalPlanPtr& node, ObjectStore& store, TableSou
     }
     return std::make_shared<HashJoinNode>(std::move(left_child), std::move(right_child), *left_key_narrowed,
                                           *right_key_narrowed, std::move(combined_column_map),
-                                          estimated_build_rows);
+                                          estimated_build_rows, join->join_type());
   }
   if (const auto* filter = dynamic_cast<const LogicalFilter*>(node.get())) {
     PhysicalPlanPtr child = convert(filter->child(), store, extra_resolver);

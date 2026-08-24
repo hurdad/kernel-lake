@@ -17,6 +17,8 @@
 #include <variant>
 #include <vector>
 
+#include "kernellake/types/join_type.hpp"
+
 namespace kernellake::sql {
 
 struct AstExpr;
@@ -221,13 +223,15 @@ struct AstParquetSource {
 struct AstJoinStep {
   AstParquetSource source;
   AstExprPtr condition;
+  kernellake::JoinType join_type = kernellake::JoinType::Inner;
 };
 
 // `FROM read_parquet(...) AS a JOIN read_parquet(...) AS b ON <c1> [JOIN
-// read_parquet(...) AS c ON <c2> ...]`. Each step is a two-table INNER
-// JOIN with a single equality key against the running combined schema so
-// far -- see docs/ARCHITECTURE.md for the full scope (both sides of every
-// step must be aliased `read_parquet(...)` sources, no comma-style joins).
+// read_parquet(...) AS c ON <c2> ...]`. Each step is a two-table INNER or
+// LEFT OUTER JOIN (its own `join_type`) with a single equality key against
+// the running combined schema so far -- see docs/ARCHITECTURE.md for the
+// full scope (both sides of every step must be aliased
+// `read_parquet(...)` sources, no comma-style joins, no RIGHT/FULL).
 struct AstJoinClause {
   AstParquetSource first;
   std::vector<AstJoinStep> steps;  // at least one

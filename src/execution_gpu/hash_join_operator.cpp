@@ -1,10 +1,12 @@
 #include "kernellake/execution_gpu/hash_join_operator.hpp"
 
 #include <arrow/io/file.h>
+#include <cudf/column/column_factories.hpp>
 #include <cudf/concatenate.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/hashing.hpp>
 #include <cudf/partitioning.hpp>
+#include <cudf/scalar/scalar_factories.hpp>
 #include <cudf/table/table_view.hpp>
 #include <fmt/format.h>
 
@@ -16,6 +18,7 @@
 
 #include "kernellake/common/errors.hpp"
 #include "kernellake/execution_gpu/arrow_bridge.hpp"
+#include "kernellake/execution_gpu/cudf_adapter.hpp"
 
 namespace kernellake {
 
@@ -230,13 +233,14 @@ std::size_t choose_partition_count(std::optional<std::int64_t> estimated_build_r
 HashJoinOperator::HashJoinOperator(OperatorId id, std::unique_ptr<PhysicalOperator> left,
                                    std::unique_ptr<PhysicalOperator> right, std::size_t left_key_index,
                                    std::size_t right_key_index, std::shared_ptr<const Schema> output_schema,
-                                   std::size_t partition_count, std::string spill_directory)
+                                   std::size_t partition_count, std::string spill_directory, JoinType join_type)
     : id_(id),
       left_(std::move(left)),
       right_(std::move(right)),
       left_key_index_(static_cast<cudf::size_type>(left_key_index)),
       right_key_index_(static_cast<cudf::size_type>(right_key_index)),
       output_schema_(std::move(output_schema)),
+      join_type_(join_type),
       partition_count_(partition_count == 0 ? 1 : partition_count),
       spill_directory_(std::move(spill_directory)) {}
 
@@ -269,23 +273,59 @@ std::optional<DeviceBatch> HashJoinOperator::probe_one_batch(const DeviceBatch& 
                                                              ExecutionContext& context) {
   const cudf::table_view left_view = left_batch.view();
   const cudf::table_view left_key_view({left_view.column(left_key_index_)});
-  auto [left_indices, right_indices] = hash_join_->inner_join(left_key_view, std::nullopt, context.stream);
+  // left_join()'s right_indices carries JoinNoMatch (an out-of-bounds
+  // sentinel) for any left row with no match -- NULLIFY turns that gather
+  // position into a real NULL instead of undefined behavior/garbage;
+  // inner_join() never produces an out-of-bounds index, so DONT_CHECK
+  // (skipping the bounds check entirely) is still correct and cheaper
+  // there. left_indices is guaranteed non-empty for left_join() whenever
+  // left_batch itself has rows -- every left row appears at least once --
+  // so the is_empty() check below still means exactly "left_batch was
+  // itself empty" for both join types.
+  auto [left_indices, right_indices] = join_type_ == JoinType::LeftOuter
+                                           ? hash_join_->left_join(left_key_view, std::nullopt, context.stream)
+                                           : hash_join_->inner_join(left_key_view, std::nullopt, context.stream);
   if (left_indices->is_empty()) {
     return std::nullopt;
   }
 
   const cudf::column_view left_map = as_gather_map(*left_indices);
   const cudf::column_view right_map = as_gather_map(*right_indices);
+  const cudf::out_of_bounds_policy right_gather_policy =
+      join_type_ == JoinType::LeftOuter ? cudf::out_of_bounds_policy::NULLIFY
+                                        : cudf::out_of_bounds_policy::DONT_CHECK;
   std::unique_ptr<cudf::table> gathered_left = cudf::gather(
       left_view, left_map, cudf::out_of_bounds_policy::DONT_CHECK, context.stream, context.memory_resource);
-  std::unique_ptr<cudf::table> gathered_right =
-      cudf::gather(right_table_->view(), right_map, cudf::out_of_bounds_policy::DONT_CHECK, context.stream,
-                   context.memory_resource);
+  std::unique_ptr<cudf::table> gathered_right = cudf::gather(
+      right_table_->view(), right_map, right_gather_policy, context.stream, context.memory_resource);
 
   std::vector<std::unique_ptr<cudf::column>> columns = gathered_left->release();
   std::vector<std::unique_ptr<cudf::column>> right_columns = gathered_right->release();
   columns.insert(columns.end(), std::make_move_iterator(right_columns.begin()),
                  std::make_move_iterator(right_columns.end()));
+  return DeviceBatch(std::make_unique<cudf::table>(std::move(columns)), output_schema_);
+}
+
+std::optional<DeviceBatch> HashJoinOperator::null_extend_batch(const DeviceBatch& left_batch,
+                                                                ExecutionContext& context) {
+  const cudf::table_view left_view = left_batch.view();
+  if (left_view.num_rows() == 0) {
+    return std::nullopt;
+  }
+  std::unique_ptr<cudf::table> owned_left =
+      std::make_unique<cudf::table>(left_view, context.stream, context.memory_resource);
+  std::vector<std::unique_ptr<cudf::column>> columns = owned_left->release();
+
+  const std::size_t left_field_count = columns.size();
+  const std::size_t right_field_count = output_schema_->field_count() - left_field_count;
+  columns.reserve(output_schema_->field_count());
+  for (std::size_t i = 0; i < right_field_count; ++i) {
+    const DataType& type = output_schema_->field(left_field_count + i).type;
+    const std::unique_ptr<cudf::scalar> null_scalar =
+        cudf::make_default_constructed_scalar(to_cudf_type(type), context.stream, context.memory_resource);
+    columns.push_back(cudf::make_column_from_scalar(*null_scalar, left_view.num_rows(), context.stream,
+                                                     context.memory_resource));
+  }
   return DeviceBatch(std::make_unique<cudf::table>(std::move(columns)), output_schema_);
 }
 
@@ -343,6 +383,17 @@ void HashJoinOperator::open(ExecutionContext& context) {
 std::optional<DeviceBatch> HashJoinOperator::next(ExecutionContext& context) {
   if (partition_count_ <= 1) {
     if (right_is_empty_) {
+      if (join_type_ == JoinType::LeftOuter) {
+        // Nothing to probe against, but every left row must still appear,
+        // NULL-extended -- unlike INNER JOIN below, an empty build side
+        // does not mean an empty result.
+        while (std::optional<DeviceBatch> left_batch = left_->next(context)) {
+          if (std::optional<DeviceBatch> result = null_extend_batch(*left_batch, context)) {
+            return result;
+          }
+        }
+        return std::nullopt;
+      }
       // An INNER JOIN against an empty build side can never produce a row;
       // drain the probe side so its resources are released the same way a
       // fully-consumed operator's would be, then report exhausted --
@@ -370,11 +421,18 @@ std::optional<DeviceBatch> HashJoinOperator::next(ExecutionContext& context) {
   // (lazily rebuilt) hash_join_, resuming mid-bucket across calls via
   // probe_reader_/probe_batch_index_. A bucket with no rows on *either*
   // side can never produce a match -- skipped without ever reloading it to
-  // GPU, or even opening its probe file, at all.
+  // GPU, or even opening its probe file, at all. A bucket with probe rows
+  // but no build rows is a real result for LEFT OUTER JOIN, unlike INNER
+  // (see next()'s own non-partitioned-path comment above) -- still
+  // processed there (skipping only the now-pointless hash_join_ build),
+  // null-extending each probe batch instead of probing it.
   while (current_partition_ < partition_count_) {
-    if (probe_partition_nonempty_[current_partition_] && build_partition_nonempty_[current_partition_]) {
+    const bool has_left_outer_orphan_probe_rows =
+        join_type_ == JoinType::LeftOuter && !build_partition_nonempty_[current_partition_];
+    if (probe_partition_nonempty_[current_partition_] &&
+        (build_partition_nonempty_[current_partition_] || has_left_outer_orphan_probe_rows)) {
       ensure_partition_built(context);
-      if (!right_is_empty_) {
+      if (!right_is_empty_ || join_type_ == JoinType::LeftOuter) {
         if (probe_reader_ == nullptr) {
           probe_reader_ = open_partition_reader(probe_partition_paths_[current_partition_]);
           probe_batch_index_ = 0;
@@ -390,7 +448,9 @@ std::optional<DeviceBatch> HashJoinOperator::next(ExecutionContext& context) {
           ++probe_batch_index_;
           DeviceBatch left_batch =
               from_arrow_record_batch(**batch_result, left_schema_, context.stream, context.memory_resource);
-          if (std::optional<DeviceBatch> result = probe_one_batch(left_batch, context)) {
+          std::optional<DeviceBatch> result =
+              right_is_empty_ ? null_extend_batch(left_batch, context) : probe_one_batch(left_batch, context);
+          if (result) {
             return result;
           }
         }

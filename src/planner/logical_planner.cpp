@@ -328,7 +328,7 @@ LogicalPlanPtr build_logical_plan(const BoundQuery& query, const std::vector<Sch
     auto right_scan =
         std::make_shared<LogicalScan>(step.source_paths, join_schemas[i + 1], partition_columns_for(i + 1));
     plan = std::make_shared<LogicalJoin>(std::move(plan), std::move(right_scan), step.combined_key_index,
-                                         step.source_key_index);
+                                         step.source_key_index, step.join_type);
   }
   return finish_logical_plan(std::move(plan), query);
 }

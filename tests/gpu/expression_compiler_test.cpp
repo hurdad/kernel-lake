@@ -2,8 +2,10 @@
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/filling.hpp>
+#include <cudf/null_mask.hpp>
 #include <cudf/scalar/scalar_factories.hpp>
 #include <cudf/transform.hpp>
+#include <rmm/device_buffer.hpp>
 
 #include "kernellake/common/errors.hpp"
 #include "kernellake/execution_gpu/cuda_utils.hpp"
@@ -354,6 +356,81 @@ TEST(ExpressionCompiler, NotIsNullIsNotNullUnaryOperatorsProduceCorrectResults) 
     ASSERT_EQ(result->type().id(), cudf::type_id::BOOL8);
     cudaDeviceSynchronize();
     for (unsigned char value : copy_to_host<unsigned char>(result->view())) EXPECT_TRUE(value != 0);
+  }
+}
+
+// to_ast_operator() must map SQL AND/OR to cudf::ast's NULL_LOGICAL_AND/
+// NULL_LOGICAL_OR, not plain LOGICAL_AND/LOGICAL_OR -- the plain variants
+// propagate NULL whenever *either* operand is null, with no special-casing
+// of a definitively-FALSE/TRUE operand, whereas SQL's three-valued (Kleene)
+// logic requires `TRUE OR NULL = TRUE` and `FALSE AND NULL = FALSE`. This
+// regressed for real: `WHERE x IS NULL OR x = 3` silently dropped every
+// NULL row (IS NULL evaluates to TRUE, but LOGICAL_OR(TRUE, NULL) came out
+// NULL instead of TRUE, since `x = 3` is itself NULL when x is NULL) --
+// caught by a LEFT OUTER JOIN test since that was the first path to
+// produce a genuinely nullable column feeding a WHERE clause, but the bug
+// itself has nothing to do with joins, hence this direct, join-free
+// regression test.
+TEST(ExpressionCompiler, LogicalOrAndAndUseKleeneNullSemantics) {
+  // 4 rows: a = [0, NULL, 2, NULL] (rows 1 and 3 null).
+  auto column =
+      cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT64}, 4, cudf::mask_state::ALL_VALID);
+  {
+    cudf::mutable_column_view view = column->mutable_view();
+    const std::vector<std::int64_t> host_values = {0, 0, 2, 0};
+    cudaMemcpy(view.data<std::int64_t>(), host_values.data(), host_values.size() * sizeof(std::int64_t),
+               cudaMemcpyHostToDevice);
+  }
+  const cudf::bitmask_type valid_mask_word = 0b0101;  // rows 0,2 valid; rows 1,3 null.
+  rmm::device_buffer null_mask(cudf::bitmask_allocation_size_bytes(4), rmm::cuda_stream_default);
+  cudaMemsetAsync(null_mask.data(), 0, null_mask.size(), rmm::cuda_stream_default.value());
+  cudaMemcpyAsync(null_mask.data(), &valid_mask_word, sizeof(valid_mask_word), cudaMemcpyHostToDevice,
+                  rmm::cuda_stream_default.value());
+  rmm::cuda_stream_default.synchronize();
+  column->set_null_mask(std::move(null_mask), /*new_null_count=*/2);
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(std::move(column));
+  cudf::table table(std::move(columns));
+
+  auto a = std::make_shared<ColumnExpression>("a", 0, int64_type(true));
+  auto is_null = std::make_shared<UnaryExpression>(UnaryOperator::IsNull, a, boolean_type(false));
+  auto two = std::make_shared<LiteralExpression>(LiteralExpression::make_int64(2));
+  auto equals_two = std::make_shared<BinaryExpression>(BinaryOperator::Equal, a, two, boolean_type(false));
+  TestContext ctx;
+
+  {
+    // `a IS NULL OR a = 2`: row 0 (0==2 false, not null) -> FALSE; row 1
+    // (null, IS NULL true) -> TRUE via NULL_LOGICAL_OR's null-with-true
+    // case; row 2 (2==2 true) -> TRUE; row 3 (null) -> TRUE. All 4 rows
+    // must be non-null booleans -- none should come out NULL.
+    BinaryExpression or_expr(BinaryOperator::Or, is_null, equals_two, boolean_type(false));
+    ExpressionCompiler compiler;
+    std::unique_ptr<cudf::column> result = cudf::compute_column(table.view(), compiler.compile(or_expr, ctx.context));
+    ASSERT_EQ(result->null_count(), 0);
+    cudaDeviceSynchronize();
+    const std::vector<unsigned char> values = copy_to_host<unsigned char>(result->view());
+    EXPECT_EQ(values[0], 0);
+    EXPECT_NE(values[1], 0);
+    EXPECT_NE(values[2], 0);
+    EXPECT_NE(values[3], 0);
+  }
+  {
+    // `a IS NOT NULL AND a = 2`: row 0 (not null, 0==2 false) -> FALSE;
+    // row 1 (null -> IS NOT NULL false) -> FALSE via NULL_LOGICAL_AND's
+    // null-with-false case; row 2 (not null, 2==2 true) -> TRUE; row 3
+    // (null) -> FALSE. Again none should come out NULL.
+    auto is_not_null = std::make_shared<UnaryExpression>(UnaryOperator::IsNotNull, a, boolean_type(false));
+    BinaryExpression and_expr(BinaryOperator::And, is_not_null, equals_two, boolean_type(false));
+    ExpressionCompiler compiler;
+    std::unique_ptr<cudf::column> result =
+        cudf::compute_column(table.view(), compiler.compile(and_expr, ctx.context));
+    ASSERT_EQ(result->null_count(), 0);
+    cudaDeviceSynchronize();
+    const std::vector<unsigned char> values = copy_to_host<unsigned char>(result->view());
+    EXPECT_EQ(values[0], 0);
+    EXPECT_EQ(values[1], 0);
+    EXPECT_NE(values[2], 0);
+    EXPECT_EQ(values[3], 0);
   }
 }
 

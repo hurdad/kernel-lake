@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "kernellake/execution_gpu/operator.hpp"
+#include "kernellake/types/join_type.hpp"
 
 namespace kernellake {
 
@@ -36,9 +37,17 @@ namespace kernellake {
 [[nodiscard]] std::size_t choose_partition_count(std::optional<std::int64_t> estimated_build_rows,
                                                  const Schema& build_side_schema, std::size_t budget_bytes);
 
-// Two-table INNER equi-join (see HashJoinNode / docs/ARCHITECTURE.md's "Hash
-// joins" section for the full scope: exactly one equality key, no
-// LEFT/RIGHT/FULL, no 3+-way joins).
+// Two-table INNER or LEFT OUTER equi-join (see HashJoinNode /
+// docs/ARCHITECTURE.md's "Hash joins" section for the full scope: exactly
+// one equality key, no RIGHT/FULL, no 3+-way joins in a single node --
+// though a chain of these nodes handles a 3+-way JOIN clause). For LEFT
+// OUTER, `left` (probe) is always the *preserved* side -- every left row
+// appears in the output at least once, NULL-extended on the right side's
+// columns if it has no match -- and `right` (build) is always the *nullable*
+// side. This is why the physical planner's build-side size swap (see
+// physical_planner.cpp's own comment) is disabled for LEFT OUTER: swapping
+// which SQL-level side lands in `left`/`right` here would silently invert
+// which side gets preserved vs. null-extended.
 //
 // `right` is the *build* side, `left` the *probe* side -- put the smaller
 // table on the right for best performance; the physical planner already
@@ -108,7 +117,8 @@ class HashJoinOperator final : public PhysicalOperator {
   HashJoinOperator(OperatorId id, std::unique_ptr<PhysicalOperator> left,
                    std::unique_ptr<PhysicalOperator> right, std::size_t left_key_index,
                    std::size_t right_key_index, std::shared_ptr<const Schema> output_schema,
-                   std::size_t partition_count = 1, std::string spill_directory = "");
+                   std::size_t partition_count = 1, std::string spill_directory = "",
+                   JoinType join_type = JoinType::Inner);
   ~HashJoinOperator() override;
 
   void open(ExecutionContext& context) override;
@@ -128,8 +138,22 @@ class HashJoinOperator final : public PhysicalOperator {
   // currently-built hash_join_/right_table_, returning a matched output
   // batch, or nullopt if this specific batch produced zero matches (the
   // caller moves on to the next batch/bucket, same "skip empty-match
-  // batches" convention next() has always used).
+  // batches" convention next() has always used). INNER JOIN only -- see
+  // null_extend_batch() for LEFT OUTER's own empty-right-side path.
   std::optional<DeviceBatch> probe_one_batch(const DeviceBatch& left_batch, ExecutionContext& context);
+
+  // LEFT OUTER JOIN only: right_table_ has no rows for the current
+  // bucket/whole build side (right_is_empty_), so there is nothing to
+  // probe against at all -- every left row still has to appear in the
+  // output, with every right-side column NULL. Builds those NULL columns
+  // directly from output_schema_'s own right-side field types/count
+  // (output_schema_->field_count() minus left_batch's own column count),
+  // not from right_table_/right_schema_ -- both can be entirely absent
+  // here (the build side may never have produced a single batch), unlike
+  // probe_one_batch()'s own right_table_->view() dependency. Returns
+  // nullopt for a genuinely empty left_batch, matching every other
+  // "skip empty batches" convention in this operator.
+  std::optional<DeviceBatch> null_extend_batch(const DeviceBatch& left_batch, ExecutionContext& context);
 
   // Partitioned mode only: makes sure right_table_/hash_join_/
   // right_is_empty_ reflect build_partition_paths_[current_partition_],
@@ -149,6 +173,7 @@ class HashJoinOperator final : public PhysicalOperator {
   cudf::size_type left_key_index_;
   cudf::size_type right_key_index_;
   std::shared_ptr<const Schema> output_schema_;
+  JoinType join_type_;
   std::size_t partition_count_;
   std::string spill_directory_;
 

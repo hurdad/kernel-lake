@@ -176,7 +176,8 @@ std::unique_ptr<PhysicalOperator> build(const PhysicalPlanPtr& node, ObjectStore
               build_side_budget_bytes, spill_directory, max_distinct_keys);
     return instrument(std::make_unique<HashJoinOperator>(
         next_id++, std::move(left), std::move(right), join->left_key_index(), join->right_key_index(),
-        std::make_shared<const Schema>(join->output_schema()), partition_count, spill_directory));
+        std::make_shared<const Schema>(join->output_schema()), partition_count, spill_directory,
+        join->join_type()));
   }
   if (const auto* filter = dynamic_cast<const FilterNode*>(node.get())) {
     return instrument(std::make_unique<FilterOperator>(

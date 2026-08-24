@@ -196,9 +196,19 @@ cudf::ast::ast_operator to_ast_operator(BinaryOperator op) {
     case BinaryOperator::GreaterEqual:
       return cudf::ast::ast_operator::GREATER_EQUAL;
     case BinaryOperator::And:
-      return cudf::ast::ast_operator::LOGICAL_AND;
+      // NULL_LOGICAL_AND, not LOGICAL_AND: SQL's three-valued (Kleene) logic
+      // requires FALSE AND NULL = FALSE (not NULL) so that e.g. `WHERE x > 5
+      // AND y IS NULL` still excludes rows where x is NULL. Plain
+      // LOGICAL_AND/LOGICAL_OR propagate NULL whenever *either* operand is
+      // null, with no special-casing of a definitively-FALSE/TRUE operand --
+      // see cudf/ast/detail/operator_functor.cuh's own NULL_LOGICAL_AND/
+      // NULL_LOGICAL_OR doc comments for the exact truth tables.
+      return cudf::ast::ast_operator::NULL_LOGICAL_AND;
     case BinaryOperator::Or:
-      return cudf::ast::ast_operator::LOGICAL_OR;
+      // NULL_LOGICAL_OR, not LOGICAL_OR: same Kleene-logic reasoning as AND
+      // above, mirrored -- TRUE OR NULL = TRUE (not NULL), which is what
+      // makes `WHERE x IS NULL OR x = 'Bob'` correctly include NULL rows.
+      return cudf::ast::ast_operator::NULL_LOGICAL_OR;
   }
   throw ExecutionError("unreachable: unknown BinaryOperator in expression compiler");
 }

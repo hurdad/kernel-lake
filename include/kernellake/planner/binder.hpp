@@ -7,6 +7,7 @@
 
 #include "kernellake/expression/expression.hpp"
 #include "kernellake/sql/ast.hpp"
+#include "kernellake/types/join_type.hpp"
 #include "kernellake/types/schema.hpp"
 
 namespace kernellake {
@@ -35,6 +36,7 @@ struct BoundJoinStep {
   std::vector<std::string> source_paths;
   std::size_t combined_key_index;
   std::size_t source_key_index;
+  JoinType join_type = JoinType::Inner;
 };
 
 // The bound form of a `JOIN ... ON` chain (see sql::AstJoinClause):

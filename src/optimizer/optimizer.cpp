@@ -468,25 +468,39 @@ ExpressionPtr conjunction(std::vector<ExpressionPtr> conjuncts) {
 
 // Pushes WHERE-clause conjuncts that reference only one side of a join down
 // below it: `sigma_p(A JOIN B) = sigma_p(A) JOIN B` when p only touches A's
-// columns, unconditionally valid for the INNER-only joins this engine
-// supports (see HashJoinOperator's own doc comment -- no LEFT/RIGHT/FULL,
-// so there is no null-extension semantics to worry about). Without this, a
-// chained N-way join (e.g. TPC-H Q3's customer/orders/lineitem) fully
-// materializes every intermediate join's *build* side before any WHERE
-// predicate ever runs -- confirmed as the real cause of a genuine SF100 GPU
-// OOM on Q3 (see docs/GPU_OPTIMIZATIONS.md): with orders/customer's
-// referential integrity, an unfiltered customer JOIN orders materializes
-// ~100% of orders, not the ~20% left after `WHERE c_mktsegment='BUILDING'`,
-// because that filter never reached either scan. Recurses through
-// rewrite_plan so it also pushes through N-way join chains one level at a
-// time, not just a single join. Returns nullptr (caller keeps the plain
-// Filter(join, predicate) shape) when no conjunct could be pushed either
-// side.
+// columns. Unconditionally valid on the *left* (preserved) side regardless
+// of join type: a predicate touching only `left`'s own columns determines
+// exactly the same left rows whether it's applied before or after the join,
+// with no null-extension subtlety either way. On the *right* side, this is
+// only valid for INNER JOIN -- for a LEFT OUTER JOIN, pushing a right-side
+// predicate below the join would change which left rows count as
+// "matched": e.g. `a LEFT JOIN b ON a.x=b.x WHERE b.y > 5` must apply
+// `b.y > 5` *after* null-extension (a NULL b.y from an unmatched a-row
+// correctly fails the predicate and is dropped, same as any other
+// unmatched-then-filtered row), but pre-filtering `b` to `y > 5` before the
+// join would instead turn any a-row that matched a *real* b-row with
+// `y <= 5` into a spurious NULL-extended row, which the original query
+// never asked for -- a real correctness bug, not just a performance
+// difference. See HashJoinOperator's own doc comment for the two join
+// types this engine supports (no RIGHT/FULL).
+//
+// Without pushing the left side at all, a chained N-way join (e.g. TPC-H
+// Q3's customer/orders/lineitem) fully materializes every intermediate
+// join's *build* side before any WHERE predicate ever runs -- confirmed as
+// the real cause of a genuine SF100 GPU OOM on Q3 (see
+// docs/GPU_OPTIMIZATIONS.md): with orders/customer's referential
+// integrity, an unfiltered customer JOIN orders materializes ~100% of
+// orders, not the ~20% left after `WHERE c_mktsegment='BUILDING'`, because
+// that filter never reached either scan. Recurses through rewrite_plan so
+// it also pushes through N-way join chains one level at a time, not just a
+// single join. Returns nullptr (caller keeps the plain Filter(join,
+// predicate) shape) when no conjunct could be pushed either side.
 LogicalPlanPtr push_predicate_through_join(const LogicalJoin& join, const ExpressionPtr& predicate) {
   std::vector<ExpressionPtr> conjuncts;
   collect_conjuncts(predicate, conjuncts);
 
   const std::size_t left_count = join.left()->output_schema().field_count();
+  const bool right_side_pushable = join.join_type() == JoinType::Inner;
   std::vector<ExpressionPtr> left_conjuncts;
   std::vector<ExpressionPtr> right_conjuncts;
   std::vector<ExpressionPtr> remaining_conjuncts;
@@ -501,7 +515,7 @@ LogicalPlanPtr push_predicate_through_join(const LogicalJoin& join, const Expres
                                         [left_count](std::size_t index) { return index >= left_count; });
     if (all_left) {
       left_conjuncts.push_back(std::move(conjunct));
-    } else if (all_right) {
+    } else if (all_right && right_side_pushable) {
       right_conjuncts.push_back(shift_columns(conjunct, static_cast<std::int64_t>(left_count)));
     } else {
       remaining_conjuncts.push_back(std::move(conjunct));
@@ -522,8 +536,8 @@ LogicalPlanPtr push_predicate_through_join(const LogicalJoin& join, const Expres
     new_right =
         rewrite_plan(std::make_shared<LogicalFilter>(new_right, conjunction(std::move(right_conjuncts))));
   }
-  LogicalPlanPtr new_join = std::make_shared<LogicalJoin>(std::move(new_left), std::move(new_right),
-                                                          join.left_key_index(), join.right_key_index());
+  LogicalPlanPtr new_join = std::make_shared<LogicalJoin>(
+      std::move(new_left), std::move(new_right), join.left_key_index(), join.right_key_index(), join.join_type());
   if (remaining_conjuncts.empty()) {
     return new_join;
   }
@@ -559,7 +573,7 @@ LogicalPlanPtr rewrite_plan(const LogicalPlanPtr& node) {
     LogicalPlanPtr left = rewrite_plan(join->left());
     LogicalPlanPtr right = rewrite_plan(join->right());
     return std::make_shared<LogicalJoin>(std::move(left), std::move(right), join->left_key_index(),
-                                         join->right_key_index());
+                                         join->right_key_index(), join->join_type());
   }
 
   if (const auto* filter = dynamic_cast<const LogicalFilter*>(node.get())) {

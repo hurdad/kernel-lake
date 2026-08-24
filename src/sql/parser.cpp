@@ -690,17 +690,33 @@ AstParquetSource convert_join_source(const hsql::TableRef* ref, ConversionState&
   return AstParquetSource{source.paths, std::string(ref->alias->name)};
 }
 
+// hsql's own JoinType enum ({kJoinInner, kJoinFull, kJoinLeft, kJoinRight,
+// kJoinCross, kJoinNatural}) has no fixed underlying type to static_cast
+// against outside this translation unit, so this is a plain switch rather
+// than a table lookup -- RIGHT/FULL/CROSS/NATURAL all still fail clearly
+// via the fallback, not just LEFT succeeding silently for everything else.
+JoinType convert_join_type(hsql::JoinType type) {
+  switch (type) {
+    case hsql::kJoinInner:
+      return JoinType::Inner;
+    case hsql::kJoinLeft:
+      return JoinType::LeftOuter;
+    default:
+      unsupported("JOIN types other than INNER JOIN and LEFT [OUTER] JOIN");
+  }
+}
+
 // hsql parses a multi-way JOIN left-associatively: `A JOIN B ON c1 JOIN C
 // ON c2` becomes a TableRef tree `(A JOIN B ON c1) JOIN C ON c2`, i.e.
 // `join->left` is itself a kTableJoin for a chain of 3+ sources, while
 // `join->right` is always a plain leaf table -- so this recurses only on
 // `join->left`, appending each level's `join->right`/condition as one more
 // AstJoinStep, in left-to-right source order. Every join in the chain must
-// be a plain INNER JOIN between a (possibly-nested) JOIN and a single
-// aliased read_parquet(...) source -- anything else (a comma-style join, a
-// subquery on either side, a non-INNER join type) fails clearly via
-// convert_join_source()/the checks below, at whichever level of the chain
-// it appears.
+// be an INNER or LEFT [OUTER] JOIN between a (possibly-nested) JOIN and a
+// single aliased read_parquet(...) source -- anything else (a comma-style
+// join, a subquery on either side, RIGHT/FULL/CROSS/NATURAL) fails clearly
+// via convert_join_source()/convert_join_type()/the checks below, at
+// whichever level of the chain it appears.
 AstJoinClause flatten_join_chain(const hsql::TableRef* table_ref, ConversionState& state) {
   if (table_ref == nullptr || table_ref->type != hsql::kTableJoin || table_ref->join == nullptr) {
     unsupported("malformed JOIN");
@@ -709,9 +725,7 @@ AstJoinClause flatten_join_chain(const hsql::TableRef* table_ref, ConversionStat
   if (join->left == nullptr || join->right == nullptr) {
     unsupported("malformed JOIN");
   }
-  if (join->type != hsql::kJoinInner) {
-    unsupported("JOIN types other than INNER JOIN");
-  }
+  const JoinType join_type = convert_join_type(join->type);
   if (join->condition == nullptr) {
     unsupported("JOIN with no ON condition");
   }
@@ -723,7 +737,7 @@ AstJoinClause flatten_join_chain(const hsql::TableRef* table_ref, ConversionStat
     clause.first = convert_join_source(join->left, state);
   }
   clause.steps.push_back(
-      AstJoinStep{convert_join_source(join->right, state), convert_expr(join->condition, state)});
+      AstJoinStep{convert_join_source(join->right, state), convert_expr(join->condition, state), join_type});
   return clause;
 }
 
