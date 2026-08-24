@@ -227,6 +227,38 @@ TEST(ProjectionOperator, EvaluatesCaseExpressionAcrossBatches) {
   projection.close(context);
 }
 
+// materialize_case()'s no-ELSE path had no coverage -- the test above
+// always supplies an else_branch. Rows where no WHEN matches must
+// evaluate to NULL (the default-constructed-scalar path), not 0 or the
+// column's own type's zero value.
+TEST(ProjectionOperator, EvaluatesCaseExpressionWithNoElseAsNullForUnmatchedRows) {
+  RmmEnvironment env(default_config());
+  std::vector<DeviceBatch> batches;
+  batches.push_back(make_filled_batch(1, 2));  // 1 <= 5 for every row -- no WHEN matches.
+
+  auto a = std::make_shared<ColumnExpression>("a", 0, int32_type(false));
+  auto five = std::make_shared<LiteralExpression>(LiteralExpression::make_int64(5));
+  auto a_i64 = std::make_shared<CastExpression>(a, int64_type(false));
+  auto condition =
+      std::make_shared<BinaryExpression>(BinaryOperator::Greater, a_i64, five, boolean_type(false));
+  auto then_value = std::make_shared<LiteralExpression>(LiteralExpression::make_int64(100));
+  std::vector<CaseExpression::WhenThen> when_then = {CaseExpression::WhenThen{condition, then_value}};
+  auto case_expr = std::make_shared<CaseExpression>(std::move(when_then), nullptr, int64_type(true));
+
+  std::vector<NamedExpression> items = {NamedExpression{case_expr, "bucket"}};
+  ProjectionOperator projection(1, std::make_unique<VectorSourceOperator>(std::move(batches)),
+                                std::move(items));
+  ExecutionContext context = make_context();
+  projection.open(context);
+
+  std::optional<DeviceBatch> result = projection.next(context);
+  ASSERT_TRUE(result.has_value());
+  ASSERT_EQ(result->row_count(), 2u);
+  EXPECT_EQ(result->view().column(0).null_count(), 2);
+  EXPECT_FALSE(projection.next(context).has_value());
+  projection.close(context);
+}
+
 // Regression coverage: compile_value()'s EXTRACT branch and
 // materialize_extract() had zero coverage through ProjectionOperator --
 // EXTRACT was previously only ever tested as a GROUP BY key (e.g. TPC-H
