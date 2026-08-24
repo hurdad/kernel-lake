@@ -649,5 +649,35 @@ TEST(ScalarAggregateOperator, OpenThrowsWhenAggregateItemIsNotAnAggregateExpress
   EXPECT_THROW({ op.open(context); }, ExecutionError);
 }
 
+// process_batch()'s/finalize()'s own final fallback throws (guarding an
+// AggregateFunction value with no matching enumerator) had no coverage --
+// AggregateFunction has a fixed uint8_t underlying type (expression.hpp),
+// so this cast is well-defined, not UB. open() itself doesn't validate
+// aggregate->function() (it's forwarded straight into Accumulator::function
+// unchecked), so a bogus value survives open() and is only ever rejected
+// once process_batch() actually dispatches on it during next().
+TEST(ScalarAggregateOperator, ProcessBatchThrowsForUnknownAggregateFunction) {
+  RmmEnvironment env(default_config());
+  Schema schema({Field{"amount", float64_type(false)}});
+  std::vector<DeviceBatch> batches;
+  {
+    std::vector<std::unique_ptr<cudf::column>> columns;
+    columns.push_back(filled_column(cudf::type_id::FLOAT64, 1.0, 3));
+    batches.push_back(DeviceBatch(std::make_unique<cudf::table>(std::move(columns)),
+                                  std::make_shared<const Schema>(schema)));
+  }
+
+  auto amount = std::make_shared<ColumnExpression>("amount", 0, float64_type(false));
+  auto bogus_expr =
+      std::make_shared<AggregateExpression>(static_cast<AggregateFunction>(255), amount, float64_type(true));
+  std::vector<NamedExpression> aggregates = {NamedExpression{bogus_expr, "x"}};
+
+  ScalarAggregateOperator op(1, std::make_unique<VectorSourceOperator>(std::move(batches)),
+                             std::move(aggregates));
+  ExecutionContext context = make_context();
+  op.open(context);
+  EXPECT_THROW({ (void)(op.next(context)); }, ExecutionError);
+}
+
 }  // namespace
 }  // namespace kernellake
