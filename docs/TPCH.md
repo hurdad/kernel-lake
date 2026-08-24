@@ -83,9 +83,11 @@ script hardcodes real `dbgen` reference data instead of sampling; `part`'s
 own `p_name` uses a representative subset of real `dbgen`'s color-word
 list rather than a purely synthetic string, specifically so Q9's `p_name
 LIKE '%green%'` filter matches real rows -- see the script's docstring
-for the full list of deviations, including DOUBLE instead of DECIMAL,
-since KernelLake's GPU execution layer doesn't support Decimal yet). It
-requires the `pyarrow` Python package.
+for the full list of deviations, including DOUBLE instead of DECIMAL --
+KernelLake's GPU execution layer does support DECIMAL now (see
+`docs/ARCHITECTURE.md`'s "DECIMAL support" section), so this is a
+generator choice, not an engine limitation). It requires the `pyarrow`
+Python package.
 
 `l_suppkey` is the one foreign key in this generator that is **not**
 drawn independently at random: every part is stocked by exactly 4
@@ -127,7 +129,7 @@ also a single file.
 
 The queries live in version-controlled files, `benchmarks/tpch/queries/
 q01.sql`, `q03.sql`, `q05.sql`, `q06.sql`, `q07.sql`, `q09.sql`, `q10.sql`,
-`q11.sql`, `q12.sql`, `q14.sql`, `q18.sql`, `q19.sql`, each with a header comment documenting
+`q11.sql`, `q12.sql`, `q13.sql`, `q14.sql`, `q18.sql`, `q19.sql`, each with a header comment documenting
 its specific deviations from canonical TPC-H syntax (`FROM lineitem` ->
 `FROM read_parquet('{data}')`, no `INTERVAL` arithmetic). Q1/Q6 need only
 `{data}` substituted with your `lineitem` glob; Q19/Q14 also need
@@ -157,7 +159,11 @@ into Q11's query text. Q18 needs `{customer_data}`, `{orders_data}`, and
 `{data}` substituted with your `customer`, `orders`, and `lineitem`
 globs (`{data}` appears *twice* -- once in the outer join, once in its
 own independently-scoped subquery -- and both get the same
-substitution). `{data}` must always be a `lineitem`-specific
+substitution). Q13 needs `{customer_data}` and `{orders_data}`
+substituted with your `customer` and `orders` globs -- like Q11, it
+doesn't reference `lineitem` at all, so `{data}`/`--data` is still
+required by this project's own tooling but never actually substituted
+into Q13's query text. `{data}` must always be a `lineitem`-specific
 glob (e.g. `lineitem-*.parquet`), not a bare `*.parquet` --
 `generate_tpch.py` writes every table into the same output directory, so
 a bare glob would pull in all of them at once and fail with a schema
@@ -238,6 +244,12 @@ sql=$(grep -v '^--' benchmarks/tpch/queries/q18.sql | tr '\n' ' ' | \
        s|{customer_data}|/tmp/kernellake-tpch-sf1/customer-*.parquet|g; \
        s|{orders_data}|/tmp/kernellake-tpch-sf1/orders-*.parquet|g")
 ./build/gpu-dev/src/cli/kernellake query --sql "$sql" --stats
+
+# Q13 doesn't reference {data} at all -- only {customer_data}/{orders_data}.
+sql=$(grep -v '^--' benchmarks/tpch/queries/q13.sql | tr '\n' ' ' | \
+  sed "s|{customer_data}|/tmp/kernellake-tpch-sf1/customer-*.parquet|; \
+       s|{orders_data}|/tmp/kernellake-tpch-sf1/orders-*.parquet|")
+./build/gpu-dev/src/cli/kernellake query --sql "$sql" --stats
 ```
 
 ## 3. Validate against DuckDB
@@ -265,9 +277,10 @@ python3 tools/validate_tpch.py \
 # --nation-data, Q9 needs --part-data, --supplier-data,
 # --partsupp-data, --orders-data, and --nation-data, Q11 needs
 # --partsupp-data, --supplier-data, and --nation-data (--data is still
-# required but unused by Q11's own query text), Q18 needs
-# --customer-data and --orders-data (none covered by --query all, which
-# only passes --data):
+# required but unused by Q11's own query text), Q13 needs
+# --customer-data and --orders-data (--data likewise required but
+# unused), Q18 needs --customer-data and --orders-data (none covered by
+# --query all, which only passes --data):
 python3 tools/validate_tpch.py \
   --kernellake build/gpu-dev/src/cli/kernellake \
   --data '/tmp/kernellake-tpch-sf1/lineitem-*.parquet' \
@@ -334,6 +347,12 @@ python3 tools/validate_tpch.py \
   --data '/tmp/kernellake-tpch-sf1/lineitem-*.parquet' \
   --customer-data '/tmp/kernellake-tpch-sf1/customer-*.parquet' \
   --orders-data '/tmp/kernellake-tpch-sf1/orders-*.parquet' \
+  --scale-factor 1 --query 13
+python3 tools/validate_tpch.py \
+  --kernellake build/gpu-dev/src/cli/kernellake \
+  --data '/tmp/kernellake-tpch-sf1/lineitem-*.parquet' \
+  --customer-data '/tmp/kernellake-tpch-sf1/customer-*.parquet' \
+  --orders-data '/tmp/kernellake-tpch-sf1/orders-*.parquet' \
   --scale-factor 1 --query 18
 ```
 
@@ -377,9 +396,10 @@ for Q5, `--orders-data`, `--customer-data`, `--supplier-data`, and
 `--nation-data` for Q7, `--part-data`, `--supplier-data`,
 `--partsupp-data`, `--orders-data`, and `--nation-data` for Q9,
 `--partsupp-data`, `--supplier-data`, and `--nation-data` for Q11
-(`--data` is still required but unused by Q11's own query text), or
-`--customer-data` and `--orders-data` for Q18 (or any combination for a
-future query needing those extra tables).
+(`--data` is still required but unused by Q11's own query text),
+`--customer-data` and `--orders-data` for Q13 (`--data` likewise
+required but unused), or `--customer-data` and `--orders-data` for Q18
+(or any combination for a future query needing those extra tables).
 
 ```bash
 ./build/gpu-dev/src/cli/kernellake benchmark tpch \

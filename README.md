@@ -153,10 +153,10 @@ dedicated combined preset yet (see `otel-dev`'s own `description` in
 
 ## Build and test
 
-Six CMake presets (`CMakePresets.json`), each independently build+test-able;
-`cpu-dev` is the one `server-dev`/`otel-dev` both build on
-(`inherits: cpu-dev`), `gpu-dev`/`gpu-release` share `cpu-dev`/`cpu-release`'s
-base config plus CUDA:
+Eight CMake presets (`CMakePresets.json`), each independently build+test-able;
+`cpu-dev` is the one `server-dev`/`otel-dev`/`cpu-coverage` all build on
+(`inherits: cpu-dev`), `gpu-dev`/`gpu-release`/`gpu-coverage` share
+`cpu-dev`/`cpu-release`'s base config plus CUDA:
 
 ```bash
 # cpu-dev: CPU-only debug build -- SQL parsing through physical planning,
@@ -196,6 +196,14 @@ ctest --preset server-dev
 cmake --preset otel-dev
 cmake --build --preset otel-dev
 ctest --preset otel-dev
+
+# cpu-coverage / gpu-coverage: cpu-dev/gpu-dev plus gcc --coverage
+# instrumentation, for CI's coverage/gpu-coverage jobs (see
+# .github/workflows/ci.yml). Not for day-to-day development -- slower
+# builds, .gcda files accumulate across runs.
+cmake --preset cpu-coverage
+cmake --build --preset cpu-coverage
+ctest --preset cpu-coverage
 ```
 
 ## Usage
@@ -264,18 +272,21 @@ grouped aggregates (including a ~40,000-group `GROUP BY customer_id`), and
 ## TPC-H-derived benchmarking (unofficial)
 
 **Unofficial TPC-H-derived benchmark. Not a certified TPC result.** Q1,
-Q3, Q5, Q6, Q7, Q9, Q10, Q11, Q12, Q14, Q18, and Q19 are supported
-(12 of 22) -- both single-table scans (Q1/Q6) and multi-table
-`INNER JOIN` chains (Q3's/Q11's/Q18's 3-way joins, Q10's 4-way join, and
+Q3, Q5, Q6, Q7, Q9, Q10, Q11, Q12, Q13, Q14, Q18, and Q19 are supported
+(13 of 22) -- both single-table scans (Q1/Q6) and multi-table `INNER`/
+`LEFT OUTER JOIN` chains (Q3's/Q11's/Q18's 3-way joins, Q10's 4-way join,
 Q5's/Q7's/Q9's 6-way joins -- Q7 self-joins `nation` under two aliases,
 Q9 splits `partsupp`'s two-column join key across a `JOIN` condition and
-a `WHERE` filter, Q12/Q14/Q19's 2-way joins), on both the CPU and GPU
+a `WHERE` filter, Q12/Q13/Q14/Q19's 2-way joins), on both the CPU and GPU
 execution backends. Q11 was also the first query needing `GROUP BY`'s
 `HAVING` clause or a subquery (a non-correlated scalar one computing
 `HAVING`'s own threshold); Q18 generalizes that same subquery machinery
-to `WHERE ... IN (SELECT ...)` (non-correlated, any row count) -- see
-[docs/SQL_COMPATIBILITY.md](docs/SQL_COMPATIBILITY.md) for the full
-scope of both. See [docs/TPCH.md](docs/TPCH.md) for the full generate ->
+to `WHERE ... IN (SELECT ...)` (non-correlated, any row count); Q13 is
+the first needing a `LEFT OUTER JOIN`, a `JOIN ON` clause combining the
+required equality key with an extra predicate scoped to just the
+newly-joined side, or a derived table (`FROM (SELECT ...) AS alias`) --
+see [docs/SQL_COMPATIBILITY.md](docs/SQL_COMPATIBILITY.md) for the full
+scope of all of these. See [docs/TPCH.md](docs/TPCH.md) for the full generate ->
 query -> validate -> benchmark workflow, including `tools/generate_tpch.py`
 (a synthetic generator, not the official `dbgen`) and `kernellake
 benchmark tpch`'s cold/warm timing modes.
@@ -375,14 +386,15 @@ src/<module>/                  implementation, mirrors include/
 tests/unit/                    GoogleTest unit tests (CPU-only, every preset)
 tests/gpu/                     GoogleTest GPU tests (gpu-dev preset only)
 tools/                         Python tooling (DuckDB cross-validation, TPC-H generation)
-benchmarks/tpch/queries/       Version-controlled TPC-H-derived SQL (q01/q03/q05/q06/q07/q09/q10/q12/q14/q19.sql)
+benchmarks/tpch/queries/       Version-controlled TPC-H-derived SQL (q01/q03/q05/q06/q07/q09/q10/q11/q12/q13/q14/q18/q19.sql)
 benchmarks/local/              Single-machine docker-compose stack (kernellake-server + OTel
                                 Collector + Prometheus + Grafana + Jaeger + MinIO), no cloud needed
 benchmarks/aws/                Real Terraform-provisioned AWS benchmark harness (KernelLake vs.
                                 PySpark/DuckDB over real S3 data) -- see its own README.md
 docker/                        Dockerfile (runtime-cpu/runtime-gpu images) and related tooling
 charts/kernellake/             Helm chart for deploying kernellake-server to Kubernetes
-docs/                          ARCHITECTURE.md, ROADMAP.md, TPCH.md, OBSERVABILITY.md, GPU_OPTIMIZATIONS.md
+docs/                          ARCHITECTURE.md, ROADMAP.md, TPCH.md, SQL_COMPATIBILITY.md,
+                                OBSERVABILITY.md, GPU_OPTIMIZATIONS.md, MULTI_GPU_SCALING.md
 config/kernellake.yaml         default engine configuration
 ```
 

@@ -3660,6 +3660,47 @@ log` is the authoritative chronology if that ordering ever matters.
   regressions, confirmed on a real `gpu-dev-wsl2` rebuild against real
   GPU hardware.
 
+- **TPC-H Q13**, resuming the deferred work above (`9a098db`, `8d7b140`,
+  2026-08-23/24): all three blockers identified during the earlier
+  deferred-research pass were implemented for real. `LEFT OUTER JOIN`
+  itself: `JoinType` threaded through AST/parser/binder/logical-plan/
+  optimizer/physical-plan/both backends, right-side schema nullable-
+  widening, and both correctness hazards fixed (physical planner's
+  build-side swap disabled for `LEFT OUTER` -- only safe for symmetric
+  `INNER`; `push_predicate_through_join()` no longer pushes a right-side-
+  only `WHERE` predicate below a `LEFT OUTER JOIN`, since that changes
+  which left rows count as matched). An `ON`-clause auxiliary predicate
+  beyond the equality key (Q13's own `o_comment NOT LIKE
+  '%special%requests%'`): `extract_join_step_keys()` (`binder.cpp`) now
+  splits the condition into AND-conjuncts, requires exactly one
+  cross-side equality key, and accepts additional conjuncts only if they
+  reference exclusively the newly-joined (right) source's own columns --
+  pushed down as a `LogicalFilter` directly on that source's scan before
+  the join runs (exact, not an approximation, for both `INNER` and `LEFT
+  OUTER`); a conjunct referencing the left side at all is rejected
+  (deliberately out of scope -- see `binder.cpp`'s own comment). A
+  derived table (`FROM (SELECT ...) AS alias`): a new recursive
+  `QueryEngine::plan_logical_unoptimized()` helper binds/builds the inner
+  query first, feeding its output schema to the outer query's existing
+  single-table `bind_query()` overload and its logical plan directly into
+  a new `build_logical_plan(query, source_plan)` overload -- no new
+  physical-planning or execution-backend code needed, since both already
+  handle arbitrary node stacking generically.
+
+  Also found and fixed along the way: a real, pre-existing GPU bug (not
+  LEFT-JOIN-specific) where `HashAggregateOperator`'s `COUNT(column)`
+  returned `NULL` instead of `0` for a group whose argument was `NULL` in
+  every row (reachable via a `LEFT JOIN`'s own null-extended row, e.g. a
+  customer with zero orders) -- a SUM-of-ones-trick artifact where
+  cudf's own "SUM of nothing is NULL" doesn't match COUNT's "0 non-null
+  values is 0" semantics.
+
+  Verified for real: `tools/validate_tpch.py --query 13` exact match
+  against DuckDB on both the CPU and GPU backends, against real generated
+  SF0.01 TPC-H data. 13 of TPC-H's 22 queries now, up from 12. See
+  `docs/ARCHITECTURE.md`'s "Hash joins" and "Derived tables" sections for
+  the full scope.
+
 ## Not yet started
 
 - **Unity Catalog support: remaining gaps** -- the core read path (Phase 5
@@ -3854,9 +3895,13 @@ log` is the authoritative chronology if that ordering ever matters.
   Q1/Q6, see "Done" above -- this stale "beyond SF10" framing was corrected
   by a later audit pass; what's still genuinely open at that scale is
   `kernellake-cpu` at SF1000 -- deliberately skipped, unbounded scan
-  materialization risk, see the SF1000 entry's own `--backends` note -- and
-  Q12/Q19 at SF1000, blocked on the same GPU `HashJoinOperator`/CPU-OOM
-  issues already tracked below, not re-attempted there)
+  materialization risk, see the SF1000 entry's own `--backends` note.
+  **Corrected 2026-08-24**: Q12/Q19 at SF1000 are *not* still blocked --
+  `benchmarks/aws/runs/20260817-sf1000-v3-final/results.json` shows both
+  ran to completion on the GPU backend, real cold-mode numbers recorded
+  for Q1/Q6/Q12/Q14/Q19, confirming the build-side-swap fix held at
+  SF1000, not just re-attempted-and-still-failing as this entry
+  previously implied)
 - Re-running the three-way benchmark's full cold/warm x SF0.01-SF10 sweep
   (see the earlier "Confirmed on real GPU hardware" entry above) with Q19
   and Q12 included, now that both are wired in -- the only way to test
@@ -3881,77 +3926,16 @@ log` is the authoritative chronology if that ordering ever matters.
 - ~~Q18~~ -- done, see "TPC-H Q18" in "Done" above. A narrow
   non-correlated multi-row `IN (SELECT ...)` subquery in `WHERE` is now
   also supported (see `docs/ARCHITECTURE.md`'s "`IN (SELECT ...)`
-  subqueries" section). Every *other* still-missing query needs an
-  outer join, `DISTINCT`, set operations, `WITH`/CTEs, window functions,
-  `EXISTS`, a correlated subquery, or a derived table (subquery in
-  `FROM`) -- none of which KernelLake's SQL layer supports yet (see
-  `docs/ARCHITECTURE.md`'s "Not yet supported" list) -- 12 of TPC-H's 22
-  queries now, down from 11
-- **LEFT OUTER JOIN (Q13's own blocker, plus two more features Q13
-  needs on top of it)** -- deferred, not abandoned, after research (two
-  parallel `Explore` agents) found Q13's canonical form needs three
-  separate new features together, not just outer join alone:
-  1. **`LEFT OUTER JOIN` itself.** hsql already parses it
-     (`hsql::JoinType::kJoinLeft`, both `LEFT JOIN` and `LEFT OUTER
-     JOIN` -- `OUTER` is a grammatical no-op); the rejection is one
-     `if (join->type != hsql::kJoinInner)` in `flatten_join_chain()`
-     (`parser.cpp`). `LogicalJoin`/`HashJoinNode` would need a join-type
-     field threaded through (currently absent, `explain_attributes()`
-     hardcodes the string `"INNER"`), and the joined schema's nullable
-     side needs its `DataType.nullable` widened to `true` (currently a
-     plain field concatenation with no adjustment). Acero already
-     supports `arrow::acero::JoinType::LEFT_OUTER` via the *same*
-     `HashJoinNodeOptions` constructor already used for `INNER` -- the
-     easy part. `cudf::hash_join` already exposes `left_join()` with an
-     identical signature to the `inner_join()` the GPU
-     `HashJoinOperator` calls today; the real GPU-side work is
-     switching the right-side gather's out-of-bounds policy from
-     `DONT_CHECK` to `NULLIFY` (so an unmatched left row's right-side
-     columns come back genuinely null, not garbage) and removing the
-     empty-build-side fast-path short-circuit (which today assumes an
-     empty build side can never produce a row -- true for `INNER`,
-     false for `LEFT OUTER`, where every left row must still be
-     emitted). Two real correctness hazards found during research, not
-     yet fixed (nothing to fix until `LEFT JOIN` itself exists): the
-     physical planner's size-aware build-side swap
-     (`physical_planner.cpp`) is only safe because `INNER JOIN` is
-     symmetric -- swapping sides for a `LEFT JOIN` would silently
-     change which side keeps its unmatched rows; and the optimizer's
-     `push_predicate_through_join()` (`optimizer.cpp`) is only
-     unconditionally valid today because there's no null-extension
-     semantics to worry about -- pushing a predicate on the nullable
-     side of a future `LEFT JOIN` down below it would change results.
-  2. **An extra `AND`'d predicate inside `JOIN ... ON`**, not just a
-     single equality key. Q13's own `o_comment NOT LIKE
-     '%special%requests%'` is part of the `ON` clause, not `WHERE` --
-     and, unlike Q5's/Q9's own composite-join-key predicates (which
-     could safely move to `WHERE` since they're on `INNER JOIN`s),
-     moving it to `WHERE` for a `LEFT JOIN` would silently drop
-     unmatched/`NULL` customer rows, defeating the whole point of the
-     outer join. `extract_join_step_keys()` (`binder.cpp`) only ever
-     extracts a single equality key per step today; this needs real
-     new capability, not another WHERE-vs-ON placement trick.
-  3. **A derived table (subquery in `FROM`)**, the largest of the
-     three. Q13's own second-level `GROUP BY c_count` groups over the
-     *output* of a first-level per-customer aggregate
-     (`count(o_orderkey) as c_count`) -- confirmed structurally that
-     this can't be flattened into one flat query the way Q7's/Q9's own
-     derived tables were (those added no filtering of their own, purely
-     naming a computed `GROUP BY` key; Q13's is a genuine two-stage
-     aggregation pipeline). `AstSelectStatement::from` has no
-     derived-table variant at all today (`FROM (SELECT ...)` hits the
-     same `unsupported("joins and subqueries ...")` rejection any other
-     subquery in `FROM` gets, and `WITH` is rejected separately,
-     unconditionally, at the top of `convert_select_statement()`) --
-     `build_logical_plan()` only ever constructs one `LogicalAggregate`
-     per statement, and there's no dormant/partial CTE mechanism to
-     build on.
-
-  If resumed: implement `LEFT OUTER JOIN` as its own standalone,
-  tested engine feature first (real, contained value on its own,
-  the two correctness hazards above are worth fixing regardless of
-  Q13), then revisit whether Q13's other two blockers are worth a
-  second, separate project.
+  subqueries" section) -- 12 of TPC-H's 22 queries at this point, down
+  from 11. See the `~~LEFT OUTER JOIN / Q13~~` entry directly below for
+  what unblocked next.
+- ~~LEFT OUTER JOIN / Q13~~ -- done, see "TPC-H Q13" in "Done" above.
+  Every *other* still-missing query needs `DISTINCT`, set operations,
+  `WITH`/CTEs, window functions, `EXISTS`, a correlated subquery, or a
+  derived table nested inside a JOIN (a single top-level derived table is
+  now supported, but not one as a JOIN side) -- see
+  `docs/ARCHITECTURE.md`'s "Supported SQL grammar" section for the
+  current scope -- 13 of TPC-H's 22 queries now, up from 12.
 - `CASE`/`EXTRACT` inside `WHERE` on the GPU backend (`FilterOperator`'s
   own gap, separate from the aggregate-argument fix above; the CPU backend
   already supports both via its one shared expression compiler) -- not
@@ -4003,22 +3987,19 @@ log` is the authoritative chronology if that ordering ever matters.
   instead of this project's own hand-rolled `record_batch_reader_source`
   reader, which would also pick up Acero's own fragment-level parallelism
   for free.
-- GPU `HashJoinOperator` still has no bounded-memory/streaming design --
-  unlike `ParquetScanOperator`'s pass-based reading or
-  `HashAggregateOperator`'s `max_distinct_keys` batching, `open()`
-  unconditionally drains the *entire* right (build) side into device
-  memory (`while (right_->next()) { right_batches.push_back(...) }`, then
-  `cudf::concatenate()` and one `cudf::hash_join` over all of it) before
-  the probe side is ever touched. The physical planner now chooses the
-  smaller side to build on (see "Done" above), which narrows the real
-  SF100 Q12 OOM this entry originally documented (`lineitem`, 600M rows,
-  used to be forced onto the build side purely by clause order), but
-  doesn't close it: building on `orders` (150M rows) instead would still
-  likely exceed a real 8-12 GiB VRAM budget at that scale. Genuinely
-  bounded memory needs a streaming/partitioned (grace) hash join, a
-  substantially bigger feature than the build-side fix. Not yet
-  re-attempted at SF100 with the fix in place to confirm exactly how much
-  it narrows the gap in practice.
+- ~~GPU `HashJoinOperator` bounded-memory/streaming design~~ -- done
+  (`b915063`, 2026-08-13). This entry originally described `open()`
+  unconditionally draining the *entire* right (build) side into device
+  memory with no bound; `HashJoinOperator` now has a real grace-hash
+  partitioned mode (`choose_partition_count()`-selected, engages once the
+  build side's estimated size exceeds the configured GPU memory budget),
+  hash-partitioning and spilling both sides to *disk* as they stream in
+  rather than an unbounded in-memory `std::vector<arrow::RecordBatch>`
+  (an earlier version of this design tried that and OOM'd a real SF1000
+  Q12 run at ~75 GiB host RSS -- see `docs/ARCHITECTURE.md`'s "Hash
+  joins" section, "cudf::hash_join mechanics", for the full design and
+  `docs/GPU_OPTIMIZATIONS.md` for the SF100/SF1000 Q3/Q12 OOM
+  investigations this was built to close).
 - Q19 on the **CPU** backend got killed partway through SF100 timed
   iterations (correctness validated fine first; died on cold iteration
   3/5) -- a real, reproduced-once resource failure, root cause not yet

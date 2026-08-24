@@ -1400,14 +1400,18 @@ directly on the host (CUDA 12.4, `/usr/bin/nvcc`) -- invoking the
 `CMAKE_CUDA_ARCHITECTURES` cannot be left at the top-level `CMakeLists.txt`
 default of `native` (which probes an actual device) inside
 `docker/Dockerfile`, since no GPU is visible during `docker build` (unlike
-`docker run --gpus all`). It's pinned explicitly instead:
-`"70-real;75-real;80-real;86-real;89"` -- real compiled code for
-Volta through Ada, with Hopper's entry left without the `-real` suffix so
-its PTX is embedded too, letting the driver JIT-compile for newer
-architectures with no native code in the binary at all. This is exactly
-what let an RTX 5060 Ti (Blackwell/sm_120 -- newer than anything CUDA
-12.4's nvcc can target directly) run the full test suite successfully
-against this image.
+`docker run --gpus all`). It's exposed as a `CUDA_ARCHITECTURES` build arg
+instead (`docker/Dockerfile`'s `gpu-release` stage), defaulting to
+`"75-real;80-real;86-real;89-real;90-real;100-real;120"` -- real compiled
+code for Turing through Blackwell-datacenter (Hopper/Blackwell included as
+`-real` now, not PTX-only), with the newest Blackwell entry (`120`, no
+`-real` suffix) left PTX-only so the driver can JIT-compile for anything
+even newer with no native code in the binary at all. Volta (`70-real`,
+this default's original lower bound) was dropped once the base image
+switched to CUDA 13.3: CUDA 13 removed Volta support outright (`nvcc
+fatal: Unsupported gpu architecture 'compute_70'` is the real build
+failure that forced the change) -- Turing (`75`) is this default's floor
+now.
 
 **Verified for real, not just configured**: `docker build --target dev`
 completes (RAPIDS/libcudf/RMM/kvikio FetchContent vendoring, 103/103

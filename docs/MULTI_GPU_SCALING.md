@@ -15,9 +15,13 @@ arbitrary limit that's easy to lift:
   resource stack as **the process's current CUDA device resource** --
   singular, process-wide, for whatever `EngineConfig::device_id` is.
 - `GpuExecutionCoordinator` (`src/server/gpu_execution_coordinator_gpu.cpp`)
-  single-flights every query through that one `RmmEnvironment` --
-  today's concurrency model is "one query at a time," not "one query
-  per GPU."
+  bounds concurrent queries through that one `RmmEnvironment` with a
+  `std::counting_semaphore` sized to `EngineConfig::max_concurrent_gpu_queries`
+  (default 2) -- since `GPU_OPTIMIZATIONS.md`'s "Opt #2 implemented"
+  (2026-08-21), this is no longer single-flight/mutex-serialized, but it's
+  still "up to N concurrent queries on device 0," not "one query per GPU":
+  every concurrent query still shares the one process-wide `RmmEnvironment`
+  (and therefore the one device) regardless of N.
 - `ExecutionContext::cuda_device_id` (`execution_context.hpp`) exists as
   a field but is never set to anything but its `0` default anywhere in
   the tree -- it's a placeholder, not wired-up multi-device support.
@@ -32,19 +36,20 @@ depends on the previous one's infrastructure):
 
 **What it is**: turn 8 idle GPUs into 8x concurrent-query throughput.
 Each GPU gets its own `RmmEnvironment` instance; `GpuExecutionCoordinator`
-picks a free GPU per incoming query instead of mutex-serializing
-everything onto device 0. Any single query still runs entirely on one
-GPU, capped at that GPU's own memory (80GB H100 / 179GB(ish) B200) --
-this tier does not help one query that's too big for one GPU.
+picks a free GPU per incoming query instead of bounding every concurrent
+query onto device 0. Any single query still runs entirely on one GPU,
+capped at that GPU's own memory (80GB H100 / 179GB(ish) B200) -- this
+tier does not help one query that's too big for one GPU.
 
-**Why it's cheap**: it's mostly the already-scoped opt #2 work
-(`GPU_OPTIMIZATIONS.md`'s "drop the `GpuExecutionCoordinator` mutex")
-plus a device dimension bolted on, not new architecture. The pre-fix
-audit already done for opt #2 (2026-08-17: `ObjectStoreDatasource::device_read()`'s
-missing `mr` arg, `literal_to_scalar()`'s missing `stream`/`mr`) applies
-identically here -- those gaps must be closed regardless of whether the
-result is "N concurrent queries on 1 GPU" or "N concurrent queries
-across N GPUs."
+**Why it's cheap**: `GPU_OPTIMIZATIONS.md`'s "Opt #2 implemented: bounded
+concurrent GPU queries" (2026-08-21) already did the hard, riskiest part
+of this tier's prerequisite work -- replacing the mutex with a semaphore,
+and the grep-every-call-site audit for `mr`/`stream` gaps
+(`ObjectStoreDatasource::device_read()`'s missing `mr` arg,
+`literal_to_scalar()`'s missing `stream`/`mr`) that made concurrent
+execution safe in the first place. What's left for this tier is now just
+the device dimension bolted on top (items 1-4 below), not that whole
+prerequisite plus the device dimension.
 
 **Concrete pieces**:
 

@@ -962,6 +962,18 @@ tuning question.
 
 ## Follow-up: GPU memory growing across benchmark runs
 
+**Superseded 2026-08-21**: the mechanism description below (a single
+mutex-serialized `execute()` call, `push_counters()`/`pop_counters()`
+isolating each query) describes this investigation's own point-in-time
+snapshot (2026-08-08), before "Opt #2 implemented: bounded concurrent GPU
+queries" below replaced the mutex with a `std::counting_semaphore` and the
+push/pop mechanism with a fresh `QueryMemoryTracker`/
+`statistics_resource_adaptor` per query (`RmmEnvironment::make_query_tracker()`).
+The investigation's own conclusion (device-memory growth across runs is
+the async pool's high-water mark, not a leak) is unaffected by that later
+change -- only the specific mechanism description below is now historical,
+not current.
+
 Observed during AWS GPU-instance benchmark testing (`benchmarks/aws/`):
 device memory usage climbed with each successive benchmark run. **Root
 cause found and confirmed benign, not a leak** -- see the verified
