@@ -532,8 +532,8 @@ PhysicalPlanPtr convert(const LogicalPlanPtr& node, ObjectStore& store, TableSou
     // swapping which SQL-level side lands in each physical slot here would
     // silently invert that, preserving the wrong side. See
     // docs/ARCHITECTURE.md's "Hash joins" section.
-    const bool swap_for_build_side = join->join_type() == JoinType::Inner && left_estimate && right_estimate &&
-                                     *left_estimate < *right_estimate;
+    const bool swap_for_build_side = join->join_type() == JoinType::Inner && left_estimate &&
+                                     right_estimate && *left_estimate < *right_estimate;
     // Whichever side ends up in the *build* (right) slot after the swap
     // decision below -- persisted on HashJoinNode so HashJoinOperator can
     // size its partition count against it (see choose_partition_count() in

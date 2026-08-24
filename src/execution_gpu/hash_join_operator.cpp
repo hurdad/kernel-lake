@@ -233,7 +233,8 @@ std::size_t choose_partition_count(std::optional<std::int64_t> estimated_build_r
 HashJoinOperator::HashJoinOperator(OperatorId id, std::unique_ptr<PhysicalOperator> left,
                                    std::unique_ptr<PhysicalOperator> right, std::size_t left_key_index,
                                    std::size_t right_key_index, std::shared_ptr<const Schema> output_schema,
-                                   std::size_t partition_count, std::string spill_directory, JoinType join_type)
+                                   std::size_t partition_count, std::string spill_directory,
+                                   JoinType join_type)
     : id_(id),
       left_(std::move(left)),
       right_(std::move(right)),
@@ -282,18 +283,18 @@ std::optional<DeviceBatch> HashJoinOperator::probe_one_batch(const DeviceBatch& 
   // left_batch itself has rows -- every left row appears at least once --
   // so the is_empty() check below still means exactly "left_batch was
   // itself empty" for both join types.
-  auto [left_indices, right_indices] = join_type_ == JoinType::LeftOuter
-                                           ? hash_join_->left_join(left_key_view, std::nullopt, context.stream)
-                                           : hash_join_->inner_join(left_key_view, std::nullopt, context.stream);
+  auto [left_indices, right_indices] =
+      join_type_ == JoinType::LeftOuter ? hash_join_->left_join(left_key_view, std::nullopt, context.stream)
+                                        : hash_join_->inner_join(left_key_view, std::nullopt, context.stream);
   if (left_indices->is_empty()) {
     return std::nullopt;
   }
 
   const cudf::column_view left_map = as_gather_map(*left_indices);
   const cudf::column_view right_map = as_gather_map(*right_indices);
-  const cudf::out_of_bounds_policy right_gather_policy =
-      join_type_ == JoinType::LeftOuter ? cudf::out_of_bounds_policy::NULLIFY
-                                        : cudf::out_of_bounds_policy::DONT_CHECK;
+  const cudf::out_of_bounds_policy right_gather_policy = join_type_ == JoinType::LeftOuter
+                                                             ? cudf::out_of_bounds_policy::NULLIFY
+                                                             : cudf::out_of_bounds_policy::DONT_CHECK;
   std::unique_ptr<cudf::table> gathered_left = cudf::gather(
       left_view, left_map, cudf::out_of_bounds_policy::DONT_CHECK, context.stream, context.memory_resource);
   std::unique_ptr<cudf::table> gathered_right = cudf::gather(
@@ -307,7 +308,7 @@ std::optional<DeviceBatch> HashJoinOperator::probe_one_batch(const DeviceBatch& 
 }
 
 std::optional<DeviceBatch> HashJoinOperator::null_extend_batch(const DeviceBatch& left_batch,
-                                                                ExecutionContext& context) {
+                                                               ExecutionContext& context) {
   const cudf::table_view left_view = left_batch.view();
   if (left_view.num_rows() == 0) {
     return std::nullopt;
@@ -324,7 +325,7 @@ std::optional<DeviceBatch> HashJoinOperator::null_extend_batch(const DeviceBatch
     const std::unique_ptr<cudf::scalar> null_scalar =
         cudf::make_default_constructed_scalar(to_cudf_type(type), context.stream, context.memory_resource);
     columns.push_back(cudf::make_column_from_scalar(*null_scalar, left_view.num_rows(), context.stream,
-                                                     context.memory_resource));
+                                                    context.memory_resource));
   }
   return DeviceBatch(std::make_unique<cudf::table>(std::move(columns)), output_schema_);
 }

@@ -196,8 +196,9 @@ TEST(SqlParser, ParsesThreeTableInnerJoinChain) {
 }
 
 TEST(SqlParser, ParsesTwoTableLeftOuterJoin) {
-  const auto stmt = parse_sql("SELECT a.x, b.y FROM read_parquet('/x.parquet') AS a "
-                              "LEFT JOIN read_parquet('/y.parquet') AS b ON a.order_id = b.order_id");
+  const auto stmt = parse_sql(
+      "SELECT a.x, b.y FROM read_parquet('/x.parquet') AS a "
+      "LEFT JOIN read_parquet('/y.parquet') AS b ON a.order_id = b.order_id");
   ASSERT_TRUE(stmt.join.has_value());
   ASSERT_EQ(stmt.join->steps.size(), 1u);
   EXPECT_EQ(stmt.join->steps[0].join_type, JoinType::LeftOuter);
@@ -208,16 +209,18 @@ TEST(SqlParser, ParsesTwoTableLeftOuterJoin) {
 // just confirms this project's own conversion doesn't accidentally depend
 // on which spelling was used.
 TEST(SqlParser, ParsesLeftOuterJoinExplicitSpelling) {
-  const auto stmt = parse_sql("SELECT a.x, b.y FROM read_parquet('/x.parquet') AS a "
-                              "LEFT OUTER JOIN read_parquet('/y.parquet') AS b ON a.order_id = b.order_id");
+  const auto stmt = parse_sql(
+      "SELECT a.x, b.y FROM read_parquet('/x.parquet') AS a "
+      "LEFT OUTER JOIN read_parquet('/y.parquet') AS b ON a.order_id = b.order_id");
   ASSERT_TRUE(stmt.join.has_value());
   ASSERT_EQ(stmt.join->steps.size(), 1u);
   EXPECT_EQ(stmt.join->steps[0].join_type, JoinType::LeftOuter);
 }
 
 TEST(SqlParser, PlainInnerJoinDefaultsToInnerJoinType) {
-  const auto stmt = parse_sql("SELECT a.x, b.y FROM read_parquet('/x.parquet') AS a "
-                              "JOIN read_parquet('/y.parquet') AS b ON a.order_id = b.order_id");
+  const auto stmt = parse_sql(
+      "SELECT a.x, b.y FROM read_parquet('/x.parquet') AS a "
+      "JOIN read_parquet('/y.parquet') AS b ON a.order_id = b.order_id");
   ASSERT_TRUE(stmt.join.has_value());
   ASSERT_EQ(stmt.join->steps.size(), 1u);
   EXPECT_EQ(stmt.join->steps[0].join_type, JoinType::Inner);

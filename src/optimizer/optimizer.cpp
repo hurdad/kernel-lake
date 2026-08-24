@@ -536,8 +536,9 @@ LogicalPlanPtr push_predicate_through_join(const LogicalJoin& join, const Expres
     new_right =
         rewrite_plan(std::make_shared<LogicalFilter>(new_right, conjunction(std::move(right_conjuncts))));
   }
-  LogicalPlanPtr new_join = std::make_shared<LogicalJoin>(
-      std::move(new_left), std::move(new_right), join.left_key_index(), join.right_key_index(), join.join_type());
+  LogicalPlanPtr new_join =
+      std::make_shared<LogicalJoin>(std::move(new_left), std::move(new_right), join.left_key_index(),
+                                    join.right_key_index(), join.join_type());
   if (remaining_conjuncts.empty()) {
     return new_join;
   }

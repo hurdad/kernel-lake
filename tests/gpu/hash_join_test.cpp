@@ -443,15 +443,16 @@ TEST_F(HashJoinQueryTest, LeftOuterJoinCpuBackendMatchesGpuBackend) {
 // spuriously reappear as a NULL row alongside order 3 -- both wrongly
 // counted as passing -- rather than genuinely being NULL post-join.
 TEST_F(HashJoinQueryTest, LeftOuterJoinWhereOnNullableSideAppliesAfterNullExtension) {
-  const QueryResult result = engine_.execute("SELECT o.order_id " + left_join_clause() +
-                                             " WHERE c.name IS NULL OR c.name = 'Bob'");
+  const QueryResult result =
+      engine_.execute("SELECT o.order_id " + left_join_clause() + " WHERE c.name IS NULL OR c.name = 'Bob'");
   ASSERT_EQ(result.batches.size(), 1u);
   const auto order_id_column =
       std::static_pointer_cast<arrow::Int64Array>(result.batches.front()->GetColumnByName("order_id"));
   ASSERT_NE(order_id_column, nullptr);
   ASSERT_EQ(result.batches.front()->num_rows(), 2);
   std::vector<std::int64_t> ids;
-  for (std::int64_t i = 0; i < result.batches.front()->num_rows(); ++i) ids.push_back(order_id_column->Value(i));
+  for (std::int64_t i = 0; i < result.batches.front()->num_rows(); ++i)
+    ids.push_back(order_id_column->Value(i));
   std::sort(ids.begin(), ids.end());
   // order 3 (customer_id=20, Bob) and order 5 (customer_id=99, genuinely
   // unmatched -> NULL). A wrongly-pushed-down predicate would instead
@@ -477,9 +478,9 @@ TEST_F(HashJoinQueryTest, LeftOuterJoinWithEntirelyEmptyBuildSideNullExtendsEver
   auto sink = arrow::io::FileOutputStream::Open(empty_customers_path).ValueOrDie();
   ASSERT_TRUE(parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), sink, /*chunk_size=*/1).ok());
 
-  const QueryResult result = engine_.execute(
-      "SELECT o.order_id, c.name FROM read_parquet('" + orders_path_ + "') AS o LEFT JOIN read_parquet('" +
-      empty_customers_path + "') AS c ON o.customer_id = c.customer_id ORDER BY o.order_id");
+  const QueryResult result = engine_.execute("SELECT o.order_id, c.name FROM read_parquet('" + orders_path_ +
+                                             "') AS o LEFT JOIN read_parquet('" + empty_customers_path +
+                                             "') AS c ON o.customer_id = c.customer_id ORDER BY o.order_id");
   ASSERT_EQ(result.batches.size(), 1u);
   const std::shared_ptr<arrow::RecordBatch>& batch = result.batches.front();
   ASSERT_EQ(batch->num_rows(), 5);  // every order row, none dropped.
@@ -544,7 +545,8 @@ TEST(HashJoinPartitionedQueryTest, PartitionedLeftOuterJoinNullExtendsUnmatchedR
                                        arrow::field("amount", arrow::float64(), false)});
     const auto table = arrow::Table::Make(schema, {order_id_array, customer_id_array, amount_array});
     auto sink = arrow::io::FileOutputStream::Open(orders_path).ValueOrDie();
-    ASSERT_TRUE(parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), sink, /*chunk_size=*/3).ok());
+    ASSERT_TRUE(
+        parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), sink, /*chunk_size=*/3).ok());
   }
 
   EngineConfig config = default_config();

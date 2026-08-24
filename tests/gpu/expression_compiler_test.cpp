@@ -405,7 +405,8 @@ TEST(ExpressionCompiler, LogicalOrAndAndUseKleeneNullSemantics) {
     // must be non-null booleans -- none should come out NULL.
     BinaryExpression or_expr(BinaryOperator::Or, is_null, equals_two, boolean_type(false));
     ExpressionCompiler compiler;
-    std::unique_ptr<cudf::column> result = cudf::compute_column(table.view(), compiler.compile(or_expr, ctx.context));
+    std::unique_ptr<cudf::column> result =
+        cudf::compute_column(table.view(), compiler.compile(or_expr, ctx.context));
     ASSERT_EQ(result->null_count(), 0);
     cudaDeviceSynchronize();
     const std::vector<unsigned char> values = copy_to_host<unsigned char>(result->view());
