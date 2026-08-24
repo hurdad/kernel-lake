@@ -53,7 +53,15 @@ project needing a `LEFT OUTER JOIN`, an `ON`-clause predicate beyond the
 bare equality key, or a derived table, all three genuinely supported (not
 flattened away); see `docs/ARCHITECTURE.md`'s "Hash joins" section for the
 `LEFT OUTER JOIN`/`ON`-clause-predicate scope and its "Derived tables"
-section for the `FROM`-subquery scope). KernelLake supports a chain of two
+section for the `FROM`-subquery scope), and **Q4** (an `orders`-only outer
+query whose `WHERE` clause combines an `o_orderdate` range with a
+correlated `EXISTS (SELECT * FROM lineitem WHERE l_orderkey = o_orderkey
+AND l_commitdate < l_receiptdate)` -- the first query in this project
+needing a correlated subquery, rewritten internally into a `LEFT SEMI
+JOIN` reusing the same ON-clause-auxiliary-predicate machinery Q13's
+`LEFT OUTER JOIN` already exercises; see `docs/ARCHITECTURE.md`'s
+"Correlated subqueries" section for the exact `EXISTS`/`NOT EXISTS` scope).
+KernelLake supports a chain of two
 or more tables via `INNER` or `LEFT OUTER JOIN ... ON`, each step a single
 equality key (`LEFT OUTER` additionally allows an `ON`-clause predicate
 scoped to just the newly-joined side), on both the CPU and GPU execution
@@ -128,13 +136,17 @@ also a single file.
 ## 2. Query
 
 The queries live in version-controlled files, `benchmarks/tpch/queries/
-q01.sql`, `q03.sql`, `q05.sql`, `q06.sql`, `q07.sql`, `q09.sql`, `q10.sql`,
-`q11.sql`, `q12.sql`, `q13.sql`, `q14.sql`, `q18.sql`, `q19.sql`, each with a header comment documenting
+q01.sql`, `q03.sql`, `q04.sql`, `q05.sql`, `q06.sql`, `q07.sql`, `q09.sql`,
+`q10.sql`, `q11.sql`, `q12.sql`, `q13.sql`, `q14.sql`, `q18.sql`,
+`q19.sql`, each with a header comment documenting
 its specific deviations from canonical TPC-H syntax (`FROM lineitem` ->
 `FROM read_parquet('{data}')`, no `INTERVAL` arithmetic). Q1/Q6 need only
 `{data}` substituted with your `lineitem` glob; Q19/Q14 also need
 `{part_data}` substituted with your `part` glob; Q12 also needs
-`{orders_data}` substituted with your `orders` glob; Q3 needs both
+`{orders_data}` substituted with your `orders` glob; Q4 needs the same
+`{data}`/`{orders_data}` pair as Q12 (its correlated `EXISTS` subquery is
+the one place `{data}` appears, its outer `FROM` the one place
+`{orders_data}` does); Q3 needs both
 `{orders_data}` and `{customer_data}` substituted with your `orders` and
 `customer` globs; Q10 needs `{orders_data}`, `{customer_data}`, and
 `{nation_data}` substituted with your `orders`, `customer`, and `nation`
@@ -185,6 +197,11 @@ sql=$(grep -v '^--' benchmarks/tpch/queries/q14.sql | tr '\n' ' ' | \
 ./build/gpu-dev/src/cli/kernellake query --sql "$sql" --stats
 
 sql=$(grep -v '^--' benchmarks/tpch/queries/q12.sql | tr '\n' ' ' | \
+  sed "s|{data}|/tmp/kernellake-tpch-sf1/lineitem-*.parquet|; \
+       s|{orders_data}|/tmp/kernellake-tpch-sf1/orders-*.parquet|")
+./build/gpu-dev/src/cli/kernellake query --sql "$sql" --stats
+
+sql=$(grep -v '^--' benchmarks/tpch/queries/q04.sql | tr '\n' ' ' | \
   sed "s|{data}|/tmp/kernellake-tpch-sf1/lineitem-*.parquet|; \
        s|{orders_data}|/tmp/kernellake-tpch-sf1/orders-*.parquet|")
 ./build/gpu-dev/src/cli/kernellake query --sql "$sql" --stats
@@ -269,7 +286,7 @@ python3 tools/validate_tpch.py \
   --kernellake build/gpu-dev/src/cli/kernellake \
   --data '/tmp/kernellake-tpch-sf1/lineitem-*.parquet' --scale-factor 1 --query 6
 
-# Q19/Q14 need --part-data, Q12 needs --orders-data, Q3 needs both
+# Q19/Q14 need --part-data, Q12 and Q4 need --orders-data, Q3 needs both
 # --orders-data and --customer-data, Q10 needs --orders-data,
 # --customer-data, and --nation-data, Q5 needs --orders-data,
 # --customer-data, --supplier-data, --nation-data, and --region-data,
@@ -296,6 +313,11 @@ python3 tools/validate_tpch.py \
   --data '/tmp/kernellake-tpch-sf1/lineitem-*.parquet' \
   --orders-data '/tmp/kernellake-tpch-sf1/orders-*.parquet' \
   --scale-factor 1 --query 12
+python3 tools/validate_tpch.py \
+  --kernellake build/gpu-dev/src/cli/kernellake \
+  --data '/tmp/kernellake-tpch-sf1/lineitem-*.parquet' \
+  --orders-data '/tmp/kernellake-tpch-sf1/orders-*.parquet' \
+  --scale-factor 1 --query 4
 python3 tools/validate_tpch.py \
   --kernellake build/gpu-dev/src/cli/kernellake \
   --data '/tmp/kernellake-tpch-sf1/lineitem-*.parquet' \
@@ -362,6 +384,13 @@ scale, including the full SF1 run (~105 MiB single Parquet file, zstd
 compression, 1,000,000-row row groups). Q19, Q12, Q14, Q3, Q10, Q5, Q7,
 Q9, Q11, and Q18 have each been verified at SF0.01 on both the CPU and
 GPU backends, exact match against DuckDB (Q3 including its 3-way join,
+Q4 including its correlated `EXISTS` subquery -- verified not just at
+SF0.01 but stress-tested at SF10 (a ~60M-row `lineitem` build side,
+orders split across 4 files), 20/20 clean runs and an exact DuckDB match
+on real GPU hardware, since the correlated-subquery-as-semi-join
+operator's first (`cudf::filtered_join`-based) implementation had a
+real, scale-dependent crash that only showed up there -- see the "Hash
+joins" section's own note on why it's built on `cudf::hash_join` instead;
 `ORDER BY revenue DESC, o_orderdate` multi-key sort, and `LIMIT 10`; Q10
 including its 4-way join, 7-column `GROUP BY` spanning two non-adjacent
 join sources, and `LIMIT 20`; Q5 including its 6-way join and the

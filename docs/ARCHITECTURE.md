@@ -215,10 +215,10 @@ functions, `CASE`/`EXTRACT` in `WHERE` (GPU only -- see above), any
 function other than the five aggregates and `EXTRACT` above, `EXTRACT`
 fields other than `YEAR`/`MONTH`/`DAY`, comma-style joins,
 `LEFT`/`RIGHT`/`FULL`/`CROSS` JOIN, subqueries in `FROM` (derived
-tables), `EXISTS`/correlated subqueries, and multi-key or non-equality
-join conditions. `HAVING` and two narrow subquery forms are now
-supported -- see "`HAVING` and scalar subqueries" and "`IN (SELECT ...)`
-subqueries" below.
+tables), correlated *scalar* subqueries, and multi-key or non-equality
+join conditions. `HAVING` and three narrow subquery forms are now
+supported -- see "`HAVING` and scalar subqueries", "`IN (SELECT ...)`
+subqueries", and "Correlated subqueries" (`EXISTS`/`NOT EXISTS`) below.
 
 ### `HAVING` and scalar subqueries
 
@@ -243,8 +243,11 @@ additionally produce **exactly one row, one column** (a true scalar;
 `DOUBLE`/`INT64`/`STRING` results only). Anywhere else -- bare in `WHERE`
 (not inside `IN`), `SELECT`, `FROM`, `GROUP BY`, join `ON` -- a subquery
 is still rejected with a clear `BindingError`
-(`Binder::bind_node(const sql::AstSubquery&, bool)`), and `EXISTS`/
-correlated subqueries are not supported at all.
+(`Binder::bind_node(const sql::AstSubquery&, bool)`). `EXISTS`/`NOT
+EXISTS` is supported within a narrower, specifically-correlated scope --
+see "Correlated subqueries" below -- anything outside that scope hits
+the same `BindingError` path via `Binder::bind_node(const
+sql::AstExists&, bool)`.
 
 Implementation: `sql::resolve_subqueries()` (a pure, storage-independent
 AST tree walker) runs once, in `QueryEngine::plan_logical()`, before the
@@ -549,6 +552,7 @@ each operator's own row in the table below for which.
 | `LimitOperator` | `cudf::slice` + the `cudf::table` copy constructor to truncate the final batch |
 | `SortOperator` | `ORDER BY`: **blocking**, unlike every operator above -- consumes `child` to exhaustion, concatenates every batch (`cudf::concatenate`) into one table, then `cudf::stable_sorted_order` + `cudf::gather`. Memory footprint is the whole result set, not bounded like the streaming operators. |
 | `HashJoinOperator` | Two-table `INNER JOIN`: when `choose_partition_count()` decides the build side is small enough, its *build* (right) side is **blocking** like `SortOperator` (consumed to exhaustion, concatenated into one table, then wraps a single `cudf::hash_join`); otherwise both sides are grace-hash partitioned and spilled to disk, bounding device memory to one partition/batch at a time (`b915063`, 2026-08-13). Its *probe* (left) side streams normally, one `inner_join()` + double-`cudf::gather` per batch (unpartitioned case). See "Hash joins" above. |
+| `SemiAntiJoinOperator` | `LEFT SEMI`/`LEFT ANTI`, produced only by the `EXISTS`/`NOT EXISTS` rewrite: its *build* (right) side is **blocking**, same shape as `HashJoinOperator`'s unpartitioned build (no partitioned mode yet). Its *probe* (left) side streams normally, wrapping the same `cudf::hash_join` -- `LEFT SEMI` via `inner_join()` + `cudf::distinct()` dedup, `LEFT ANTI` via `left_join()` filtered to the `JoinNoMatch` sentinel -- gathering only *its own* columns, never the build side's. See "Correlated subqueries" above. |
 | `ArrowResultOperator` | Trivial passthrough; the actual `DeviceBatch` -> `arrow::RecordBatch` conversion happens in `QueryEngine::execute()` via `to_arrow_record_batch()`, since `PhysicalOperator::next()` must return a `DeviceBatch` |
 
 Two correctness details worth knowing if you touch these operators:
@@ -1218,6 +1222,102 @@ would fail on an implementation detail unrelated to correctness.
   `null_extend_batch()` instead -- every probe row still appears, NULL-
   extended, built directly from `output_schema_`'s own right-side field
   types since there is no build-side schema to gather from at all.
+
+### Correlated subqueries
+
+- **Scope**: `EXISTS`/`NOT EXISTS` as a top-level `WHERE` `AND`-conjunct,
+  wrapping a subquery whose own `WHERE` clause has exactly one equality
+  key correlating it to a column already in scope from the outer query
+  (`WHERE inner.k = outer.k`), plus optionally an `AND`-conjunct that
+  references *only* the subquery's own source (TPC-H Q4's own
+  `l_commitdate < l_receiptdate`) -- no `JOIN`/derived-table `FROM`, no
+  `GROUP BY`/`HAVING`/`ORDER BY`/`LIMIT` inside the subquery, and the
+  outer query's own `FROM` must already be aliased or already joined.
+  `sql::rewrite_exists_subqueries()` (`subquery_resolver.cpp`) is a pure
+  AST-to-AST pass, run before binding, that rewrites a matching
+  `EXISTS`/`NOT EXISTS` conjunct directly into an appended join step --
+  `LEFT SEMI` for `EXISTS`, `LEFT ANTI` for `NOT EXISTS` -- reusing
+  exactly the same `extract_join_step_keys()` machinery the "Hash joins"
+  section's `ON`-clause-auxiliary-predicate handling above already has,
+  since a rewritten `EXISTS` step's shape (one equality key plus an
+  optional right-side-only predicate) is identical to a real `JOIN ...
+  ON`'s. Anything outside this scope (a correlated *scalar* subquery, a
+  predicate mixing both sides, `EXISTS` mixed with `OR` rather than
+  `AND`) is left as-is in the AST, and `Binder::bind_node(const
+  AstExists&, bool)` rejects it at bind time with a clear error -- this
+  first version does not attempt general subquery decorrelation.
+- **Why a semi/anti join, not a nested-loop check per outer row**: `a
+  LEFT SEMI JOIN b ON b.k = a.k AND <b-only predicate>` is exactly
+  `EXISTS (SELECT * FROM b WHERE b.k = a.k AND <b-only predicate>)`'s
+  standard relational-algebra rewrite (`NOT EXISTS` -> `LEFT ANTI`),
+  and it composes with everything else a join step already does --
+  predicate pushdown, size-aware planning inputs, N-way chaining --
+  instead of needing its own separate execution path.
+- **Output schema is left-only.** Unlike `INNER`/`LEFT OUTER JOIN`
+  (which concatenate both sides' columns), a semi/anti join's output is
+  *only* the probe (left) side's own schema -- the build (right) side
+  never contributes a single column, not even the join key itself (see
+  `LogicalJoin::build_schema()`/`HashJoinNode::build_schema()`'s own
+  early-return for `JoinType::LeftSemi`/`LeftAnti`, and
+  `physical_planner.cpp`'s `combined_column_map` construction, which maps
+  every right-side physical column to `nullopt` for these two join
+  types regardless of that subtree's own pruning). This is why
+  `push_predicate_through_join()` needs no semi/anti-specific handling
+  either: since no predicate sitting above such a join could ever
+  reference a right-side column index (there isn't one), the unsafe
+  pushdown path for those join types is unreachable by construction, not
+  specifically guarded against.
+- **"Semi/anti step is always last in the chain" invariant.** A
+  rewritten `EXISTS` step is appended to the join chain from a
+  `WHERE`-clause conjunct, and SQL syntax itself guarantees `WHERE` is
+  parsed after every real `JOIN` clause -- so a semi/anti step can never
+  be followed by a real join step. This means `Binder`'s own sequential
+  column-offset accounting (unconditionally summing each join source's
+  field count for the *next* source's offset) stays correct unchanged:
+  there is never a "source after it" whose offset could be corrupted by
+  a semi/anti step's own (zero) field-count contribution being
+  miscounted. The one accepted, documented gap from this: a query
+  referencing a semi/anti-joined source's own alias *outside* its own
+  step's `ON` condition (e.g. in the outer `SELECT` list) is not cleanly
+  rejected at bind time -- real TPC-H usage never does this, and a full
+  fix would mean splitting the shared `Binder`'s scope by binding phase,
+  judged not worth the complexity for a case that can't currently arise
+  from a real query.
+- **`SemiAntiJoinOperator` (GPU) is built on `cudf::hash_join`, not
+  `cudf::join::filtered_join`** -- despite `filtered_join` looking like
+  the more direct fit on paper (it builds a hash *set*, not a full hash
+  table, from just the build side's key column, with `semi_join()`/
+  `anti_join()` member functions returning exactly the probe-side
+  indices needed). It was this operator's original implementation, but
+  it produced sporadic illegal-memory-access crashes at real TPC-H Q4
+  scale (SF10, a ~60M-row `lineitem` build side) that reproduced even
+  with zero concurrency on the calling side (both join sides fully
+  materialized first, single host thread, no operator-side stream
+  overlap) -- narrowing it to a bug inside that vendored implementation
+  itself (RAPIDS 26.6.0, a genuinely new API), not anything fixable from
+  calling code; `CUDA_LAUNCH_BLOCKING=1` masking the crash is consistent
+  with a missing internal synchronization between the library's own
+  probe-kernel passes. Rebuilt on `cudf::hash_join` instead -- the same
+  building block `HashJoinOperator` above already uses reliably at this
+  scale -- emulating semi/anti behavior directly: `LEFT SEMI` via
+  `inner_join()` followed by `cudf::distinct()` to dedupe (a probe row
+  can match multiple build rows -- one order can have many `lineitem`
+  rows -- but a semi join wants each matching probe row at most once);
+  `LEFT ANTI` via `left_join()` filtered down to exactly the entries
+  whose `right_index` is the `JoinNoMatch` sentinel (`left_join()`
+  guarantees a zero-match probe row appears exactly once with that
+  sentinel, and a row with >=1 matches never does, so this needs no
+  dedup, just a boolean-mask filter via `cudf::apply_boolean_mask()`).
+  Verified 20/20 clean runs at the original crashing scale plus an exact
+  DuckDB match; see `docs/TPCH.md`'s Q4 section for the full repro/fix
+  writeup.
+- **No grace-hash partitioned/disk-spilling mode yet**, unlike
+  `HashJoinOperator`'s own build side. A correlated `EXISTS`/`NOT
+  EXISTS` subquery's build side is not, in general, guaranteed small
+  (TPC-H Q4's own `lineitem` is not) -- a real, deliberate scope
+  limitation for this first version, not an oversight; see
+  `docs/ROADMAP.md`'s "not yet started" list for the follow-up if a real
+  OOM is hit at scale.
 
 ### Derived tables
 

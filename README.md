@@ -272,8 +272,8 @@ grouped aggregates (including a ~40,000-group `GROUP BY customer_id`), and
 ## TPC-H-derived benchmarking (unofficial)
 
 **Unofficial TPC-H-derived benchmark. Not a certified TPC result.** Q1,
-Q3, Q5, Q6, Q7, Q9, Q10, Q11, Q12, Q13, Q14, Q18, and Q19 are supported
-(13 of 22) -- both single-table scans (Q1/Q6) and multi-table `INNER`/
+Q3, Q4, Q5, Q6, Q7, Q9, Q10, Q11, Q12, Q13, Q14, Q18, and Q19 are supported
+(14 of 22) -- both single-table scans (Q1/Q6) and multi-table `INNER`/
 `LEFT OUTER JOIN` chains (Q3's/Q11's/Q18's 3-way joins, Q10's 4-way join,
 Q5's/Q7's/Q9's 6-way joins -- Q7 self-joins `nation` under two aliases,
 Q9 splits `partsupp`'s two-column join key across a `JOIN` condition and
@@ -284,8 +284,10 @@ execution backends. Q11 was also the first query needing `GROUP BY`'s
 to `WHERE ... IN (SELECT ...)` (non-correlated, any row count); Q13 is
 the first needing a `LEFT OUTER JOIN`, a `JOIN ON` clause combining the
 required equality key with an extra predicate scoped to just the
-newly-joined side, or a derived table (`FROM (SELECT ...) AS alias`) --
-see [docs/SQL_COMPATIBILITY.md](docs/SQL_COMPATIBILITY.md) for the full
+newly-joined side, or a derived table (`FROM (SELECT ...) AS alias`); Q4
+is the first needing a correlated subquery -- `EXISTS`/`NOT EXISTS`,
+rewritten internally into a `LEFT SEMI`/`LEFT ANTI` join -- see
+[docs/SQL_COMPATIBILITY.md](docs/SQL_COMPATIBILITY.md) for the full
 scope of all of these. See [docs/TPCH.md](docs/TPCH.md) for the full generate ->
 query -> validate -> benchmark workflow, including `tools/generate_tpch.py`
 (a synthetic generator, not the official `dbgen`) and `kernellake

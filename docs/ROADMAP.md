@@ -3701,6 +3701,65 @@ log` is the authoritative chronology if that ordering ever matters.
   `docs/ARCHITECTURE.md`'s "Hash joins" and "Derived tables" sections for
   the full scope.
 
+- **Correlated subqueries (`EXISTS`/`NOT EXISTS`) and TPC-H Q4**
+  (`c23ac98`, `cfa8e63`, 2026-08-24): the highest-leverage remaining SQL
+  gap going into this work -- correlated subqueries block 7 of the 9
+  TPC-H queries not yet supported. Scoped deliberately narrow for this
+  first version: `EXISTS`/`NOT EXISTS` as a top-level `WHERE`
+  `AND`-conjunct, single equality correlation key, optional
+  right-side-only auxiliary predicate -- not correlated scalar
+  subqueries (still out of scope) or a predicate mixing both sides.
+  `sql::rewrite_exists_subqueries()` (new, `subquery_resolver.cpp`) is a
+  pure AST-to-AST pass, run before binding, that rewrites a matching
+  conjunct directly into an appended `LEFT SEMI`/`LEFT ANTI` join step,
+  reusing Q13's own `extract_join_step_keys()` machinery unchanged since
+  the shapes are identical. New `JoinType::LeftSemi`/`LeftAnti`; fixed
+  `LogicalJoin`/`HashJoinNode::build_schema()` and
+  `physical_planner.cpp`'s column-map construction for these two types'
+  own zero-right-column output (unlike every other join type); native
+  `LEFT_SEMI`/`LEFT_ANTI` dispatch added to the Acero (CPU) backend
+  (already supported by `HashJoinNodeOptions`'s own `join_type` enum, a
+  small addition). A real architectural investigation confirmed the
+  Binder's existing sequential column-offset accounting needs *no*
+  changes for the new join types, since SQL syntax plus this rewrite's
+  append-only design together guarantee a semi/anti step is always last
+  in the chain -- see `docs/ARCHITECTURE.md`'s "Correlated subqueries"
+  section for the full reasoning and the one accepted, narrow gap that
+  falls out of it.
+
+  **Real bug found and fixed during scale validation, not just at unit-test
+  scale.** The new GPU `SemiAntiJoinOperator`'s first implementation used
+  `cudf::join::filtered_join` (a newer, narrower "hash set" API that looks
+  like the more direct fit on paper). It passed every unit/GPU test and
+  extensive manual verification at small scale, but wiring up the actual
+  TPC-H Q4 query and validating it at real SF10 scale (`lineitem` as a
+  ~60M-row build side) surfaced sporadic illegal-memory-access crashes --
+  non-deterministic, the same query/data passing or crashing across
+  repeated runs. Real root-cause investigation (not a guess-and-check
+  fix): ruled out every layer of *this codebase's own* concurrency
+  (stream-ordering around the async Parquet-scan prefetch pipeline, the
+  build-vs-probe handoff, cross-thread allocator use) by fully
+  materializing both join sides before ever calling into `filtered_join`
+  at all -- single host thread, zero background-thread overlap -- and it
+  still crashed at a similar rate. That narrows it to a bug inside the
+  vendored `filtered_join` implementation itself (RAPIDS 26.6.0, a
+  genuinely new API); `CUDA_LAUNCH_BLOCKING=1` fully masking the crash is
+  consistent with a missing internal synchronization between the
+  library's own probe-kernel passes, not anything reachable from calling
+  code. Fixed by rebuilding `SemiAntiJoinOperator` on `cudf::hash_join`
+  instead -- the same, already-proven-reliable-at-this-scale building
+  block `HashJoinOperator` uses -- emulating `LEFT SEMI` via
+  `inner_join()` + `cudf::distinct()` dedup and `LEFT ANTI` via
+  `left_join()` filtered to the `JoinNoMatch` sentinel. Verified 20/20
+  clean runs at the original crashing scale (SF10, orders split across 4
+  files against the full `lineitem` build side) plus an exact DuckDB
+  match, with zero regressions across the full unit (803/806, 3 expected
+  MinIO skips) and GPU (220/220) suites.
+
+  Also added: `q04.sql` (TPC-H Q4) wired into the benchmark suite,
+  cross-validated against DuckDB via `tools/validate_tpch.py --query 4`.
+  14 of TPC-H's 22 queries now, up from 13.
+
 ## Not yet started
 
 - **Unity Catalog support: remaining gaps** -- the core read path (Phase 5
@@ -3936,6 +3995,14 @@ log` is the authoritative chronology if that ordering ever matters.
   now supported, but not one as a JOIN side) -- see
   `docs/ARCHITECTURE.md`'s "Supported SQL grammar" section for the
   current scope -- 13 of TPC-H's 22 queries now, up from 12.
+- ~~Correlated subqueries (`EXISTS`/`NOT EXISTS`) / Q4~~ -- done, see
+  "Correlated subqueries (`EXISTS`/`NOT EXISTS`) and TPC-H Q4" in "Done"
+  above. Scoped to `EXISTS`/`NOT EXISTS`, single equality key; correlated
+  *scalar* subqueries remain unsupported. Every *other* still-missing
+  query needs `DISTINCT`, set operations, `WITH`/CTEs, window functions,
+  a correlated scalar subquery, or a derived table nested inside a JOIN
+  -- see `docs/ARCHITECTURE.md`'s "Supported SQL grammar" section for the
+  current scope -- 14 of TPC-H's 22 queries now, up from 13.
 - `CASE`/`EXTRACT` inside `WHERE` on the GPU backend (`FilterOperator`'s
   own gap, separate from the aggregate-argument fix above; the CPU backend
   already supports both via its one shared expression compiler) -- not
