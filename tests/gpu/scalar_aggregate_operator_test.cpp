@@ -1,11 +1,14 @@
 #include <gtest/gtest.h>
 
+#include <arrow/api.h>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/filling.hpp>
 #include <cudf/null_mask.hpp>
 #include <cudf/scalar/scalar_factories.hpp>
 #include <rmm/device_buffer.hpp>
 
+#include "kernellake/common/errors.hpp"
+#include "kernellake/execution_gpu/arrow_bridge.hpp"
 #include "kernellake/execution_gpu/filter_operator.hpp"
 #include "kernellake/execution_gpu/projection_operator.hpp"
 #include "kernellake/execution_gpu/scalar_aggregate_operator.hpp"
@@ -459,6 +462,191 @@ TEST(ScalarAggregateOperator, FullTpchQ6ShapedPipeline) {
   EXPECT_DOUBLE_EQ(single_row_value<double>(*result), 29.0);
   EXPECT_FALSE(aggregate.next(context).has_value());
   aggregate.close(context);
+}
+
+// compile_expr()/materialize_case(): a CASE with no ELSE (else_branch() is
+// null) had no coverage -- every existing CASE-shaped test in this suite
+// only reaches this operator via a plain ColumnExpression/LiteralExpression
+// argument, never a CaseExpression itself. Rows where no WHEN matches must
+// evaluate to NULL (materialize_case's default-constructed-scalar path),
+// not be silently skipped or zeroed.
+TEST(ScalarAggregateOperator, SumOverCaseWithNoElseTreatsUnmatchedRowsAsNull) {
+  RmmEnvironment env(default_config());
+  Schema schema({Field{"amount", float64_type(false)}});
+  std::vector<DeviceBatch> batches;
+  {
+    std::vector<std::unique_ptr<cudf::column>> columns;
+    columns.push_back(filled_column(cudf::type_id::FLOAT64, 5.0, 4));
+    batches.push_back(DeviceBatch(std::make_unique<cudf::table>(std::move(columns)),
+                                  std::make_shared<const Schema>(schema)));
+  }
+
+  // CASE WHEN amount > 100 THEN amount END -- amount is always 5.0, so
+  // every row falls through the (absent) ELSE and must be NULL, making the
+  // SUM over all 4 rows NULL rather than 0.
+  auto amount = std::make_shared<ColumnExpression>("amount", 0, float64_type(false));
+  auto hundred = std::make_shared<LiteralExpression>(LiteralExpression::make_float64(100.0));
+  auto condition =
+      std::make_shared<BinaryExpression>(BinaryOperator::Greater, amount, hundred, boolean_type(false));
+  CaseExpression::WhenThen branch{condition, amount};
+  auto case_expr = std::make_shared<CaseExpression>(std::vector<CaseExpression::WhenThen>{branch}, nullptr,
+                                                    float64_type(true));
+  auto sum_expr =
+      std::make_shared<AggregateExpression>(AggregateFunction::Sum, case_expr, float64_type(true));
+  std::vector<NamedExpression> aggregates = {NamedExpression{sum_expr, "total"}};
+
+  ScalarAggregateOperator op(1, std::make_unique<VectorSourceOperator>(std::move(batches)),
+                             std::move(aggregates));
+  ExecutionContext context = make_context();
+  op.open(context);
+  std::optional<DeviceBatch> result = op.next(context);
+  ASSERT_TRUE(result.has_value());
+  EXPECT_TRUE(single_row_is_null(*result));
+  op.close(context);
+}
+
+// compile_expr()/materialize_like(): the negated (NOT LIKE) branch had no
+// coverage -- COUNT of a NOT LIKE expression is non-null for every row
+// regardless of the match result, so this exercises materialize_like's
+// cudf::unary_operation(NOT, ...) path with a correctness check on the
+// count, not just "it runs."
+TEST(ScalarAggregateOperator, CountOfNotLikeExpressionCountsEveryNonNullRow) {
+  RmmEnvironment env(default_config());
+  const std::shared_ptr<const Schema> schema =
+      std::make_shared<const Schema>(Schema({Field{"name", string_type(false)}}));
+
+  arrow::StringBuilder builder;
+  for (const std::string& value : {"apple", "banana", "cherry"}) ASSERT_TRUE(builder.Append(value).ok());
+  std::shared_ptr<arrow::Array> array;
+  ASSERT_TRUE(builder.Finish(&array).ok());
+  const auto arrow_schema = arrow::schema({arrow::field("name", arrow::utf8(), false)});
+  const auto arrow_batch = arrow::RecordBatch::Make(arrow_schema, 3, {array});
+
+  std::vector<DeviceBatch> batches;
+  batches.push_back(from_arrow_record_batch(*arrow_batch, schema));
+
+  auto name = std::make_shared<ColumnExpression>("name", 0, string_type(false));
+  auto not_like = std::make_shared<LikeExpression>(name, "a%", /*negated=*/true);
+  auto count_expr =
+      std::make_shared<AggregateExpression>(AggregateFunction::Count, not_like, int64_type(true));
+  std::vector<NamedExpression> aggregates = {NamedExpression{count_expr, "n"}};
+
+  ScalarAggregateOperator op(1, std::make_unique<VectorSourceOperator>(std::move(batches)),
+                             std::move(aggregates));
+  ExecutionContext context = make_context();
+  op.open(context);
+  std::optional<DeviceBatch> result = op.next(context);
+  ASSERT_TRUE(result.has_value());
+  EXPECT_FALSE(single_row_is_null(*result));
+  EXPECT_EQ(single_row_value<std::int64_t>(*result), 3);
+  op.close(context);
+}
+
+// compile_expr()/materialize_extract(): EXTRACT(... FROM ...) as a scalar
+// aggregate's own argument had no coverage.
+TEST(ScalarAggregateOperator, MaxOverExtractedYearMatchesExpectedValue) {
+  RmmEnvironment env(default_config());
+  Schema schema({Field{"event_date", date32_type(false)}});
+  std::vector<DeviceBatch> batches;
+  {
+    auto column = cudf::make_fixed_width_column(cudf::data_type{cudf::type_id::TIMESTAMP_DAYS}, 3);
+    cudf::mutable_column_view view = column->mutable_view();
+    // 2024-01-01, 2025-06-15, 2023-12-31 as days-since-epoch.
+    std::vector<std::int32_t> days = {19723, 20254, 19722};
+    cudaMemcpy(view.data<std::int32_t>(), days.data(), days.size() * sizeof(std::int32_t),
+               cudaMemcpyHostToDevice);
+    std::vector<std::unique_ptr<cudf::column>> columns;
+    columns.push_back(std::move(column));
+    batches.push_back(DeviceBatch(std::make_unique<cudf::table>(std::move(columns)),
+                                  std::make_shared<const Schema>(schema)));
+  }
+
+  auto event_date = std::make_shared<ColumnExpression>("event_date", 0, date32_type(false));
+  auto extract_year = std::make_shared<ExtractExpression>(DatePart::Year, event_date, int64_type(false));
+  auto max_expr =
+      std::make_shared<AggregateExpression>(AggregateFunction::Max, extract_year, int64_type(true));
+  std::vector<NamedExpression> aggregates = {NamedExpression{max_expr, "latest_year"}};
+
+  ScalarAggregateOperator op(1, std::make_unique<VectorSourceOperator>(std::move(batches)),
+                             std::move(aggregates));
+  ExecutionContext context = make_context();
+  op.open(context);
+  std::optional<DeviceBatch> result = op.next(context);
+  ASSERT_TRUE(result.has_value());
+  EXPECT_FALSE(single_row_is_null(*result));
+  EXPECT_EQ(single_row_value<std::int64_t>(*result), 2025);
+  op.close(context);
+}
+
+// compile_expr()/materialize()'s CastExpression-to-Decimal branch had no
+// coverage -- every existing CAST-shaped test in this suite casts between
+// plain numeric types, never to a DECIMAL result_type.
+TEST(ScalarAggregateOperator, CountOverDecimalCastExpressionCountsEveryRow) {
+  RmmEnvironment env(default_config());
+  Schema schema({Field{"amount", float64_type(false)}});
+  std::vector<DeviceBatch> batches;
+  {
+    std::vector<std::unique_ptr<cudf::column>> columns;
+    columns.push_back(filled_column(cudf::type_id::FLOAT64, 12.34, 5));
+    batches.push_back(DeviceBatch(std::make_unique<cudf::table>(std::move(columns)),
+                                  std::make_shared<const Schema>(schema)));
+  }
+
+  auto amount = std::make_shared<ColumnExpression>("amount", 0, float64_type(false));
+  auto decimal_cast =
+      std::make_shared<CastExpression>(amount, decimal_type(/*precision=*/10, /*scale=*/2, false));
+  auto count_expr =
+      std::make_shared<AggregateExpression>(AggregateFunction::Count, decimal_cast, int64_type(true));
+  std::vector<NamedExpression> aggregates = {NamedExpression{count_expr, "n"}};
+
+  ScalarAggregateOperator op(1, std::make_unique<VectorSourceOperator>(std::move(batches)),
+                             std::move(aggregates));
+  ExecutionContext context = make_context();
+  op.open(context);
+  std::optional<DeviceBatch> result = op.next(context);
+  ASSERT_TRUE(result.has_value());
+  EXPECT_FALSE(single_row_is_null(*result));
+  EXPECT_EQ(single_row_value<std::int64_t>(*result), 5);
+  op.close(context);
+}
+
+// finalize()'s Avg-with-no-accumulated-data branch had no coverage -- every
+// existing AVG test above contributes at least one valid row across all
+// its batches. AVG() over an entirely-empty input must be NULL, matching
+// SQL's own AVG semantics (unlike COUNT, which is 0 in the same case).
+TEST(ScalarAggregateOperator, AvgOverEntirelyEmptyInputIsNullNotZero) {
+  RmmEnvironment env(default_config());
+  Schema schema({Field{"amount", float64_type(true)}});
+  std::vector<DeviceBatch> batches;
+
+  auto amount = std::make_shared<ColumnExpression>("amount", 0, float64_type(true));
+  auto avg_expr = std::make_shared<AggregateExpression>(AggregateFunction::Avg, amount, float64_type(true));
+  std::vector<NamedExpression> aggregates = {NamedExpression{avg_expr, "avg"}};
+
+  ScalarAggregateOperator op(1, std::make_unique<VectorSourceOperator>(std::move(batches)),
+                             std::move(aggregates));
+  ExecutionContext context = make_context();
+  op.open(context);
+  std::optional<DeviceBatch> result = op.next(context);
+  ASSERT_TRUE(result.has_value());
+  EXPECT_TRUE(single_row_is_null(*result));
+  op.close(context);
+}
+
+// open()'s own validation had no coverage: every NamedExpression handed to
+// this operator must wrap an AggregateExpression (a plain column reference
+// is a real planner bug, not a user-facing SQL error -- the binder itself
+// is what rejects a non-aggregate SELECT item alongside real aggregates).
+TEST(ScalarAggregateOperator, OpenThrowsWhenAggregateItemIsNotAnAggregateExpression) {
+  RmmEnvironment env(default_config());
+  Schema schema({Field{"amount", float64_type(false)}});
+  auto amount = std::make_shared<ColumnExpression>("amount", 0, float64_type(false));
+  std::vector<NamedExpression> aggregates = {NamedExpression{amount, "amount"}};
+
+  ScalarAggregateOperator op(1, std::make_unique<VectorSourceOperator>(std::vector<DeviceBatch>{}),
+                             std::move(aggregates));
+  ExecutionContext context = make_context();
+  EXPECT_THROW({ op.open(context); }, ExecutionError);
 }
 
 }  // namespace
