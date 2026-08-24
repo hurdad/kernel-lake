@@ -1,7 +1,10 @@
 #include "kernellake/execution_gpu/semi_anti_join_operator.hpp"
 
+#include <cudf/binaryop.hpp>
 #include <cudf/concatenate.hpp>
 #include <cudf/copying.hpp>
+#include <cudf/scalar/scalar.hpp>
+#include <cudf/stream_compaction.hpp>
 #include <cudf/table/table_view.hpp>
 #include <fmt/format.h>
 
@@ -15,11 +18,10 @@ namespace kernellake {
 namespace {
 
 // Wraps a device_uvector<size_type> gather map (as returned by
-// cudf::filtered_join::semi_join()/anti_join()) in a non-owning
-// column_view, the shape cudf::gather() expects -- mirrors
-// hash_join_operator.cpp's identical helper (there is no cudf-provided
-// conversion for this, just the raw pointer/size the vendored header
-// itself documents).
+// cudf::hash_join::inner_join()/left_join()) in a non-owning column_view,
+// the shape cudf::gather() expects -- mirrors hash_join_operator.cpp's
+// identical helper (there is no cudf-provided conversion for this, just
+// the raw pointer/size the vendored header itself documents).
 cudf::column_view as_gather_map(const rmm::device_uvector<cudf::size_type>& indices) {
   return cudf::column_view(cudf::data_type{cudf::type_id::INT32},
                            static_cast<cudf::size_type>(indices.size()), indices.data(), nullptr, 0);
@@ -72,24 +74,58 @@ void SemiAntiJoinOperator::open(ExecutionContext& context) {
   }
   right_is_empty_ = false;
   const cudf::table_view right_key_view({right_table_->view().column(right_key_index_)});
-  filtered_join_ =
-      std::make_unique<cudf::filtered_join>(right_key_view, cudf::null_equality::EQUAL, context.stream);
+  hash_join_ = std::make_unique<cudf::hash_join>(right_key_view, cudf::null_equality::EQUAL, context.stream);
 }
 
 std::optional<DeviceBatch> SemiAntiJoinOperator::probe_one_batch(const DeviceBatch& left_batch,
                                                                  ExecutionContext& context) {
   const cudf::table_view left_view = left_batch.view();
   const cudf::table_view left_key_view({left_view.column(left_key_index_)});
-  const std::unique_ptr<rmm::device_uvector<cudf::size_type>> left_indices =
-      join_type_ == JoinType::LeftSemi
-          ? filtered_join_->semi_join(left_key_view, context.stream, context.memory_resource)
-          : filtered_join_->anti_join(left_key_view, context.stream, context.memory_resource);
+
+  if (join_type_ == JoinType::LeftSemi) {
+    auto [left_indices, right_indices] = hash_join_->inner_join(left_key_view, std::nullopt, context.stream);
+    static_cast<void>(right_indices);  // never gathered -- see this class's own header comment.
+    if (left_indices->is_empty()) {
+      return std::nullopt;
+    }
+    // A probe row can match more than one build row (TPC-H Q4: one order
+    // can have several lineitem rows), but LEFT SEMI JOIN wants each
+    // matching probe row at most once -- dedupe inner_join()'s
+    // one-entry-per-match left_indices down to the distinct set.
+    const cudf::table_view left_indices_table({as_gather_map(*left_indices)});
+    const std::unique_ptr<cudf::table> distinct_indices = cudf::distinct(
+        left_indices_table, {0}, cudf::duplicate_keep_option::KEEP_ANY, cudf::null_equality::EQUAL,
+        cudf::nan_equality::ALL_EQUAL, context.stream, context.memory_resource);
+    std::unique_ptr<cudf::table> gathered =
+        cudf::gather(left_view, distinct_indices->view().column(0), cudf::out_of_bounds_policy::DONT_CHECK,
+                     context.stream, context.memory_resource);
+    return DeviceBatch(std::move(gathered), output_schema_);
+  }
+
+  // LeftAnti: left_join() guarantees every probe row appears at least
+  // once -- a row with zero matches appears exactly once, paired with
+  // the JoinNoMatch sentinel; a row with >=1 matches never carries that
+  // sentinel (see cudf::hash_join::left_join()'s own doc comment). So
+  // filtering right_indices down to exactly that sentinel value gives
+  // the anti-join's left_indices directly, with no dedup needed.
+  auto [left_indices, right_indices] = hash_join_->left_join(left_key_view, std::nullopt, context.stream);
   if (left_indices->is_empty()) {
     return std::nullopt;
   }
-  const cudf::column_view left_map = as_gather_map(*left_indices);
-  std::unique_ptr<cudf::table> gathered = cudf::gather(
-      left_view, left_map, cudf::out_of_bounds_policy::DONT_CHECK, context.stream, context.memory_resource);
+  const cudf::numeric_scalar<cudf::size_type> no_match_sentinel(cudf::JoinNoMatch, /*is_valid=*/true,
+                                                                context.stream, context.memory_resource);
+  const std::unique_ptr<cudf::column> is_unmatched =
+      cudf::binary_operation(as_gather_map(*right_indices), no_match_sentinel, cudf::binary_operator::EQUAL,
+                             cudf::data_type{cudf::type_id::BOOL8}, context.stream, context.memory_resource);
+  const cudf::table_view left_indices_table({as_gather_map(*left_indices)});
+  const std::unique_ptr<cudf::table> unmatched_indices = cudf::apply_boolean_mask(
+      left_indices_table, is_unmatched->view(), context.stream, context.memory_resource);
+  if (unmatched_indices->num_rows() == 0) {
+    return std::nullopt;
+  }
+  std::unique_ptr<cudf::table> gathered =
+      cudf::gather(left_view, unmatched_indices->view().column(0), cudf::out_of_bounds_policy::DONT_CHECK,
+                   context.stream, context.memory_resource);
   return DeviceBatch(std::move(gathered), output_schema_);
 }
 

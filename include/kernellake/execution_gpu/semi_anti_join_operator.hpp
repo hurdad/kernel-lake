@@ -1,6 +1,6 @@
 #pragma once
 
-#include <cudf/join/filtered_join.hpp>
+#include <cudf/join/hash_join.hpp>
 #include <cudf/table/table.hpp>
 
 #include <memory>
@@ -17,33 +17,48 @@ namespace kernellake {
 // never directly from SQL syntax). Unlike HashJoinOperator (INNER/LEFT
 // OUTER), this operator's output is *only* `left`'s own columns -- a
 // semi/anti join never contributes anything from `right` at all (see
-// HashJoinNode::output_schema()), so there's no gather-and-concatenate
-// step, no null-extension, and no per-row NULL handling beyond whatever
-// cudf::filtered_join itself already does.
+// HashJoinNode::output_schema()), so there's no null-extension and no
+// per-row NULL handling beyond whatever cudf::hash_join itself already
+// does.
 //
-// Built on cudf::filtered_join, not cudf::hash_join: it builds a hash
-// *set* from the build/right side's key column alone (never needing to
-// gather anything else from that side, unlike cudf::hash_join, which
-// keeps the whole build table alive for inner_join()/left_join()'s own
-// gather step), via its `semi_join()`/`anti_join()` member functions,
-// which each return only the *left* (probe) row indices that do/don't
-// have a match -- no right_indices at all, unlike cudf::hash_join's
-// inner_join()/left_join().
+// Built on cudf::hash_join, the same proven building block
+// HashJoinOperator itself uses -- NOT cudf::join::filtered_join (a
+// newer, narrower "hash set + semi_join()/anti_join()" API that looks
+// like a more direct fit on paper). filtered_join was this operator's
+// first implementation, but it produced sporadic illegal-memory-access
+// crashes at real TPC-H Q4 scale (SF10 lineitem as the build side, ~60M
+// rows) that reproduced even with zero concurrency on our side (probe
+// side fully materialized before ever calling into it, single host
+// thread, no overlap with any decode thread) -- narrowing it to a bug
+// inside that vendored implementation itself (RAPIDS 26.6.0), not
+// anything fixable from calling code. See git history for the repro
+// notes. hash_join's own semi/anti behavior is emulated instead:
+//   - LEFT SEMI: inner_join(), then dedupe left_indices (cudf::distinct)
+//     -- a probe row can match multiple build rows (e.g. one order can
+//     have many lineitem rows), but a semi join wants each matching
+//     probe row at most once.
+//   - LEFT ANTI: left_join(), then keep only the left_indices whose
+//     paired right_index is the JoinNoMatch sentinel -- left_join()
+//     guarantees a zero-match probe row appears exactly once with that
+//     sentinel (and a row with >=1 matches never does), so this needs no
+//     dedup, just a boolean-mask filter.
+// Both still only ever gather `left`'s own columns -- right_table_ is
+// kept alive only because hash_join's own key view must outlive it, the
+// same lifetime requirement HashJoinOperator's build side already has.
 //
 // Same "build once, probe streaming" shape as HashJoinOperator's own
 // non-partitioned fast path (open() pulls `right` to exhaustion,
-// concatenates it, builds one filtered_join; `left` streams through
-// next() batch by batch) -- but *only* that shape: no size-aware
-// build-side swap consideration (physical_planner.cpp never swaps a
-// semi/anti join's sides at all, same reasoning as LEFT OUTER JOIN --
-// see that file's own comment), and no grace-hash partitioned/disk-
-// spilling mode yet. A correlated EXISTS/NOT EXISTS subquery's own build
-// side is not, in general, guaranteed small (TPC-H Q4's own `lineitem`
-// is not) -- this is a real, deliberate scope limitation for this first
-// version, not an oversight: see docs/ROADMAP.md's "not yet started"
-// list for the follow-up if a real OOM is hit at scale, the same
-// iterative pattern HashJoinOperator's own partitioned mode was itself
-// added under.
+// concatenates it, builds one hash_join; `left` streams through next()
+// batch by batch) -- but *only* that shape: no size-aware build-side
+// swap consideration (physical_planner.cpp never swaps a semi/anti
+// join's sides at all, same reasoning as LEFT OUTER JOIN -- see that
+// file's own comment), and no grace-hash partitioned/disk-spilling mode
+// yet. A correlated EXISTS/NOT EXISTS subquery's own build side is not,
+// in general, guaranteed small (TPC-H Q4's own `lineitem` is not) --
+// this is a real, deliberate scope limitation for this first version,
+// not an oversight: see docs/ROADMAP.md's "not yet started" list for the
+// follow-up if a real OOM is hit at scale, the same iterative pattern
+// HashJoinOperator's own partitioned mode was itself added under.
 class SemiAntiJoinOperator final : public PhysicalOperator {
  public:
   // `join_type` must be LeftSemi or LeftAnti -- open() throws otherwise
@@ -81,10 +96,10 @@ class SemiAntiJoinOperator final : public PhysicalOperator {
   JoinType join_type_;
 
   // Populated in open(): the whole build side, concatenated. Must outlive
-  // filtered_join_ (which only views it, per cudf::filtered_join's own
-  // documented lifetime requirement, same as cudf::hash_join's).
+  // hash_join_ (which only views it -- same lifetime requirement
+  // HashJoinOperator's own right_table_ has).
   std::unique_ptr<cudf::table> right_table_;
-  std::unique_ptr<cudf::filtered_join> filtered_join_;
+  std::unique_ptr<cudf::hash_join> hash_join_;
   // An empty build side means: LeftSemi can never match anything (result
   // is empty, probe side just gets drained); LeftAnti's every probe row
   // trivially "has no match" (the whole probe side passes through
