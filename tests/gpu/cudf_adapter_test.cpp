@@ -48,6 +48,14 @@ TEST(CudfAdapter, ToCudfTypeIdThrowsForDecimal) {
   EXPECT_THROW((void)(to_cudf_type_id(TypeId::Decimal)), PlanningError);
 }
 
+TEST(CudfAdapter, ToCudfTypeIdThrowsForUnknownTypeId) {
+  // TypeId has a fixed uint8_t underlying type (schema.hpp), so this cast
+  // is well-defined (not UB) -- a value with no matching enumerator,
+  // exactly what this function's own final fallback throw exists to guard
+  // against, unreachable through any real TypeId value.
+  EXPECT_THROW((void)(to_cudf_type_id(static_cast<TypeId>(255))), PlanningError);
+}
+
 TEST(CudfAdapter, ToCudfTypePicksNarrowestDecimalTierByPrecision) {
   const cudf::data_type narrow = to_cudf_type(decimal_type(5, 2));
   EXPECT_EQ(narrow.id(), cudf::type_id::DECIMAL32);
@@ -187,6 +195,38 @@ TEST(CudfAdapter, LiteralToScalarThrowsWhenDecimal32ValueOutOfRange) {
   // precision=9 picks the DECIMAL32 tier, but 99,999,999,999 * 10^0 far
   // exceeds INT32_MAX (~2.1 billion) once raw-shifted by scale=0.
   const LiteralExpression expr(99'999'999'999.0, decimal_type(9, 0, false));
+  EXPECT_THROW((void)(literal_to_scalar(expr, ctx.context)), PlanningError);
+}
+
+// literal_as_double()'s fallback (unlike expression_compiler.cpp's own
+// as_double(), this file's version doesn't even check bool -- only
+// double/int64) had no coverage -- a bool-holding LiteralStorage
+// declared Decimal is a value/type combination the real binder never
+// produces, constructible directly the same way
+// LiteralToScalarThrowsWhenDecimal32ValueOutOfRange above already does.
+TEST(CudfAdapter, LiteralToScalarDecimalFromBoolValuedLiteralFallsBackToZero) {
+  TestContext ctx;
+  const LiteralExpression expr(true, decimal_type(5, 2, false));
+  const std::unique_ptr<cudf::scalar> scalar = literal_to_scalar(expr, ctx.context);
+  EXPECT_EQ(scalar->type().id(), cudf::type_id::DECIMAL32);
+  const auto& decimal = static_cast<const cudf::fixed_point_scalar<numeric::decimal32>&>(*scalar);
+  EXPECT_EQ(decimal.value(), 0);
+}
+
+// TypeId/DatePart both have a fixed uint8_t underlying type (schema.hpp/
+// expression.hpp), so casting an out-of-range value to either is well-
+// defined (not UB) -- just a value with no matching enumerator, exactly
+// what these two functions' own final fallback throws exist to guard
+// against. Neither fallback is reachable through any real TypeId/DatePart
+// value, since every one of those already has its own case above it.
+TEST(CudfAdapter, ToCudfDatetimeComponentThrowsForUnknownDatePart) {
+  EXPECT_THROW((void)(to_cudf_datetime_component(static_cast<DatePart>(255))), ExecutionError);
+}
+
+TEST(CudfAdapter, LiteralToScalarThrowsForUnknownTypeId) {
+  TestContext ctx;
+  const DataType bogus{static_cast<TypeId>(255), false, std::nullopt, std::nullopt};
+  const LiteralExpression expr(static_cast<std::int64_t>(1), bogus);
   EXPECT_THROW((void)(literal_to_scalar(expr, ctx.context)), PlanningError);
 }
 

@@ -399,5 +399,125 @@ TEST(ExpressionCompiler, UnaryNegateOnUnsignedColumnSilentlyWrapsAround) {
   EXPECT_EQ(host[0], 4294967291U);  // 2^32 - 5, not an error and not saturated to 0.
 }
 
+// Characterization tests for as_double()/as_int64()'s bool/fallback
+// branches -- LiteralExpression's own two-argument constructor lets a
+// test build a value/type combination the real binder would never
+// produce (e.g. a bool-holding LiteralStorage declared Float64), the
+// same pattern CastingNegativeInt64ToUInt64SilentlyWrapsAround above
+// already uses to pin down defined behavior for a case the binder
+// itself prevents. Locks in that a bool coerces to 1.0/0.0 (or 1/0) and
+// anything else (a string here) falls back to 0.0/0, rather than being
+// silently wrong or crashing, should some future caller ever bypass the
+// binder's own type-matching.
+TEST(ExpressionCompiler, AsDoubleCoercesBoolAndFallsBackToZeroForOtherVariants) {
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(filled_int32_column(0, 1));
+  cudf::table table(std::move(columns));
+  TestContext ctx;
+
+  {
+    const LiteralExpression bool_as_float64(true, float64_type(false));
+    ExpressionCompiler compiler;
+    std::unique_ptr<cudf::column> result =
+        cudf::compute_column(table.view(), compiler.compile(bool_as_float64, ctx.context));
+    cudaDeviceSynchronize();
+    EXPECT_DOUBLE_EQ(copy_to_host<double>(result->view())[0], 1.0);
+  }
+  {
+    const LiteralExpression string_as_float64(std::string("x"), float64_type(false));
+    ExpressionCompiler compiler;
+    std::unique_ptr<cudf::column> result =
+        cudf::compute_column(table.view(), compiler.compile(string_as_float64, ctx.context));
+    cudaDeviceSynchronize();
+    EXPECT_DOUBLE_EQ(copy_to_host<double>(result->view())[0], 0.0);
+  }
+}
+
+TEST(ExpressionCompiler, AsInt64CoercesDoubleAndBoolAndFallsBackToZeroForOtherVariants) {
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(filled_int32_column(0, 1));
+  cudf::table table(std::move(columns));
+  TestContext ctx;
+
+  {
+    const LiteralExpression double_as_int32(3.7, int32_type(false));
+    ExpressionCompiler compiler;
+    std::unique_ptr<cudf::column> result =
+        cudf::compute_column(table.view(), compiler.compile(double_as_int32, ctx.context));
+    cudaDeviceSynchronize();
+    EXPECT_EQ(copy_to_host<std::int32_t>(result->view())[0], 3);
+  }
+  {
+    const LiteralExpression bool_as_int32(true, int32_type(false));
+    ExpressionCompiler compiler;
+    std::unique_ptr<cudf::column> result =
+        cudf::compute_column(table.view(), compiler.compile(bool_as_int32, ctx.context));
+    cudaDeviceSynchronize();
+    EXPECT_EQ(copy_to_host<std::int32_t>(result->view())[0], 1);
+  }
+  {
+    const LiteralExpression string_as_int32(std::string("x"), int32_type(false));
+    ExpressionCompiler compiler;
+    std::unique_ptr<cudf::column> result =
+        cudf::compute_column(table.view(), compiler.compile(string_as_int32, ctx.context));
+    cudaDeviceSynchronize();
+    EXPECT_EQ(copy_to_host<std::int32_t>(result->view())[0], 0);
+  }
+}
+
+// Test-only Expression subclass -- no real Expression kind reaches
+// compile()'s final fallback throw, since every kind the real parser/
+// binder can produce has its own dynamic_cast check above it. A type
+// outside that closed set is the only way to reach it at all.
+class UnknownExpression final : public Expression {
+ public:
+  [[nodiscard]] const DataType& result_type() const override { return type_; }
+  [[nodiscard]] std::string to_string() const override { return "UnknownExpression"; }
+  [[nodiscard]] std::string structural_key() const override { return "UnknownExpression"; }
+
+ private:
+  DataType type_ = int64_type(false);
+};
+
+TEST(ExpressionCompiler, CompilingUnrecognizedExpressionTypeThrows) {
+  const UnknownExpression unknown;
+  TestContext ctx;
+  ExpressionCompiler compiler;
+  EXPECT_THROW({ (void)compiler.compile(unknown, ctx.context); }, ExecutionError);
+}
+
+// BinaryOperator/UnaryOperator both have a fixed uint8_t underlying type
+// (expression.hpp), so casting an out-of-range value to either is well-
+// defined (not UB) -- just a value with no matching enumerator, exactly
+// what to_ast_operator()'s/compile_unary()'s own final fallback throws
+// exist to guard against for a corrupted or future-added-but-unhandled
+// operator value.
+TEST(ExpressionCompiler, CompilingBinaryExpressionWithUnknownOperatorThrows) {
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(filled_int32_column(0, 1));
+  cudf::table table(std::move(columns));
+
+  auto a = std::make_shared<LiteralExpression>(LiteralExpression::make_int64(1));
+  auto b = std::make_shared<LiteralExpression>(LiteralExpression::make_int64(2));
+  BinaryExpression bogus(static_cast<BinaryOperator>(255), a, b, int64_type(false));
+
+  TestContext ctx;
+  ExpressionCompiler compiler;
+  EXPECT_THROW({ (void)compiler.compile(bogus, ctx.context); }, ExecutionError);
+}
+
+TEST(ExpressionCompiler, CompilingUnaryExpressionWithUnknownOperatorThrows) {
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(filled_int32_column(0, 1));
+  cudf::table table(std::move(columns));
+
+  auto a = std::make_shared<LiteralExpression>(LiteralExpression::make_int64(1));
+  UnaryExpression bogus(static_cast<UnaryOperator>(255), a, int64_type(false));
+
+  TestContext ctx;
+  ExpressionCompiler compiler;
+  EXPECT_THROW({ (void)compiler.compile(bogus, ctx.context); }, ExecutionError);
+}
+
 }  // namespace
 }  // namespace kernellake

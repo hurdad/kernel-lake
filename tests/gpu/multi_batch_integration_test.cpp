@@ -16,6 +16,7 @@
 #include <map>
 #include <numeric>
 
+#include "kernellake/common/errors.hpp"
 #include "kernellake/execution_gpu/cuda_utils.hpp"
 #include "kernellake/execution_gpu/operator_builder.hpp"
 #include "kernellake/execution_gpu/parquet_scan_operator.hpp"
@@ -234,6 +235,26 @@ TEST_F(MultiBatchIntegrationTest, FullPipelineCorrectAcrossMultipleBatchesAndMis
   EXPECT_EQ(totals_by_region.at("A").second, 275);
   EXPECT_DOUBLE_EQ(totals_by_region.at("B").first, 400.0);
   EXPECT_EQ(totals_by_region.at("B").second, 275);
+}
+
+// Test-only PhysicalPlanNode subclass -- no real physical plan node
+// reaches build()'s final fallback throw, since every node kind
+// build_physical_plan() can produce has its own dynamic_cast check above
+// it. A type outside that closed set is the only way to reach it at all.
+class UnknownPlanNode final : public PhysicalPlanNode {
+ public:
+  [[nodiscard]] const Schema& output_schema() const override { return schema_; }
+  [[nodiscard]] std::string_view node_name() const noexcept override { return "UnknownPlanNode"; }
+  [[nodiscard]] std::vector<PhysicalPlanPtr> children() const override { return {}; }
+
+ private:
+  Schema schema_{{}};
+};
+
+TEST(OperatorBuilder, BuildOperatorTreeThrowsForUnrecognizedPlanNode) {
+  auto node = std::make_shared<UnknownPlanNode>();
+  LocalObjectStore store;
+  EXPECT_THROW((void)(build_operator_tree(node, store, /*pass_read_limit_bytes=*/256)), PlanningError);
 }
 
 }  // namespace
