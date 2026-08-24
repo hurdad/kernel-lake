@@ -679,5 +679,26 @@ TEST(ScalarAggregateOperator, ProcessBatchThrowsForUnknownAggregateFunction) {
   EXPECT_THROW({ (void)(op.next(context)); }, ExecutionError);
 }
 
+// finalize() has its own separate exhaustive-switch fallback, distinct
+// from process_batch()'s above -- with at least one input batch,
+// process_batch() throws first (it runs inside next()'s own while loop,
+// before finalize() is ever reached), so that test alone can't cover this
+// one. Zero input batches skip process_batch() entirely (the while loop
+// body never runs), but next() still unconditionally calls finalize() on
+// every (never-populated) Accumulator afterward -- the only way to reach
+// finalize()'s own fallback without process_batch()'s firing first.
+TEST(ScalarAggregateOperator, FinalizeThrowsForUnknownAggregateFunction) {
+  RmmEnvironment env(default_config());
+  auto bogus_expr =
+      std::make_shared<AggregateExpression>(static_cast<AggregateFunction>(255), nullptr, float64_type(true));
+  std::vector<NamedExpression> aggregates = {NamedExpression{bogus_expr, "x"}};
+
+  ScalarAggregateOperator op(1, std::make_unique<VectorSourceOperator>(std::vector<DeviceBatch>{}),
+                             std::move(aggregates));
+  ExecutionContext context = make_context();
+  op.open(context);
+  EXPECT_THROW({ (void)(op.next(context)); }, ExecutionError);
+}
+
 }  // namespace
 }  // namespace kernellake
