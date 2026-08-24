@@ -163,6 +163,33 @@ TEST(CudfAdapter, LiteralToScalarBuildsEachDecimalTier) {
   }
 }
 
+// literal_as_double() (this file's own internal helper feeding
+// decimal_raw_value()) had no coverage for a decimal literal whose
+// LiteralStorage holds an int64_t rather than a double -- every existing
+// decimal test above constructs one directly from a double literal.
+TEST(CudfAdapter, LiteralToScalarBuildsDecimalFromInt64ValuedLiteral) {
+  TestContext ctx;
+  const LiteralExpression expr(static_cast<std::int64_t>(1234), decimal_type(5, 2, false));
+  const std::unique_ptr<cudf::scalar> scalar = literal_to_scalar(expr, ctx.context);
+  EXPECT_EQ(scalar->type().id(), cudf::type_id::DECIMAL32);
+  const auto& decimal = static_cast<const cudf::fixed_point_scalar<numeric::decimal32>&>(*scalar);
+  EXPECT_EQ(decimal.value(), 123400);
+}
+
+// make_decimal_scalar()'s DECIMAL32 out-of-range guard is documented
+// defense-in-depth for a literal construction path that bypasses
+// binder.cpp's own cast_if_needed() range check (see that guard's own
+// comment) -- exercising it directly here, the only way to reach it at
+// all, since going through the real SQL binder can never produce this
+// combination by construction.
+TEST(CudfAdapter, LiteralToScalarThrowsWhenDecimal32ValueOutOfRange) {
+  TestContext ctx;
+  // precision=9 picks the DECIMAL32 tier, but 99,999,999,999 * 10^0 far
+  // exceeds INT32_MAX (~2.1 billion) once raw-shifted by scale=0.
+  const LiteralExpression expr(99'999'999'999.0, decimal_type(9, 0, false));
+  EXPECT_THROW((void)(literal_to_scalar(expr, ctx.context)), PlanningError);
+}
+
 TEST(CudfAdapter, LiteralToScalarThrowsForDecimalMissingPrecisionScale) {
   TestContext ctx;
   const DataType incomplete{TypeId::Decimal, false, std::nullopt, std::nullopt};

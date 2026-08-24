@@ -705,6 +705,38 @@ TEST_F(QueryEngineExecuteTest, CorruptParquetFileFailsCleanlyDuringOpenNotNext) 
   EXPECT_THROW((void)(engine_.execute("SELECT * FROM read_parquet('" + corrupt_path + "')")), std::exception);
 }
 
+// Regression coverage for operator_builder.cpp's InstrumentedOperator::
+// open()'s own catch block, specifically -- as opposed to the plain
+// execute()-driven test above, which throws during *binding* (schema
+// inference needs to read the file too), never actually reaching
+// build_operator_tree()/open() at all. Corrupting the file only *after*
+// explain() has already captured a valid physical plan (which needed the
+// file to still be readable) forces the failure into open() itself, via
+// the real split execution path.
+TEST_F(QueryEngineExecuteTest, CorruptedFileAfterPlanningFailsCleanlyDuringOperatorOpen) {
+  const std::string path = (dir_ / "will_be_corrupted.parquet").string();
+  {
+    arrow::StringBuilder region_builder;
+    ASSERT_TRUE(region_builder.Append("A").ok());
+    std::shared_ptr<arrow::Array> region_array;
+    ASSERT_TRUE(region_builder.Finish(&region_array).ok());
+    const auto schema = arrow::schema({arrow::field("region", arrow::utf8(), false)});
+    const auto table = arrow::Table::Make(schema, {region_array});
+    auto sink = arrow::io::FileOutputStream::Open(path).ValueOrDie();
+    ASSERT_TRUE(
+        parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), sink, /*chunk_size=*/1).ok());
+  }
+  const PhysicalPlanPtr physical = engine_.explain("SELECT region FROM read_parquet('" + path + "')");
+
+  {
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    out << "not a real parquet file anymore";
+  }
+
+  RmmEnvironment rmm_environment(default_config());
+  EXPECT_THROW((void)(engine_.execute(physical, rmm_environment)), std::exception);
+}
+
 TEST_F(QueryEngineExecuteTest, SplitExecutionPathLeavesMetadataInspectionSecondsNull) {
   // The split entry point never does planning itself (see its doc comment
   // in query_engine.hpp) -- it cannot honestly report metadata_inspection_

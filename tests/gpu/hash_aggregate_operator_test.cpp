@@ -1,8 +1,11 @@
 #include <gtest/gtest.h>
 
+#include <arrow/api.h>
+
 #include <map>
 
 #include "kernellake/common/errors.hpp"
+#include "kernellake/execution_gpu/arrow_bridge.hpp"
 #include "kernellake/execution_gpu/hash_aggregate_operator.hpp"
 #include "kernellake/memory/rmm_environment.hpp"
 
@@ -528,6 +531,101 @@ TEST(HashAggregateOperator, GroupedCountOverDecimalCastExpressionCountsEveryRow)
   ASSERT_TRUE(result.has_value());
   EXPECT_EQ(result->row_count(), 1u);
   EXPECT_EQ(copy_to_host<std::int64_t>(result->view().column(1))[0], 3);
+  op.close(context);
+}
+
+// compile_expr()/materialize_like(): the negated (NOT LIKE) branch had no
+// coverage as a GROUP BY value expression -- mirrors
+// ScalarAggregateOperator.CountOfNotLikeExpressionCountsEveryNonNullRow.
+TEST(HashAggregateOperator, GroupedCountOfNotLikeExpressionCountsEveryNonNullRow) {
+  RmmEnvironment env(default_config());
+  const std::shared_ptr<const Schema> schema = std::make_shared<const Schema>(
+      Schema({Field{"region", int32_type(false)}, Field{"name", string_type(false)}}));
+
+  arrow::Int32Builder region_builder;
+  arrow::StringBuilder name_builder;
+  for (const auto& [region, name] :
+       std::vector<std::pair<int32_t, std::string>>{{1, "apple"}, {1, "banana"}, {2, "avocado"}}) {
+    ASSERT_TRUE(region_builder.Append(region).ok());
+    ASSERT_TRUE(name_builder.Append(name).ok());
+  }
+  std::shared_ptr<arrow::Array> region_array, name_array;
+  ASSERT_TRUE(region_builder.Finish(&region_array).ok());
+  ASSERT_TRUE(name_builder.Finish(&name_array).ok());
+  const auto arrow_schema = arrow::schema(
+      {arrow::field("region", arrow::int32(), false), arrow::field("name", arrow::utf8(), false)});
+  const auto arrow_batch = arrow::RecordBatch::Make(arrow_schema, 3, {region_array, name_array});
+
+  std::vector<DeviceBatch> batches;
+  batches.push_back(from_arrow_record_batch(*arrow_batch, schema));
+
+  auto region = std::make_shared<ColumnExpression>("region", 0, int32_type(false));
+  std::vector<NamedExpression> group_by = {NamedExpression{region, "region"}};
+  auto name = std::make_shared<ColumnExpression>("name", 1, string_type(false));
+  auto not_like = std::make_shared<LikeExpression>(name, "a%", /*negated=*/true);
+  auto count_expr =
+      std::make_shared<AggregateExpression>(AggregateFunction::Count, not_like, int64_type(true));
+  std::vector<NamedExpression> aggregates = {NamedExpression{count_expr, "n"}};
+
+  HashAggregateOperator op(1, std::make_unique<VectorSourceOperator>(std::move(batches)), std::move(group_by),
+                           std::move(aggregates));
+  ExecutionContext context = make_context();
+  op.open(context);
+  std::optional<DeviceBatch> result = op.next(context);
+  ASSERT_TRUE(result.has_value());
+  EXPECT_EQ(result->row_count(), 2u);
+
+  const std::vector<int32_t> region_values = copy_to_host<int32_t>(result->view().column(0));
+  const std::vector<std::int64_t> counts = copy_to_host<std::int64_t>(result->view().column(1));
+  std::map<int32_t, std::int64_t> counts_by_region;
+  for (std::size_t i = 0; i < region_values.size(); ++i) counts_by_region[region_values[i]] = counts[i];
+  EXPECT_EQ(counts_by_region[1], 2);
+  EXPECT_EQ(counts_by_region[2], 1);
+  op.close(context);
+}
+
+// materialize_count_ones()'s nullable-argument null-mask-copy branch had
+// no coverage -- GroupedCountOfColumnMatchesRowCountPerGroup above uses a
+// non-nullable argument column (nullable() is false, so this branch is
+// never entered), unlike ScalarAggregateOperator's own COUNT tests, which
+// already exercise a real nullable argument via CountOfColumnExcludesNulls.
+TEST(HashAggregateOperator, GroupedCountOfNullableColumnExcludesNulls) {
+  RmmEnvironment env(default_config());
+  const std::shared_ptr<const Schema> schema = std::make_shared<const Schema>(
+      Schema({Field{"region", int32_type(false)}, Field{"amount", float64_type(true)}}));
+
+  arrow::Int32Builder region_builder;
+  arrow::DoubleBuilder amount_builder;
+  ASSERT_TRUE(region_builder.Append(1).ok());
+  ASSERT_TRUE(amount_builder.Append(10.0).ok());
+  ASSERT_TRUE(region_builder.Append(1).ok());
+  ASSERT_TRUE(amount_builder.AppendNull().ok());
+  ASSERT_TRUE(region_builder.Append(1).ok());
+  ASSERT_TRUE(amount_builder.Append(20.0).ok());
+  std::shared_ptr<arrow::Array> region_array, amount_array;
+  ASSERT_TRUE(region_builder.Finish(&region_array).ok());
+  ASSERT_TRUE(amount_builder.Finish(&amount_array).ok());
+  const auto arrow_schema = arrow::schema(
+      {arrow::field("region", arrow::int32(), false), arrow::field("amount", arrow::float64(), true)});
+  const auto arrow_batch = arrow::RecordBatch::Make(arrow_schema, 3, {region_array, amount_array});
+
+  std::vector<DeviceBatch> batches;
+  batches.push_back(from_arrow_record_batch(*arrow_batch, schema));
+
+  auto region = std::make_shared<ColumnExpression>("region", 0, int32_type(false));
+  std::vector<NamedExpression> group_by = {NamedExpression{region, "region"}};
+  auto amount = std::make_shared<ColumnExpression>("amount", 1, float64_type(true));
+  auto count_expr = std::make_shared<AggregateExpression>(AggregateFunction::Count, amount, int64_type(true));
+  std::vector<NamedExpression> aggregates = {NamedExpression{count_expr, "n"}};
+
+  HashAggregateOperator op(1, std::make_unique<VectorSourceOperator>(std::move(batches)), std::move(group_by),
+                           std::move(aggregates));
+  ExecutionContext context = make_context();
+  op.open(context);
+  std::optional<DeviceBatch> result = op.next(context);
+  ASSERT_TRUE(result.has_value());
+  ASSERT_EQ(result->row_count(), 1u);
+  EXPECT_EQ(copy_to_host<std::int64_t>(result->view().column(1))[0], 2);  // excludes the 1 NULL row
   op.close(context);
 }
 

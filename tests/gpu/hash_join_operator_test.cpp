@@ -281,5 +281,35 @@ TEST(HashJoinFreeFunctions, ChoosePartitionCountScalesWithEstimatedOverageAndCla
   EXPECT_EQ(clamped, 64u);
 }
 
+// spill_partitioned_to_disk()'s empty-batch skip (`if (batch->row_count()
+// == 0) continue;`) had no coverage -- every existing partitioned test
+// only ever hands it batches with real rows. An empty incoming batch
+// (e.g. a child operator's own empty-batch-skip convention producing a
+// zero-row DeviceBatch that still reaches this far) must not confuse the
+// per-batch hash_partition()/writer bookkeeping.
+TEST(HashJoinOperator, PartitionedJoinSkipsEmptyIncomingBatchDuringSpill) {
+  RmmEnvironment env(default_config());
+  const CudaStream stream;
+  ExecutionContext context = make_context(stream.get());
+
+  std::vector<DeviceBatch> left_batches;
+  left_batches.push_back(make_left_batch({}, {}));  // empty batch first -- must be skipped, not crash.
+  left_batches.push_back(make_left_batch({1, 2}, {10.0, 20.0}));
+  std::vector<DeviceBatch> right_batches;
+  right_batches.push_back(make_right_batch({}, {}));
+  right_batches.push_back(make_right_batch({1, 2}, {100.0, 200.0}));
+
+  HashJoinOperator op(1, std::make_unique<VectorSourceOperator>(std::move(left_batches)),
+                      std::make_unique<VectorSourceOperator>(std::move(right_batches)), /*left_key_index=*/0,
+                      /*right_key_index=*/0, join_output_schema(), /*partition_count=*/4);
+  op.open(context);
+  const std::map<int32_t, std::pair<double, double>> by_key = drain_join(op, context);
+  op.close(context);
+
+  ASSERT_EQ(by_key.size(), 2u);
+  EXPECT_DOUBLE_EQ(by_key.at(1).first, 10.0);
+  EXPECT_DOUBLE_EQ(by_key.at(2).first, 20.0);
+}
+
 }  // namespace
 }  // namespace kernellake

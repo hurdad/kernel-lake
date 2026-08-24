@@ -12,6 +12,7 @@
 
 #include <filesystem>
 
+#include "kernellake/execution_gpu/arrow_bridge.hpp"
 #include "kernellake/execution_gpu/filter_operator.hpp"
 #include "kernellake/execution_gpu/parquet_scan_operator.hpp"
 #include "kernellake/execution_gpu/projection_operator.hpp"
@@ -103,6 +104,81 @@ TEST(FilterOperator, PassesMatchingBatchesAndSkipsEmptyOnes) {
   EXPECT_EQ(second->row_count(), 3u);  // the all-failing batch was skipped
 
   EXPECT_FALSE(filter.next(context).has_value());
+  filter.close(context);
+}
+
+// and_together()'s actual fold loop (as opposed to its single-conjunct
+// pass-through) had no coverage -- the test above uses one plain
+// comparison as the whole predicate, never two ANDed together.
+TEST(FilterOperator, TwoPlainConjunctsCombineViaLogicalAnd) {
+  RmmEnvironment env(default_config());
+  std::vector<DeviceBatch> batches;
+  batches.push_back(make_filled_batch(10, 5));  // 3 < 10 < 100 -> passes both conjuncts
+  batches.push_back(make_filled_batch(1, 5));   // fails "a > 3" -> excluded
+
+  auto a = std::make_shared<ColumnExpression>("a", 0, int32_type(false));
+  auto a_i64 = std::make_shared<CastExpression>(a, int64_type(false));
+  auto three = std::make_shared<LiteralExpression>(LiteralExpression::make_int64(3));
+  auto hundred = std::make_shared<LiteralExpression>(LiteralExpression::make_int64(100));
+  auto lower = std::make_shared<BinaryExpression>(BinaryOperator::Greater, a_i64, three, boolean_type(false));
+  auto upper = std::make_shared<BinaryExpression>(BinaryOperator::Less, a_i64, hundred, boolean_type(false));
+  auto predicate = std::make_shared<BinaryExpression>(BinaryOperator::And, lower, upper, boolean_type(false));
+
+  FilterOperator filter(1, std::make_unique<VectorSourceOperator>(std::move(batches)), predicate);
+  ExecutionContext context = make_context();
+  filter.open(context);
+
+  std::optional<DeviceBatch> result = filter.next(context);
+  ASSERT_TRUE(result.has_value());
+  EXPECT_EQ(result->row_count(), 5u);
+  EXPECT_FALSE(filter.next(context).has_value());
+  filter.close(context);
+}
+
+// next()'s LOGICAL_AND combine (a LIKE conjunct's mask ANDed against
+// either the AST-conjuncts' mask or another LIKE mask) had no coverage --
+// every existing LIKE test uses LIKE as the *only* predicate, so mask
+// stays nullptr until the (single) like_mask is just moved in directly.
+TEST(FilterOperator, LikeConjunctCombinesWithPlainConjunctViaLogicalAnd) {
+  RmmEnvironment env(default_config());
+  arrow::Int32Builder id_builder;
+  arrow::StringBuilder name_builder;
+  for (const auto& [id, name] : std::vector<std::pair<int32_t, std::string>>{
+           {10, "apple"}, {20, "apricot"}, {5, "avocado"}, {10, "banana"}}) {
+    ASSERT_TRUE(id_builder.Append(id).ok());
+    ASSERT_TRUE(name_builder.Append(name).ok());
+  }
+  std::shared_ptr<arrow::Array> id_array, name_array;
+  ASSERT_TRUE(id_builder.Finish(&id_array).ok());
+  ASSERT_TRUE(name_builder.Finish(&name_array).ok());
+  const auto arrow_schema =
+      arrow::schema({arrow::field("id", arrow::int32(), false), arrow::field("name", arrow::utf8(), false)});
+  const auto arrow_batch = arrow::RecordBatch::Make(arrow_schema, 4, {id_array, name_array});
+  const auto schema = std::make_shared<const Schema>(
+      Schema({Field{"id", int32_type(false)}, Field{"name", string_type(false)}}));
+
+  std::vector<DeviceBatch> batches;
+  batches.push_back(from_arrow_record_batch(*arrow_batch, schema));
+
+  auto id = std::make_shared<ColumnExpression>("id", 0, int32_type(false));
+  auto id_i64 = std::make_shared<CastExpression>(id, int64_type(false));
+  auto nine = std::make_shared<LiteralExpression>(LiteralExpression::make_int64(9));
+  auto id_predicate =
+      std::make_shared<BinaryExpression>(BinaryOperator::Greater, id_i64, nine, boolean_type(false));
+  auto name = std::make_shared<ColumnExpression>("name", 1, string_type(false));
+  auto like_predicate = std::make_shared<LikeExpression>(name, "a%", /*negated=*/false);
+  auto predicate = std::make_shared<BinaryExpression>(BinaryOperator::And, id_predicate, like_predicate,
+                                                      boolean_type(false));
+
+  FilterOperator filter(1, std::make_unique<VectorSourceOperator>(std::move(batches)), predicate);
+  ExecutionContext context = make_context();
+  filter.open(context);
+
+  std::optional<DeviceBatch> result = filter.next(context);
+  ASSERT_TRUE(result.has_value());
+  // id>9 AND name LIKE 'a%': row0 (10,apple) passes both; row1 (20,apricot)
+  // passes both; row2 (5,avocado) fails id>9; row3 (10,banana) fails LIKE.
+  EXPECT_EQ(result->row_count(), 2u);
   filter.close(context);
 }
 
