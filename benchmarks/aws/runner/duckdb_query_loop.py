@@ -44,9 +44,25 @@ from pathlib import Path
 
 QUERIES_DIR = Path(__file__).resolve().parent / "queries"
 
-ALL_QUERIES = (1, 3, 6, 12, 14, 19)
-QUERIES_WITH_SECOND_TABLE = {19: "part_data", 14: "part_data", 12: "orders_data", 3: "orders_data"}
-QUERIES_WITH_THIRD_TABLE = {3: "customer_data"}
+ALL_QUERIES = (1, 3, 5, 6, 7, 9, 10, 11, 12, 13, 14, 18, 19)
+# Every extra table (beyond lineitem/{data}) a given query's own text
+# references -- mirrors aws_benchmark_runner.py's identical
+# QUERY_EXTRA_TABLES exactly (kept in sync by hand; see that file's own
+# comment for the full rationale, including why Q11/Q13 not referencing
+# lineitem at all isn't a missing entry here).
+QUERY_EXTRA_TABLES = {
+    3: ("orders", "customer"),
+    5: ("orders", "customer", "supplier", "nation", "region"),
+    7: ("orders", "customer", "supplier", "nation"),
+    9: ("part", "supplier", "partsupp", "orders", "nation"),
+    10: ("orders", "customer", "nation"),
+    11: ("partsupp", "supplier", "nation"),
+    12: ("orders",),
+    13: ("customer", "orders"),
+    14: ("part",),
+    18: ("customer", "orders"),
+    19: ("part",),
+}
 
 
 def load_query_text(query_number: int) -> str:
@@ -56,27 +72,37 @@ def load_query_text(query_number: int) -> str:
     return re.sub(r"--[^\n]*\n", "\n", path.read_text())
 
 
+EXTRA_TABLE_PLACEHOLDERS = ("part_data", "orders_data", "customer_data", "nation_data", "supplier_data",
+                           "region_data", "partsupp_data")
+
+
 def kernellake_sql(
     query_number: int,
     data_glob: str,
     part_data_glob: str | None = None,
     orders_data_glob: str | None = None,
     customer_data_glob: str | None = None,
+    nation_data_glob: str | None = None,
+    supplier_data_glob: str | None = None,
+    region_data_glob: str | None = None,
+    partsupp_data_glob: str | None = None,
 ) -> str:
     text = load_query_text(query_number)
-    if "{part_data}" in text and not part_data_glob:
-        raise ValueError(f"Q{query_number} needs a second table -- part_data glob missing")
-    if "{orders_data}" in text and not orders_data_glob:
-        raise ValueError(f"Q{query_number} needs a second table -- orders_data glob missing")
-    if "{customer_data}" in text and not customer_data_glob:
-        raise ValueError(f"Q{query_number} needs a third table -- customer_data glob missing")
+    globs = {
+        "part_data": part_data_glob, "orders_data": orders_data_glob, "customer_data": customer_data_glob,
+        "nation_data": nation_data_glob, "supplier_data": supplier_data_glob, "region_data": region_data_glob,
+        "partsupp_data": partsupp_data_glob,
+    }
+    for placeholder in EXTRA_TABLE_PLACEHOLDERS:
+        if f"{{{placeholder}}}" in text and not globs[placeholder]:
+            raise ValueError(f"Q{query_number} needs a table -- {placeholder} glob missing")
+    # {data}/lineitem: Q11/Q13 don't reference it at all -- see
+    # tools/benchmark_three_way.py's identical kernellake_sql() for the
+    # full explanation this mirrors. .replace() is a safe no-op either way.
     text = text.replace("{data}", data_glob)
-    if part_data_glob:
-        text = text.replace("{part_data}", part_data_glob)
-    if orders_data_glob:
-        text = text.replace("{orders_data}", orders_data_glob)
-    if customer_data_glob:
-        text = text.replace("{customer_data}", customer_data_glob)
+    for placeholder, glob in globs.items():
+        if glob:
+            text = text.replace(f"{{{placeholder}}}", glob)
     return text.strip()
 
 
@@ -99,12 +125,19 @@ def s3_data_glob(
     compression_level: int | None = None,
 ) -> str:
     # Mirrors aws_benchmark_runner.py's s3_data_glob() (s3:// scheme only
-    # -- no Spark s3a:// concern here, DuckDB isn't Spark).
+    # -- no Spark s3a:// concern here, DuckDB isn't Spark), including its
+    # "part"/"partsupp" multi-file fix -- see that function's own comment
+    # for why (generate_tpch.py batches both via PART_BATCH_ROWS=5,000,000,
+    # multi-file above SF~25).
     prefix_map = {
         "lineitem": "lineitem-*.parquet",
-        "part": "part-00000.parquet",
+        "part": "part-*.parquet",
         "orders": "orders-*.parquet",
         "customer": "customer-00000.parquet",
+        "nation": "nation-00000.parquet",
+        "region": "region-00000.parquet",
+        "supplier": "supplier-00000.parquet",
+        "partsupp": "partsupp-*.parquet",
     }
     tag = compression_tag(compression, compression_level)
     sf_dir = f"sf{scale_factor}-{tag}"
@@ -163,7 +196,9 @@ def new_duckdb_connection(region: str, enable_cache: bool = False):
 
 def run_duckdb_query(con, query_number: int, globs: dict) -> tuple:
     sql = kernellake_sql(
-        query_number, globs["data"], globs.get("part_data"), globs.get("orders_data"), globs.get("customer_data")
+        query_number, globs["data"], globs.get("part_data"), globs.get("orders_data"),
+        globs.get("customer_data"), globs.get("nation_data"), globs.get("supplier_data"),
+        globs.get("region_data"), globs.get("partsupp_data"),
     )
     start = time.perf_counter()
     table = con.sql(sql).arrow().read_all()
@@ -176,13 +211,8 @@ def build_globs(
     compression_level: int | None = None,
 ) -> dict:
     globs = {"data": s3_data_glob(bucket, scale_factor, "lineitem", compression, compression_level)}
-    table_for_key = {"part_data": "part", "orders_data": "orders", "customer_data": "customer"}
-    if query_number in QUERIES_WITH_SECOND_TABLE:
-        key = QUERIES_WITH_SECOND_TABLE[query_number]
-        globs[key] = s3_data_glob(bucket, scale_factor, table_for_key[key], compression, compression_level)
-    if query_number in QUERIES_WITH_THIRD_TABLE:
-        key = QUERIES_WITH_THIRD_TABLE[query_number]
-        globs[key] = s3_data_glob(bucket, scale_factor, table_for_key[key], compression, compression_level)
+    for table in QUERY_EXTRA_TABLES.get(query_number, ()):
+        globs[f"{table}_data"] = s3_data_glob(bucket, scale_factor, table, compression, compression_level)
     return globs
 
 

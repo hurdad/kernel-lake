@@ -53,9 +53,14 @@ from pathlib import Path
 
 QUERIES_DIR = Path(__file__).resolve().parent / "queries"
 
-ALL_QUERIES = (1, 3, 6, 12, 14, 19)
-QUERIES_WITH_SECOND_TABLE = {19: "part", 14: "part", 12: "orders", 3: "orders"}
-QUERIES_WITH_THIRD_TABLE = {3: "customer"}
+ALL_QUERIES = (1, 3, 5, 6, 7, 9, 10, 11, 12, 13, 14, 18, 19)
+# Unlike aws_benchmark_runner.py's own ALL_QUERIES-adjacent table map,
+# this script needs no per-query table tracking at all:
+# register_spark_views() below unconditionally registers every table as a
+# temp view regardless of query (cheap and lazy -- Spark doesn't actually
+# read anything until a query references a view), and spark_sql() does a
+# blanket regex substitution across every possible placeholder, a no-op
+# for whichever ones a given query's text doesn't contain.
 
 # pyspark's pip wheel bundles Hadoop 3.3.4's client but not the cloud
 # connector JAR that provides org.apache.hadoop.fs.s3a.S3AFileSystem --
@@ -77,20 +82,30 @@ def load_query_text(query_number: int) -> str:
 
 def spark_sql(query_number: int) -> str:
     # The query files' only KernelLake-specific syntax is the
-    # read_parquet('{data}')/read_parquet('{part_data}')/
-    # read_parquet('{orders_data}')/read_parquet('{customer_data}')
-    # table-valued-function FROM clauses -- Spark SQL has no such
-    # function, so these are rewritten to plain table references against
-    # temp views register_spark_views() below creates ("lineitem"/"part"/
-    # "orders"/"customer"). Everything else in these query files is
-    # already plain ANSI SQL both engines understand identically.
+    # read_parquet('{data}')/read_parquet('{part_data}')/... table-valued-
+    # function FROM clauses -- Spark SQL has no such function, so these are
+    # rewritten to plain table references against temp views
+    # register_spark_views() below creates ("lineitem"/"part"/"orders"/
+    # "customer"/"nation"/"supplier"/"region"/"partsupp"). Everything else
+    # in these query files is already plain ANSI SQL both engines
+    # understand identically. Q11/Q13 reference no {data}/lineitem at all
+    # (see tools/benchmark_three_way.py's identical spark_sql() for the
+    # full explanation this mirrors) -- so unlike the substituted-tables
+    # loop below there's no single placeholder that must always match;
+    # instead, assert no `{..._data}` placeholder survives unrewritten
+    # afterward, catching a real missing-table bug without assuming which
+    # specific placeholder every query needs.
     text = load_query_text(query_number)
     rewritten = re.sub(r"read_parquet\(\s*'\{data\}'\s*\)", "lineitem", text)
-    if rewritten == text:
-        raise ValueError(f"Q{query_number}: no read_parquet('{{data}}') found to rewrite for Spark SQL")
-    rewritten = re.sub(r"read_parquet\(\s*'\{part_data\}'\s*\)", "part", rewritten)
-    rewritten = re.sub(r"read_parquet\(\s*'\{orders_data\}'\s*\)", "orders", rewritten)
-    rewritten = re.sub(r"read_parquet\(\s*'\{customer_data\}'\s*\)", "customer", rewritten)
+    for placeholder, table in (
+        ("part_data", "part"), ("orders_data", "orders"), ("customer_data", "customer"),
+        ("nation_data", "nation"), ("supplier_data", "supplier"), ("region_data", "region"),
+        ("partsupp_data", "partsupp"),
+    ):
+        rewritten = re.sub(r"read_parquet\(\s*'\{" + placeholder + r"\}'\s*\)", table, rewritten)
+    leftover = re.search(r"\{\w+_data\}", rewritten)
+    if leftover:
+        raise ValueError(f"Q{query_number}: unrewritten placeholder {leftover.group()!r} in Spark SQL")
     return rewritten.strip()
 
 
@@ -114,12 +129,19 @@ def s3_data_glob(
 ) -> str:
     # s3a://, not s3:// -- Spark's DataFrameReader needs the Hadoop S3A
     # connector's own scheme (registered by the hadoop-aws jar). Mirrors
-    # aws_benchmark_runner.py's identical s3_data_glob() exactly.
+    # aws_benchmark_runner.py's identical s3_data_glob() exactly, including
+    # its "part"/"partsupp" multi-file fix -- see that function's own
+    # comment for why (generate_tpch.py batches both via
+    # PART_BATCH_ROWS=5,000,000, multi-file above SF~25).
     prefix_map = {
         "lineitem": "lineitem-*.parquet",
-        "part": "part-00000.parquet",
+        "part": "part-*.parquet",
         "orders": "orders-*.parquet",
         "customer": "customer-00000.parquet",
+        "nation": "nation-00000.parquet",
+        "region": "region-00000.parquet",
+        "supplier": "supplier-00000.parquet",
+        "partsupp": "partsupp-*.parquet",
     }
     tag = compression_tag(compression, compression_level)
     sf_dir = f"sf{scale_factor}-{tag}"
@@ -172,7 +194,7 @@ def register_spark_views(
     spark, bucket: str, scale_factor: int, compression: str = "snappy",
     compression_level: int | None = None,
 ) -> None:
-    for table in ("lineitem", "part", "orders", "customer"):
+    for table in ("lineitem", "part", "orders", "customer", "nation", "region", "supplier", "partsupp"):
         # s3_data_glob() already returns a directly Spark-readable glob for
         # every table (including lineitem's multi-file
         # "lineitem-*.parquet") -- Spark's own reader natively supports

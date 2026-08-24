@@ -202,7 +202,16 @@ def main() -> int:
     has_duckdb = any("duckdb_median_seconds" in row for row in speedup_rows)
     duckdb_has_cost = cost_data is not None and cost_data.get("duckdb_usd", 0) > 0
 
-    coverage_text = "6 of TPC-H's 22 queries run today (Q1, Q3, Q6, Q12, Q14, Q19). The other 16 are blocked:\n" + "\n".join(
+    # Derived from the real report data, not hardcoded -- see
+    # generate_report.py's identical fix for why a hardcoded "N of 22
+    # (Q1, ...)" string here goes stale as soon as aws_benchmark_runner.py's
+    # own ALL_QUERIES grows.
+    supported = sorted(q["query"] for q in data["benchmark_runs"][0]["queries"]) if data["benchmark_runs"] else []
+    supported_list = ", ".join(f"Q{q}" for q in supported)
+    coverage_text = (
+        f"{len(supported)} of TPC-H's 22 queries run today ({supported_list}). "
+        f"The other {len(unsupported)} are blocked:\n"
+    ) + "\n".join(
         f"- Q{q}: {reason}" for q, reason in sorted(unsupported.items())
     )
     analysis_paragraphs = [coverage_text]

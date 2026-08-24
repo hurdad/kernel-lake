@@ -391,7 +391,10 @@ comparison.
 
 ## M2 -- full SF100 report
 
-Same as M1, but with the full 6-query set, treated as the first
+Same as M1, but with the full 13-query set (`ALL_QUERIES`, grown from
+its original 6 once KernelLake's SQL layer gained LEFT OUTER JOIN/
+derived tables and the AWS harness was updated to match -- see
+`docs/ROADMAP.md`'s TPC-H Q13 entry), treated as the first
 publication-candidate report. Repetition count stays at the default
 (`--iterations 2`) -- a higher count (5 was tried once, real EC2 GPU-hour
 cost made a full `--query all` x 2 modes x cold-mode-restarts-per-rep run

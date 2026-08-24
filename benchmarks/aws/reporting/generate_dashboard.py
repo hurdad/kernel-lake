@@ -67,7 +67,7 @@ def build_traces(data: dict, cost_data: dict | None) -> dict:
     }
 
 
-def render_html(traces: dict) -> str:
+def render_html(traces: dict, query_count: int) -> str:
     # A single json.dumps() of the whole payload, referenced from JS by
     # property access below -- not per-value Python repr() string
     # interpolation, which would silently emit invalid JavaScript for any
@@ -93,7 +93,7 @@ def render_html(traces: dict) -> str:
 <body>
   <h1>KernelLake AWS Benchmark</h1>
   <p class="caveat">Unofficial, TPC-H-<em>derived</em> benchmark. Not a certified TPC-H result.
-  Only 6 of TPC-H's 22 queries run today -- see the accompanying report.md for the full list of
+  Only {query_count} of TPC-H's 22 queries run today -- see the accompanying report.md for the full list of
   what's blocked and why.</p>
 
   <h2>Headline #1: Latency speedup ratio (KernelLake vs. PySpark)</h2>
@@ -166,7 +166,15 @@ def main() -> int:
     cost_data = json.loads(Path(args.cost_json).read_text()) if args.cost_json else None
 
     traces = build_traces(data, cost_data)
-    Path(args.output).write_text(render_html(traces))
+    # Derived from the real report data, not hardcoded -- see
+    # generate_report.py's identical fix for why a hardcoded query count
+    # here goes stale as soon as aws_benchmark_runner.py's own
+    # ALL_QUERIES grows. Distinct query numbers across every benchmark
+    # run (not just run 0) -- a dashboard can aggregate multiple scale
+    # factors' runs, which should all have the same query set, but this
+    # doesn't assume that.
+    query_count = len({q["query"] for run in data["benchmark_runs"] for q in run["queries"]})
+    Path(args.output).write_text(render_html(traces, query_count))
     print(f"Wrote {args.output}", file=sys.stderr)
     return 0
 

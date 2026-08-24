@@ -62,22 +62,40 @@ sys.path.insert(0, str(REPO_ROOT / "tools"))
 from benchmark_three_way import kernellake_sql, spark_sql, load_query_text, median_stats  # noqa: E402
 from duckdb_compare import normalize, rows_match  # noqa: E402
 
-# Q3 needs three tables (lineitem/{data}, orders/{orders_data},
-# customer/{customer_data} -- confirmed against its actual query text,
-# benchmarks/tpch/queries/q03.sql), not just customer -- missing the
-# orders_data entry here caused a real ValueError ("Q3 needs a second
-# table -- pass --orders-data") on a live run before this fix.
-QUERIES_WITH_SECOND_TABLE = {19: "part_data", 14: "part_data", 12: "orders_data", 3: "orders_data"}
-QUERIES_WITH_THIRD_TABLE = {3: "customer_data"}
-ALL_QUERIES = (1, 3, 6, 12, 14, 19)
+# Every extra table (beyond lineitem/{data}) a given query's own text
+# references, confirmed against the real query files in
+# benchmarks/tpch/queries/ -- see docs/TPCH.md's own per-query table list
+# (kept in sync by hand; the two aren't generated from a shared source).
+# {table}_data is always the glob kwarg name kernellake_sql()/
+# run_kernellake_query() below expect for a given table -- e.g. "orders"
+# here means "orders_data". Q11/Q13 reference no lineitem at all (not
+# missing an entry -- see kernellake_sql()'s own comment in
+# tools/benchmark_three_way.py) but still get "lineitem" counted in their
+# own bytes-scanned total below, a pre-existing tooling quirk shared with
+# tools/validate_tpch.py/kernellake benchmark tpch, not something unique
+# to this harness.
+QUERY_EXTRA_TABLES = {
+    3: ("orders", "customer"),
+    5: ("orders", "customer", "supplier", "nation", "region"),
+    7: ("orders", "customer", "supplier", "nation"),
+    9: ("part", "supplier", "partsupp", "orders", "nation"),
+    10: ("orders", "customer", "nation"),
+    11: ("partsupp", "supplier", "nation"),
+    12: ("orders",),
+    13: ("customer", "orders"),
+    14: ("part",),
+    18: ("customer", "orders"),
+    19: ("part",),
+}
+ALL_QUERIES = (1, 3, 5, 6, 7, 9, 10, 11, 12, 13, 14, 18, 19)
 
-# The other 16 of TPC-H's 22 queries -- listed explicitly (never silently
+# The other 9 of TPC-H's 22 queries -- listed explicitly (never silently
 # omitted) so every report this produces states plainly why they're
 # missing, per README.md's "What this does not measure".
 UNSUPPORTED_QUERIES = {
-    q: "needs SQL features KernelLake doesn't support yet (correlated subqueries, EXISTS, "
-    "DECIMAL, HAVING, or non-equi/multi-way joins beyond a simple INNER JOIN chain)"
-    for q in (2, 4, 5, 7, 8, 9, 10, 11, 13, 15, 16, 17, 18, 20, 21, 22)
+    q: "needs SQL features KernelLake doesn't support yet (DISTINCT, set operations, WITH/CTEs, "
+    "window functions, EXISTS, or a correlated subquery)"
+    for q in (2, 4, 8, 15, 16, 17, 20, 21, 22)
 }
 
 
@@ -123,11 +141,28 @@ def s3_data_glob(
     # that joins it (Q3, Q12). Found via a real FileNotFoundError while
     # writing generate_and_upload_iceberg_data.py's equivalent map and
     # cross-checking against a real S3 listing, not assumed.
+    #
+    # part/partsupp are the same story, found while wiring Q9 up here:
+    # generate_tpch.py batches part (and partsupp alongside it, one
+    # partsupp file per part batch) via PART_BATCH_ROWS = 5_000_000 --
+    # both single-file only up to SF~25 (200,000 part rows/SF x 25 =
+    # 5,000,000), multi-file above that. `part` had the exact same latent
+    # single-file bug `orders` already had here (just never triggered,
+    # since no part-needing query -- Q9/Q14/Q19 -- had been run through
+    # this harness above SF~25 yet); fixed proactively rather than waiting
+    # for its own real FileNotFoundError. nation/region/supplier are
+    # genuinely always single-file, fixed row counts independent of scale
+    # factor (25/5/10,000 rows respectively) -- see generate_tpch.py's own
+    # NATION_ROWS-equivalent constants.
     prefix_map = {
         "lineitem": "lineitem-*.parquet",
-        "part": "part-00000.parquet",
+        "part": "part-*.parquet",
         "orders": "orders-*.parquet",
         "customer": "customer-00000.parquet",
+        "nation": "nation-00000.parquet",
+        "region": "region-00000.parquet",
+        "supplier": "supplier-00000.parquet",
+        "partsupp": "partsupp-*.parquet",
     }
     tag = compression_tag(compression, compression_level)
     sf_dir = f"sf{scale_factor}-{tag}"
@@ -164,7 +199,10 @@ def s3_bytes_for_glob(s3_client, bucket: str, key_prefix: str) -> int:
 def s3_table_key_prefix(
     scale_factor: int, table: str, compression: str = "snappy", compression_level: int | None = None,
 ) -> str:
-    file_prefix_map = {"lineitem": "lineitem-", "part": "part-", "orders": "orders-", "customer": "customer-"}
+    file_prefix_map = {
+        "lineitem": "lineitem-", "part": "part-", "orders": "orders-", "customer": "customer-",
+        "nation": "nation-", "region": "region-", "supplier": "supplier-", "partsupp": "partsupp-",
+    }
     tag = compression_tag(compression, compression_level)
     sf_dir = f"sf{scale_factor}-{tag}"
     return f"tpch-data/{sf_dir}/{file_prefix_map[table]}"
@@ -239,7 +277,9 @@ def restart_kernellake_server(ssh_host: str, ssh_key_path: str) -> None:
 
 def run_kernellake_query(cursor, query_number: int, globs: dict, table_format: str = "flat") -> tuple:
     sql = kernellake_sql(
-        query_number, globs["data"], globs.get("part_data"), globs.get("orders_data"), globs.get("customer_data")
+        query_number, globs.get("data"), globs.get("part_data"), globs.get("orders_data"),
+        globs.get("customer_data"), globs.get("nation_data"), globs.get("supplier_data"),
+        globs.get("region_data"), globs.get("partsupp_data"),
     )
     if table_format == "iceberg":
         # The query files' FROM clauses are fixed text (read_parquet(...)) --
@@ -297,7 +337,9 @@ def run_duckdb_query(con, query_number: int, globs: dict) -> tuple:
     # DuckDB accepts that syntax natively, no rewrite needed (see
     # tools/duckdb_compare.py's equivalent comment for the local benchmark).
     sql = kernellake_sql(
-        query_number, globs["data"], globs.get("part_data"), globs.get("orders_data"), globs.get("customer_data")
+        query_number, globs.get("data"), globs.get("part_data"), globs.get("orders_data"),
+        globs.get("customer_data"), globs.get("nation_data"), globs.get("supplier_data"),
+        globs.get("region_data"), globs.get("partsupp_data"),
     )
     start = time.perf_counter()
     # .arrow() returns a RecordBatchReader (lazy), not a materialized
@@ -460,7 +502,7 @@ def register_spark_views(
     table_format: str = "flat", iceberg_catalog: str = "bench",
     compression_level: int | None = None,
 ) -> None:
-    for table in ("lineitem", "part", "orders", "customer"):
+    for table in ("lineitem", "part", "orders", "customer", "nation", "region", "supplier", "partsupp"):
         if table_format == "iceberg":
             spark.table(iceberg_table_ref(table, scale_factor, iceberg_catalog)).createOrReplaceTempView(table)
         else:
@@ -703,17 +745,15 @@ def main() -> int:
                 scheme="s3", compression_level=args.compression_level,
             )
 
+        # lineitem is always counted in bytes-scanned even for Q11/Q13
+        # (which never reference it) -- see QUERY_EXTRA_TABLES's own
+        # comment for why that's a pre-existing, shared tooling quirk,
+        # not something to special-case away here.
         query_tables = ["lineitem"]
         globs = {"data": table_ref("lineitem")}
-        if query_number in QUERIES_WITH_SECOND_TABLE:
-            key = QUERIES_WITH_SECOND_TABLE[query_number]
-            table = {"part_data": "part", "orders_data": "orders"}[key]
-            globs[key] = table_ref(table)
+        for table in QUERY_EXTRA_TABLES.get(query_number, ()):
+            globs[f"{table}_data"] = table_ref(table)
             query_tables.append(table)
-        if query_number in QUERIES_WITH_THIRD_TABLE:
-            key = QUERIES_WITH_THIRD_TABLE[query_number]
-            globs[key] = table_ref("customer")
-            query_tables.append("customer")
 
         print(f"=== Q{query_number} ===", file=sys.stderr)
         query_result, spark, duckdb_con = benchmark_query(

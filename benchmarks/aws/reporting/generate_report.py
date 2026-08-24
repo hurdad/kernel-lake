@@ -398,6 +398,15 @@ def main() -> int:
     (out_dir / "raw_aggregated.json").write_text(json.dumps(data, indent=2))
 
     unsupported = data["benchmark_runs"][0]["unsupported_queries"] if data["benchmark_runs"] else {}
+    # Derived from the real report data, not hardcoded -- a hardcoded "N of
+    # 22 (Q1, Q3, ...)" string here went stale for real once
+    # aws_benchmark_runner.py's own ALL_QUERIES grew past its original 6
+    # (see docs/ROADMAP.md's TPC-H Q13 entry), silently under-describing
+    # this exact run's real coverage. `run["queries"]` already has one
+    # entry per query this run actually executed (see e.g. line 76's
+    # identical `by_query` construction above).
+    supported = sorted(q["query"] for q in data["benchmark_runs"][0]["queries"]) if data["benchmark_runs"] else []
+    supported_list = ", ".join(f"Q{q}" for q in supported)
     md = [
         "# KernelLake AWS Benchmark Report",
         "",
@@ -405,7 +414,8 @@ def main() -> int:
         "",
         "## Query coverage",
         "",
-        f"6 of TPC-H's 22 queries run today (Q1, Q3, Q6, Q12, Q14, Q19). The other 16 are blocked:",
+        f"{len(supported)} of TPC-H's 22 queries run today ({supported_list}). "
+        f"The other {len(unsupported)} are blocked:",
         "",
     ]
     for q, reason in sorted(unsupported.items()):

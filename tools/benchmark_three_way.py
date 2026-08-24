@@ -201,50 +201,81 @@ def load_query_text(query_number: int) -> str:
     return re.sub(r"--[^\n]*\n", "\n", path.read_text())
 
 
+# One entry per non-{data} placeholder this whole toolchain understands,
+# in the order each first appeared -- reused by both kernellake_sql() and
+# spark_sql() below so the two never drift apart on which tables exist.
+# Mirrors tools/validate_tpch.py's own load_query()/argparse surface
+# exactly (that tool needed this full table set for Q5/Q7/Q9/Q10/Q11
+# before this file did -- see its own module docstring for real per-query
+# --*-data examples).
+EXTRA_TABLE_PLACEHOLDERS = ("part_data", "orders_data", "customer_data", "nation_data", "supplier_data",
+                           "region_data", "partsupp_data")
+
+
 def kernellake_sql(
     query_number: int,
     data_glob: str,
     part_data_glob: str | None = None,
     orders_data_glob: str | None = None,
     customer_data_glob: str | None = None,
+    nation_data_glob: str | None = None,
+    supplier_data_glob: str | None = None,
+    region_data_glob: str | None = None,
+    partsupp_data_glob: str | None = None,
 ) -> str:
     text = load_query_text(query_number)
-    if "{part_data}" in text and not part_data_glob:
-        raise ValueError(f"Q{query_number} needs a second table -- pass --part-data")
-    if "{orders_data}" in text and not orders_data_glob:
-        raise ValueError(f"Q{query_number} needs a second table -- pass --orders-data")
-    if "{customer_data}" in text and not customer_data_glob:
-        raise ValueError(f"Q{query_number} needs a third table -- pass --customer-data")
+    globs = {
+        "part_data": part_data_glob, "orders_data": orders_data_glob, "customer_data": customer_data_glob,
+        "nation_data": nation_data_glob, "supplier_data": supplier_data_glob, "region_data": region_data_glob,
+        "partsupp_data": partsupp_data_glob,
+    }
+    for placeholder in EXTRA_TABLE_PLACEHOLDERS:
+        if f"{{{placeholder}}}" in text and not globs[placeholder]:
+            raise ValueError(f"Q{query_number} needs a table -- pass --{placeholder.replace('_', '-')}")
+    # {data}/lineitem is the one placeholder every *other* query needs but
+    # Q11/Q13 don't reference at all (both are entirely lineitem-free --
+    # see benchmarks/tpch/queries/q11.sql's/q13.sql's own header comments)
+    # -- .replace() is a safe no-op when the placeholder isn't present, so
+    # this line never needs its own conditional the way the optional
+    # tables above do.
     text = text.replace("{data}", data_glob)
-    if part_data_glob:
-        text = text.replace("{part_data}", part_data_glob)
-    if orders_data_glob:
-        text = text.replace("{orders_data}", orders_data_glob)
-    if customer_data_glob:
-        text = text.replace("{customer_data}", customer_data_glob)
+    for placeholder, glob in globs.items():
+        if glob:
+            text = text.replace(f"{{{placeholder}}}", glob)
     return text.strip()
 
 
 def spark_sql(query_number: int) -> str:
     # The query files' only KernelLake-specific syntax is the
-    # read_parquet('{data}')/read_parquet('{part_data}')/
-    # read_parquet('{orders_data}')/read_parquet('{customer_data}')
-    # table-valued-function FROM clauses (see each query file's own
-    # "Deviations" comment) -- Spark SQL has no such function, so these are
-    # rewritten to plain table references against temp views the caller
-    # registers via spark.read.parquet(...) instead
-    # ("lineitem"/"part"/"orders"/"customer"). Everything else in these
-    # query files is already plain ANSI SQL both engines understand
-    # identically. {part_data}/{orders_data}/{customer_data} are only
-    # present for queries needing that extra table (e.g. Q19/Q12/Q3); their
-    # regexes simply find no match otherwise.
+    # read_parquet('{data}')/read_parquet('{part_data}')/... table-valued-
+    # function FROM clauses (see each query file's own "Deviations"
+    # comment) -- Spark SQL has no such function, so these are rewritten to
+    # plain table references against temp views the caller registers via
+    # spark.read.parquet(...) instead ("lineitem"/"part"/"orders"/
+    # "customer"/"nation"/"supplier"/"region"/"partsupp"). Everything else
+    # in these query files is already plain ANSI SQL both engines
+    # understand identically. Every placeholder here is optional -- only
+    # the queries that actually reference a given one (e.g. {part_data}
+    # for Q19/Q12/Q3, {nation_data} for Q7/Q9/Q10/Q11) have a match; Q11/
+    # Q13 reference no {data}/lineitem at all (see kernellake_sql()'s own
+    # comment), so unlike the substituted-tables loop below there is no
+    # single "this one must always match" placeholder to assert on --
+    # instead, after every substitution, assert no `{..._data}` placeholder
+    # survives unrewritten (a real typo/missing-table bug would leave one
+    # behind; a query file syntax error unrelated to these placeholders
+    # would not, and isn't this function's job to catch).
     text = load_query_text(query_number)
     rewritten = re.sub(r"read_parquet\(\s*'\{data\}'\s*\)", "lineitem", text)
-    if rewritten == text:
-        raise ValueError(f"Q{query_number}: no read_parquet('{{data}}') found to rewrite for Spark SQL")
-    rewritten = re.sub(r"read_parquet\(\s*'\{part_data\}'\s*\)", "part", rewritten)
-    rewritten = re.sub(r"read_parquet\(\s*'\{orders_data\}'\s*\)", "orders", rewritten)
-    rewritten = re.sub(r"read_parquet\(\s*'\{customer_data\}'\s*\)", "customer", rewritten)
+    for placeholder, table in (
+        ("part_data", "part"), ("orders_data", "orders"), ("customer_data", "customer"),
+        ("nation_data", "nation"), ("supplier_data", "supplier"), ("region_data", "region"),
+        ("partsupp_data", "partsupp"),
+    ):
+        rewritten = re.sub(r"read_parquet\(\s*'\{" + placeholder + r"\}'\s*\)", table, rewritten)
+    leftover = re.search(r"\{\w+_data\}", rewritten)
+    if leftover:
+        raise ValueError(f"Q{query_number}: unrewritten placeholder {leftover.group()!r} in Spark SQL "
+                         "-- a table this query needs has no read_parquet(...) rewrite wired up above")
     return rewritten.strip()
 
 
