@@ -730,7 +730,15 @@ class Binder {
     ExpressionPtr value = bind(node.value, allow_aggregates);
     ExpressionPtr result;
     for (const AstExprPtr& item : node.list) {
-      ExpressionPtr comparison = combine_binary(AstBinaryOp::Eq, value, bind(item, allow_aggregates));
+      // Retype a bare NULL list item to match `value`, the same special
+      // case bind_node(AstBinary&) applies to `x = NULL` -- without it, an
+      // IN-list NULL (e.g. `name IN ('a', NULL, 'b')`) hits the untyped
+      // NULL's Int64 default and fails to bind against a non-numeric value.
+      ExpressionPtr bound_item =
+          is_untyped_null(item)
+              ? std::make_shared<LiteralExpression>(LiteralExpression::make_null(value->result_type()))
+              : bind(item, allow_aggregates);
+      ExpressionPtr comparison = combine_binary(AstBinaryOp::Eq, value, std::move(bound_item));
       result = result == nullptr ? std::move(comparison)
                                  : combine_binary(AstBinaryOp::Or, std::move(result), std::move(comparison));
     }

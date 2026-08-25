@@ -150,6 +150,40 @@ TEST(UnityCatalogSourceResolver, ThrowsWhenAzureVendedCredentialsCarryNoSasToken
   server.join();
 }
 
+constexpr const char* kS3TableInfoJsonForCredentialCheck = R"({
+  "table_id": "table-uuid-s3",
+  "table_type": "EXTERNAL",
+  "data_source_format": "PARQUET",
+  "storage_location": "s3://warehouse/db/orders"
+})";
+
+// Regression test: unlike the GCS/Azure branches right next to it in
+// unity_catalog_source_resolver.cpp, the S3 branch used to build an
+// S3ObjectStore straight from credentials.access_key_id/secret_access_key
+// with no empty check at all -- a present-but-empty aws_temp_credentials
+// response (the client itself only rejects a field missing entirely, see
+// unity_catalog_client_test.cpp) would silently produce a non-functional
+// S3ObjectStore instead of failing clearly here.
+TEST(UnityCatalogSourceResolver, ThrowsWhenS3VendedCredentialsCarryNoAccessKeyId) {
+  LoopbackHttpServer server;
+  std::vector<std::string> requests(2);
+  server.respond(
+      {http_ok_json(kS3TableInfoJsonForCredentialCheck),
+       http_ok_json(
+           R"({"aws_temp_credentials": {"access_key_id": "", "secret_access_key": "", "session_token": ""}})")},
+      &requests);
+
+  UnityCatalogSourceResolver resolver = make_resolver(single_instance_config(server.base_url()));
+  LocalObjectStore store;
+  try {
+    (void)resolver.resolve(store, {"unitycatalog://prod.main.db.orders"}, {});
+    FAIL() << "expected resolve() to throw";
+  } catch (const StorageError& e) {
+    EXPECT_NE(std::string(e.what()).find("access_key_id"), std::string::npos) << e.what();
+  }
+  server.join();
+}
+
 // There's no real GCS endpoint in this test environment, so the actual
 // file listing resolve() attempts once it's past credential-fetching must
 // fail -- what matters here is *how* it fails: endpoint_override/

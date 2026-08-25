@@ -144,6 +144,12 @@ ResolvedTable UnityCatalogSourceResolver::resolve(ObjectStore& store, const std:
     const UnityCatalogTemporaryCredentials credentials =
         client.get_temporary_table_credentials(table.table_id, "READ");
     if (storage_scheme == "s3") {
+      if (credentials.access_key_id.empty() || credentials.secret_access_key.empty()) {
+        throw StorageError(fmt::format(
+            "read_unity_catalog(...): table '{}' is S3-backed but Unity Catalog's temporary-credentials "
+            "response carried no access_key_id/secret_access_key",
+            source));
+      }
       temp_store = std::make_shared<S3ObjectStore>(s3_config_.options, credentials.access_key_id,
                                                    credentials.secret_access_key, credentials.session_token);
     } else if (storage_scheme == "gs" || storage_scheme == "gcs") {

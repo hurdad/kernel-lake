@@ -9,6 +9,7 @@
 
 #include <arrow/api.h>
 #include <arrow/io/file.h>
+#include <fmt/format.h>
 #include <parquet/arrow/writer.h>
 
 #include <filesystem>
@@ -234,6 +235,123 @@ TEST_F(ExistsQueryTest, ExistsCpuBackendMatchesGpuBackend) {
   for (std::int64_t i = 0; i < gpu_batch.num_rows(); ++i) {
     EXPECT_EQ(gpu_order_id->Value(i), cpu_order_id->Value(i)) << "row " << i;
   }
+}
+
+// End-to-end coverage for SemiAntiJoinOperator's *partitioned* (grace hash
+// join) path, through the real parse -> plan -> physical-plan ->
+// build_operator_tree() -> execute pipeline -- not a hand-built operator
+// unit test (this operator, unlike HashJoinOperator, has none; see the
+// end-to-end style every other test in this file already uses). Same
+// forced-partitioning setup as hash_join_test.cpp's own
+// HashJoinPartitionedQueryTest (a small engine.query_memory_limit_bytes
+// against a 3M-row build side -- see that test's own comment for why a
+// real, not pathologically tiny, ceiling is used), reused here because
+// EXISTS's build side (the correlated subquery's own table) is put through
+// the identical choose_partition_count() call as HashJoinNode's INNER/LEFT
+// OUTER path -- see operator_builder.cpp's own comment on why LEFT SEMI/
+// LEFT ANTI needed this too, not just a simpler unpartitioned operator.
+class SemiAntiJoinPartitionedQueryTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    dir_ = fs::temp_directory_path() / fs::path("kernellake_semi_anti_partitioned_test");
+    fs::create_directories(dir_);
+    customers_path_ = (dir_ / "customers.parquet").string();
+    orders_path_ = (dir_ / "orders.parquet").string();
+
+    // 3,000,000 customers (customer_id 0..2999999) -- the build (right)
+    // side, exactly the row count/type shape
+    // HashJoinPartitionedQueryTest's own comment sizes against a 128 MiB
+    // query_memory_limit_bytes to force partition_count > 1 for real.
+    constexpr std::int64_t kCustomerCount = 3'000'000;
+    arrow::Int64Builder customer_id_builder;
+    arrow::StringBuilder name_builder;
+    for (std::int64_t i = 0; i < kCustomerCount; ++i) {
+      ASSERT_TRUE(customer_id_builder.Append(i).ok());
+      ASSERT_TRUE(name_builder.Append("customer_" + std::to_string(i)).ok());
+    }
+    std::shared_ptr<arrow::Array> customer_id_array, name_array;
+    ASSERT_TRUE(customer_id_builder.Finish(&customer_id_array).ok());
+    ASSERT_TRUE(name_builder.Finish(&name_array).ok());
+    const auto customers_schema = arrow::schema(
+        {arrow::field("customer_id", arrow::int64(), false), arrow::field("name", arrow::utf8(), false)});
+    const auto customers_table = arrow::Table::Make(customers_schema, {customer_id_array, name_array});
+    auto customers_sink = arrow::io::FileOutputStream::Open(customers_path_).ValueOrDie();
+    ASSERT_TRUE(parquet::arrow::WriteTable(*customers_table, arrow::default_memory_pool(), customers_sink,
+                                           /*chunk_size=*/500)
+                    .ok());
+
+    // Orders (probe/left side): matches at the low end, middle, and high
+    // end of the build side's key range (order_ids 1-3), plus one
+    // (order_id=4, customer_id=-1) that matches nothing at all -- forces
+    // left_join()'s own JoinNoMatch-sentinel path to run against a real,
+    // reloaded-from-disk build bucket, not just the non-partitioned fast
+    // path the other EXISTS/NOT EXISTS tests in this file cover.
+    arrow::Int64Builder order_id_builder;
+    arrow::Int64Builder order_customer_id_builder;
+    const std::vector<std::int64_t> order_ids = {1, 2, 3, 4};
+    const std::vector<std::int64_t> order_customer_ids = {0, 1500000, 2999999, -1};
+    for (std::size_t i = 0; i < order_ids.size(); ++i) {
+      ASSERT_TRUE(order_id_builder.Append(order_ids[i]).ok());
+      ASSERT_TRUE(order_customer_id_builder.Append(order_customer_ids[i]).ok());
+    }
+    std::shared_ptr<arrow::Array> order_id_array, order_customer_id_array;
+    ASSERT_TRUE(order_id_builder.Finish(&order_id_array).ok());
+    ASSERT_TRUE(order_customer_id_builder.Finish(&order_customer_id_array).ok());
+    const auto orders_schema = arrow::schema({arrow::field("order_id", arrow::int64(), false),
+                                              arrow::field("customer_id", arrow::int64(), false)});
+    const auto orders_table = arrow::Table::Make(orders_schema, {order_id_array, order_customer_id_array});
+    auto orders_sink = arrow::io::FileOutputStream::Open(orders_path_).ValueOrDie();
+    ASSERT_TRUE(
+        parquet::arrow::WriteTable(*orders_table, arrow::default_memory_pool(), orders_sink, /*chunk_size=*/4)
+            .ok());
+  }
+
+  void TearDown() override { fs::remove_all(dir_); }
+
+  [[nodiscard]] std::string exists_sql(bool negate) const {
+    return fmt::format(
+        "SELECT o.order_id FROM read_parquet('{}') AS o WHERE {}EXISTS (SELECT * FROM read_parquet('{}') AS "
+        "c WHERE c.customer_id = o.customer_id) ORDER BY o.order_id",
+        orders_path_, negate ? "NOT " : "", customers_path_);
+  }
+
+  fs::path dir_;
+  std::string customers_path_;
+  std::string orders_path_;
+};
+
+TEST_F(SemiAntiJoinPartitionedQueryTest, PartitionedExistsMatchesLowMidHighRangeRows) {
+  EngineConfig config = default_config();
+  // Same 128 MiB budget as HashJoinPartitionedQueryTest, forcing
+  // choose_partition_count() to pick partition_count > 1 for this join too.
+  config.engine.query_memory_limit_bytes = 128ULL * 1024 * 1024;
+  QueryEngine engine(config);
+
+  const QueryResult result = engine.execute(exists_sql(/*negate=*/false));
+  ASSERT_EQ(result.batches.size(), 1u);
+  const std::shared_ptr<arrow::RecordBatch>& batch = result.batches.front();
+  const auto order_id_column =
+      std::static_pointer_cast<arrow::Int64Array>(batch->GetColumnByName("order_id"));
+  ASSERT_NE(order_id_column, nullptr);
+  ASSERT_EQ(batch->num_rows(), 3);  // order_id 4 (customer_id=-1) has no match.
+  EXPECT_EQ(order_id_column->Value(0), 1);
+  EXPECT_EQ(order_id_column->Value(1), 2);
+  EXPECT_EQ(order_id_column->Value(2), 3);
+}
+
+TEST_F(SemiAntiJoinPartitionedQueryTest, PartitionedNotExistsKeepsOnlyTheGenuinelyUnmatchedRow) {
+  EngineConfig config = default_config();
+  config.engine.query_memory_limit_bytes = 128ULL * 1024 * 1024;
+  QueryEngine engine(config);
+
+  const QueryResult result = engine.execute(exists_sql(/*negate=*/true));
+  ASSERT_EQ(result.batches.size(), 1u);
+  const std::shared_ptr<arrow::RecordBatch>& batch = result.batches.front();
+  const auto order_id_column =
+      std::static_pointer_cast<arrow::Int64Array>(batch->GetColumnByName("order_id"));
+  ASSERT_NE(order_id_column, nullptr);
+  ASSERT_EQ(batch->num_rows(), 1);
+  EXPECT_EQ(order_id_column->Value(0), 4);  // customer_id=-1, genuinely unmatched.
 }
 
 }  // namespace

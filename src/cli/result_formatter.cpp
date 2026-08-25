@@ -15,6 +15,30 @@ namespace kernellake::cli {
 
 namespace {
 
+// RAII close for the std::FILE* branches below: write_table_format()/
+// write_jsonl_format() can throw mid-write (scalar_text() throws
+// ExecutionError on a malformed/unsupported Arrow value), and a plain
+// std::fclose() call placed after that write, as this used to be, is
+// skipped on that exception path -- leaking the fd. Never closes stdout
+// (owns_ is false whenever output_path was unset).
+class OwnedFile {
+ public:
+  OwnedFile(std::FILE* file, bool owns) : file_(file), owns_(owns) {}
+  ~OwnedFile() {
+    if (owns_ && file_ != nullptr) {
+      std::fclose(file_);
+    }
+  }
+  OwnedFile(const OwnedFile&) = delete;
+  OwnedFile& operator=(const OwnedFile&) = delete;
+
+  [[nodiscard]] std::FILE* get() const { return file_; }
+
+ private:
+  std::FILE* file_;
+  bool owns_;
+};
+
 [[nodiscard]] std::string arrow_status_message(const arrow::Status& status, std::string_view context) {
   return fmt::format("{}: {}", context, status.ToString());
 }
@@ -241,31 +265,28 @@ void write_query_result(const QueryResult& result, ResultFormat format,
                         const std::optional<std::string>& output_path) {
   switch (format) {
     case ResultFormat::Table: {
-      std::FILE* out = output_path ? std::fopen(output_path->c_str(), "w") : stdout;
-      // out == nullptr only when output_path was set (fopen failed): stdout
-      // is never null, so the !output_path branch above can't reach here.
-      if (out == nullptr) {
+      const OwnedFile out(output_path ? std::fopen(output_path->c_str(), "w") : stdout,
+                          output_path.has_value());
+      // out.get() == nullptr only when output_path was set (fopen failed):
+      // stdout is never null, so the !output_path branch above can't reach
+      // here.
+      if (out.get() == nullptr) {
         throw ExecutionError(fmt::format("failed to open query result output '{}'",
                                          *output_path));  // NOLINT(bugprone-unchecked-optional-access)
       }
-      write_table_format(result, out);
-      if (output_path) {
-        std::fclose(out);
-      }
+      write_table_format(result, out.get());
       return;
     }
     case ResultFormat::JsonLines: {
-      std::FILE* out = output_path ? std::fopen(output_path->c_str(), "w") : stdout;
-      // See ResultFormat::Table's branch above: out == nullptr implies
-      // output_path was set.
-      if (out == nullptr) {
+      const OwnedFile out(output_path ? std::fopen(output_path->c_str(), "w") : stdout,
+                          output_path.has_value());
+      // See ResultFormat::Table's branch above: out.get() == nullptr
+      // implies output_path was set.
+      if (out.get() == nullptr) {
         throw ExecutionError(fmt::format("failed to open query result output '{}'",
                                          *output_path));  // NOLINT(bugprone-unchecked-optional-access)
       }
-      write_jsonl_format(result, out);
-      if (output_path) {
-        std::fclose(out);
-      }
+      write_jsonl_format(result, out.get());
       return;
     }
     case ResultFormat::Csv:

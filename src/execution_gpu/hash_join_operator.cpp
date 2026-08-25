@@ -1,11 +1,7 @@
 #include "kernellake/execution_gpu/hash_join_operator.hpp"
 
-#include <arrow/io/file.h>
 #include <cudf/column/column_factories.hpp>
-#include <cudf/concatenate.hpp>
 #include <cudf/copying.hpp>
-#include <cudf/hashing.hpp>
-#include <cudf/partitioning.hpp>
 #include <cudf/scalar/scalar_factories.hpp>
 #include <cudf/table/table_view.hpp>
 #include <fmt/format.h>
@@ -19,6 +15,7 @@
 #include "kernellake/common/errors.hpp"
 #include "kernellake/execution_gpu/arrow_bridge.hpp"
 #include "kernellake/execution_gpu/cudf_adapter.hpp"
+#include "kernellake/execution_gpu/spill_partitioned_join.hpp"
 
 namespace kernellake {
 
@@ -31,143 +28,6 @@ namespace {
 cudf::column_view as_gather_map(const rmm::device_uvector<cudf::size_type>& indices) {
   return cudf::column_view(cudf::data_type{cudf::type_id::INT32},
                            static_cast<cudf::size_type>(indices.size()), indices.data(), nullptr, 0);
-}
-
-std::unique_ptr<cudf::table> concatenate_batches(const std::vector<DeviceBatch>& batches,
-                                                 ExecutionContext& context) {
-  std::vector<cudf::table_view> views;
-  views.reserve(batches.size());
-  for (const DeviceBatch& batch : batches) {
-    views.push_back(batch.view());
-  }
-  return cudf::concatenate(views, context.stream, context.memory_resource);
-}
-
-std::shared_ptr<arrow::ipc::RecordBatchFileReader> open_partition_reader(const std::string& path) {
-  arrow::Result<std::shared_ptr<arrow::io::ReadableFile>> file_result = arrow::io::ReadableFile::Open(path);
-  if (!file_result.ok()) {
-    throw ExecutionError(
-        fmt::format("failed to reopen hash-join spill file '{}': {}", path, file_result.status().ToString()));
-  }
-  arrow::Result<std::shared_ptr<arrow::ipc::RecordBatchFileReader>> reader_result =
-      arrow::ipc::RecordBatchFileReader::Open(*file_result);
-  if (!reader_result.ok()) {
-    throw ExecutionError(
-        fmt::format("failed to read hash-join spill file '{}': {}", path, reader_result.status().ToString()));
-  }
-  return *reader_result;
-}
-
-std::vector<DeviceBatch> read_partition_batches(const std::string& path,
-                                                const std::shared_ptr<const Schema>& schema,
-                                                ExecutionContext& context) {
-  const std::shared_ptr<arrow::ipc::RecordBatchFileReader> reader = open_partition_reader(path);
-  std::vector<DeviceBatch> batches;
-  batches.reserve(static_cast<std::size_t>(reader->num_record_batches()));
-  for (int i = 0; i < reader->num_record_batches(); ++i) {
-    arrow::Result<std::shared_ptr<arrow::RecordBatch>> batch_result = reader->ReadRecordBatch(i);
-    if (!batch_result.ok()) {
-      throw ExecutionError(fmt::format("failed to read hash-join spill batch from '{}': {}", path,
-                                       batch_result.status().ToString()));
-    }
-    batches.push_back(
-        from_arrow_record_batch(**batch_result, schema, context.stream, context.memory_resource));
-  }
-  return batches;
-}
-
-// Streams `child` to exhaustion, hash-partitioning each incoming batch by
-// its `key_index` column into `partition_count` buckets (cudf::hash_partition,
-// deterministic MURMUR3 with a fixed seed -- see hash_join_operator.hpp's
-// class-level comment for why calling this identically on both sides of a
-// join guarantees equal keys land in the same bucket index), and spills
-// each bucket's slice straight to a *disk* file under `scratch_dir`
-// (`{side_prefix}-{i}.arrow`, Arrow IPC file format) instead of
-// accumulating it on GPU *or* in host RAM -- device memory stays bounded
-// to ~one incoming batch (plus its own partitioned reorder) throughout,
-// and host memory stays bounded to whatever's needed to stream one batch
-// through, regardless of `child`'s total output size. Each bucket's own
-// arrow::ipc::RecordBatchWriter is opened lazily, on that bucket's first
-// row (needs a real arrow::RecordBatch to read the schema off of), and
-// closed once `child` is exhausted.
-//
-// Each reordered/sliced device table's destruction (a stream-ordered free
-// on context.stream, via context.memory_resource) is safe once
-// to_arrow_host()'s device->host copy below (inside to_arrow_record_batch(),
-// called with this same context.stream/context.memory_resource) has
-// completed -- properly stream-ordered against the rest of this query's
-// work, not an implicit dependency on cudf's null-stream default the way
-// this used to be documented here.
-void spill_partitioned_to_disk(PhysicalOperator& child, cudf::size_type key_index,
-                               std::size_t partition_count, const std::filesystem::path& scratch_dir,
-                               const std::string& side_prefix, std::vector<std::string>& paths_out,
-                               std::vector<bool>& nonempty_out, std::shared_ptr<const Schema>& schema_out,
-                               ExecutionContext& context) {
-  paths_out.assign(partition_count, std::string());
-  nonempty_out.assign(partition_count, false);
-  std::vector<std::shared_ptr<arrow::io::FileOutputStream>> sinks(partition_count);
-  std::vector<std::shared_ptr<arrow::ipc::RecordBatchWriter>> writers(partition_count);
-
-  auto ensure_writer_open = [&](std::size_t i, const arrow::RecordBatch& sample) {
-    if (writers[i] != nullptr) {
-      return;
-    }
-    paths_out[i] = (scratch_dir / fmt::format("{}-{}.arrow", side_prefix, i)).string();
-    arrow::Result<std::shared_ptr<arrow::io::FileOutputStream>> sink_result =
-        arrow::io::FileOutputStream::Open(paths_out[i]);
-    if (!sink_result.ok()) {
-      throw ExecutionError(fmt::format("failed to open hash-join spill file '{}': {}", paths_out[i],
-                                       sink_result.status().ToString()));
-    }
-    sinks[i] = *sink_result;
-    arrow::Result<std::shared_ptr<arrow::ipc::RecordBatchWriter>> writer_result =
-        arrow::ipc::MakeFileWriter(sinks[i], sample.schema());
-    if (!writer_result.ok()) {
-      throw ExecutionError(fmt::format("failed to open hash-join spill writer '{}': {}", paths_out[i],
-                                       writer_result.status().ToString()));
-    }
-    writers[i] = *writer_result;
-  };
-
-  while (std::optional<DeviceBatch> batch = child.next(context)) {
-    if (!schema_out) {
-      schema_out = batch->schema_ptr();
-    }
-    if (batch->row_count() == 0) {
-      continue;
-    }
-    auto [reordered, offsets] = cudf::hash_partition(
-        batch->view(), {key_index}, static_cast<int>(partition_count), cudf::hash_id::HASH_MURMUR3,
-        cudf::DEFAULT_HASH_SEED, context.stream, context.memory_resource);
-    for (std::size_t i = 0; i < partition_count; ++i) {
-      const cudf::size_type begin = offsets[i];
-      const cudf::size_type end = offsets[i + 1];
-      if (begin == end) {
-        continue;
-      }
-      const std::vector<cudf::table_view> sliced =
-          cudf::slice(reordered->view(), {begin, end}, context.stream);
-      const std::shared_ptr<arrow::RecordBatch> record_batch =
-          to_arrow_record_batch(sliced.front(), *schema_out, context.stream, context.memory_resource);
-      ensure_writer_open(i, *record_batch);
-      const arrow::Status status = writers[i]->WriteRecordBatch(*record_batch);
-      if (!status.ok()) {
-        throw ExecutionError(fmt::format("failed to write hash-join spill batch to '{}': {}", paths_out[i],
-                                         status.ToString()));
-      }
-      nonempty_out[i] = true;
-    }
-  }
-  for (std::size_t i = 0; i < partition_count; ++i) {
-    if (writers[i] == nullptr) {
-      continue;
-    }
-    const arrow::Status status = writers[i]->Close();
-    if (!status.ok()) {
-      throw ExecutionError(
-          fmt::format("failed to close hash-join spill writer '{}': {}", paths_out[i], status.ToString()));
-    }
-  }
 }
 
 }  // namespace
@@ -189,8 +49,22 @@ std::size_t estimate_row_width_bytes(const Schema& schema) {
       case TypeId::UInt64:
       case TypeId::Float64:
       case TypeId::Timestamp:
-      case TypeId::Decimal:
         total += 8;
+        break;
+      case TypeId::Decimal:
+        // DECIMAL's cudf-side storage width depends on precision, not a
+        // fixed 8 bytes (see cudf_adapter.cpp's decimal_cudf_type_id(),
+        // whose precision tiers this mirrors): a DECIMAL(19+, s) column is
+        // DECIMAL128 (16 bytes/row), not DECIMAL64, and undercounting it
+        // here would under-partition and risk the exact repeat-OOM this
+        // heuristic exists to avoid.
+        if (!field.type.precision.has_value() || *field.type.precision > 18) {
+          total += 16;
+        } else if (*field.type.precision > 9) {
+          total += 8;
+        } else {
+          total += 4;
+        }
         break;
       case TypeId::String:
         // No data has been read yet at plan time -- this is a flat,
@@ -345,8 +219,8 @@ void HashJoinOperator::ensure_partition_built(ExecutionContext& context) {
   // ~1/partition_count_ of the whole build side, comfortably under the
   // budget choose_partition_count() sized partition_count_ against.
   const std::vector<DeviceBatch> batches =
-      read_partition_batches(build_partition_paths_[current_partition_], right_schema_, context);
-  right_table_ = concatenate_batches(batches, context);
+      read_spill_partition_batches(build_partition_paths_[current_partition_], right_schema_, context);
+  right_table_ = concatenate_device_batches(batches, context);
   build_hash_join(context);
   current_partition_built_ = true;
 }
@@ -360,7 +234,7 @@ void HashJoinOperator::open(ExecutionContext& context) {
     while (std::optional<DeviceBatch> batch = right_->next(context)) {
       right_batches.push_back(std::move(*batch));
     }
-    right_table_ = right_batches.empty() ? nullptr : concatenate_batches(right_batches, context);
+    right_table_ = right_batches.empty() ? nullptr : concatenate_device_batches(right_batches, context);
     build_hash_join(context);
     return;
   }
@@ -435,7 +309,7 @@ std::optional<DeviceBatch> HashJoinOperator::next(ExecutionContext& context) {
       ensure_partition_built(context);
       if (!right_is_empty_ || join_type_ == JoinType::LeftOuter) {
         if (probe_reader_ == nullptr) {
-          probe_reader_ = open_partition_reader(probe_partition_paths_[current_partition_]);
+          probe_reader_ = open_spill_partition_reader(probe_partition_paths_[current_partition_]);
           probe_batch_index_ = 0;
         }
         while (probe_batch_index_ < static_cast<std::size_t>(probe_reader_->num_record_batches())) {

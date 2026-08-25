@@ -13,6 +13,7 @@ add_library(kernellake_execution_gpu STATIC
   parquet_scan_operator.cpp
   limit_operator.cpp
   sort_operator.cpp
+  spill_partitioned_join.cpp
   hash_join_operator.cpp
   semi_anti_join_operator.cpp
   batch_size_limit_operator.cpp

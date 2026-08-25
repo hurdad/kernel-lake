@@ -74,15 +74,25 @@ void check_within_root(const fs::path& path, const std::string& local_root, cons
 
 std::vector<ObjectInfo> list_directory_matching(const fs::path& dir, std::string_view pattern) {
   std::vector<ObjectInfo> results;
-  for (const auto& entry : fs::directory_iterator(dir)) {
-    if (!entry.is_regular_file()) {
-      continue;
+  // fs::directory_iterator's constructor and increment can both throw
+  // fs::filesystem_error (e.g. permission denied on an entry, or the
+  // directory being removed mid-walk) -- every other failure path in this
+  // file surfaces as StorageError, so this needs the same conversion
+  // rather than letting a std::filesystem exception type escape uncaught.
+  try {
+    for (const auto& entry : fs::directory_iterator(dir)) {
+      if (!entry.is_regular_file()) {
+        continue;
+      }
+      const std::string filename = entry.path().filename().string();
+      if (!glob_match(pattern, filename)) {
+        continue;
+      }
+      results.push_back(
+          ObjectInfo{Uri(entry.path().string()), static_cast<std::uint64_t>(entry.file_size())});
     }
-    const std::string filename = entry.path().filename().string();
-    if (!glob_match(pattern, filename)) {
-      continue;
-    }
-    results.push_back(ObjectInfo{Uri(entry.path().string()), static_cast<std::uint64_t>(entry.file_size())});
+  } catch (const fs::filesystem_error& e) {
+    throw StorageError(fmt::format("failed to list directory '{}': {}", dir.string(), e.what()));
   }
   std::sort(results.begin(), results.end(),
             [](const ObjectInfo& a, const ObjectInfo& b) { return a.uri < b.uri; });
@@ -163,14 +173,23 @@ std::vector<ObjectInfo> LocalObjectStore::list_recursive(const Uri& prefix) {
   // boundary enforcement happens at open() time regardless of what list()
   // discovers, same reasoning as the existing (non-recursive) list().
   std::vector<ObjectInfo> results;
-  for (const auto& entry : fs::recursive_directory_iterator(path)) {
-    if (!entry.is_regular_file()) {
-      continue;
+  // See list_directory_matching()'s identical try/catch: a recursive walk
+  // is even more likely to hit an unreadable subdirectory partway through
+  // than a single-level listing, and fs::filesystem_error would otherwise
+  // escape uncaught instead of becoming this file's own StorageError.
+  try {
+    for (const auto& entry : fs::recursive_directory_iterator(path)) {
+      if (!entry.is_regular_file()) {
+        continue;
+      }
+      if (entry.path().extension() != ".parquet") {
+        continue;
+      }
+      results.push_back(
+          ObjectInfo{Uri(entry.path().string()), static_cast<std::uint64_t>(entry.file_size())});
     }
-    if (entry.path().extension() != ".parquet") {
-      continue;
-    }
-    results.push_back(ObjectInfo{Uri(entry.path().string()), static_cast<std::uint64_t>(entry.file_size())});
+  } catch (const fs::filesystem_error& e) {
+    throw StorageError(fmt::format("failed to recursively list directory '{}': {}", path.string(), e.what()));
   }
   if (results.empty()) {
     throw StorageError(fmt::format("directory tree contains no Parquet files: '{}'", prefix.value()));

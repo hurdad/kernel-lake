@@ -245,6 +245,24 @@ TEST(HashJoinFreeFunctions, EstimateRowWidthBytesSumsEachFieldsRealWidth) {
   EXPECT_EQ(estimate_row_width_bytes(schema), 37u);
 }
 
+// Regression test: estimate_row_width_bytes() used to count every DECIMAL
+// field as 8 bytes regardless of precision, but cudf_adapter.cpp's
+// decimal_cudf_type_id() (the actual on-device storage this heuristic is
+// supposed to approximate) picks DECIMAL128 (16 bytes) once precision > 18
+// -- undercounting a high-precision DECIMAL build side here would
+// under-partition it and risk the repeat-OOM this function exists to avoid.
+TEST(HashJoinFreeFunctions, EstimateRowWidthBytesUsesDecimal128WidthForHighPrecision) {
+  Schema schema({Field{"amount", decimal_type(/*precision=*/25, /*scale=*/2, /*nullable=*/false)}});
+  EXPECT_EQ(estimate_row_width_bytes(schema), 16u);
+}
+
+TEST(HashJoinFreeFunctions, EstimateRowWidthBytesUsesDecimal32AndDecimal64WidthsByPrecisionTier) {
+  Schema schema({Field{"small", decimal_type(/*precision=*/5, /*scale=*/1, /*nullable=*/false)},
+                 Field{"mid", decimal_type(/*precision=*/15, /*scale=*/2, /*nullable=*/false)}});
+  // 4 (DECIMAL32, precision<=9) + 8 (DECIMAL64, precision<=18) = 12.
+  EXPECT_EQ(estimate_row_width_bytes(schema), 12u);
+}
+
 // choose_partition_count()'s actual multi-partition sizing math (the
 // safety-factor/ceiling/kMaxPartitions clamp) had no direct coverage --
 // every existing test in this file constructs HashJoinOperator with an

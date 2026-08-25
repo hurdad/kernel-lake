@@ -223,6 +223,32 @@ TEST(Binder, NotInNegatesTheDesugaredOrChain) {
   EXPECT_EQ(not_expr->op(), UnaryOperator::Not);
 }
 
+TEST(Binder, InListWithNullLiteralBindsAgainstNonNumericColumn) {
+  // Regression test: bind_node(AstIn&) used to bind each list item with a
+  // plain bind() call, so a bare NULL in the list kept its untyped Int64
+  // default (see bind_literal's own AstLiteralKind::Null comment) instead
+  // of being retyped to match `value` the way bind_node(AstBinary&) already
+  // does for `region = NULL` -- failing to bind here with "incompatible
+  // comparison between STRING and INT64" even though `region IN (...)` with
+  // no NULL in the list binds fine.
+  const auto stmt =
+      sql::parse_sql("SELECT region FROM read_parquet('/x.parquet') WHERE region IN ('A', NULL, 'B')");
+  const BoundQuery bound = bind_query(stmt, sales_schema());
+  ASSERT_NE(bound.where, nullptr);
+  const auto* outer_or = dynamic_cast<const BinaryExpression*>(bound.where.get());
+  ASSERT_NE(outer_or, nullptr);
+  EXPECT_EQ(outer_or->op(), BinaryOperator::Or);
+  const auto* inner_or = dynamic_cast<const BinaryExpression*>(outer_or->left().get());
+  ASSERT_NE(inner_or, nullptr);
+  const auto* null_eq = dynamic_cast<const BinaryExpression*>(inner_or->right().get());
+  ASSERT_NE(null_eq, nullptr);
+  EXPECT_EQ(null_eq->op(), BinaryOperator::Equal);
+  const auto* null_literal = dynamic_cast<const LiteralExpression*>(null_eq->right().get());
+  ASSERT_NE(null_literal, nullptr);
+  EXPECT_TRUE(null_literal->is_null());
+  EXPECT_EQ(null_literal->result_type().id, TypeId::String);
+}
+
 TEST(Binder, CaseRequiresBooleanConditionsAndUnifiesResultTypes) {
   const auto stmt = sql::parse_sql(
       "SELECT CASE WHEN amount > 500 THEN 1 WHEN amount > 100 THEN 2 ELSE 0 END AS bucket "

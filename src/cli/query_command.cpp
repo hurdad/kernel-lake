@@ -131,11 +131,18 @@ int run_query(const std::vector<std::string_view>& args, const CliConfig& config
       if (show_stats) {
         print_stats(result, engine.cache_metrics());
       }
-    } catch (const KernelLakeError& e) {
+    } catch (const std::exception& e) {
+      // Catches std::exception, not just KernelLakeError: a GPU-side
+      // failure (cudf::logic_error, rmm::bad_alloc/out_of_memory,
+      // std::bad_alloc) is exactly the kind of severe failure an operator
+      // most needs recorded on the span -- narrowing this to
+      // KernelLakeError left those exceptions un-finished (destructor
+      // fallback: status Unset, no exception event, no duration
+      // recorded), silently dropping the failure from observability.
       span.finish_error(e, query_sql, effective_engine_config.engine.backend);
       throw;
     }
-  } catch (const KernelLakeError& e) {
+  } catch (const std::exception& e) {
     std::fprintf(stderr, "kernellake query: %s\n", e.what());
     return 1;
   }

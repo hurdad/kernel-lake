@@ -153,20 +153,25 @@ std::unique_ptr<PhysicalOperator> build(const PhysicalPlanPtr& node, ObjectStore
   }
   if (const auto* join = dynamic_cast<const HashJoinNode*>(node.get())) {
     // LEFT SEMI/LEFT ANTI (see SemiAntiJoinOperator's own class comment):
-    // a much simpler operator with no partitioned/spilling mode at all
-    // yet, so none of HashJoinOperator's own partition-sizing/budget-
-    // halving machinery below applies -- both children just get the
-    // plain pass_read_limit_bytes every non-join subtree already uses.
+    // same choose_partition_count()/budget-halving treatment as INNER/LEFT
+    // OUTER below -- a correlated EXISTS/NOT EXISTS subquery's build side
+    // is not, in general, guaranteed small (TPC-H Q4's own `lineitem` is
+    // not), so this needs the same grace-hash partitioned fallback.
     if (join->join_type() == JoinType::LeftSemi || join->join_type() == JoinType::LeftAnti) {
+      const std::size_t semi_anti_partition_count = choose_partition_count(
+          join->estimated_build_rows(), join->right()->output_schema(), build_side_budget_bytes);
+      const std::size_t semi_anti_child_pass_read_limit_bytes =
+          semi_anti_partition_count > 1 ? pass_read_limit_bytes / 2 : pass_read_limit_bytes;
       std::unique_ptr<PhysicalOperator> semi_anti_left =
-          build(join->left(), store, pass_read_limit_bytes, next_id, nvtx_enabled, build_side_budget_bytes,
-                spill_directory, max_distinct_keys, batch_rows, result_batch_rows);
+          build(join->left(), store, semi_anti_child_pass_read_limit_bytes, next_id, nvtx_enabled,
+                build_side_budget_bytes, spill_directory, max_distinct_keys, batch_rows, result_batch_rows);
       std::unique_ptr<PhysicalOperator> semi_anti_right =
-          build(join->right(), store, pass_read_limit_bytes, next_id, nvtx_enabled, build_side_budget_bytes,
-                spill_directory, max_distinct_keys, batch_rows, result_batch_rows);
+          build(join->right(), store, semi_anti_child_pass_read_limit_bytes, next_id, nvtx_enabled,
+                build_side_budget_bytes, spill_directory, max_distinct_keys, batch_rows, result_batch_rows);
       return instrument(std::make_unique<SemiAntiJoinOperator>(
           next_id++, std::move(semi_anti_left), std::move(semi_anti_right), join->left_key_index(),
-          join->right_key_index(), std::make_shared<const Schema>(join->output_schema()), join->join_type()));
+          join->right_key_index(), std::make_shared<const Schema>(join->output_schema()),
+          semi_anti_partition_count, spill_directory, join->join_type()));
     }
     // Computed *before* recursing into children (unlike every other case
     // here): choose_partition_count() only needs the plan node itself

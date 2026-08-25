@@ -97,6 +97,37 @@ TEST_F(LocalObjectStoreTest, FileDiscoveryRejectsEmptySourceList) {
   EXPECT_THROW((void)(discover_parquet_files(store_, {})), StorageError);
 }
 
+// Regression test: fs::directory_iterator's own constructor/increment can
+// throw fs::filesystem_error (e.g. this unreadable subdirectory) -- list()
+// used to let that std::filesystem exception type escape uncaught instead
+// of converting it to this file's own StorageError like every other
+// failure path here.
+TEST_F(LocalObjectStoreTest, ListThrowsStorageErrorOnUnreadableDirectory) {
+  const fs::path unreadable = dir_ / "unreadable";
+  fs::create_directories(unreadable);
+  write_file(unreadable / "hidden.parquet", "x");
+  fs::permissions(unreadable, fs::perms::owner_read | fs::perms::owner_write, fs::perm_options::replace);
+  struct RestorePerms {
+    fs::path path;
+    ~RestorePerms() { fs::permissions(path, fs::perms::owner_all, fs::perm_options::replace); }
+  } restore{unreadable};
+
+  EXPECT_THROW((void)(store_.list(Uri(unreadable.string()))), StorageError);
+}
+
+TEST_F(LocalObjectStoreTest, ListRecursiveThrowsStorageErrorOnUnreadableSubdirectory) {
+  const fs::path unreadable = dir_ / "unreadable_recursive";
+  fs::create_directories(unreadable);
+  write_file(unreadable / "hidden.parquet", "x");
+  fs::permissions(unreadable, fs::perms::owner_read | fs::perms::owner_write, fs::perm_options::replace);
+  struct RestorePerms {
+    fs::path path;
+    ~RestorePerms() { fs::permissions(path, fs::perms::owner_all, fs::perm_options::replace); }
+  } restore{unreadable};
+
+  EXPECT_THROW((void)(store_.list_recursive(Uri(dir_.string()))), StorageError);
+}
+
 class LocalObjectStoreRootConfinementTest : public ::testing::Test {
  protected:
   void SetUp() override {
