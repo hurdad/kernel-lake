@@ -84,18 +84,6 @@ ResolvedTable inspect_source(ObjectStore& store, const std::vector<std::string>&
 }  // namespace
 
 QueryResult QueryEngine::run_subquery(const sql::AstSelectStatement& subquery_ast) const {
-  sql::AstSelectStatement resolved = subquery_ast;
-  if (resolved.having != nullptr) {
-    resolved.having = sql::resolve_subqueries(resolved.having, [this](const sql::AstSelectStatement& nested) {
-      return evaluate_scalar_subquery(nested);
-    });
-  }
-  if (resolved.where != nullptr) {
-    resolved.where = sql::resolve_in_subqueries(
-        resolved.where,
-        [this](const sql::AstSelectStatement& nested) { return evaluate_list_subquery(nested); });
-  }
-
   // Same per-call resolver construction plan_logical()/explain() already
   // use -- see their own comments on why this stays fresh per call today.
   iceberg::IcebergSourceResolver iceberg_resolver(config_.iceberg);
@@ -105,32 +93,15 @@ QueryResult QueryEngine::run_subquery(const sql::AstSelectStatement& subquery_as
       &unity_catalog_token_cache_);
   CompositeSourceResolver resolver(iceberg_resolver, delta_resolver, unity_catalog_resolver);
 
-  LogicalPlanPtr logical;
-  if (resolved.join.has_value()) {
-    std::vector<Schema> join_schemas;
-    std::vector<std::vector<PartitionColumn>> partition_columns_per_source;
-    join_schemas.reserve(resolved.join->steps.size() + 1);
-    partition_columns_per_source.reserve(resolved.join->steps.size() + 1);
-    // nullptr: this subquery's own metadata-inspection time isn't folded
-    // into the outer query's QueryResult::metadata_inspection_seconds --
-    // it's a genuinely separate nested execution, not part of the outer
-    // query's own resolve() work.
-    const ResolvedTable first = inspect_source(store_, resolved.join->first.paths, &resolver, nullptr);
-    join_schemas.push_back(first.schema);
-    partition_columns_per_source.push_back(first.partition_columns);
-    for (const sql::AstJoinStep& step : resolved.join->steps) {
-      const ResolvedTable joined = inspect_source(store_, step.source.paths, &resolver, nullptr);
-      join_schemas.push_back(joined.schema);
-      partition_columns_per_source.push_back(joined.partition_columns);
-    }
-    const BoundQuery bound = bind_query(resolved, join_schemas);
-    logical = optimize(build_logical_plan(bound, join_schemas, std::move(partition_columns_per_source)));
-  } else {
-    const ResolvedTable table = inspect_source(store_, resolved.from.paths, &resolver, nullptr);
-    const BoundQuery bound = bind_query(resolved, table.schema);
-    logical = optimize(build_logical_plan(bound, table.schema, table.partition_columns));
-  }
-
+  // nullptr: this subquery's own metadata-inspection time isn't folded
+  // into the outer query's QueryResult::metadata_inspection_seconds --
+  // it's a genuinely separate nested execution, not part of the outer
+  // query's own resolve() work. plan_logical_unoptimized() itself already
+  // handles every FROM shape (single table, JOIN chain, derived table)
+  // plus this subquery's own nested HAVING/WHERE-IN/EXISTS resolution --
+  // see this method's own header comment (query_engine.hpp).
+  const LogicalPlanPtr logical =
+      optimize(plan_logical_unoptimized(subquery_ast, resolver, /*metadata_inspection_seconds_out=*/nullptr));
   const PhysicalPlanPtr physical = build_physical_plan(logical, store_, &resolver);
   // Always the CPU backend, regardless of config_.engine.backend -- see
   // this method's own header comment (query_engine.hpp) for why nesting a

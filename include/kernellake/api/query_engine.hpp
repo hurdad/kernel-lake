@@ -167,12 +167,20 @@ class QueryEngine {
   // Runs `subquery_ast` as a genuinely separate, complete query (bind,
   // logical-plan, optimize, physical-plan, execute) on the CPU (Acero)
   // backend, always -- regardless of the outer query's own configured
-  // backend, see docs/ARCHITECTURE.md's HAVING section for why. Shared by
-  // evaluate_scalar_subquery()/evaluate_list_subquery() below; recursively
-  // resolves `subquery_ast`'s own HAVING and WHERE-IN subqueries first
-  // (via sql::resolve_subqueries()/sql::resolve_in_subqueries()), so a
-  // subquery nested inside a subquery works for free regardless of which
-  // kind of subquery it is.
+  // backend, see docs/ARCHITECTURE.md's HAVING section for why. Delegates
+  // straight to plan_logical_unoptimized() (the same recursive planner a
+  // real top-level query goes through) rather than reimplementing its own
+  // narrower join-or-single-table planning, so a subquery whose own FROM
+  // is itself a derived table (TPC-H Q15's shape: `HAVING total_revenue =
+  // (SELECT MAX(total_revenue) FROM (SELECT ... GROUP BY l_suppkey) AS
+  // r2)`) works the same way a top-level derived-table query already
+  // does -- plan_logical_unoptimized() also recursively resolves this
+  // subquery's own nested HAVING/WHERE-IN subqueries and any EXISTS/NOT
+  // EXISTS along the way, so a subquery nested inside a subquery works for
+  // free regardless of which kind it is. (Fixed 2026-08-24: the previous
+  // hand-rolled version had no case for `from_subquery` at all, silently
+  // falling through to the single-table branch with an empty path list --
+  // "no data source given" at execution time for exactly this shape.)
   [[nodiscard]] QueryResult run_subquery(const sql::AstSelectStatement& subquery_ast) const;
 
   // Returns `subquery_ast`'s single scalar result as an AstLiteral -- see

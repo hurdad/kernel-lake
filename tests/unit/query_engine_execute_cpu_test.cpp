@@ -1083,6 +1083,32 @@ TEST_F(QueryEngineExecuteCpuTest, HavingSubqueryContainingAJoinSucceeds) {
   EXPECT_EQ(region_column->GetString(0), "B");
 }
 
+// Regression test, found while adding TPC-H Q15 (query_engine.cpp's
+// run_subquery()): a HAVING subquery whose *own* FROM is a derived table
+// (TPC-H Q15's shape -- `HAVING total_revenue = (SELECT MAX(total_revenue)
+// FROM (SELECT ... GROUP BY l_suppkey) AS r2)`, needed since a "max of
+// grouped sums" can't be expressed without one) used to fail with "no
+// data source given" -- run_subquery() reimplemented its own narrower
+// join-or-single-table planning instead of delegating to
+// plan_logical_unoptimized() (the same recursive planner a real top-level
+// query already uses), so it had no case for from_subquery at all and
+// silently fell through to the single-table branch with an empty path
+// list. Fixed by having run_subquery() delegate to
+// plan_logical_unoptimized() directly.
+TEST_F(QueryEngineExecuteCpuTest, HavingSubqueryContainingADerivedTableSucceeds) {
+  const QueryResult result =
+      engine_.execute("SELECT region, SUM(amount) AS total FROM read_parquet('" + path_ +
+                      "') GROUP BY region HAVING SUM(amount) = (SELECT MAX(total) FROM (SELECT region AS r, "
+                      "SUM(amount) AS total FROM read_parquet('" +
+                      path_ + "') GROUP BY region) AS t)");
+
+  ASSERT_EQ(result.rows_returned, 1);
+  const std::shared_ptr<arrow::RecordBatch>& batch = result.batches.front();
+  const auto region_column = std::static_pointer_cast<arrow::StringArray>(batch->GetColumnByName("region"));
+  ASSERT_NE(region_column, nullptr);
+  EXPECT_EQ(region_column->GetString(0), "B");  // B: 100+7+3=110 > A: 10+20+5=35
+}
+
 TEST_F(QueryEngineExecuteCpuTest, HavingSubqueryReturningZeroRowsThrowsExecutionError) {
   EXPECT_THROW((void)(engine_.execute("SELECT region, SUM(amount) AS total FROM read_parquet('" + path_ +
                                       "') GROUP BY region HAVING SUM(amount) > "
