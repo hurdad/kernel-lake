@@ -15,6 +15,7 @@ add_library(kernellake_execution_gpu STATIC
   sort_operator.cpp
   hash_join_operator.cpp
   semi_anti_join_operator.cpp
+  batch_size_limit_operator.cpp
   operator_builder.cpp
   object_store_datasource.cpp
 )

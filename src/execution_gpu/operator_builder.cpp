@@ -10,6 +10,7 @@
 
 #include "kernellake/common/errors.hpp"
 #include "kernellake/execution_gpu/arrow_result_operator.hpp"
+#include "kernellake/execution_gpu/batch_size_limit_operator.hpp"
 #include "kernellake/execution_gpu/filter_operator.hpp"
 #include "kernellake/execution_gpu/hash_aggregate_operator.hpp"
 #include "kernellake/execution_gpu/hash_join_operator.hpp"
@@ -126,7 +127,8 @@ class InstrumentedOperator final : public PhysicalOperator {
 std::unique_ptr<PhysicalOperator> build(const PhysicalPlanPtr& node, ObjectStore& store,
                                         std::size_t pass_read_limit_bytes, OperatorId& next_id,
                                         bool nvtx_enabled, std::size_t build_side_budget_bytes,
-                                        const std::string& spill_directory, std::uint64_t max_distinct_keys) {
+                                        const std::string& spill_directory, std::uint64_t max_distinct_keys,
+                                        std::uint64_t batch_rows, std::uint64_t result_batch_rows) {
   auto instrument = [nvtx_enabled](std::unique_ptr<PhysicalOperator> op) {
     return std::make_unique<InstrumentedOperator>(std::move(op), nvtx_enabled);
   };
@@ -137,9 +139,17 @@ std::unique_ptr<PhysicalOperator> build(const PhysicalPlanPtr& node, ObjectStore
     // Catalog's S3/GCS/Azure) must read through that store, not the
     // caller's own default.
     ObjectStore& effective_store = scan->owned_store() != nullptr ? *scan->owned_store() : store;
-    return instrument(std::make_unique<ParquetScanOperator>(
+    std::unique_ptr<PhysicalOperator> scan_op = instrument(std::make_unique<ParquetScanOperator>(
         next_id++, scan->fragments(), scan->columns(), std::make_shared<const Schema>(scan->output_schema()),
         effective_store, pass_read_limit_bytes, scan->partition_columns()));
+    // EngineSection::batch_rows caps the scan's own output batch size --
+    // see BatchSizeLimitOperator's own doc comment. Wraps the
+    // already-instrumented ParquetScanOperator (rather than the other way
+    // around) so that operator's own resource_seconds()/metrics stay keyed
+    // under "ParquetScan" exactly as before; this adds one more
+    // separately-instrumented "BatchSizeLimit" node on top, not a change
+    // to the scan's own instrumentation.
+    return instrument(std::make_unique<BatchSizeLimitOperator>(next_id++, std::move(scan_op), batch_rows));
   }
   if (const auto* join = dynamic_cast<const HashJoinNode*>(node.get())) {
     // LEFT SEMI/LEFT ANTI (see SemiAntiJoinOperator's own class comment):
@@ -150,10 +160,10 @@ std::unique_ptr<PhysicalOperator> build(const PhysicalPlanPtr& node, ObjectStore
     if (join->join_type() == JoinType::LeftSemi || join->join_type() == JoinType::LeftAnti) {
       std::unique_ptr<PhysicalOperator> semi_anti_left =
           build(join->left(), store, pass_read_limit_bytes, next_id, nvtx_enabled, build_side_budget_bytes,
-                spill_directory, max_distinct_keys);
+                spill_directory, max_distinct_keys, batch_rows, result_batch_rows);
       std::unique_ptr<PhysicalOperator> semi_anti_right =
           build(join->right(), store, pass_read_limit_bytes, next_id, nvtx_enabled, build_side_budget_bytes,
-                spill_directory, max_distinct_keys);
+                spill_directory, max_distinct_keys, batch_rows, result_batch_rows);
       return instrument(std::make_unique<SemiAntiJoinOperator>(
           next_id++, std::move(semi_anti_left), std::move(semi_anti_right), join->left_key_index(),
           join->right_key_index(), std::make_shared<const Schema>(join->output_schema()), join->join_type()));
@@ -187,10 +197,10 @@ std::unique_ptr<PhysicalOperator> build(const PhysicalPlanPtr& node, ObjectStore
     // non-deterministic across the two subtrees.
     std::unique_ptr<PhysicalOperator> left =
         build(join->left(), store, child_pass_read_limit_bytes, next_id, nvtx_enabled,
-              build_side_budget_bytes, spill_directory, max_distinct_keys);
+              build_side_budget_bytes, spill_directory, max_distinct_keys, batch_rows, result_batch_rows);
     std::unique_ptr<PhysicalOperator> right =
         build(join->right(), store, child_pass_read_limit_bytes, next_id, nvtx_enabled,
-              build_side_budget_bytes, spill_directory, max_distinct_keys);
+              build_side_budget_bytes, spill_directory, max_distinct_keys, batch_rows, result_batch_rows);
     return instrument(std::make_unique<HashJoinOperator>(
         next_id++, std::move(left), std::move(right), join->left_key_index(), join->right_key_index(),
         std::make_shared<const Schema>(join->output_schema()), partition_count, spill_directory,
@@ -200,20 +210,20 @@ std::unique_ptr<PhysicalOperator> build(const PhysicalPlanPtr& node, ObjectStore
     return instrument(std::make_unique<FilterOperator>(
         next_id++,
         build(filter->child(), store, pass_read_limit_bytes, next_id, nvtx_enabled, build_side_budget_bytes,
-              spill_directory, max_distinct_keys),
+              spill_directory, max_distinct_keys, batch_rows, result_batch_rows),
         filter->predicate()));
   }
   if (const auto* projection = dynamic_cast<const ProjectionNode*>(node.get())) {
     return instrument(std::make_unique<ProjectionOperator>(
         next_id++,
         build(projection->child(), store, pass_read_limit_bytes, next_id, nvtx_enabled,
-              build_side_budget_bytes, spill_directory, max_distinct_keys),
+              build_side_budget_bytes, spill_directory, max_distinct_keys, batch_rows, result_batch_rows),
         projection->items()));
   }
   if (const auto* hash_aggregate = dynamic_cast<const HashAggregateNode*>(node.get())) {
     std::unique_ptr<PhysicalOperator> child =
         build(hash_aggregate->child(), store, pass_read_limit_bytes, next_id, nvtx_enabled,
-              build_side_budget_bytes, spill_directory, max_distinct_keys);
+              build_side_budget_bytes, spill_directory, max_distinct_keys, batch_rows, result_batch_rows);
     // 0 means "unset in config" -- HashAggregateOperator's own default
     // constructor argument (kDefaultMaxDistinctKeys) only applies when the
     // parameter is omitted entirely, so an explicit 0 has to be resolved
@@ -230,14 +240,14 @@ std::unique_ptr<PhysicalOperator> build(const PhysicalPlanPtr& node, ObjectStore
     return instrument(std::make_unique<ScalarAggregateOperator>(
         next_id++,
         build(scalar_aggregate->child(), store, pass_read_limit_bytes, next_id, nvtx_enabled,
-              build_side_budget_bytes, spill_directory, max_distinct_keys),
+              build_side_budget_bytes, spill_directory, max_distinct_keys, batch_rows, result_batch_rows),
         scalar_aggregate->aggregates()));
   }
   if (const auto* sort = dynamic_cast<const SortNode*>(node.get())) {
     return instrument(std::make_unique<SortOperator>(
         next_id++,
         build(sort->child(), store, pass_read_limit_bytes, next_id, nvtx_enabled, build_side_budget_bytes,
-              spill_directory, max_distinct_keys),
+              spill_directory, max_distinct_keys, batch_rows, result_batch_rows),
         sort->keys()));
   }
   if (const auto* limit = dynamic_cast<const LimitNode*>(node.get())) {
@@ -254,33 +264,45 @@ std::unique_ptr<PhysicalOperator> build(const PhysicalPlanPtr& node, ObjectStore
       return instrument(std::make_unique<SortOperator>(
           next_id++,
           build(sort->child(), store, pass_read_limit_bytes, next_id, nvtx_enabled, build_side_budget_bytes,
-                spill_directory, max_distinct_keys),
+                spill_directory, max_distinct_keys, batch_rows, result_batch_rows),
           sort->keys(), limit->limit()));
     }
     return instrument(std::make_unique<LimitOperator>(
         next_id++,
         build(limit->child(), store, pass_read_limit_bytes, next_id, nvtx_enabled, build_side_budget_bytes,
-              spill_directory, max_distinct_keys),
+              spill_directory, max_distinct_keys, batch_rows, result_batch_rows),
         limit->limit()));
   }
   if (const auto* arrow_result = dynamic_cast<const ArrowResultNode*>(node.get())) {
-    return instrument(std::make_unique<ArrowResultOperator>(
-        next_id++, build(arrow_result->child(), store, pass_read_limit_bytes, next_id, nvtx_enabled,
-                         build_side_budget_bytes, spill_directory, max_distinct_keys)));
+    std::unique_ptr<PhysicalOperator> child =
+        build(arrow_result->child(), store, pass_read_limit_bytes, next_id, nvtx_enabled,
+              build_side_budget_bytes, spill_directory, max_distinct_keys, batch_rows, result_batch_rows);
+    // EngineSection::result_batch_rows caps the whole query's final output
+    // -- see BatchSizeLimitOperator's own doc comment. Applied just below
+    // ArrowResultOperator (a pure passthrough, see its own class comment),
+    // not by wrapping the whole build_operator_tree() result from
+    // outside: ArrowResultOperator::name() == "ArrowResult" is a
+    // documented contract other callers (tracing, metrics,
+    // multi_batch_integration_test.cpp) rely on for the tree's actual
+    // root -- wrapping from outside would replace it with "BatchSizeLimit"
+    // instead. Capping right below a pure passthrough is functionally
+    // identical to capping the whole tree's output.
+    std::unique_ptr<PhysicalOperator> limited =
+        instrument(std::make_unique<BatchSizeLimitOperator>(next_id++, std::move(child), result_batch_rows));
+    return instrument(std::make_unique<ArrowResultOperator>(next_id++, std::move(limited)));
   }
   throw PlanningError("build_operator_tree: unrecognized physical plan node");
 }
 
 }  // namespace
 
-std::unique_ptr<PhysicalOperator> build_operator_tree(const PhysicalPlanPtr& plan, ObjectStore& store,
-                                                      std::size_t pass_read_limit_bytes, bool nvtx_enabled,
-                                                      std::size_t build_side_budget_bytes,
-                                                      const std::string& spill_directory,
-                                                      std::uint64_t max_distinct_keys) {
+std::unique_ptr<PhysicalOperator> build_operator_tree(
+    const PhysicalPlanPtr& plan, ObjectStore& store, std::size_t pass_read_limit_bytes, bool nvtx_enabled,
+    std::size_t build_side_budget_bytes, const std::string& spill_directory, std::uint64_t max_distinct_keys,
+    std::uint64_t batch_rows, std::uint64_t result_batch_rows) {
   OperatorId next_id = 1;
   return build(plan, store, pass_read_limit_bytes, next_id, nvtx_enabled, build_side_budget_bytes,
-               spill_directory, max_distinct_keys);
+               spill_directory, max_distinct_keys, batch_rows, result_batch_rows);
 }
 
 }  // namespace kernellake

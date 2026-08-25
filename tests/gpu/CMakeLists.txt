@@ -15,6 +15,7 @@ add_executable(kernellake_gpu_tests
   hash_aggregate_operator_test.cpp
   parquet_scan_operator_test.cpp
   limit_operator_test.cpp
+  batch_size_limit_operator_test.cpp
   sort_operator_test.cpp
   query_engine_execute_test.cpp
   multi_batch_integration_test.cpp

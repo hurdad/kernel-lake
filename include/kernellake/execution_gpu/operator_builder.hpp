@@ -46,6 +46,16 @@ namespace kernellake {
 // see EngineConfig::EngineSection::max_distinct_keys for why this is
 // config-driven rather than a compile-time constant.
 //
+// `batch_rows` caps every ParquetScanNode's own output batch at that many
+// rows (via BatchSizeLimitOperator, wrapping each scan operator
+// individually); `result_batch_rows` caps the whole tree's final output
+// the same way (wrapping the returned root once). Both are real row-count
+// caps, not "0 means unlimited" sentinels -- EngineSection::batch_rows/
+// result_batch_rows are validated non-zero at config-load time. See
+// BatchSizeLimitOperator's own doc comment for the real cost of actually
+// splitting an oversized batch (a device-to-device copy per extra chunk),
+// which only applies when a batch exceeds its cap in the first place.
+//
 // Every node in the returned tree is wrapped (see operator_builder.cpp's
 // InstrumentedOperator) to record its own wall-clock next() time into
 // ExecutionContext::metrics when non-null, and to emit an NVTX range per
@@ -55,6 +65,7 @@ namespace kernellake {
 [[nodiscard]] std::unique_ptr<PhysicalOperator> build_operator_tree(
     const PhysicalPlanPtr& plan, ObjectStore& store, std::size_t pass_read_limit_bytes,
     bool nvtx_enabled = false, std::size_t build_side_budget_bytes = 0,
-    const std::string& spill_directory = "", std::uint64_t max_distinct_keys = 0);
+    const std::string& spill_directory = "", std::uint64_t max_distinct_keys = 0,
+    std::uint64_t batch_rows = 1'000'000, std::uint64_t result_batch_rows = 65'536);
 
 }  // namespace kernellake

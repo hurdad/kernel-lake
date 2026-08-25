@@ -13,6 +13,20 @@
 namespace kernellake {
 
 struct EngineSection {
+  // Row-count caps enforced by BatchSizeLimitOperator
+  // (kernellake/execution_gpu/batch_size_limit_operator.hpp), forwarded via
+  // build_operator_tree() (operator_builder.hpp/.cpp): batch_rows caps
+  // each ParquetScanNode's own output batch, result_batch_rows caps the
+  // whole query's final output. Both real row-count limits (validated
+  // > 0), not "0 means unlimited" sentinels. Splitting an oversized batch
+  // costs a real device-to-device copy per extra chunk -- see that
+  // operator's own doc comment -- so raising either value trades a
+  // smaller number of larger host-side Arrow conversions/network
+  // messages against more GPU memory held by one batch at a time;
+  // lowering it trades the reverse, plus more splitting-copy overhead if
+  // batches naturally produced upstream (governed by
+  // query_memory_limit_bytes-derived byte budgets, not row counts) often
+  // exceed the cap.
   std::uint64_t batch_rows = 1'000'000;
   std::uint64_t result_batch_rows = 65'536;
   // 0 (the default) means "auto-detect": resolve_query_memory_limit_bytes()

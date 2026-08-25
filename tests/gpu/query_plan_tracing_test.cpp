@@ -139,7 +139,11 @@ TEST_F(QueryPlanTracingTest, JoinProducesRealSpanTreeWithSiblingScansAndDecodeTi
   }
   EXPECT_TRUE(reached_query_span) << "HashJoin span's parent chain never reached the whole-query span";
 
-  // Both scans parent directly to HashJoin -- true siblings, not nested
+  // Each scan's own immediate parent is now a "BatchSizeLimit" span (see
+  // operator_builder.cpp: EngineSection::batch_rows wraps every
+  // ParquetScanNode's own operator in a BatchSizeLimitOperator), not
+  // HashJoin directly -- but those two BatchSizeLimit spans must
+  // themselves parent directly to HashJoin as true siblings, not nested
   // under each other. This is the specific bug
   // ExecutionContext::current_span's scoped attach/detach (restoring the
   // previous parent right after each child's own recursive open() call
@@ -148,12 +152,33 @@ TEST_F(QueryPlanTracingTest, JoinProducesRealSpanTreeWithSiblingScansAndDecodeTi
   // operator's entire open()-to-close() lifetime would make the second
   // child (whichever side HashJoinOperator::open() opens second) wrongly
   // nest under the first child's span instead.
+  // Three BatchSizeLimit spans exist in this tree in total (one per scan's
+  // own EngineSection::batch_rows wrapper, plus one more just below
+  // ArrowResult for EngineSection::result_batch_rows) -- only the two
+  // wrapping a scan are relevant to this check, found by walking each
+  // scan's own immediate parent rather than assuming a fixed total count.
+  std::unordered_map<std::string, const opentelemetry::sdk::trace::SpanData*> span_by_id;
+  for (const auto& span : finished) {
+    span_by_id.emplace(span_id_to_string(span->GetSpanId()), span.get());
+  }
+  std::vector<const opentelemetry::sdk::trace::SpanData*> scan_batch_limit_spans;
   for (const auto* scan : scan_spans) {
-    EXPECT_TRUE(scan->GetParentSpanId() == hash_join_span->GetSpanId())
-        << "ParquetScan span " << span_id_to_string(scan->GetSpanId()) << " parented to "
-        << span_id_to_string(scan->GetParentSpanId()) << ", expected HashJoin ("
+    const auto it = span_by_id.find(span_id_to_string(scan->GetParentSpanId()));
+    ASSERT_NE(it, span_by_id.end()) << "ParquetScan span " << span_id_to_string(scan->GetSpanId())
+                                    << " has no matching parent span";
+    EXPECT_EQ(it->second->GetName(), "BatchSizeLimit")
+        << "ParquetScan span " << span_id_to_string(scan->GetSpanId()) << " parented to \""
+        << it->second->GetName() << "\", expected \"BatchSizeLimit\"";
+    scan_batch_limit_spans.push_back(it->second);
+  }
+  for (const auto* limit : scan_batch_limit_spans) {
+    EXPECT_TRUE(limit->GetParentSpanId() == hash_join_span->GetSpanId())
+        << "BatchSizeLimit span " << span_id_to_string(limit->GetSpanId()) << " parented to "
+        << span_id_to_string(limit->GetParentSpanId()) << ", expected HashJoin ("
         << span_id_to_string(hash_join_span->GetSpanId()) << ")";
   }
+  ASSERT_EQ(scan_batch_limit_spans.size(), 2u);
+  EXPECT_FALSE(scan_batch_limit_spans[0]->GetSpanId() == scan_batch_limit_spans[1]->GetSpanId());
   EXPECT_FALSE(scan_spans[0]->GetSpanId() == scan_spans[1]->GetSpanId());
 
   // Real decode time (not just span nesting) reaches at least one scan's
