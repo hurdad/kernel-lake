@@ -179,13 +179,27 @@ std::optional<int> compare_literals(const LiteralStorage& a, const LiteralStorag
   return std::nullopt;
 }
 
-// `cmp` is compare(partition_value, transformed_literal): -1/0/1. See
-// partition_pruning.hpp's own doc comment for why `!=` is only sound when
-// `is_identity` (no coarsening) -- every other operator's per-operator
-// emptiness rule is safe under coarsening, since it only ever reasons
-// about the transform value as a monotonic proxy for a range boundary,
-// the same way evaluate_pruning() treats a real [min, max] row-group
-// range, here degenerated to a single point [V, V].
+// `cmp` is compare(partition_value, transformed_literal): -1/0/1. Under a
+// coarsening transform (day/month/year/hour, is_identity false), the
+// transformed literal only pins down *which bucket* the literal's real
+// value falls in, not where within that bucket -- so cmp == 0 means "the
+// file's bucket and the literal's bucket are the same", which is
+// ambiguous for any operator whose emptiness proof would otherwise rely
+// on that exact boundary: NotEqual (a file whose bucket matches the
+// literal's bucket can still contain rows unequal to the literal -- see
+// partition_pruning.hpp's own doc comment) and the two *strict*
+// inequalities Less/Greater (a file whose bucket matches the literal's
+// bucket can still contain rows on the correct side of the literal
+// within that same bucket, e.g. `ts < '2024-01-15 12:00:00'` against a
+// file whose day-partition is also 2024-01-15 -- rows earlier that same
+// day still satisfy the predicate, so cmp == 0 must NOT prove empty
+// unless is_identity). Equal/LessEqual/GreaterEqual need no such gate:
+// their emptiness proofs only ever fire on a strict cmp != 0 (Equal) or
+// cmp on the far side of the boundary (cmp > 0 / cmp < 0), never on the
+// ambiguous cmp == 0 case itself, so they're already sound under
+// coarsening regardless of is_identity -- the same way evaluate_pruning()
+// treats a real [min, max] row-group range, here degenerated to a single
+// point [V, V].
 bool proves_empty(BinaryOperator op, int cmp, bool is_identity) {
   switch (op) {
     case BinaryOperator::Equal:
@@ -193,11 +207,11 @@ bool proves_empty(BinaryOperator op, int cmp, bool is_identity) {
     case BinaryOperator::NotEqual:
       return is_identity && cmp == 0;
     case BinaryOperator::Less:
-      return cmp >= 0;
+      return is_identity ? cmp >= 0 : cmp > 0;
     case BinaryOperator::LessEqual:
       return cmp > 0;
     case BinaryOperator::Greater:
-      return cmp <= 0;
+      return is_identity ? cmp <= 0 : cmp < 0;
     case BinaryOperator::GreaterEqual:
       return cmp < 0;
     default:

@@ -123,6 +123,66 @@ TEST(ExpressionCompiler, CompilesTpchQ6FilterShapeAndArithmetic) {
   for (double value : copy_to_host<double>(revenue->view())) EXPECT_DOUBLE_EQ(value, 6.0);  // 100.0*0.06
 }
 
+// Regression coverage: compile_between() used to combine its two bound
+// comparisons with plain LOGICAL_AND instead of NULL_LOGICAL_AND,
+// contradicting the Kleene-logic convention this file follows everywhere
+// else (see LogicalOrAndAndUseKleeneNullSemantics above and
+// to_ast_operator()'s own BinaryOperator::And case) -- CPU backend parity
+// depends on this too, since expression_compiler_cpu.cpp composes BETWEEN
+// via Arrow's "and_kleene".
+TEST(ExpressionCompiler, BetweenUsesKleeneNullSemantics) {
+  // 2 rows, value = [10, 10]. lower = [NULL, NULL] (both rows). upper =
+  // [5, 20] -- row 0's upper comparison is definitively FALSE (10 > 5),
+  // row 1's is definitively TRUE (10 <= 20).
+  auto value_col = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT64}, 2);
+  {
+    cudf::mutable_column_view view = value_col->mutable_view();
+    const std::vector<std::int64_t> host_values = {10, 10};
+    cudaMemcpy(view.data<std::int64_t>(), host_values.data(), host_values.size() * sizeof(std::int64_t),
+               cudaMemcpyHostToDevice);
+  }
+  auto lower_col =
+      cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT64}, 2, cudf::mask_state::ALL_NULL);
+  auto upper_col = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT64}, 2);
+  {
+    cudf::mutable_column_view view = upper_col->mutable_view();
+    const std::vector<std::int64_t> host_values = {5, 20};
+    cudaMemcpy(view.data<std::int64_t>(), host_values.data(), host_values.size() * sizeof(std::int64_t),
+               cudaMemcpyHostToDevice);
+  }
+
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(std::move(value_col));
+  columns.push_back(std::move(lower_col));
+  columns.push_back(std::move(upper_col));
+  cudf::table table(std::move(columns));
+
+  auto value = std::make_shared<ColumnExpression>("value", 0, int64_type(false));
+  auto lower = std::make_shared<ColumnExpression>("lower", 1, int64_type(true));
+  auto upper = std::make_shared<ColumnExpression>("upper", 2, int64_type(false));
+  BetweenExpression between(value, lower, upper);
+
+  TestContext ctx;
+  ExpressionCompiler compiler;
+  std::unique_ptr<cudf::column> result =
+      cudf::compute_column(table.view(), compiler.compile(between, ctx.context));
+
+  // Row 0: GE(10, NULL)=NULL, LE(10,5)=FALSE -> Kleene AND = FALSE, not
+  // NULL -- exactly the case plain LOGICAL_AND got wrong. Row 1:
+  // GE(10, NULL)=NULL, LE(10,20)=TRUE -> genuinely ambiguous, correctly
+  // stays NULL either way, so null_count()==1 (not 0 or 2) confirms both
+  // halves of the fix at once.
+  ASSERT_EQ(result->null_count(), 1);
+  cudaDeviceSynchronize();
+  const std::vector<unsigned char> values = copy_to_host<unsigned char>(result->view());
+  EXPECT_EQ(values[0], 0);  // FALSE.
+
+  cudf::bitmask_type mask_word = 0;
+  cudaMemcpy(&mask_word, result->view().null_mask(), sizeof(mask_word), cudaMemcpyDeviceToHost);
+  EXPECT_TRUE(mask_word & 0b01);   // row 0 valid (non-null FALSE).
+  EXPECT_FALSE(mask_word & 0b10);  // row 1 null.
+}
+
 TEST(ExpressionCompiler, CastingNegativeInt64ToUInt64SilentlyWrapsAround) {
   // Characterization test: pins down the exact cudf::ast behavior that
   // motivates binder.cpp's promote_numeric() rejecting a signed/unsigned

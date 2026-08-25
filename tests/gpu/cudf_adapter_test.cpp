@@ -184,6 +184,25 @@ TEST(CudfAdapter, LiteralToScalarBuildsDecimalFromInt64ValuedLiteral) {
   EXPECT_EQ(decimal.value(), 123400);
 }
 
+// Regression coverage: decimal_raw_value() used to route every literal
+// through literal_as_double() + llround(double * pow(10, n)), even when
+// the literal was already an exact std::int64_t (no decimal point in the
+// source SQL) -- silently rounding any value beyond a double's exact
+// integer range (2^53 ~= 9.007e15) to the nearest double-representable
+// value before ever reaching the DECIMAL128 raw integer. This value
+// exceeds that range but is exactly representable as std::int64_t (well
+// under INT64_MAX ~9.22e18); the fix computes the raw value via
+// __int128_t integer arithmetic instead, with no double involved at all.
+TEST(CudfAdapter, LiteralToScalarBuildsExactDecimal128FromLargeInt64Literal) {
+  TestContext ctx;
+  const std::int64_t exact_value = 123456789012345678LL;
+  const LiteralExpression expr(exact_value, decimal_type(19, 0, false));
+  const std::unique_ptr<cudf::scalar> scalar = literal_to_scalar(expr, ctx.context);
+  EXPECT_EQ(scalar->type().id(), cudf::type_id::DECIMAL128);
+  const auto& decimal = static_cast<const cudf::fixed_point_scalar<numeric::decimal128>&>(*scalar);
+  EXPECT_EQ(decimal.value(), 123456789012345678LL);
+}
+
 // make_decimal_scalar()'s DECIMAL32 out-of-range guard is documented
 // defense-in-depth for a literal construction path that bypasses
 // binder.cpp's own cast_if_needed() range check (see that guard's own

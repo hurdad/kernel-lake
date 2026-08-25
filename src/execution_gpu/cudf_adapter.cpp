@@ -36,6 +36,19 @@ const DataType& require_decimal_precision_scale(const DataType& type) {
   return type;
 }
 
+// Exact 10^exponent in __int128_t -- binder.cpp's DECIMAL type-checking
+// (AstColumnDef handling) already rejects a negative scale, so every
+// caller here only ever needs a non-negative exponent (a multiplication,
+// never a division); 10^38 still fits __int128_t's ~1.70141e38 max, which
+// covers this codebase's largest supported DECIMAL precision.
+__int128_t pow10_int128(int exponent) {
+  __int128_t result = 1;
+  for (int i = 0; i < exponent; ++i) {
+    result *= 10;
+  }
+  return result;
+}
+
 }  // namespace
 
 cudf::datetime::datetime_component to_cudf_datetime_component(DatePart part) {
@@ -89,8 +102,25 @@ cudf::data_type to_cudf_type(const DataType& type) {
 DecimalRawValue decimal_raw_value(const DataType& type, const LiteralStorage& value) {
   require_decimal_precision_scale(type);
   const std::int32_t cudf_scale = -*type.scale;
-  const __int128_t raw =
-      static_cast<__int128_t>(std::llround(literal_as_double(value) * std::pow(10.0, -cudf_scale)));
+  __int128_t raw = 0;
+  if (std::holds_alternative<std::int64_t>(value)) {
+    // Exact integer arithmetic when the source SQL literal had no decimal
+    // point (e.g. `WHERE amount = 100000000000` against a DECIMAL
+    // column): avoids literal_as_double()'s std::int64_t -> double
+    // conversion, itself lossy for values beyond 2^53, and the
+    // llround(double * pow(10.0, n)) below's own floating-point rounding
+    // -- neither is needed when the input is already an exact integer.
+    raw = static_cast<__int128_t>(std::get<std::int64_t>(value)) * pow10_int128(-cudf_scale);
+  } else {
+    // The literal had a fractional part in the source SQL, so it already
+    // passed through this project's SQL parser's own double-based lexing
+    // (hyrise-sql-parser's flex_lexer.l calls atof() on the raw token
+    // text) before ever reaching this function -- any precision beyond a
+    // double's ~15-17 significant digits was already lost there, outside
+    // this codebase's own control. This conversion is the most accurate
+    // one achievable from what's actually left in `value` at this point.
+    raw = static_cast<__int128_t>(std::llround(literal_as_double(value) * std::pow(10.0, -cudf_scale)));
+  }
   return DecimalRawValue{raw, cudf_scale, decimal_cudf_type_id(*type.precision)};
 }
 

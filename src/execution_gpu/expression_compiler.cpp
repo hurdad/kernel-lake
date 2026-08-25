@@ -254,7 +254,14 @@ const cudf::ast::expression& ExpressionCompiler::compile_between(const BetweenEx
       tree_.emplace<cudf::ast::operation>(cudf::ast::ast_operator::GREATER_EQUAL, value, lower);
   const cudf::ast::expression& le =
       tree_.emplace<cudf::ast::operation>(cudf::ast::ast_operator::LESS_EQUAL, value, upper);
-  return tree_.emplace<cudf::ast::operation>(cudf::ast::ast_operator::LOGICAL_AND, ge, le);
+  // NULL_LOGICAL_AND, not LOGICAL_AND -- same Kleene-logic reasoning
+  // to_ast_operator()'s own BinaryOperator::And case documents: FALSE AND
+  // NULL must be FALSE, not NULL, or `NOT (x BETWEEN NULL AND 5)` would
+  // silently diverge from the CPU backend (which composes BETWEEN from
+  // the same two comparisons via and_kleene) whenever exactly one bound
+  // is NULL and the other bound alone already resolves the comparison to
+  // FALSE.
+  return tree_.emplace<cudf::ast::operation>(cudf::ast::ast_operator::NULL_LOGICAL_AND, ge, le);
 }
 
 const cudf::ast::expression& ExpressionCompiler::compile_cast(const CastExpression& expr,

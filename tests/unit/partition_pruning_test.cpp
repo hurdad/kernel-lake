@@ -129,6 +129,67 @@ TEST(PartitionPruning, DayTransformOnTimestampColumnUsesFloorDivision) {
       metadata, spec, values, {PushablePredicate{"ts", BinaryOperator::Less, timestamp_literal_micros(-1)}}));
 }
 
+// Regression coverage: proves_empty()'s strict Less/Greater cases used to
+// apply the identity-only boundary rule (cmp >= 0 / cmp <= 0)
+// unconditionally, even under a coarsening transform -- wrongly proving a
+// file empty whenever the file's own day matched the literal's day
+// exactly, even though rows earlier/later that same day could still
+// satisfy a strict `<`/`>` predicate. Mirrors DayTransformNotEqualNeverPrunes
+// above, for Less/Greater instead of NotEqual.
+TEST(PartitionPruning, DayTransformStrictLessDoesNotPruneWithinSameDay) {
+  const IcebergTableMetadata metadata =
+      metadata_with_schema({IcebergSchemaField{1, "ts", true, "timestamp"}});
+  const IcebergPartitionSpec spec = spec_with_field(1, "day");
+  // Every row in this file is on 2024-01-02.
+  const std::vector<PartitionFieldValue> values = {static_cast<std::int64_t>(parse_iso_date("2024-01-02"))};
+  const std::int64_t noon_jan_2 =
+      static_cast<std::int64_t>(parse_iso_date("2024-01-02")) * 86'400'000'000LL + 12 * 3'600'000'000LL;
+  const std::int64_t noon_jan_1 =
+      static_cast<std::int64_t>(parse_iso_date("2024-01-01")) * 86'400'000'000LL + 12 * 3'600'000'000LL;
+
+  // Literal at noon on the SAME day as the file's own day (cmp == 0): a
+  // row earlier that day (e.g. 03:00) still satisfies `ts < noon` -- must
+  // not be proven empty.
+  EXPECT_FALSE(partition_values_prove_empty(
+      metadata, spec, values,
+      {PushablePredicate{"ts", BinaryOperator::Less, timestamp_literal_micros(noon_jan_2)}}));
+
+  // Literal on the PRECEDING day: every row in this file (all on
+  // 2024-01-02) is necessarily later than any 2024-01-01 timestamp, so
+  // `ts < noon_jan_1` is impossible for every row -- correctly proven
+  // empty.
+  EXPECT_TRUE(partition_values_prove_empty(
+      metadata, spec, values,
+      {PushablePredicate{"ts", BinaryOperator::Less, timestamp_literal_micros(noon_jan_1)}}));
+}
+
+TEST(PartitionPruning, DayTransformStrictGreaterDoesNotPruneWithinSameDay) {
+  const IcebergTableMetadata metadata =
+      metadata_with_schema({IcebergSchemaField{1, "ts", true, "timestamp"}});
+  const IcebergPartitionSpec spec = spec_with_field(1, "day");
+  // Every row in this file is on 2024-01-01.
+  const std::vector<PartitionFieldValue> values = {static_cast<std::int64_t>(parse_iso_date("2024-01-01"))};
+  const std::int64_t noon_jan_1 =
+      static_cast<std::int64_t>(parse_iso_date("2024-01-01")) * 86'400'000'000LL + 12 * 3'600'000'000LL;
+  const std::int64_t noon_jan_2 =
+      static_cast<std::int64_t>(parse_iso_date("2024-01-02")) * 86'400'000'000LL + 12 * 3'600'000'000LL;
+
+  // Literal at noon on the SAME day as the file's own day (cmp == 0): a
+  // row later that day (e.g. 18:00) still satisfies `ts > noon` -- must
+  // not be proven empty.
+  EXPECT_FALSE(partition_values_prove_empty(
+      metadata, spec, values,
+      {PushablePredicate{"ts", BinaryOperator::Greater, timestamp_literal_micros(noon_jan_1)}}));
+
+  // Literal on the FOLLOWING day: every row in this file (all on
+  // 2024-01-01) is necessarily earlier than any 2024-01-02 timestamp, so
+  // `ts > noon_jan_2` is impossible for every row -- correctly proven
+  // empty.
+  EXPECT_TRUE(partition_values_prove_empty(
+      metadata, spec, values,
+      {PushablePredicate{"ts", BinaryOperator::Greater, timestamp_literal_micros(noon_jan_2)}}));
+}
+
 TEST(PartitionPruning, HourTransformRequiresTimestampNotDate) {
   const IcebergTableMetadata metadata = metadata_with_schema({IcebergSchemaField{1, "d", true, "date"}});
   const IcebergPartitionSpec spec = spec_with_field(1, "hour");
@@ -166,18 +227,34 @@ TEST(PartitionPruning, YearAndMonthTransformsRecoverCorrectCalendarComponents) {
     EXPECT_FALSE(partition_values_prove_empty(
         metadata, year_spec, year_partition,
         {PushablePredicate{"d", BinaryOperator::Equal, date_literal("2000-03-01")}}));
-    EXPECT_TRUE(partition_values_prove_empty(
+    // A literal within the SAME year as the partition (cmp == 0): a file
+    // partitioned by year(d)=2000 can still contain dates later in 2000
+    // than 2000-03-01 (e.g. 2000-06-01), so `d > '2000-03-01'` must not
+    // be proven empty -- see proves_empty()'s own comment on why strict
+    // Less/Greater need the is_identity gate under coarsening.
+    EXPECT_FALSE(partition_values_prove_empty(
         metadata, year_spec, year_partition,
         {PushablePredicate{"d", BinaryOperator::Greater, date_literal("2000-03-01")}}));
+    // A literal in a STRICTLY LATER year: every row in this file is in
+    // 2000, entirely before any 2001 date, so this is correctly proven
+    // empty.
+    EXPECT_TRUE(partition_values_prove_empty(
+        metadata, year_spec, year_partition,
+        {PushablePredicate{"d", BinaryOperator::Greater, date_literal("2001-01-01")}}));
 
     const std::vector<PartitionFieldValue> month_partition = {std::int64_t{362}};
     const IcebergPartitionSpec month_spec = spec_with_field(1, "month");
     EXPECT_FALSE(partition_values_prove_empty(
         metadata, month_spec, month_partition,
         {PushablePredicate{"d", BinaryOperator::Equal, date_literal("2000-03-01")}}));
-    EXPECT_TRUE(partition_values_prove_empty(
+    // Same reasoning at month granularity: a file partitioned by
+    // month(d)=2000-03 can still contain dates later in March 2000.
+    EXPECT_FALSE(partition_values_prove_empty(
         metadata, month_spec, month_partition,
         {PushablePredicate{"d", BinaryOperator::Greater, date_literal("2000-03-01")}}));
+    EXPECT_TRUE(partition_values_prove_empty(
+        metadata, month_spec, month_partition,
+        {PushablePredicate{"d", BinaryOperator::Greater, date_literal("2000-04-01")}}));
   }
   {
     // 1969-12-31 (one day before epoch): year -1; month -1 -- exercises
