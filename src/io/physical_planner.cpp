@@ -640,7 +640,27 @@ PhysicalPlanPtr convert(const LogicalPlanPtr& node, ObjectStore& store, TableSou
   }
   if (const auto* aggregate = dynamic_cast<const LogicalAggregate*>(node.get())) {
     PhysicalPlanPtr child = convert(aggregate->child(), store, extra_resolver);
-    const std::optional<ScanBoundary> boundary = find_scan_boundary(*child);
+    // Same discriminator as the Filter/Projection/Sort cases above: an
+    // aggregate query's own group_by()/aggregates() reference *that*
+    // node's own child schema directly (base-table scan/join schema when
+    // the aggregate sits on Scan/Filter/Join, needing remap same as a
+    // Filter predicate) -- but when this aggregate's child is instead a
+    // LogicalProjection (a derived table's own finished, already-
+    // narrowed SELECT list, e.g. TPC-H Q8's own `FROM (SELECT ... FROM
+    // <8-way join>) AS all_nations ... GROUP BY o_year` shape -- the
+    // outer GROUP BY's own indices already correctly reference the
+    // Projection's narrow output one-for-one, not the join beneath it).
+    // Missing this check previously let find_scan_boundary() search
+    // *through* the already-converted physical Projection node and find
+    // the join's own boundary underneath it, wrongly remapping
+    // already-correct indices against it -- a real bug: an out-of-range
+    // column access at execution time for any query aggregating over a
+    // derived table whose own inner query is a plain (non-aggregate)
+    // JOIN projection, e.g. `SELECT x, COUNT(*) FROM (SELECT a.k AS x
+    // FROM a JOIN b ON ...) AS t GROUP BY x`.
+    const bool items_reference_scan_schema = references_scan_schema(aggregate->child().get());
+    const std::optional<ScanBoundary> boundary =
+        items_reference_scan_schema ? find_scan_boundary(*child) : std::nullopt;
     std::vector<NamedExpression> aggregates =
         boundary ? remap_named(aggregate->aggregates(), *boundary) : aggregate->aggregates();
     if (aggregate->group_by().empty()) {

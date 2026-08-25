@@ -732,6 +732,47 @@ TEST_F(QueryEngineExecuteCpuTest, ThreeTableInnerJoinWithWhereFilterMatchesExpec
   EXPECT_DOUBLE_EQ(totals_by_manager.at("Bo"), 107.0);  // Beta: 100+7 (amount=3 filtered out by WHERE)
 }
 
+// Regression test, found while adding TPC-H Q8 (physical_planner.cpp's
+// LogicalAggregate case): an aggregate GROUP BY over a derived table whose
+// own inner query is a plain (non-aggregate) JOIN projection -- e.g. TPC-H
+// Q8's own `FROM (SELECT ... FROM <8-way join>) AS all_nations ... GROUP BY
+// o_year` shape. The outer GROUP BY's own column indices already correctly
+// reference the derived table's narrow output one-for-one, but the
+// LogicalAggregate case unconditionally called find_scan_boundary() without
+// first checking whether its child actually needs that remap (unlike the
+// Filter/Projection/Sort cases just above it, which all already had this
+// guard) -- find_scan_boundary() then searched *through* the already-
+// converted physical Projection node and found the JOIN's own (wider)
+// boundary underneath it, wrongly remapping already-correct indices against
+// it. Manifested as an out-of-range column access at execution time (a CPU
+// Acero "No match for FieldRef.FieldPath" error here; a GPU
+// vector::_M_range_check crash on the GPU backend) for any such query --
+// never caught before since no prior TPC-H query's derived table lacked its
+// own inner GROUP BY (TPC-H Q13's does, which is why this shape was never
+// exercised).
+TEST_F(QueryEngineExecuteCpuTest, GroupByOverDerivedTableWhoseInnerQueryIsAPlainJoinMatchesExpectedCounts) {
+  const QueryResult result = engine_.execute(
+      "SELECT region_name, COUNT(*) AS n FROM (SELECT r.region_name AS region_name FROM read_parquet('" +
+      path_ + "') AS s JOIN read_parquet('" + regions_path_ +
+      "') AS r ON s.region = r.region) AS t GROUP BY region_name");
+
+  ASSERT_EQ(result.rows_returned, 2);
+  const std::shared_ptr<arrow::RecordBatch>& batch = result.batches.front();
+  const auto region_name_column =
+      std::static_pointer_cast<arrow::StringArray>(batch->GetColumnByName("region_name"));
+  const auto count_column = std::static_pointer_cast<arrow::Int64Array>(batch->GetColumnByName("n"));
+  ASSERT_NE(region_name_column, nullptr);
+  ASSERT_NE(count_column, nullptr);
+
+  std::map<std::string, std::int64_t> counts_by_region_name;
+  for (std::int64_t i = 0; i < batch->num_rows(); ++i) {
+    counts_by_region_name[region_name_column->GetString(i)] = count_column->Value(i);
+  }
+  ASSERT_EQ(counts_by_region_name.size(), 2u);
+  EXPECT_EQ(counts_by_region_name.at("Alpha"), 3);  // region "A": 3 sales rows
+  EXPECT_EQ(counts_by_region_name.at("Beta"), 3);   // region "B": 3 sales rows
+}
+
 // Regression test for physical_planner.cpp's remap_columns(): it used to
 // resolve a ColumnExpression above a JOIN by re-looking-up its bare *name*
 // against the combined narrowed schema (Schema::find_field(), first match
