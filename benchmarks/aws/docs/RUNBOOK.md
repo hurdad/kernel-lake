@@ -156,6 +156,23 @@ EOF
 ./generate_and_upload_data.sh --scale-factor 100 --wait
 ```
 
+**Iceberg comparison leg** (optional, real extra AWS spend -- an ephemeral
+`r6i.2xlarge` writer instance plus the standalone Iceberg REST catalog
+instance `terraform/iceberg_catalog.tf` already stands up unconditionally):
+writes `lineitem`/`part`/`orders`/`customer` from the flat data just
+uploaded above into real Iceberg tables (`lineitem` partitioned by
+`years(l_shipdate)`, `orders` by `years(o_orderdate)`) via the REST
+catalog, specifically to exercise KernelLake's real manifest-level
+partition pruning (`src/iceberg/partition_pruning.cpp`) end to end rather
+than only against the unit tests' synthetic fixtures -- see
+`runner/generate_and_upload_iceberg_data.py`'s own module docstring. Must
+run after the flat `generate_and_upload_data.sh` call above, for the same
+`--scale-factor`/`--source-compression` (defaults to the same `snappy`):
+
+```bash
+./generate_and_upload_iceberg_data.sh --scale-factor 100 --wait
+```
+
 **Compression comparison** (optional): `generate_and_upload_data.sh --compression` writes
 each choice to its own fully-tagged `tpch-data/sf<N>-<tag>/` prefix, so multiple
 compressions of the same scale factor can coexist and be pointed at independently via
@@ -225,6 +242,26 @@ python3 aws_benchmark_runner.py \
   --kernellake-host "$KL_HOST" \
   --s3-bucket "$BUCKET" --scale-factor 100 \
   --query all --iterations 2 --output "$RUN_DIR/results.json"
+```
+
+**Iceberg comparison leg** (optional; only if `generate_and_upload_iceberg_data.sh`
+was run above): a separate `--output` file, not `results.json` -- this is a
+second, distinct leg (flat vs. Iceberg reader for the same underlying
+data), not a replacement for the flat run, so `aggregate_results.py`/
+`generate_report.py` above still only ever consume the flat
+`results.json`. Restricted to `--query 1,3,6,12,14` -- the only queries
+`generate_and_upload_iceberg_data.py` actually wrote Iceberg tables for
+(`lineitem`/`part`/`orders`/`customer` only; a query needing
+`supplier`/`nation`/`region`/`partsupp`, e.g. Q5/Q7/Q9/Q10/Q11, has no
+Iceberg table to read and would just fail) -- see that script's own
+module docstring for why exactly these five:
+
+```bash
+python3 aws_benchmark_runner.py \
+  --kernellake-host "$KL_HOST" \
+  --s3-bucket "$BUCKET" --scale-factor 100 \
+  --table-format iceberg \
+  --query 1,3,6,12,14 --iterations 2 --output "$RUN_DIR/results-iceberg.json"
 ```
 
 **Spark** runs on its own dedicated host, the same shape as DuckDB below --
