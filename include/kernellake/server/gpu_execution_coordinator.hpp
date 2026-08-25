@@ -8,15 +8,19 @@
 
 namespace kernellake {
 
-// Owns one long-lived RmmEnvironment per visible CUDA device (see
-// docs/MULTI_GPU_SCALING.md's Tier 1) that a Flight SQL server needs to
-// safely call QueryEngine::execute(physical, RmmEnvironment&) across
-// concurrent gRPC handler threads for the "gpu" backend, instead of the
-// one-shot QueryEngine::execute(sql) convenience overload's per-call
+// Owns one long-lived RmmEnvironment per GPU this server is configured to
+// use (see docs/MULTI_GPU_SCALING.md's Tier 1) that a Flight SQL server
+// needs to safely call QueryEngine::execute(physical, RmmEnvironment&)
+// across concurrent gRPC handler threads for the "gpu" backend, instead of
+// the one-shot QueryEngine::execute(sql) convenience overload's per-call
 // RmmEnvironment (see query_engine.hpp's own doc comment on that overload,
 // and docs/ARCHITECTURE.md's Concurrency notes -- rebuilding the RMM pool
 // per request is both wrong under concurrency and wasteful even
-// single-threaded).
+// single-threaded). Which GPUs "this server is configured to use" means is
+// ServerConfig::gpu_device_ids -- every visible device
+// (cudaGetDeviceCount()) if that list is empty (Tier 1's original
+// behavior), or exactly the listed ordinals otherwise, e.g. to leave some
+// GPUs on a shared box for other workloads.
 //
 // This split into its own translation-unit pair
 // (gpu_execution_coordinator_gpu.cpp / _stub.cpp, selected by
@@ -29,10 +33,13 @@ namespace kernellake {
 //
 // Constructing this in a KERNELLAKE_WITH_CUDA=OFF build throws
 // ConfigurationError immediately -- callers must not construct it for
-// backend == "cpu" in the first place.
+// backend == "cpu" in the first place. Also throws ConfigurationError if
+// ServerConfig::gpu_device_ids names an ordinal >= the real
+// cudaGetDeviceCount(), or if cudaGetDeviceCount() itself reports zero
+// visible devices.
 class GpuExecutionCoordinator {
  public:
-  explicit GpuExecutionCoordinator(const EngineConfig& config);
+  explicit GpuExecutionCoordinator(const ServerConfig& config);
   ~GpuExecutionCoordinator();
 
   GpuExecutionCoordinator(const GpuExecutionCoordinator&) = delete;

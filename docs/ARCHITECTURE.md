@@ -92,12 +92,15 @@ around those placeholders. This scan is hand-rolled rather than
 per repetition of a `(...)*` group and could stack-overflow on pathological
 input (see `src/sql/parser.cpp`'s own comments for the detail). `parse_sql()`
 then walks the resulting `fromTable` and accepts either a single placeholder
-(the single-table MVP case) or a chain of `INNER JOIN ... ON` steps between
-placeholders, up to `kMaxJoinSources = 12` sources, each aliased (see "Hash
-joins" below for the N-way generalization); anything else (a real table
-name, a subquery, `LEFT`/`RIGHT`/`FULL`/`CROSS` JOIN, a comma-style join,
-or more than 12 sources) fails with a clear `SqlError` rather than being
-silently reinterpreted. This is a narrow, deliberately limited syntax
+(the single-table MVP case) or a chain of `INNER JOIN ... ON` or
+`LEFT [OUTER] JOIN ... ON` steps between placeholders, up to
+`kMaxJoinSources = 12` sources, each aliased (see "Hash joins" below for
+the N-way generalization); anything else (a real table name, a subquery
+used as a join source, `RIGHT`/`FULL`/`CROSS` JOIN, a comma-style join, or
+more than 12 sources) fails with a clear `SqlError` rather than being
+silently reinterpreted. (A derived table as a query's *entire* FROM
+clause -- not a JOIN source -- is a separate AST path, not this
+placeholder scan; see "Derived tables" below.) This is a narrow, deliberately limited syntax
 adapter, not general SQL-string rewriting -- optimizer rules always operate
 on the structured plan/expression trees, never on SQL text.
 
@@ -214,11 +217,14 @@ Not yet supported (fails clearly rather than being silently reinterpreted):
 functions, `CASE`/`EXTRACT` in `WHERE` (GPU only -- see above), any
 function other than the five aggregates and `EXTRACT` above, `EXTRACT`
 fields other than `YEAR`/`MONTH`/`DAY`, comma-style joins,
-`LEFT`/`RIGHT`/`FULL`/`CROSS` JOIN, subqueries in `FROM` (derived
-tables), correlated *scalar* subqueries, and multi-key or non-equality
-join conditions. `HAVING` and three narrow subquery forms are now
-supported -- see "`HAVING` and scalar subqueries", "`IN (SELECT ...)`
-subqueries", and "Correlated subqueries" (`EXISTS`/`NOT EXISTS`) below.
+`RIGHT`/`FULL`/`CROSS` JOIN, a subquery used as a JOIN source (a derived
+table is only accepted as a query's entire `FROM` clause -- see "Derived
+tables" below), correlated *scalar* subqueries, and multi-key or
+non-equality join conditions. `LEFT [OUTER] JOIN`, a single top-level
+derived table, `HAVING`, and three narrow subquery forms are now
+supported -- see "Hash joins", "Derived tables", "`HAVING` and scalar
+subqueries", "`IN (SELECT ...)` subqueries", and "Correlated subqueries"
+(`EXISTS`/`NOT EXISTS`) below.
 
 ### `HAVING` and scalar subqueries
 
@@ -510,18 +516,43 @@ performs real Parquet-metadata I/O during planning regardless) followed
 by
 `execute(const PhysicalPlanPtr&, RmmEnvironment&) -> QueryResult`, which
 takes an **externally owned** `RmmEnvironment` instead of building its own.
-A long-lived caller should construct exactly one `RmmEnvironment` at
-startup and reuse it across every request. `GpuExecutionCoordinator`
-(`kernellake/server/`) is that caller for the Flight SQL server: it bounds
-concurrent calls to this split `execute()` via a semaphore
-(`EngineSection::max_concurrent_gpu_queries`, default 2) rather than the
-single-flight mutex this used to be -- see
-`docs/GPU_OPTIMIZATIONS.md`'s "Opt #2 implemented" section for why bounded
-rather than unbounded (real memory-budget oversubscription and GPU
-decode-contention risks, not just an arbitrary cap), and
-`RmmEnvironment::make_query_tracker()`/`QueryMemoryTracker`
+A long-lived caller should construct exactly one `RmmEnvironment` per
+device it wants to use and reuse those across every request.
+`GpuExecutionCoordinator` (`kernellake/server/`) is that caller for the
+Flight SQL server: since `docs/MULTI_GPU_SCALING.md`'s Tier 1
+(2026-08-24), it takes a `ServerConfig` -- the server's own top-level
+config type, distinct from the CLI's `CliConfig`, both of which embed
+the sections genuinely shared by both binaries (storage, memory,
+logging, etc.) as one common `EngineConfig` (`kernellake/common/config.hpp`
+explains the split in full; the short version: `device_id` used to live
+on a shared `EngineSection` and be silently ignored by the server once
+Tier 1 landed, which is exactly the bug this split exists to make
+structurally impossible for any future field) -- and constructs one
+`RmmEnvironment` -- and one `std::counting_semaphore` -- per device
+named in `ServerConfig::gpu_device_ids`, or every device
+`cudaGetDeviceCount()` reports if that list is empty (rather than a
+single process-wide `RmmEnvironment`, which is what it did before
+Tier 1). Which device each `RmmEnvironment` targets is now an explicit
+constructor argument (`RmmEnvironment(config, device_id)`), not read
+from config at all; `QueryEngine::execute(sql)`'s one-shot CLI overload
+passes its own explicit `device_id` (`CliConfig::device_id`) the same
+way. `GpuExecutionCoordinator` round-robins each `execute()` call across
+devices and bounds concurrency on whichever device a call lands on via
+that device's own semaphore, sized from
+`ServerConfig::max_concurrent_gpu_queries` -- a **per-device** cap since
+Tier 1, not process-wide: an N-GPU node gets up to N times the total
+concurrent-query throughput a single-GPU node does. See
+`docs/GPU_OPTIMIZATIONS.md`'s "Opt #2 implemented" section for why a
+bounded semaphore rather than an unbounded one or the single-flight mutex
+this used to be (real memory-budget oversubscription and GPU
+decode-contention risks, not just an arbitrary cap), that same doc's
+"Multi-GPU Tier 1 implemented" section for the per-device generalization,
+and `RmmEnvironment::make_query_tracker()`/`QueryMemoryTracker`
 (`kernellake/memory/`) for how each concurrent call gets its own isolated
-memory-usage reporting layered over the same shared, thread-safe limiter.
+memory-usage reporting layered over its device's shared, thread-safe
+limiter. A single query still runs entirely on whichever one device the
+coordinator dispatched it to -- spanning one query across multiple GPUs
+is Tier 2, not implemented.
 `execute(sql)` itself is implemented in terms of this split pair -- it is
 not two independent code paths to keep in sync.
 
@@ -605,7 +636,8 @@ each operator's own row in the table below for which.
 | `ProjectionOperator` | Compiled AST per computed item; a bare column reference is copied directly instead (see below) |
 | `ScalarAggregateOperator` | No `GROUP BY`: `cudf::reduce` with its `init` parameter folds each batch into a running scalar (SUM/MIN/MAX/AVG numerator); COUNT/AVG's denominator is a host-side counter. Empty input produces NULL, not zero, except `COUNT(*)`/`COUNT(x)` which produce 0. |
 | `HashAggregateOperator` | `GROUP BY`: each incoming batch is aggregated on its own with a plain, one-shot `cudf::groupby::groupby`, then folded into a running partial result (concatenate + re-aggregate) -- not `cudf::groupby::streaming_groupby` (replaced: that design coupled `max_distinct_keys` to an unrelated per-call row-count limit, causing severe slowdowns on low-cardinality GROUP BYs over large scans). `accumulated_` exceeding `max_distinct_keys` (default 75M, config-driven via
-`engine.max_distinct_keys` in `kernellake.yaml`) throws. |
+`engine.max_distinct_keys`, a shared `EngineConfig` field settable in
+either `config/kernellake-cli.yaml` or `config/kernellake-server.yaml`) throws. |
 | `LimitOperator` | `cudf::slice` + the `cudf::table` copy constructor to truncate the final batch |
 | `SortOperator` | `ORDER BY`: **blocking**, unlike every operator above -- consumes `child` to exhaustion, concatenates every batch (`cudf::concatenate`) into one table, then `cudf::stable_sorted_order` + `cudf::gather`. Memory footprint is the whole result set, not bounded like the streaming operators. |
 | `HashJoinOperator` | Two-table `INNER JOIN`: when `choose_partition_count()` decides the build side is small enough, its *build* (right) side is **blocking** like `SortOperator` (consumed to exhaustion, concatenated into one table, then wraps a single `cudf::hash_join`); otherwise both sides are grace-hash partitioned and spilled to disk, bounding device memory to one partition/batch at a time (`b915063`, 2026-08-13). Its *probe* (left) side streams normally, one `inner_join()` + double-`cudf::gather` per batch (unpartitioned case). See "Hash joins" above. |
@@ -1719,8 +1751,9 @@ the gRPC boundary as a raw C++ exception -- verified with a real ADBC
 Python client seeing a clean `INVALID_ARGUMENT` for bad SQL rather than a
 dropped connection.
 
-Respects `engine.backend: gpu|cpu` (a `ServerSection` in `EngineConfig`
-carries `server.host`/`server.port`, a `max_pending_results` cap on
+Respects `engine.backend: gpu|cpu` (a `ServerSection` in `ServerConfig`,
+the server's own top-level config type -- see the Concurrency section
+above -- carries `server.host`/`server.port`, a `max_pending_results` cap on
 buffered-not-yet-fetched results, inbound TLS for the Flight SQL listener
 itself -- `use_tls`/`tls_cert_path`/`tls_key_path`, plus mTLS via
 `require_client_cert`/`tls_client_ca_cert_path` -- and static bearer-token
@@ -1733,12 +1766,17 @@ and tears down its own `RmmEnvironment` per call -- a real
 use-after-free race under concurrent gRPC handler threads, per the
 Concurrency notes above); instead `GpuExecutionCoordinator`
 (`include/kernellake/server/gpu_execution_coordinator.hpp`) owns one
-`RmmEnvironment` for the server's whole lifetime and bounds concurrent GPU
-`execute()` calls via a `std::counting_semaphore` sized from
-`engine.max_concurrent_gpu_queries` (default 2) -- not single-flight
-anymore; see `docs/GPU_OPTIMIZATIONS.md`'s "Opt #2 implemented" section
-for the real-hardware throughput numbers and why a bounded semaphore was
-chosen over unconditional removal. Split into
+`RmmEnvironment` (and one `std::counting_semaphore`) per visible CUDA
+device for the server's whole lifetime, round-robining each `execute()`
+call across devices and bounding concurrency on whichever device it
+lands on -- since `docs/MULTI_GPU_SCALING.md`'s Tier 1 (2026-08-24),
+`engine.max_concurrent_gpu_queries` (default 2) is a per-device cap, not
+process-wide, so an N-GPU node gets up to N times the total
+concurrent-query throughput; see `docs/GPU_OPTIMIZATIONS.md`'s "Opt #2
+implemented" section for the real-hardware throughput numbers and why a
+bounded semaphore was chosen over unconditional removal, and its
+"Multi-GPU Tier 1 implemented" section for the per-device
+generalization. Split into
 `gpu_execution_coordinator_{gpu,stub}.cpp`, selected by
 `KERNELLAKE_WITH_CUDA` exactly like `query_engine_execute_{gpu,stub}.cpp`,
 so `server-dev` (CPU-only) needs no CUDA/RMM at all; requesting `backend:
@@ -2005,8 +2043,8 @@ points at a Secret the operator creates themselves (cert-manager,
 `secretName`/`secretCertKey`/`secretKeyKey` for the server's own cert+key,
 `clientCaSecretName`/`clientCaSecretKey` for the mTLS client CA), which
 `templates/deployment.yaml` mounts read-only. `templates/configmap.yaml` renders a real
-`kernellake.yaml` from those values; `templates/deployment.yaml` overrides
-`command` to run `kernellake-server --config /etc/kernellake/kernellake.yaml`,
+`kernellake-server.yaml` from those values; `templates/deployment.yaml` overrides
+`command` to run `kernellake-server --config /etc/kernellake/kernellake-server.yaml`,
 uses `tcpSocket` readiness/liveness probes (Flight SQL is a gRPC protocol
 with no HTTP health endpoint to poll -- a TCP-connect probe is the honest
 choice, not an invented HTTP endpoint that doesn't exist), and merges in a

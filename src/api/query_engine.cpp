@@ -22,7 +22,8 @@
 
 namespace kernellake {
 
-QueryEngine::QueryEngine(EngineConfig config) : config_(std::move(config)), store_(config_.storage) {}
+QueryEngine::QueryEngine(EngineConfig config, int device_id)
+    : config_(std::move(config)), device_id_(device_id), store_(config_.storage) {}
 
 namespace {
 

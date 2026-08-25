@@ -12,23 +12,24 @@ namespace kernellake {
 // Resolves EngineSection::query_memory_limit_bytes's "0 means auto-detect"
 // convention (see that field's own comment) into a concrete byte count:
 // the configured value as-is if non-zero (an explicit override always
-// wins), otherwise 75% of config.engine.device_id's currently *free* VRAM
-// (not total capacity -- a real device can already have a meaningful chunk
+// wins), otherwise 90% of `device_id`'s currently *free* VRAM (not total
+// capacity -- a real device can already have a meaningful chunk
 // permanently held by something else entirely, e.g. a desktop compositor
 // on a GPU shared with a display; sizing off total capacity there would
 // set a limit the allocator could never actually satisfy), queried fresh
 // via cudaMemGetInfo() every call rather than cached -- cheap (a single
-// driver call), and correct if a caller ever changes device_id between
-// calls. 75%, not e.g. 90%, leaves real headroom for the CUDA context
-// itself, driver overhead, and any further external usage that arises
-// after this snapshot was taken -- deliberately not tuned to exactly
-// saturate whatever was free at that instant. Every caller that
-// needs the actually-enforced limit (RmmEnvironment's own
+// driver call), and correct regardless of which device a caller asks
+// about. `device_id` is an explicit parameter, not read from `config`
+// (config.engine no longer carries a device_id field at all -- see
+// EngineConfig's own comment: which device is a runtime dispatch
+// parameter, not a shared config concern, since GpuExecutionCoordinator
+// needs a different device per RmmEnvironment instance it builds). Every
+// caller that needs the actually-enforced limit (RmmEnvironment's own
 // limiting_resource_adaptor, and query_engine_execute_gpu.cpp's
 // pass_read_limit_bytes sizing) must call this rather than reading
 // config.engine.query_memory_limit_bytes directly, or the two would
 // disagree whenever auto-detection is in effect.
-[[nodiscard]] std::uint64_t resolve_query_memory_limit_bytes(const EngineConfig& config);
+[[nodiscard]] std::uint64_t resolve_query_memory_limit_bytes(const EngineConfig& config, int device_id = 0);
 
 // Owns KernelLake's RMM device memory resource stack for the process, built
 // from EngineConfig's memory/engine sections, and installs it as the
@@ -57,7 +58,14 @@ namespace kernellake {
 // docs/ARCHITECTURE.md's "Concurrency" notes.
 class RmmEnvironment {
  public:
-  explicit RmmEnvironment(const EngineConfig& config);
+  // `device_id` is an explicit parameter, not read from `config` --
+  // EngineConfig carries no device_id field (see its own comment: which
+  // device is a runtime dispatch parameter, not a shared config concern).
+  // Defaults to 0 so the CLI's single-device path, and every test that
+  // just wants "a" RmmEnvironment, need not pass one explicitly.
+  // GpuExecutionCoordinator passes each visible device's own index when it
+  // builds its one-per-device RmmEnvironments.
+  explicit RmmEnvironment(const EngineConfig& config, int device_id = 0);
   ~RmmEnvironment();
 
   RmmEnvironment(const RmmEnvironment&) = delete;
@@ -90,17 +98,11 @@ class RmmEnvironment {
   [[nodiscard]] std::uint64_t query_memory_limit_bytes() const;
 
   // The CUDA device ordinal this instance's resource stack was constructed
-  // against (config.engine.device_id at construction time -- fixed for this
-  // instance's whole lifetime, since a fresh RmmEnvironment is what
-  // multi-device support constructs one-per-device from, see
-  // GpuExecutionCoordinator). Callers that need to target the *right*
+  // against (the constructor's own `device_id` argument -- fixed for this
+  // instance's whole lifetime). Callers that need to target the *right*
   // device for a given call -- CudaDeviceGuard construction and
-  // ExecutionContext::cuda_device_id in query_engine_execute_gpu.cpp -- must
-  // read it from here rather than from config_.engine.device_id directly:
-  // once GpuExecutionCoordinator owns more than one RmmEnvironment (one per
-  // visible GPU), config_.engine.device_id is just the process's original
-  // configured value and no longer identifies which specific instance a
-  // caller is holding.
+  // ExecutionContext::cuda_device_id in query_engine_execute_gpu.cpp --
+  // must read it from here.
   [[nodiscard]] int device_id() const;
 
  private:

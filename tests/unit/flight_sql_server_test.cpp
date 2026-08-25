@@ -31,9 +31,9 @@ namespace fs = std::filesystem;
 namespace flight = arrow::flight;
 namespace flight_sql = arrow::flight::sql;
 
-EngineConfig cpu_backend_server_config(std::uint32_t max_pending_results = 1024) {
-  EngineConfig config = default_config();
-  config.engine.backend = "cpu";
+ServerConfig cpu_backend_server_config(std::uint32_t max_pending_results = 1024) {
+  ServerConfig config = default_server_config();
+  config.engine_config.engine.backend = "cpu";
   config.server.host = "127.0.0.1";
   config.server.port = 0;  // OS-assigned ephemeral port, read back after Init().
   config.server.max_pending_results = max_pending_results;

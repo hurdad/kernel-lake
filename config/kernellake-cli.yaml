@@ -1,4 +1,18 @@
+# Default config for the `kernellake` CLI (query/explain/inspect-parquet/
+# benchmark tpch) -- loaded automatically when no --config is passed
+# (src/cli/main.cpp), and contains only the top-level keys CliConfig
+# actually reads. See include/kernellake/common/config.hpp's own comment
+# on the EngineConfig/CliConfig/ServerConfig split for why this and
+# kernellake-server.yaml look different: `device_id` and `benchmark:`
+# below are CLI-only and would simply be ignored if a kernellake-server
+# process read this same file; `server:` and
+# `engine.max_concurrent_gpu_queries`/`engine.gpu_device_ids` (server-only)
+# are omitted here entirely since the CLI never reads them.
+
 engine:
+  # Which GPU an ad-hoc CLI query runs on (`kernellake query --backend gpu`,
+  # or the config-file default when --backend isn't passed). Only matters
+  # on a multi-GPU box; on a single-GPU dev machine, leave at 0.
   device_id: 0
   batch_rows: 1000000
   result_batch_rows: 65536
@@ -7,11 +21,8 @@ engine:
   # (include/kernellake/common/config.hpp) for why. Set an explicit
   # non-zero byte count here to override auto-detection.
   query_memory_limit_bytes: 0
-  # 0 means "use HashAggregateOperator::kDefaultMaxDistinctKeys". A fixed
-  # safety cap on GROUP BY result cardinality, not a cardinality estimate
-  # -- see EngineSection::max_distinct_keys's own comment for why this is
-  # config-driven (real TPC-H scale factor has already needed this raised
-  # twice: SF100's ~10.8M measured distinct groups, SF1000's ~38.9M).
+  # 0 means "use HashAggregateOperator::kDefaultMaxDistinctKeys" -- see
+  # that field's own comment for why this is config-driven.
   max_distinct_keys: 0
 
 memory:
@@ -25,24 +36,13 @@ storage:
   # time a query references a matching URI scheme ("s3://", "gs://",
   # "abfs://"). Every field below is optional; empty/unset means "use that
   # provider's own default" (real AWS S3/GCS/Azure, default credential
-  # chain). See include/kernellake/common/config.hpp for full field docs --
-  # these sections mirror Arrow's own S3Options/GcsOptions/AzureOptions/
-  # HdfsOptions field-for-field.
+  # chain). See include/kernellake/common/config.hpp for full field docs.
   s3:
     credentials_kind: default  # anonymous | default | explicit | role | web_identity
     region: ""
     endpoint_override: ""      # e.g. "localhost:9000" for MinIO
     scheme: https               # https | http -- MinIO w/o TLS needs http
     tls_verify_certificates: true
-    # Threads backing the AWS SDK's process-wide S3 I/O event loop
-    # (arrow::fs::S3GlobalOptions::num_event_loop_threads). Arrow's own
-    # default is 1, documented as fine for "at most, in the hundreds" of
-    # concurrent connections -- a single large Parquet scan pass at real
-    # SF1000 scale can burst well past that. Confirmed for real: 1 -> 4
-    # gave a reproducible ~13% wall-time improvement on real SF1000 data;
-    # 4 -> 8 made no further difference (see S3Section::s3_event_loop_threads's
-    # own comment for the full A/B). Only the *first* S3 config constructed
-    # in this process actually takes effect.
     event_loop_threads: 4
   gcs:
     credentials_kind: default  # anonymous | default | access_token | service_account_json
@@ -56,19 +56,12 @@ storage:
     dfs_storage_authority: .dfs.core.windows.net    # e.g. "127.0.0.1:10001" for Azurite
     blob_storage_scheme: https  # https | http -- Azurite needs http
     dfs_storage_scheme: https
-  # HDFS: config schema only in this pass (no lightweight local emulator
-  # for real verification, see docs/ROADMAP.md).
   hdfs:
     connection_config:
       host: ""
       port: 0
   # Local-NVMe read-through cache in front of the remote (s3/gcs/azure/hdfs)
   # backends above -- see docs/ARCHITECTURE.md's "NVMe cache tier" section.
-  # Disabled by default; never applies to plain local paths. On a cache
-  # miss, the whole remote object is downloaded once to `directory` and
-  # served from there for every later read of that same object (repeat
-  # queries against overlapping data become a local disk read instead of a
-  # network fetch).
   cache:
     enabled: false
     directory: ""            # e.g. "/mnt/nvme/kernellake-cache" -- required if enabled
@@ -82,45 +75,19 @@ profiling:
   nvtx: true
   operator_metrics: true
 
+# `kernellake benchmark tpch`'s own defaults, overridable per-run with
+# --iterations/--warmup-iterations.
 benchmark:
   default_iterations: 5
   warmup_iterations: 1
-  output_format: json
-  verify_results: true
-  baseline: duckdb
 
-# Only consumed by kernellake-server (KERNELLAKE_BUILD_SERVER=ON).
-server:
-  host: 0.0.0.0
-  port: 31337
-  # Inbound TLS for the Flight SQL listener. Both tls_cert_path and
-  # tls_key_path (PEM) are required when use_tls is true.
-  use_tls: false
-  tls_cert_path: ""
-  tls_key_path: ""
-  # mTLS: require clients to present a certificate signed by the CA in
-  # tls_client_ca_cert_path. Requires use_tls: true.
-  require_client_cert: false
-  tls_client_ca_cert_path: ""
-  # Static bearer-token auth: every RPC must carry an
-  # "authorization: Bearer <auth_token>" header, or it's rejected before
-  # reaching the query engine. auth_token must be set when auth_enabled is
-  # true. Combine with use_tls above -- a bearer token sent over plaintext
-  # gives an eavesdropper the token itself.
-  auth_enabled: false
-  auth_token: ""
-
-# Only takes effect when built with KERNELLAKE_ENABLE_OTEL=ON. See
-# include/kernellake/common/config.hpp for full field docs -- notably:
-# otlp_endpoint's shape depends on otlp_protocol (host:port for grpc, a full
-# URL for http); use_tls/tls_ca_cert_path apply to grpc only (http uses the
-# endpoint's own scheme); tls_client_cert_path/tls_client_key_path (mTLS)
-# apply to http only.
+# Same schema as config/kernellake.yaml's own observability: section --
+# only takes effect when built with KERNELLAKE_ENABLE_OTEL=ON.
 observability:
   enabled: false
   otlp_protocol: grpc  # grpc | http
   otlp_endpoint: localhost:4317
-  service_name: kernellake
+  service_name: kernellake-cli
   use_tls: false
   tls_ca_cert_path: ""
   tls_client_cert_path: ""
@@ -132,7 +99,6 @@ observability:
       max_export_batch_size: 512
       schedule_delay_ms: 5000
     sampler: default  # default | always | never
-  # Metrics always use a periodic reader (no simple/batch choice).
   metrics:
     export_interval_ms: 60000
     export_timeout_ms: 30000

@@ -316,12 +316,19 @@ presets, RelWithDebInfo -- not the Debug builds `cpu-dev`/`gpu-dev` produce
 for local iteration); they differ only in whether the GPU execution
 backend is compiled in. The `cpu-release`/`gpu-release` build stages (full
 toolchain, repo built inside them) are intermediate only and are never
-published. Every stage builds on plain `ubuntu:26.04`, with
-`runtime-gpu`/`gpu-release` installing CUDA via apt's own
-`nvidia-cuda-toolkit` (12.4.1), not Ubuntu 24.04 or NVIDIA's official
-`nvidia/cuda` images -- see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)'s
-"Ubuntu 26.04 baseline" section for why (Arrow Flight SQL and otel-cpp both
-need it). This is independent of the Requirements/Build sections above,
+published. CPU-path stages (`build-base`, `cpu-release`, `runtime-cpu`) build on plain
+`ubuntu:26.04` throughout. The GPU build stage (`gpu-build-base`/
+`gpu-release`) instead builds FROM NVIDIA's official
+`nvidia/cuda:${CUDA_VERSION}-devel-ubuntu26.04` image (CUDA 13.3.1 by
+default, an overridable `--build-arg`) rather than Ubuntu 24.04 or (as an
+earlier revision of this Dockerfile did) apt's own `nvidia-cuda-toolkit`;
+`runtime-gpu` itself still starts fresh `FROM` plain `ubuntu:26.04` and only
+copies in the already-built binaries plus their shared-library closure, so
+no CUDA toolkit/compiler ships in the published image. See
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)'s "Ubuntu 26.04 baseline"
+section for the full history and why Ubuntu 26.04 itself is required
+either way (Arrow Flight SQL and otel-cpp both need it). This is
+independent of the Requirements/Build sections above,
 which describe this project's own non-container development environment
 -- neither one needs to match the other exactly (this project's own
 sandbox happens to be Ubuntu 26.04 too, matching the container, but that's
@@ -375,9 +382,15 @@ GitHub Actions run).
 `kernellake-server` (built behind `KERNELLAKE_BUILD_SERVER`, the
 `server-dev` preset) serves SQL queries over Arrow Flight SQL instead of
 one-shot CLI invocations -- the same `QueryEngine` the CLI uses, so it
-supports the identical SQL grammar and both execution backends. Query it
-from Python with `adbc-driver-flightsql`, or deploy it to Kubernetes via
-`charts/kernellake/` (see that chart's own `README.md`).
+supports the identical SQL grammar and both execution backends. On a
+multi-GPU host, its `GpuExecutionCoordinator` builds one `RmmEnvironment`
+per visible GPU and round-robins incoming GPU-backend queries across them
+(one query per GPU, Multi-GPU Tier 1) instead of pinning every query to
+device 0 -- see [docs/MULTI_GPU_SCALING.md](docs/MULTI_GPU_SCALING.md) and
+[docs/GPU_OPTIMIZATIONS.md](docs/GPU_OPTIMIZATIONS.md)'s "Multi-GPU Tier 1
+implemented" section. Query it from Python with `adbc-driver-flightsql`,
+or deploy it to Kubernetes via `charts/kernellake/` (see that chart's own
+`README.md`).
 
 Built behind `KERNELLAKE_ENABLE_OTEL` (the `otel-dev` preset), KernelLake
 also exports OpenTelemetry traces (one span per query), metrics (a
@@ -395,7 +408,7 @@ src/<module>/                  implementation, mirrors include/
 tests/unit/                    GoogleTest unit tests (CPU-only, every preset)
 tests/gpu/                     GoogleTest GPU tests (gpu-dev preset only)
 tools/                         Python tooling (DuckDB cross-validation, TPC-H generation)
-benchmarks/tpch/queries/       Version-controlled TPC-H-derived SQL (q01/q03/q05/q06/q07/q09/q10/q11/q12/q13/q14/q18/q19.sql)
+benchmarks/tpch/queries/       Version-controlled TPC-H-derived SQL (q01/q03/q04/q05/q06/q07/q08/q09/q10/q11/q12/q13/q14/q15/q18/q19.sql)
 benchmarks/local/              Single-machine docker-compose stack (kernellake-server + OTel
                                 Collector + Prometheus + Grafana + Jaeger + MinIO), no cloud needed
 benchmarks/aws/                Real Terraform-provisioned AWS benchmark harness (KernelLake vs.
@@ -404,7 +417,7 @@ docker/                        Dockerfile (runtime-cpu/runtime-gpu images) and r
 charts/kernellake/             Helm chart for deploying kernellake-server to Kubernetes
 docs/                          ARCHITECTURE.md, ROADMAP.md, TPCH.md, SQL_COMPATIBILITY.md,
                                 OBSERVABILITY.md, GPU_OPTIMIZATIONS.md, MULTI_GPU_SCALING.md
-config/kernellake.yaml         default engine configuration
+config/                        kernellake-cli.yaml/kernellake-server.yaml default configs (see config/README.md)
 ```
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for what each module owns

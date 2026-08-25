@@ -5,15 +5,30 @@ surfacing the only two real GDS-validated instance types left standing
 (`p5.48xlarge`, 8x H100; `p6-b200.48xlarge`, 8x B200) -- both are
 fixed 8-GPU boxes, so using one at all raises the question of whether
 KernelLake should do anything with GPUs 2-8 beyond let them sit idle.
-This is a planning document only; nothing here is implemented, and
-none of it should be started without a separate go-ahead per tier.
+This is a planning document only; nothing here was implemented at the
+time it was written, and none of it should be started without a
+separate go-ahead per tier. **Tier 1 is now the one exception** -- see
+its own section below, marked IMPLEMENTED (2026-08-24).
 
-Today's architecture is single-GPU by construction, not by an
-arbitrary limit that's easy to lift:
+Today's architecture **was** single-GPU by construction, not by an
+arbitrary limit that's easy to lift. This description is now historical
+for Tier 1's pieces specifically (see "Tier 1 ... IMPLEMENTED" below for
+the current state of each); still accurate for tiers 2 and 3:
 
 - `RmmEnvironment` (`src/memory/rmm_environment.cpp`) installs one RMM
   resource stack as **the process's current CUDA device resource** --
   singular, process-wide, for whatever `EngineConfig::device_id` is.
+  **Since updated (2026-08-24):** inside `kernellake-server`,
+  `GpuExecutionCoordinator` now owns one such instance per device named in
+  `ServerConfig::gpu_device_ids` (or every visible device if that list is
+  empty), not one for the whole process -- see Tier 1 below. Still exactly
+  one instance for the CLI's one-shot `QueryEngine::execute(sql)` path
+  (which never goes through `GpuExecutionCoordinator`), targeting
+  `CliConfig::device_id`. `EngineConfig::device_id` itself no longer
+  exists -- which device a given `RmmEnvironment` targets is now an
+  explicit constructor argument, not a config field at all (see
+  `include/kernellake/common/config.hpp`'s own comment on the
+  `EngineConfig`/`CliConfig`/`ServerConfig` split for why).
 - `GpuExecutionCoordinator` (`src/server/gpu_execution_coordinator_gpu.cpp`)
   bounds concurrent queries through that one `RmmEnvironment` with a
   `std::counting_semaphore` sized to `EngineConfig::max_concurrent_gpu_queries`
@@ -21,13 +36,23 @@ arbitrary limit that's easy to lift:
   (2026-08-21), this is no longer single-flight/mutex-serialized, but it's
   still "up to N concurrent queries on device 0," not "one query per GPU":
   every concurrent query still shares the one process-wide `RmmEnvironment`
-  (and therefore the one device) regardless of N.
+  (and therefore the one device) regardless of N. **Since updated
+  (2026-08-24):** this bound is now per-device, not process-wide -- an
+  N-GPU node allows up to N times as many concurrent queries as this
+  section describes, one semaphore per device. The field itself also moved
+  to `ServerConfig::max_concurrent_gpu_queries` (CLI configs have no such
+  field -- only the server has a concurrency-across-GPUs concept at all).
 - `ExecutionContext::cuda_device_id` (`execution_context.hpp`) exists as
   a field but is never set to anything but its `0` default anywhere in
   the tree -- it's a placeholder, not wired-up multi-device support.
+  **Since updated (2026-08-24):** now threaded through for real --
+  `RmmEnvironment::device_id()` flows into it via
+  `query_engine_execute_gpu.cpp`, see Tier 1 below.
 - There is exactly one `flight_sql_server.cpp` process, no
   worker/coordinator split, no concept of "node" anywhere in the
-  codebase.
+  codebase. Still true -- Tier 1 adds multiple GPUs *within* that one
+  process, not multiple processes; see tier 3 for the worker/coordinator
+  split.
 
 Three tiers below, roughly in the order they'd need to be built (each
 depends on the previous one's infrastructure):
@@ -66,10 +91,15 @@ docs/GPU_OPTIMIZATIONS.md's "Multi-GPU Tier 1 implemented" section):
 1. ~~`RmmEnvironment` becomes one-per-device instead of
    one-per-process~~ -- done. `GpuExecutionCoordinator` owns a
    `std::vector<std::unique_ptr<RmmEnvironment>>` sized to
-   `cudaGetDeviceCount()`, each constructed under a `CudaDeviceGuard`
-   for its own index from its own `EngineConfig` copy. Turned out to be
-   exactly as mechanical as expected -- `set_current_device_resource()`
-   really is one slot per device.
+   `ServerConfig::gpu_device_ids` (or `cudaGetDeviceCount()` if that list
+   is empty), each constructed under a `CudaDeviceGuard` for its own
+   index. Simpler than first planned: `RmmEnvironment` gained an explicit
+   `device_id` constructor parameter (rather than reading it from a
+   config copy with that field overridden per device, the original plan
+   here), so no per-device `EngineConfig` copy is needed at all -- one
+   shared `EngineConfig` plus a different integer per call. Turned out to
+   be exactly as mechanical as expected either way --
+   `set_current_device_resource()` really is one slot per device.
 2. ~~`GpuExecutionCoordinator::execute()` picks a device instead of
    assuming device 0~~ -- done, via round-robin (an ever-growing atomic
    counter modulo device count). Memory-aware placement remains an
@@ -87,6 +117,25 @@ docs/GPU_OPTIMIZATIONS.md's "Multi-GPU Tier 1 implemented" section):
    `TrackingMemoryResource`/`GpuMemoryMetricsRegistry` were already
    device-keyed; they just weren't being fed a real per-device
    `device_id` until piece 1 above existed.
+5. **Added, beyond the original four pieces**: explicit GPU selection.
+   Real deployments can't always assume kernellake-server should use
+   *every* visible device (a shared box may need some GPUs left for
+   other workloads) -- `ServerConfig::gpu_device_ids` (empty by default =
+   every visible device, Tier 1's original behavior) lets an operator
+   pin the server to an exact, ordered subset instead.
+   `GpuExecutionCoordinator` validates each configured ordinal against
+   the real `cudaGetDeviceCount()` at construction time. Deliberately
+   plain CUDA ordinals, not GPU UUIDs: every CUDA call this project makes
+   is ordinal-only regardless, so a UUID layer would still need to
+   resolve back to an ordinal before use, and this project's actual
+   target deployments (single-tenant bare-metal/VM boxes, not
+   GPU-sliced multi-tenant Kubernetes, where a device plugin already
+   remaps a pod's GPUs to ordinals 0..N-1 before this config is ever
+   read) don't need that extra machinery. The one real caveat: CUDA's
+   own default device enumeration order (`CUDA_DEVICE_ORDER=FASTEST_FIRST`)
+   isn't guaranteed to match `nvidia-smi`'s (PCI bus ID order) -- set
+   `CUDA_DEVICE_ORDER=PCI_BUS_ID` in the server's environment if you're
+   picking ordinals by cross-referencing `nvidia-smi -L` output.
 
 **What doesn't change**: no new operator types, no network protocol,
 no cross-GPU data movement at all. `HashJoinOperator`,

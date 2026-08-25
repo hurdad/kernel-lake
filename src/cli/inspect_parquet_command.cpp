@@ -107,7 +107,7 @@ nlohmann::json to_json(const FileMetadata& meta) {
 
 }  // namespace
 
-int run_inspect_parquet(const std::vector<std::string_view>& args, const EngineConfig& config) {
+int run_inspect_parquet(const std::vector<std::string_view>& args, const CliConfig& config) {
   std::string path;
   std::string format = "text";
   for (std::size_t i = 0; i < args.size(); ++i) {
@@ -128,7 +128,7 @@ int run_inspect_parquet(const std::vector<std::string_view>& args, const EngineC
   }
 
   try {
-    ObjectStoreRegistry store(config.storage);
+    ObjectStoreRegistry store(config.engine_config.storage);
     const std::vector<ObjectInfo> files = discover_parquet_files(store, {path});
     std::vector<FileMetadata> metadata;
     metadata.reserve(files.size());

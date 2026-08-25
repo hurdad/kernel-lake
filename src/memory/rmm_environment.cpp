@@ -14,17 +14,16 @@
 
 namespace kernellake {
 
-std::uint64_t resolve_query_memory_limit_bytes(const EngineConfig& config) {
+std::uint64_t resolve_query_memory_limit_bytes(const EngineConfig& config, int device_id) {
   if (config.engine.query_memory_limit_bytes != 0) {
     return config.engine.query_memory_limit_bytes;
   }
   // CudaDeviceGuard: cudaMemGetInfo() reports the *current* device's
-  // memory, which may not be config.engine.device_id yet at whatever point
-  // a caller invokes this from (RmmEnvironment's own constructor, in
-  // particular, runs before query_engine_execute_gpu.cpp's own
-  // CudaDeviceGuard for the query itself -- see that file's comment on
-  // construction order).
-  const CudaDeviceGuard device_guard(config.engine.device_id);
+  // memory, which may not be `device_id` yet at whatever point a caller
+  // invokes this from (RmmEnvironment's own constructor, in particular,
+  // runs before query_engine_execute_gpu.cpp's own CudaDeviceGuard for the
+  // query itself -- see that file's comment on construction order).
+  const CudaDeviceGuard device_guard(device_id);
   std::size_t free_bytes = 0;
   std::size_t total_bytes = 0;
   check_cuda(cudaMemGetInfo(&free_bytes, &total_bytes),
@@ -78,13 +77,13 @@ struct RmmEnvironment::Impl {
   TrackingMemoryResource tracking;
   cuda::mr::any_resource<cuda::mr::device_accessible> previous_resource;
 
-  Impl(const EngineConfig& config, cuda::mr::any_resource<cuda::mr::device_accessible> base,
+  Impl(const EngineConfig& config, int device_id_in, cuda::mr::any_resource<cuda::mr::device_accessible> base,
        cuda::mr::any_resource<cuda::mr::device_accessible> previous)
-      : device_id(config.engine.device_id),
-        query_memory_limit_bytes(resolve_query_memory_limit_bytes(config)),
+      : device_id(device_id_in),
+        query_memory_limit_bytes(resolve_query_memory_limit_bytes(config, device_id_in)),
         base_resource(std::move(base)),
         limiter(base_resource, query_memory_limit_bytes),
-        tracking(cuda::mr::any_resource<cuda::mr::device_accessible>{limiter}, config.engine.device_id),
+        tracking(cuda::mr::any_resource<cuda::mr::device_accessible>{limiter}, device_id_in),
         previous_resource(std::move(previous)) {}
 };
 
@@ -101,7 +100,7 @@ cuda::mr::any_resource<cuda::mr::device_accessible> build_base_resource(const Me
 
 }  // namespace
 
-RmmEnvironment::RmmEnvironment(const EngineConfig& config) {
+RmmEnvironment::RmmEnvironment(const EngineConfig& config, int device_id) {
   // Idempotent (internally std::call_once-guarded) -- registers the GPU
   // memory OTel instruments against whatever global MeterProvider
   // observability::init() already set up, the first time any
@@ -115,7 +114,8 @@ RmmEnvironment::RmmEnvironment(const EngineConfig& config) {
   // be restored on destruction; construct our Impl in two steps since the
   // limiter needs `base`, all before we know what the previous global
   // resource was.
-  RmmEnvironment::Impl* raw = new Impl(config, base, cuda::mr::any_resource<cuda::mr::device_accessible>{});
+  RmmEnvironment::Impl* raw =
+      new Impl(config, device_id, base, cuda::mr::any_resource<cuda::mr::device_accessible>{});
   impl_.reset(raw);
   impl_->previous_resource = rmm::mr::set_current_device_resource(impl_->tracking);
 }

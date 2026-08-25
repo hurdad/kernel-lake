@@ -9,34 +9,38 @@
 namespace kernellake {
 namespace {
 
+// --- EngineConfig: sections shared by both binaries (see config.hpp's own
+// comment on the CLI/server split, added 2026-08-24) ------------------------
+
 TEST(Config, DefaultsMatchSpec) {
   const EngineConfig config = default_config();
-  EXPECT_EQ(config.engine.device_id, 0);
   EXPECT_EQ(config.engine.batch_rows, 1'000'000u);
   EXPECT_EQ(config.memory.pool_max_bytes, 8ULL * 1024 * 1024 * 1024);
-  EXPECT_EQ(config.benchmark.baseline, "duckdb");
   EXPECT_NO_THROW((void)(validate_config(config)));
 }
 
 TEST(Config, ParsesOverrides) {
   const std::string yaml = R"(
 engine:
-  device_id: 2
   batch_rows: 500000
 logging:
   level: debug
   json: true
-benchmark:
-  output_format: csv
 )";
   const EngineConfig config = parse_config(yaml);
-  EXPECT_EQ(config.engine.device_id, 2);
   EXPECT_EQ(config.engine.batch_rows, 500000u);
   EXPECT_EQ(config.logging.level, "debug");
   EXPECT_TRUE(config.logging.json);
-  EXPECT_EQ(config.benchmark.output_format, "csv");
   // Fields not present in the override fall back to defaults.
   EXPECT_EQ(config.engine.result_batch_rows, default_config().engine.result_batch_rows);
+}
+
+// device_id/benchmark: are CLI-only keys (CliConfig, below) -- parse_config()
+// doesn't read them at all, so a malformed device_id here is simply never
+// looked at, not an error.
+TEST(Config, ParseConfigIgnoresCliOnlyKeys) {
+  const EngineConfig config = parse_config("engine:\n  device_id: not-a-number\n");
+  EXPECT_EQ(config.engine.batch_rows, default_config().engine.batch_rows);
 }
 
 TEST(Config, RejectsZeroBatchRows) {
@@ -71,16 +75,6 @@ TEST(Config, RejectsContradictoryMemoryPool) {
 TEST(Config, RejectsUnknownLogLevel) {
   EngineConfig config = default_config();
   config.logging.level = "verbose";
-  EXPECT_THROW((void)(validate_config(config)), ConfigurationError);
-}
-
-TEST(Config, RejectsUnsupportedBenchmarkMode) {
-  EngineConfig config = default_config();
-  config.benchmark.output_format = "xml";
-  EXPECT_THROW((void)(validate_config(config)), ConfigurationError);
-
-  config = default_config();
-  config.benchmark.baseline = "clickhouse-but-not-really";
   EXPECT_THROW((void)(validate_config(config)), ConfigurationError);
 }
 
@@ -263,117 +257,6 @@ TEST(Config, DeltaSectionDefaultsToUnconfigured) {
   EXPECT_TRUE(config.delta.api_key.empty());
 }
 
-TEST(Config, ParsesServerTlsSection) {
-  const std::string yaml = R"(
-server:
-  host: 127.0.0.1
-  port: 31338
-  use_tls: true
-  tls_cert_path: /etc/ssl/server.pem
-  tls_key_path: /etc/ssl/server.key
-  require_client_cert: true
-  tls_client_ca_cert_path: /etc/ssl/client_ca.pem
-)";
-  const EngineConfig config = parse_config(yaml);
-  EXPECT_TRUE(config.server.use_tls);
-  EXPECT_EQ(config.server.tls_cert_path, "/etc/ssl/server.pem");
-  EXPECT_EQ(config.server.tls_key_path, "/etc/ssl/server.key");
-  EXPECT_TRUE(config.server.require_client_cert);
-  EXPECT_EQ(config.server.tls_client_ca_cert_path, "/etc/ssl/client_ca.pem");
-  EXPECT_NO_THROW((void)(validate_config(config)));
-}
-
-TEST(Config, ServerTlsDefaultsToDisabled) {
-  const EngineConfig config = default_config();
-  EXPECT_FALSE(config.server.use_tls);
-  EXPECT_TRUE(config.server.tls_cert_path.empty());
-  EXPECT_TRUE(config.server.tls_key_path.empty());
-  EXPECT_FALSE(config.server.require_client_cert);
-}
-
-TEST(Config, RejectsServerTlsMissingCertOrKey) {
-  EngineConfig config = default_config();
-  config.server.use_tls = true;
-  config.server.tls_cert_path = "/etc/ssl/server.pem";
-  // tls_key_path left empty.
-  EXPECT_THROW((void)(validate_config(config)), ConfigurationError);
-
-  config = default_config();
-  config.server.use_tls = true;
-  config.server.tls_key_path = "/etc/ssl/server.key";
-  // tls_cert_path left empty.
-  EXPECT_THROW((void)(validate_config(config)), ConfigurationError);
-}
-
-TEST(Config, RejectsServerRequireClientCertWithoutTls) {
-  EngineConfig config = default_config();
-  config.server.require_client_cert = true;
-  config.server.tls_client_ca_cert_path = "/etc/ssl/client_ca.pem";
-  // use_tls left false.
-  EXPECT_THROW((void)(validate_config(config)), ConfigurationError);
-}
-
-TEST(Config, RejectsServerRequireClientCertMissingCaPath) {
-  EngineConfig config = default_config();
-  config.server.use_tls = true;
-  config.server.tls_cert_path = "/etc/ssl/server.pem";
-  config.server.tls_key_path = "/etc/ssl/server.key";
-  config.server.require_client_cert = true;
-  // tls_client_ca_cert_path left empty.
-  EXPECT_THROW((void)(validate_config(config)), ConfigurationError);
-}
-
-TEST(Config, ParsesServerAuthSection) {
-  const std::string yaml = R"(
-server:
-  auth_enabled: true
-  auth_token: super-secret-token
-)";
-  const EngineConfig config = parse_config(yaml);
-  EXPECT_TRUE(config.server.auth_enabled);
-  EXPECT_EQ(config.server.auth_token, "super-secret-token");
-  EXPECT_NO_THROW((void)(validate_config(config)));
-}
-
-TEST(Config, ServerAuthDefaultsToDisabled) {
-  const EngineConfig config = default_config();
-  EXPECT_FALSE(config.server.auth_enabled);
-  EXPECT_TRUE(config.server.auth_token.empty());
-}
-
-TEST(Config, RejectsServerAuthEnabledWithoutToken) {
-  EngineConfig config = default_config();
-  config.server.auth_enabled = true;
-  // auth_token left empty.
-  EXPECT_THROW((void)(validate_config(config)), ConfigurationError);
-}
-
-TEST(Config, LoadConfigFileRejectsMissingPath) {
-  EXPECT_THROW((void)(load_config_file("/nonexistent/kernellake.yaml")), ConfigurationError);
-}
-
-// load_config_file()'s success path (reading a real file off disk and
-// delegating to parse_config()) was never exercised -- only the missing-path
-// rejection above was.
-TEST(Config, LoadConfigFileReadsRealFile) {
-  // Suffixed with the test name (not a bare literal) to avoid colliding
-  // with another concurrently-running test binary/preset writing to the
-  // same shared temp directory -- see every other new fixture in this
-  // area (explain_command_test.cpp, generate_data_command_test.cpp,
-  // benchmark_tpch_command_test.cpp) for the same convention.
-  const std::filesystem::path path =
-      std::filesystem::temp_directory_path() /
-      ("kernellake_config_test_" +
-       std::string(::testing::UnitTest::GetInstance()->current_test_info()->name()) + ".yaml");
-  {
-    std::ofstream out(path);
-    out << "engine:\n  device_id: 3\n";
-  }
-  const EngineConfig config = load_config_file(path.string());
-  std::filesystem::remove(path);
-  EXPECT_EQ(config.engine.device_id, 3);
-}
-
 // read_string_map() (storage.hdfs.connection_config.extra_conf) had no
 // coverage at all, success or failure.
 TEST(Config, ParsesHdfsExtraConf) {
@@ -405,9 +288,9 @@ storage:
 }
 
 // storage.gcs.options.retry_limit_seconds/project_id are std::optional<>,
-// read via their own explicit-presence-check branch in parse_config()
-// rather than read_or<T>() -- neither the success nor failure path of
-// either had coverage.
+// read via their own explicit-presence-check branch in
+// parse_engine_config_from_root() rather than read_or<T>() -- neither the
+// success nor failure path of either had coverage.
 TEST(Config, ParsesGcsRetryLimitSecondsAndProjectId) {
   const std::string yaml = R"(
 storage:
@@ -433,26 +316,12 @@ TEST(Config, RejectsMalformedGcsProjectId) {
 }
 
 // A few representative read_or<T>() malformed-value cases across distinct
-// instantiated types (int, bool, uint16_t port) -- read_or<T> is
-// instantiated separately per T, and most of its many instantiations
-// (one per distinct config field type) previously had neither their
-// success nor failure path exercised by any parse_config() test.
-TEST(Config, RejectsMalformedEngineDeviceId) {
-  EXPECT_THROW((void)(parse_config("engine:\n  device_id: not-a-number\n")), ConfigurationError);
-}
-
+// instantiated types (int, bool) -- read_or<T> is instantiated separately
+// per T, and most of its many instantiations (one per distinct config field
+// type) previously had neither their success nor failure path exercised by
+// any parse_config() test.
 TEST(Config, RejectsMalformedMemoryUseAsyncAllocator) {
   EXPECT_THROW((void)(parse_config("memory:\n  use_async_allocator: not-a-bool\n")), ConfigurationError);
-}
-
-TEST(Config, RejectsMalformedServerPort) {
-  EXPECT_THROW((void)(parse_config("server:\n  port: not-a-port\n")), ConfigurationError);
-}
-
-TEST(Config, RejectsNegativeEngineDeviceId) {
-  EngineConfig config = default_config();
-  config.engine.device_id = -1;
-  EXPECT_THROW((void)(validate_config(config)), ConfigurationError);
 }
 
 TEST(Config, RejectsZeroResultBatchRows) {
@@ -564,30 +433,6 @@ TEST(Config, RejectsCacheEnabledWithoutDirectory) {
   EXPECT_THROW((void)(validate_config(config)), ConfigurationError);
 }
 
-TEST(Config, RejectsBenchmarkNonPositiveDefaultIterations) {
-  EngineConfig config = default_config();
-  config.benchmark.default_iterations = 0;
-  EXPECT_THROW((void)(validate_config(config)), ConfigurationError);
-}
-
-TEST(Config, RejectsBenchmarkNegativeWarmupIterations) {
-  EngineConfig config = default_config();
-  config.benchmark.warmup_iterations = -1;
-  EXPECT_THROW((void)(validate_config(config)), ConfigurationError);
-}
-
-TEST(Config, RejectsServerZeroPort) {
-  EngineConfig config = default_config();
-  config.server.port = 0;
-  EXPECT_THROW((void)(validate_config(config)), ConfigurationError);
-}
-
-TEST(Config, RejectsServerZeroMaxPendingResults) {
-  EngineConfig config = default_config();
-  config.server.max_pending_results = 0;
-  EXPECT_THROW((void)(validate_config(config)), ConfigurationError);
-}
-
 TEST(Config, RejectsObservabilityInvalidOtlpProtocol) {
   EngineConfig config = default_config();
   config.observability.otlp_protocol = "carrier-pigeon";
@@ -667,6 +512,240 @@ TEST(Config, RejectsLogsBatchInvalidProcessor) {
   EngineConfig config = default_config();
   config.observability.logs.processor = "carrier-pigeon";
   EXPECT_THROW((void)(validate_config(config)), ConfigurationError);
+}
+
+// --- CliConfig: the CLI's own top-level config (device_id, benchmark:) -----
+
+TEST(CliConfig, DefaultsMatchSpec) {
+  const CliConfig config = default_cli_config();
+  EXPECT_EQ(config.device_id, 0);
+  EXPECT_EQ(config.benchmark.default_iterations, 5);
+  EXPECT_EQ(config.benchmark.warmup_iterations, 1);
+  EXPECT_NO_THROW((void)(validate_cli_config(config)));
+}
+
+TEST(CliConfig, ParsesOwnTopLevelKeys) {
+  const std::string yaml = R"(
+engine:
+  device_id: 2
+  batch_rows: 500000
+benchmark:
+  default_iterations: 10
+  warmup_iterations: 2
+)";
+  const CliConfig config = parse_cli_config(yaml);
+  EXPECT_EQ(config.device_id, 2);
+  EXPECT_EQ(config.engine_config.engine.batch_rows, 500000u);
+  EXPECT_EQ(config.benchmark.default_iterations, 10);
+  EXPECT_EQ(config.benchmark.warmup_iterations, 2);
+}
+
+// A server: key present in the same YAML a CLI config is parsed from is
+// simply not read here -- both binaries can share one config file (see
+// EngineConfig's own comment).
+TEST(CliConfig, IgnoresServerOnlyKeys) {
+  const std::string yaml = "server:\n  port: 9999\n";
+  const CliConfig config = parse_cli_config(yaml);
+  EXPECT_EQ(config.device_id, default_cli_config().device_id);
+}
+
+TEST(CliConfig, RejectsMalformedDeviceId) {
+  EXPECT_THROW((void)(parse_cli_config("engine:\n  device_id: not-a-number\n")), ConfigurationError);
+}
+
+TEST(CliConfig, RejectsNegativeDeviceId) {
+  CliConfig config = default_cli_config();
+  config.device_id = -1;
+  EXPECT_THROW((void)(validate_cli_config(config)), ConfigurationError);
+}
+
+TEST(CliConfig, RejectsBenchmarkNonPositiveDefaultIterations) {
+  CliConfig config = default_cli_config();
+  config.benchmark.default_iterations = 0;
+  EXPECT_THROW((void)(validate_cli_config(config)), ConfigurationError);
+}
+
+TEST(CliConfig, RejectsBenchmarkNegativeWarmupIterations) {
+  CliConfig config = default_cli_config();
+  config.benchmark.warmup_iterations = -1;
+  EXPECT_THROW((void)(validate_cli_config(config)), ConfigurationError);
+}
+
+TEST(CliConfig, LoadConfigFileRejectsMissingPath) {
+  EXPECT_THROW((void)(load_cli_config_file("/nonexistent/kernellake.yaml")), ConfigurationError);
+}
+
+// load_cli_config_file()'s success path (reading a real file off disk and
+// delegating to parse_cli_config()) was never exercised -- only the
+// missing-path rejection above was.
+TEST(CliConfig, LoadConfigFileReadsRealFile) {
+  // Suffixed with the test name (not a bare literal) to avoid colliding
+  // with another concurrently-running test binary/preset writing to the
+  // same shared temp directory -- see every other new fixture in this
+  // area (explain_command_test.cpp, generate_data_command_test.cpp,
+  // benchmark_tpch_command_test.cpp) for the same convention.
+  const std::filesystem::path path =
+      std::filesystem::temp_directory_path() /
+      ("kernellake_config_test_" +
+       std::string(::testing::UnitTest::GetInstance()->current_test_info()->name()) + ".yaml");
+  {
+    std::ofstream out(path);
+    out << "engine:\n  device_id: 3\n";
+  }
+  const CliConfig config = load_cli_config_file(path.string());
+  std::filesystem::remove(path);
+  EXPECT_EQ(config.device_id, 3);
+}
+
+// --- ServerConfig: kernellake-server's own top-level config (server:,
+// engine.max_concurrent_gpu_queries, engine.gpu_device_ids) ------------------
+
+TEST(ServerConfig, DefaultsMatchSpec) {
+  const ServerConfig config = default_server_config();
+  EXPECT_EQ(config.max_concurrent_gpu_queries, 2);
+  EXPECT_TRUE(config.gpu_device_ids.empty());
+  EXPECT_NO_THROW((void)(validate_server_config(config)));
+}
+
+// A benchmark:/engine.device_id key present in the same YAML a server
+// config is parsed from is simply not read here.
+TEST(ServerConfig, IgnoresCliOnlyKeys) {
+  const std::string yaml = "engine:\n  device_id: 7\nbenchmark:\n  default_iterations: 99\n";
+  const ServerConfig config = parse_server_config(yaml);
+  EXPECT_EQ(config.max_concurrent_gpu_queries, default_server_config().max_concurrent_gpu_queries);
+}
+
+TEST(ServerConfig, ParsesMaxConcurrentGpuQueries) {
+  const ServerConfig config = parse_server_config("engine:\n  max_concurrent_gpu_queries: 4\n");
+  EXPECT_EQ(config.max_concurrent_gpu_queries, 4);
+}
+
+TEST(ServerConfig, RejectsNonPositiveMaxConcurrentGpuQueries) {
+  ServerConfig config = default_server_config();
+  config.max_concurrent_gpu_queries = 0;
+  EXPECT_THROW((void)(validate_server_config(config)), ConfigurationError);
+}
+
+TEST(ServerConfig, ParsesGpuDeviceIds) {
+  const ServerConfig config = parse_server_config("engine:\n  gpu_device_ids: [0, 2, 3]\n");
+  EXPECT_EQ(config.gpu_device_ids, (std::vector<int>{0, 2, 3}));
+}
+
+TEST(ServerConfig, RejectsNegativeGpuDeviceId) {
+  ServerConfig config = default_server_config();
+  config.gpu_device_ids = {0, -1};
+  EXPECT_THROW((void)(validate_server_config(config)), ConfigurationError);
+}
+
+TEST(ServerConfig, RejectsDuplicateGpuDeviceIds) {
+  ServerConfig config = default_server_config();
+  config.gpu_device_ids = {0, 1, 0};
+  EXPECT_THROW((void)(validate_server_config(config)), ConfigurationError);
+}
+
+TEST(ServerConfig, ParsesServerTlsSection) {
+  const std::string yaml = R"(
+server:
+  host: 127.0.0.1
+  port: 31338
+  use_tls: true
+  tls_cert_path: /etc/ssl/server.pem
+  tls_key_path: /etc/ssl/server.key
+  require_client_cert: true
+  tls_client_ca_cert_path: /etc/ssl/client_ca.pem
+)";
+  const ServerConfig config = parse_server_config(yaml);
+  EXPECT_TRUE(config.server.use_tls);
+  EXPECT_EQ(config.server.tls_cert_path, "/etc/ssl/server.pem");
+  EXPECT_EQ(config.server.tls_key_path, "/etc/ssl/server.key");
+  EXPECT_TRUE(config.server.require_client_cert);
+  EXPECT_EQ(config.server.tls_client_ca_cert_path, "/etc/ssl/client_ca.pem");
+  EXPECT_NO_THROW((void)(validate_server_config(config)));
+}
+
+TEST(ServerConfig, ServerTlsDefaultsToDisabled) {
+  const ServerConfig config = default_server_config();
+  EXPECT_FALSE(config.server.use_tls);
+  EXPECT_TRUE(config.server.tls_cert_path.empty());
+  EXPECT_TRUE(config.server.tls_key_path.empty());
+  EXPECT_FALSE(config.server.require_client_cert);
+}
+
+TEST(ServerConfig, RejectsServerTlsMissingCertOrKey) {
+  ServerConfig config = default_server_config();
+  config.server.use_tls = true;
+  config.server.tls_cert_path = "/etc/ssl/server.pem";
+  // tls_key_path left empty.
+  EXPECT_THROW((void)(validate_server_config(config)), ConfigurationError);
+
+  config = default_server_config();
+  config.server.use_tls = true;
+  config.server.tls_key_path = "/etc/ssl/server.key";
+  // tls_cert_path left empty.
+  EXPECT_THROW((void)(validate_server_config(config)), ConfigurationError);
+}
+
+TEST(ServerConfig, RejectsServerRequireClientCertWithoutTls) {
+  ServerConfig config = default_server_config();
+  config.server.require_client_cert = true;
+  config.server.tls_client_ca_cert_path = "/etc/ssl/client_ca.pem";
+  // use_tls left false.
+  EXPECT_THROW((void)(validate_server_config(config)), ConfigurationError);
+}
+
+TEST(ServerConfig, RejectsServerRequireClientCertMissingCaPath) {
+  ServerConfig config = default_server_config();
+  config.server.use_tls = true;
+  config.server.tls_cert_path = "/etc/ssl/server.pem";
+  config.server.tls_key_path = "/etc/ssl/server.key";
+  config.server.require_client_cert = true;
+  // tls_client_ca_cert_path left empty.
+  EXPECT_THROW((void)(validate_server_config(config)), ConfigurationError);
+}
+
+TEST(ServerConfig, ParsesServerAuthSection) {
+  const std::string yaml = R"(
+server:
+  auth_enabled: true
+  auth_token: super-secret-token
+)";
+  const ServerConfig config = parse_server_config(yaml);
+  EXPECT_TRUE(config.server.auth_enabled);
+  EXPECT_EQ(config.server.auth_token, "super-secret-token");
+  EXPECT_NO_THROW((void)(validate_server_config(config)));
+}
+
+TEST(ServerConfig, ServerAuthDefaultsToDisabled) {
+  const ServerConfig config = default_server_config();
+  EXPECT_FALSE(config.server.auth_enabled);
+  EXPECT_TRUE(config.server.auth_token.empty());
+}
+
+TEST(ServerConfig, RejectsServerAuthEnabledWithoutToken) {
+  ServerConfig config = default_server_config();
+  config.server.auth_enabled = true;
+  // auth_token left empty.
+  EXPECT_THROW((void)(validate_server_config(config)), ConfigurationError);
+}
+
+TEST(ServerConfig, LoadConfigFileRejectsMissingPath) {
+  EXPECT_THROW((void)(load_server_config_file("/nonexistent/kernellake.yaml")), ConfigurationError);
+}
+
+TEST(ServerConfig, RejectsMalformedServerPort) {
+  EXPECT_THROW((void)(parse_server_config("server:\n  port: not-a-port\n")), ConfigurationError);
+}
+
+TEST(ServerConfig, RejectsServerZeroPort) {
+  ServerConfig config = default_server_config();
+  config.server.port = 0;
+  EXPECT_THROW((void)(validate_server_config(config)), ConfigurationError);
+}
+
+TEST(ServerConfig, RejectsServerZeroMaxPendingResults) {
+  ServerConfig config = default_server_config();
+  config.server.max_pending_results = 0;
+  EXPECT_THROW((void)(validate_server_config(config)), ConfigurationError);
 }
 
 }  // namespace

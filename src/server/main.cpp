@@ -95,7 +95,7 @@ int main(int argc, char** argv) {
     return 0;
   }
 
-  std::string config_path = "config/kernellake.yaml";
+  std::string config_path = "config/kernellake-server.yaml";
   bool explicit_config = false;
   if (!args.empty() && args[0] == "--config") {
     if (args.size() < 2) {
@@ -106,16 +106,16 @@ int main(int argc, char** argv) {
     explicit_config = true;
   }
 
-  kernellake::EngineConfig config;
+  kernellake::ServerConfig config;
   try {
     if (explicit_config || std::filesystem::exists(config_path)) {
-      config = kernellake::load_config_file(config_path);
+      config = kernellake::load_server_config_file(config_path);
     } else {
-      config = kernellake::default_config();
+      config = kernellake::default_server_config();
     }
-    kernellake::validate_config(config);
-    kernellake::init_logging(config.logging);
-    kernellake::observability::init(config.observability);
+    kernellake::validate_server_config(config);
+    kernellake::init_logging(config.engine_config.logging);
+    kernellake::observability::init(config.engine_config.observability);
   } catch (const kernellake::ConfigurationError& e) {
     std::fprintf(stderr, "kernellake-server: configuration error: %s\n", e.what());
     return 1;
@@ -172,7 +172,7 @@ int main(int argc, char** argv) {
     }
 
     spdlog::info("kernellake-server listening on {}:{} (backend={}, tls={})", config.server.host,
-                 server->port(), config.engine.backend, config.server.use_tls);
+                 server->port(), config.engine_config.engine.backend, config.server.use_tls);
 
     const arrow::Status serve_status = server->Serve();
     if (!serve_status.ok()) {

@@ -171,7 +171,7 @@ double stddev_of(const std::vector<double>& values, double mean) {
 
 }  // namespace
 
-int run_benchmark_tpch(const std::vector<std::string_view>& args, const EngineConfig& config) {
+int run_benchmark_tpch(const std::vector<std::string_view>& args, const CliConfig& config) {
   std::string data;
   std::string part_data;
   std::string orders_data;
@@ -268,7 +268,7 @@ int run_benchmark_tpch(const std::vector<std::string_view>& args, const EngineCo
         strip_comments_and_substitute(read_file_or_throw(query_file), data, part_data, orders_data,
                                       customer_data, nation_data, supplier_data, region_data, partsupp_data);
 
-    ObjectStoreRegistry store(config.storage);
+    ObjectStoreRegistry store(config.engine_config.storage);
     std::vector<ObjectInfo> files = discover_parquet_files(store, {data});
     if (files.empty()) {
       std::fprintf(stderr, "kernellake benchmark tpch: no Parquet files matched '%s'\n", data.c_str());
@@ -337,7 +337,7 @@ int run_benchmark_tpch(const std::vector<std::string_view>& args, const EngineCo
       files.insert(files.end(), partsupp_files.begin(), partsupp_files.end());
     }
 
-    QueryEngine engine(config);
+    QueryEngine engine(config.engine_config, config.device_id);
 
     const auto run_once = [&]() -> IterationMetrics {
       if (mode == "cold") {

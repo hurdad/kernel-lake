@@ -39,13 +39,13 @@ does not extend to them.
 
 | Dependency | License | Source | How it's consumed |
 | --- | --- | --- | --- |
-| RAPIDS libcudf | Apache-2.0 | `libcudf-cu12` PyPI wheel, pinned version+SHA-256 | Vendored via CMake `FetchContent` (`cmake/ThirdPartyRapids.cmake`), no conda |
-| RAPIDS RMM | Apache-2.0 | `librmm-cu12` PyPI wheel | Same as above |
-| RAPIDS kvikio | Apache-2.0 | `libkvikio-cu12` PyPI wheel | Same as above |
-| rapids-logger | Apache-2.0 | `rapids_logger` PyPI wheel | Same as above |
+| RAPIDS libcudf | Apache-2.0 | `libcudf-cu12` or `libcudf-cu13` PyPI wheel (auto-selected by the detected `CUDAToolkit_VERSION_MAJOR`, same pinned RAPIDS version+per-wheel SHA-256 either way) | Vendored via CMake `FetchContent` (`cmake/ThirdPartyRapids.cmake`), no conda |
+| RAPIDS RMM | Apache-2.0 | `librmm-cu12` / `librmm-cu13` PyPI wheel | Same as above |
+| RAPIDS kvikio | Apache-2.0 | `libkvikio-cu12` / `libkvikio-cu13` PyPI wheel | Same as above |
+| rapids-logger | Apache-2.0 | `rapids_logger` PyPI wheel (one CUDA-major-agnostic wheel, unlike the four above) | Same as above |
 | NVIDIA CCCL (Thrust/CUB/libcudacxx) | Apache-2.0 with LLVM exception upstream | Bundled with the CUDA Toolkit's `cuda-cccl` apt package in this build | Transitive dependency of RAPIDS libcudf; **as consumed here** (the apt-packaged CUDA Toolkit, not the standalone `NVIDIA/cccl` GitHub release), it is distributed under the CUDA Toolkit EULA umbrella (see below), not a standalone open-source license grant |
-| **NVIDIA nvCOMP** | **Proprietary -- "NVIDIA Software Development Kit" EULA, not open source** | `nvidia-libnvcomp-cu12` PyPI wheel (supplies `libnvcomp.so.5`, an undeclared transitive dependency of libcudf's own build) | Vendored via `FetchContent`; symlinked into libcudf's own runtime directory (see `cmake/ThirdPartyRapids.cmake`) so `libcudf.so`'s `$ORIGIN` runpath resolves it |
-| **NVIDIA CUDA Toolkit** (`CUDAToolkit`: `cudart`, etc.) | **Proprietary -- NVIDIA CUDA Toolkit End User License Agreement, not open source** | Installed separately by the developer (`sudo apt-get install` the NVIDIA CUDA repo's toolkit package); not vendored by KernelLake's build | `find_package(CUDAToolkit REQUIRED)`, `CUDA::cudart` |
+| **NVIDIA nvCOMP** | **Proprietary -- "NVIDIA Software Development Kit" EULA, not open source** | `nvidia-libnvcomp-cu12` / `nvidia-libnvcomp-cu13` PyPI wheel (supplies `libnvcomp.so.5`, an undeclared transitive dependency of libcudf's own build) | Vendored via `FetchContent`; symlinked into libcudf's own runtime directory (see `cmake/ThirdPartyRapids.cmake`) so `libcudf.so`'s `$ORIGIN` runpath resolves it |
+| **NVIDIA CUDA Toolkit** (`CUDAToolkit`: `cudart`, etc.) | **Proprietary -- NVIDIA CUDA Toolkit End User License Agreement, not open source** | Installed separately by the developer (12.x via apt, or provided by the `nvidia/cuda:${CUDA_VERSION}-devel-ubuntu26.04` base image for `docker/Dockerfile`'s GPU build stage, CUDA 13.3.1 by default); not vendored by KernelLake's own build | `find_package(CUDAToolkit REQUIRED)`, `CUDA::cudart` |
 
 ### nvCOMP redistribution note
 

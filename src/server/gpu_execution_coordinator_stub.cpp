@@ -12,7 +12,7 @@ namespace kernellake {
 
 struct GpuExecutionCoordinator::Impl {};
 
-GpuExecutionCoordinator::GpuExecutionCoordinator(const EngineConfig& /*config*/) {
+GpuExecutionCoordinator::GpuExecutionCoordinator(const ServerConfig& /*config*/) {
   throw ConfigurationError(
       "server.engine.backend 'gpu' requires GPU operators (libcudf/RMM), which are not part of "
       "this build; rebuild with -DKERNELLAKE_WITH_CUDA=ON once libcudf/RMM are installed, or set "

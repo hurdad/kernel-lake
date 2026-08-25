@@ -9,7 +9,7 @@
 
 namespace kernellake::cli {
 
-int run_explain(const std::vector<std::string_view>& args, const EngineConfig& config) {
+int run_explain(const std::vector<std::string_view>& args, const CliConfig& config) {
   std::string sql;
   std::string format = "text";
   bool logical = false;
@@ -34,7 +34,7 @@ int run_explain(const std::vector<std::string_view>& args, const EngineConfig& c
   }
 
   try {
-    QueryEngine engine(config);
+    QueryEngine engine(config.engine_config, config.device_id);
     if (logical) {
       const LogicalPlanPtr plan = engine.explain_logical(sql);
       std::printf("%s\n", (format == "json" ? explain_json(*plan) : explain_text(*plan)).c_str());

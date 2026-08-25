@@ -44,7 +44,7 @@ class QueryCommandTest : public ::testing::Test {
   fs::path dir_;
   std::string path_;
   std::string output_path_;
-  EngineConfig config_ = cpu_backend_config();
+  CliConfig config_ = cpu_backend_config();
 };
 
 TEST_F(QueryCommandTest, RejectsSqlAndFileTogetherAsMutuallyExclusive) {

@@ -111,15 +111,15 @@ TEST(RmmEnvironment, AQueryTrackerThrowingDoesNotAffectAnotherTracker) {
 
 // Regression coverage for the multi-device Tier 1 rewrite
 // (docs/MULTI_GPU_SCALING.md): GpuExecutionCoordinator now constructs one
-// RmmEnvironment per visible CUDA device, each from its own EngineConfig
-// copy with device_id overridden -- query_engine_execute_gpu.cpp reads the
-// target device back via this accessor rather than from
-// config_.engine.device_id, so it must reflect whatever device_id the
-// instance was actually constructed with.
-TEST(RmmEnvironment, DeviceIdAccessorReflectsConstructionConfig) {
-  EngineConfig config = default_config();
-  config.engine.device_id = 0;
-  const RmmEnvironment env(config);
+// RmmEnvironment per configured device, each with its own explicit
+// device_id constructor argument (not read from EngineConfig, which no
+// longer has a device_id field at all -- see its own comment) --
+// query_engine_execute_gpu.cpp reads the target device back via this
+// accessor, so it must reflect whatever device_id the instance was
+// actually constructed with.
+TEST(RmmEnvironment, DeviceIdAccessorReflectsConstructionArgument) {
+  const EngineConfig config = default_config();
+  const RmmEnvironment env(config, 0);
 
   EXPECT_EQ(env.device_id(), 0);
 }

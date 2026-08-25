@@ -52,9 +52,9 @@ arrow::Status ToFlightStatus(const KernelLakeError& error) {
 
 }  // namespace
 
-KernelLakeFlightSqlServer::KernelLakeFlightSqlServer(const EngineConfig& config)
-    : config_(config), engine_(config) {
-  if (config_.engine.backend == "gpu") {
+KernelLakeFlightSqlServer::KernelLakeFlightSqlServer(const ServerConfig& config)
+    : config_(config), engine_(config.engine_config) {
+  if (config_.engine_config.engine.backend == "gpu") {
     gpu_coordinator_ = std::make_unique<GpuExecutionCoordinator>(config_);
   }
   // Safe to call unconditionally, same reasoning as
@@ -111,18 +111,18 @@ arrow::Result<std::unique_ptr<flight::FlightInfo>> KernelLakeFlightSqlServer::Ex
         ++pending_count_;
         reserved = true;
       }
-      result = config_.engine.backend == "cpu" ? engine_.execute_cpu(physical)
-                                               : gpu_coordinator_->execute(engine_, physical);
-      span.finish(result, sql, config_.engine.backend);
+      result = config_.engine_config.engine.backend == "cpu" ? engine_.execute_cpu(physical)
+                                                             : gpu_coordinator_->execute(engine_, physical);
+      span.finish(result, sql, config_.engine_config.engine.backend);
     } catch (const KernelLakeError& e) {
-      span.finish_error(e, sql, config_.engine.backend);
+      span.finish_error(e, sql, config_.engine_config.engine.backend);
       if (reserved) {
         const std::lock_guard<std::mutex> lock(results_mutex_);
         --pending_count_;
       }
       return ToFlightStatus(e);
     } catch (const std::exception& e) {
-      span.finish_error(e, sql, config_.engine.backend);
+      span.finish_error(e, sql, config_.engine_config.engine.backend);
       if (reserved) {
         const std::lock_guard<std::mutex> lock(results_mutex_);
         --pending_count_;

@@ -14,7 +14,12 @@ document what was actually done and measured.
 - Device memory goes through RMM: a `limiting_resource_adaptor` ->
   `statistics_resource_adaptor` -> `cuda_async_memory_resource` (or
   `pool_memory_resource`) stack, one instance per process
-  (`RmmEnvironment`, `src/memory/rmm_environment.cpp`).
+  (`RmmEnvironment`, `src/memory/rmm_environment.cpp`). **Since updated
+  (2026-08-24):** inside `kernellake-server`, `GpuExecutionCoordinator` now
+  builds one such instance *per visible CUDA device*, not one for the whole
+  process -- see "Multi-GPU Tier 1 implemented" below. Still exactly one
+  process-wide instance for the CLI's one-shot `QueryEngine::execute(sql)`
+  path, which never goes through `GpuExecutionCoordinator`.
 - No pinned (page-locked) host memory anywhere in the tree -- confirmed by
   grep across `src/`, `include/`, `tests/`. Host<->device transfers rely on
   whatever libcudf does internally by default.
@@ -30,7 +35,15 @@ document what was actually done and measured.
 - `GpuExecutionCoordinator` (`gpu_execution_coordinator_gpu.cpp`) holds a
   mutex around `execute()`: only one query runs at a time, server-wide.
   Streams give async/overlapping kernel execution *within* a query, not
-  concurrent queries.
+  concurrent queries. **Superseded 2026-08-21 and 2026-08-24:** this
+  describes the pre-"Opt #2" point-in-time snapshot. The mutex was replaced
+  by a `std::counting_semaphore` sized to
+  `EngineSection::max_concurrent_gpu_queries` ("Opt #2 implemented" below),
+  and that semaphore is now per-device, not process-wide, since one
+  `RmmEnvironment`/semaphore pair exists per visible GPU ("Multi-GPU Tier 1
+  implemented" below) -- an N-GPU node allows up to
+  `N x max_concurrent_gpu_queries` queries running at once, not one at a
+  time server-wide.
 - `CudaStream` (`cuda_utils.cpp`) is created via plain `cudaStreamCreate()`,
   not `cudaStreamCreateWithFlags(..., cudaStreamNonBlocking)`. This is
   load-bearing, not just an unset flag: `to_arrow_host()` / `from_arrow()`
@@ -989,7 +1002,7 @@ mutex-serialized `execute()` call -- unlike the CLI/one-shot path
 (`QueryEngine::execute(sql)`, used by `src/cli/benchmark_tpch_command.cpp`),
 which constructs and destroys a fresh `RmmEnvironment` every call. The
 default allocator (`memory.use_async_allocator: true` in
-`config/kernellake.yaml`) backs that long-lived environment with
+`config/kernellake-server.yaml`) backs that long-lived environment with
 `rmm::mr::cuda_async_memory_resource`, a `cudaMallocAsync`-style
 stream-ordered pool. Pools like this cache freed device memory for reuse
 rather than returning it to the driver immediately, so `nvidia-smi` for a
@@ -2238,9 +2251,64 @@ end-to-end and degrades to exactly the old single-device behavior when
 `GpuExecutionCoordinatorConcurrencyTest.RoundRobinDeviceSelectionStaysCorrectAcrossManyCalls`
 (`tests/unit/gpu_execution_coordinator_test.cpp`) to exercise the
 round-robin index arithmetic well past a full wrap of the counter, and
-`RmmEnvironment.DeviceIdAccessorReflectsConstructionConfig`
+`RmmEnvironment.DeviceIdAccessorReflectsConstructionArgument`
 (`tests/gpu/rmm_environment_test.cpp`) for the new accessor. Real
 8-GPU verification (confirming queries actually land on distinct
 physical devices, and a real per-device-throughput measurement) still
 needs actual `p5.48xlarge`/`p6-b200.48xlarge` hardware -- not done this
 session, no such instance was provisioned.
+
+## Follow-up: `EngineConfig`/`CliConfig`/`ServerConfig` split, plus explicit GPU selection (2026-08-24)
+
+Two real follow-ups landed the same day as the section above, both
+prompted by a closer look at how little of `config.engine.device_id`
+actually applied to the server post-Tier-1:
+
+1. **The config type itself split.** `EngineConfig` used to be one
+   struct covering everything, including `device_id` (CLI-only in
+   practice, silently ignored by the server) and `max_concurrent_gpu_queries`/
+   `ServerSection` (server-only, unused by the CLI) all mixed together.
+   It's now the *shared* sections only (storage, memory, logging,
+   profiling, observability, and an `engine` section without
+   `device_id`); `CliConfig` (`engine_config` + `device_id` +
+   `benchmark`) and `ServerConfig` (`engine_config` + `server` +
+   `max_concurrent_gpu_queries` + `gpu_device_ids`, see point 2 below)
+   are the two binaries' own top-level types. `RmmEnvironment` and
+   `QueryEngine` both gained an explicit `device_id` constructor
+   parameter (defaulting to 0) instead of reading it from config --
+   this also simplified `GpuExecutionCoordinator`'s own constructor,
+   which no longer needs to build a per-device `EngineConfig` copy with
+   `device_id` overridden (item 1 in the section above); it now passes
+   the device index straight through. `parse_config()`/`default_config()`
+   split into three matching pairs (`parse_cli_config()`/
+   `default_cli_config()`, `parse_server_config()`/
+   `default_server_config()`, plus the shared `parse_config()`/
+   `default_config()` both call internally) so a single YAML file can
+   still configure both binaries -- each parser just reads its own
+   top-level keys and ignores the other's.
+2. **`ServerConfig::gpu_device_ids` added**: real deployments can't
+   always assume the server should use *every* visible GPU (a shared
+   box may need some left for other workloads) -- empty (default) means
+   every device `cudaGetDeviceCount()` reports, Tier 1's original
+   behavior; a non-empty list pins the server to exactly those ordinals
+   instead. `GpuExecutionCoordinator` validates each configured ordinal
+   against the real device count at construction time. Considered GPU
+   UUIDs instead of plain CUDA ordinals and deliberately didn't: every
+   CUDA call this project makes is ordinal-only regardless, so a UUID
+   layer would still need to resolve back to an ordinal before use, and
+   this project's actual target deployments (single-tenant bare-metal/VM
+   boxes) don't need that extra machinery. Documented the one real
+   caveat instead: CUDA's default device enumeration order
+   (`CUDA_DEVICE_ORDER=FASTEST_FIRST`) isn't guaranteed to match
+   `nvidia-smi`'s (PCI bus ID order), so an operator picking ordinals by
+   cross-referencing `nvidia-smi -L` should set
+   `CUDA_DEVICE_ORDER=PCI_BUS_ID` in the server's environment.
+
+Verified end-to-end on this project's real dev GPU: `kernellake query
+--backend gpu`/`--backend cpu` both still work via `CliConfig`;
+`kernellake-server` starts correctly with an explicit
+`gpu_device_ids: [0]`; and a deliberately out-of-range
+`gpu_device_ids: [5]` on this 1-GPU box fails fast with a clear
+`ConfigurationError` ("... reports only 1 visible device(s) ...")
+instead of a confusing CUDA-level failure later. Full unit/GPU test
+suites (`kernellake_unit_tests`, `kernellake_gpu_tests`) pass.

@@ -3,6 +3,8 @@
 // file's comment.
 #include "kernellake/server/gpu_execution_coordinator.hpp"
 
+#include <fmt/format.h>
+
 #include <atomic>
 #include <cstddef>
 #include <semaphore>
@@ -38,29 +40,49 @@ class SemaphoreGuard {
 }  // namespace
 
 // Tier 1 of docs/MULTI_GPU_SCALING.md ("concurrent queries, one GPU each,
-// single node"): one RmmEnvironment per visible CUDA device instead of one
-// shared process-wide instance pinned to config.engine.device_id, and a
-// per-device semaphore instead of the single semaphore opt #2
-// (docs/GPU_OPTIMIZATIONS.md) introduced to replace the original
-// single-flight mutex. execute() below round-robins across devices, so an
-// N-GPU node gets up to N x EngineSection::max_concurrent_gpu_queries total
-// query throughput instead of that same cap applied to one device while
-// the rest sit idle. A single query still runs entirely on one GPU --
-// spanning one query across multiple devices is tier 2, not attempted
-// here.
+// single node"): one RmmEnvironment per GPU this server is configured to
+// use instead of one shared process-wide instance pinned to
+// config.engine.device_id, and a per-device semaphore instead of the
+// single semaphore opt #2 (docs/GPU_OPTIMIZATIONS.md) introduced to
+// replace the original single-flight mutex. execute() below round-robins
+// across devices, so an N-GPU configuration gets up to
+// N x ServerConfig::max_concurrent_gpu_queries total query throughput
+// instead of that same cap applied to one device while the rest sit idle.
+// A single query still runs entirely on one GPU -- spanning one query
+// across multiple devices is tier 2, not attempted here.
 struct GpuExecutionCoordinator::Impl {
-  explicit Impl(const EngineConfig& config) {
-    int device_count = 0;
-    check_cuda(cudaGetDeviceCount(&device_count), "cudaGetDeviceCount for GpuExecutionCoordinator");
-    if (device_count <= 0) {
+  explicit Impl(const ServerConfig& config) {
+    int real_device_count = 0;
+    check_cuda(cudaGetDeviceCount(&real_device_count), "cudaGetDeviceCount for GpuExecutionCoordinator");
+    if (real_device_count <= 0) {
       throw ConfigurationError(
           "server.engine.backend 'gpu' requires at least one visible CUDA device, but "
           "cudaGetDeviceCount() reported none");
     }
 
-    environments.reserve(static_cast<std::size_t>(device_count));
-    execute_semaphores.reserve(static_cast<std::size_t>(device_count));
-    for (int device_id = 0; device_id < device_count; ++device_id) {
+    // Empty gpu_device_ids means "every visible device" -- Tier 1's
+    // original behavior; see ServerConfig::gpu_device_ids's own comment
+    // for why a non-empty list (pinning to a subset) is also supported.
+    std::vector<int> device_ids = config.gpu_device_ids;
+    if (device_ids.empty()) {
+      device_ids.reserve(static_cast<std::size_t>(real_device_count));
+      for (int i = 0; i < real_device_count; ++i) {
+        device_ids.push_back(i);
+      }
+    } else {
+      for (const int device_id : device_ids) {
+        if (device_id >= real_device_count) {
+          throw ConfigurationError(fmt::format(
+              "engine.gpu_device_ids names device {}, but cudaGetDeviceCount() reports only {} visible "
+              "device(s) (valid range: 0-{})",
+              device_id, real_device_count, real_device_count - 1));
+        }
+      }
+    }
+
+    environments.reserve(device_ids.size());
+    execute_semaphores.reserve(device_ids.size());
+    for (const int device_id : device_ids) {
       // set_current_device_resource() (inside RmmEnvironment's constructor)
       // installs into whichever device is current *at construction time* --
       // one slot per device, confirmed from RMM source during the
@@ -68,16 +90,15 @@ struct GpuExecutionCoordinator::Impl {
       // so each instance needs its own device selected first via this
       // guard, restored again once construction finishes.
       const CudaDeviceGuard device_guard(device_id);
-      EngineConfig device_config = config;
-      device_config.engine.device_id = device_id;
-      environments.push_back(std::make_unique<RmmEnvironment>(device_config));
+      environments.push_back(std::make_unique<RmmEnvironment>(config.engine_config, device_id));
       execute_semaphores.push_back(
-          std::make_unique<std::counting_semaphore<>>(config.engine.max_concurrent_gpu_queries));
+          std::make_unique<std::counting_semaphore<>>(config.max_concurrent_gpu_queries));
     }
   }
 
-  // One entry per visible CUDA device (environments.size() ==
-  // execute_semaphores.size() == cudaGetDeviceCount() at construction).
+  // One entry per configured device (environments.size() ==
+  // execute_semaphores.size() == config.gpu_device_ids.size(), or
+  // cudaGetDeviceCount() if that list was empty at construction).
   std::vector<std::unique_ptr<RmmEnvironment>> environments;
   // Bounds how many queries run concurrently against each device's own
   // shared RmmEnvironment -- see EngineSection::max_concurrent_gpu_queries's
@@ -91,7 +112,7 @@ struct GpuExecutionCoordinator::Impl {
   std::atomic<std::uint64_t> next_device{0};
 };
 
-GpuExecutionCoordinator::GpuExecutionCoordinator(const EngineConfig& config)
+GpuExecutionCoordinator::GpuExecutionCoordinator(const ServerConfig& config)
     : impl_(std::make_unique<Impl>(config)) {}
 
 GpuExecutionCoordinator::~GpuExecutionCoordinator() = default;

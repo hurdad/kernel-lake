@@ -34,37 +34,37 @@ TEST(BenchmarkTpchCommand, InvalidQueryArgumentProducesCleanErrorNotAnUncaughtTh
   // this test.
   const std::vector<std::string_view> args = {"--data", "/nonexistent/*.parquet", "--query", "abc", "--mode",
                                               "warm"};
-  EXPECT_EQ(run_benchmark_tpch(args, default_config()), 1);
+  EXPECT_EQ(run_benchmark_tpch(args, default_cli_config()), 1);
 }
 
 TEST(BenchmarkTpchCommand, InvalidScaleFactorArgumentProducesCleanErrorNotAnUncaughtThrow) {
   const std::vector<std::string_view> args = {
       "--data", "/nonexistent/*.parquet", "--query", "1", "--mode", "warm", "--scale-factor", "not-a-number"};
-  EXPECT_EQ(run_benchmark_tpch(args, default_config()), 1);
+  EXPECT_EQ(run_benchmark_tpch(args, default_cli_config()), 1);
 }
 
 TEST(BenchmarkTpchCommand, InvalidIterationsArgumentProducesCleanErrorNotAnUncaughtThrow) {
   const std::vector<std::string_view> args = {"--data", "/nonexistent/*.parquet", "--query", "1", "--mode",
                                               "warm",   "--iterations",           "xyz"};
-  EXPECT_EQ(run_benchmark_tpch(args, default_config()), 1);
+  EXPECT_EQ(run_benchmark_tpch(args, default_cli_config()), 1);
 }
 
 TEST(BenchmarkTpchCommand, InvalidWarmupIterationsArgumentProducesCleanErrorNotAnUncaughtThrow) {
   const std::vector<std::string_view> args = {
       "--data", "/nonexistent/*.parquet", "--query",     "1", "--mode",
       "warm",   "--warmup-iterations",    "not-a-number"};
-  EXPECT_EQ(run_benchmark_tpch(args, default_config()), 1);
+  EXPECT_EQ(run_benchmark_tpch(args, default_cli_config()), 1);
 }
 
 TEST(BenchmarkTpchCommand, RejectsMissingQuery) {
   const std::vector<std::string_view> args = {"--data", "/nonexistent/*.parquet", "--mode", "warm"};
-  EXPECT_EQ(run_benchmark_tpch(args, default_config()), 1);
+  EXPECT_EQ(run_benchmark_tpch(args, default_cli_config()), 1);
 }
 
 TEST(BenchmarkTpchCommand, RejectsInvalidMode) {
   const std::vector<std::string_view> args = {"--data", "/nonexistent/*.parquet", "--query", "1", "--mode",
                                               "hot"};
-  EXPECT_EQ(run_benchmark_tpch(args, default_config()), 1);
+  EXPECT_EQ(run_benchmark_tpch(args, default_cli_config()), 1);
 }
 
 class BenchmarkTpchCommandRealRunTest : public ::testing::Test {
@@ -104,14 +104,14 @@ class BenchmarkTpchCommandRealRunTest : public ::testing::Test {
   std::string data_path_;
   std::string query_file_path_;
   std::string output_path_;
-  // default_config().engine.backend is "gpu" -- run_benchmark_tpch() has no
-  // --backend flag of its own (unlike run_query()), so the config itself
-  // must already say "cpu" for this build (KERNELLAKE_WITH_CUDA=OFF) to run
-  // the query at all instead of throwing "query execution requires GPU
-  // operators...".
-  EngineConfig config_ = [] {
-    EngineConfig config = default_config();
-    config.engine.backend = "cpu";
+  // default_cli_config().engine_config.engine.backend is "gpu" --
+  // run_benchmark_tpch() has no --backend flag of its own (unlike
+  // run_query()), so the config itself must already say "cpu" for this
+  // build (KERNELLAKE_WITH_CUDA=OFF) to run the query at all instead of
+  // throwing "query execution requires GPU operators...".
+  CliConfig config_ = [] {
+    CliConfig config = default_cli_config();
+    config.engine_config.engine.backend = "cpu";
     return config;
   }();
 };

@@ -11,14 +11,14 @@ namespace kernellake::cli {
 // the subcommand name itself) and returns a process exit code. Errors are
 // reported to stderr with a "kernellake <command>: " prefix; nothing is
 // printed to stdout on failure.
-int run_inspect_parquet(const std::vector<std::string_view>& args, const EngineConfig& config);
+int run_inspect_parquet(const std::vector<std::string_view>& args, const CliConfig& config);
 
-int run_explain(const std::vector<std::string_view>& args, const EngineConfig& config);
+int run_explain(const std::vector<std::string_view>& args, const CliConfig& config);
 
-int run_query(const std::vector<std::string_view>& args, const EngineConfig& config);
+int run_query(const std::vector<std::string_view>& args, const CliConfig& config);
 
 int run_generate_data(const std::vector<std::string_view>& args);
 
-int run_benchmark_tpch(const std::vector<std::string_view>& args, const EngineConfig& config);
+int run_benchmark_tpch(const std::vector<std::string_view>& args, const CliConfig& config);
 
 }  // namespace kernellake::cli

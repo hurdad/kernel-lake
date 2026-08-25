@@ -8,18 +8,29 @@ N>1 -- passing a single host with multiple `--concurrent-clients` already
 tests something the docstring doesn't advertise: whether *one* warm server
 handles concurrent requests well at all.
 
-That single-host case is worth running before anything below. Confirmed
-by reading `gpu_execution_coordinator_gpu.cpp`: `GpuExecutionCoordinator::execute()`
-wraps the entire `engine.execute()` call in a plain `std::mutex` -- only
-one query runs on the GPU at a time today, regardless of how many
-concurrent Flight SQL connections hit the server. `scaling_test.py
---kernellake-hosts <one-ip> --concurrent-clients 4` would very likely show
-near-total serialization (throughput barely above single-client, latency
-growing roughly linearly past 1 concurrent client) -- a real, cheap,
-already-buildable measurement, and the actual gating signal
-`docs/GPU_OPTIMIZATIONS.md` opportunity #2 (dropping this mutex) is
-waiting on ("wait until there's a concrete reason -- observed queueing
-under real load").
+That single-host case is worth running before anything below -- though
+what it should now be expected to show has changed twice since this
+design was first written. As of 2026-08-17, `gpu_execution_coordinator_gpu.cpp`
+did wrap the entire `engine.execute()` call in a plain `std::mutex` --
+only one query ran on the GPU at a time, regardless of concurrent client
+count, and that finding (real observed queueing at SF1000, see
+`RUNBOOK.md`'s M4 section) was exactly the gating signal
+`docs/GPU_OPTIMIZATIONS.md` opportunity #2 was waiting on. Opt #2
+(2026-08-21) replaced that mutex with a `std::counting_semaphore` capped
+by `EngineSection::max_concurrent_gpu_queries` (default 2) -- bounded, not
+unconditional, concurrency. The Multi-GPU Tier 1 change (2026-08-24, see
+`docs/GPU_OPTIMIZATIONS.md`'s "Multi-GPU Tier 1 implemented" section)
+went further: `GpuExecutionCoordinator` now builds one `RmmEnvironment` +
+semaphore pair per visible CUDA device and round-robins queries across
+them, so an N-GPU node gets up to N x that per-device cap in total
+concurrent throughput. On a single-GPU host (`cudaGetDeviceCount() == 1`,
+true for this project's own dev GPU) this degrades back to exactly one
+semaphore capped at `max_concurrent_gpu_queries` -- so `scaling_test.py
+--kernellake-hosts <one-ip> --concurrent-clients 4` today should be
+expected to show real (if capped) concurrency rather than near-total
+serialization; worth re-running to confirm the semaphore cap behaves as
+expected under real load, since the 2026-08-17 numbers this section
+originally cited predate both fixes.
 
 No PySpark/DuckDB equivalent exists yet. This is the design for both.
 
@@ -37,8 +48,9 @@ Running this test cold would measure "does concurrent *cold S3 access*
 scale" -- a real but different question, and one already confounded by
 the shared-S3-bandwidth-contention effect documented below, which would
 swamp the actual signal this test exists to surface (does concurrent
-*execution* scale -- i.e. does `GpuExecutionCoordinator`'s mutex, Spark's
-scheduler, or DuckDB's shared thread pool serialize concurrent queries).
+*execution* scale -- i.e. does `GpuExecutionCoordinator`'s per-device
+semaphore cap, Spark's scheduler, or DuckDB's shared thread pool bottleneck
+concurrent queries).
 Warm/cached isolates that question properly.
 
 Concretely: `duckdb_scaling_test.py` passes `enable_cache=True` to
@@ -73,8 +85,9 @@ Spark's thrift server implements).
 
 **`spark.scheduler.mode=FAIR` is not optional for this test.** Spark's
 default FIFO scheduler serializes jobs within one SparkContext -- the same
-risk class as `GpuExecutionCoordinator`'s mutex, just not documented
-anywhere as prominently. Running this test without FAIR mode would
+risk class `GpuExecutionCoordinator`'s bounded semaphore is designed
+around, just not documented anywhere as prominently. Running this test
+without FAIR mode would
 understate Spark's real concurrent capability and isn't a fair
 comparison; set it explicitly, don't rely on the default.
 

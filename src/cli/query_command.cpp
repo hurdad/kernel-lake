@@ -69,7 +69,7 @@ void print_stats(const QueryResult& result, const std::optional<NvmeCacheMetrics
 
 }  // namespace
 
-int run_query(const std::vector<std::string_view>& args, const EngineConfig& config) {
+int run_query(const std::vector<std::string_view>& args, const CliConfig& config) {
   std::string sql;
   std::string file;
   std::string format_name = "table";
@@ -117,22 +117,22 @@ int run_query(const std::vector<std::string_view>& args, const EngineConfig& con
 
   try {
     const std::string query_sql = file.empty() ? sql : read_file_or_throw(file);
-    EngineConfig effective_config = config;
+    EngineConfig effective_engine_config = config.engine_config;
     if (backend_override) {
-      effective_config.engine.backend = *backend_override;
+      effective_engine_config.engine.backend = *backend_override;
     }
-    QueryEngine engine(effective_config);
+    QueryEngine engine(effective_engine_config, config.device_id);
 
     observability::QuerySpan span = observability::start_query_span("kernellake.query");
     try {
       const QueryResult result = engine.execute(query_sql);
-      span.finish(result, query_sql, effective_config.engine.backend);
+      span.finish(result, query_sql, effective_engine_config.engine.backend);
       write_query_result(result, *format, output_path);
       if (show_stats) {
         print_stats(result, engine.cache_metrics());
       }
     } catch (const KernelLakeError& e) {
-      span.finish_error(e, query_sql, effective_config.engine.backend);
+      span.finish_error(e, query_sql, effective_engine_config.engine.backend);
       throw;
     }
   } catch (const KernelLakeError& e) {

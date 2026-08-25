@@ -18,8 +18,8 @@
 # KERNELLAKE_TARGET=runtime-cpu and drop/comment the `deploy.resources`
 # block below, and pass --backend cpu explicitly in scripts/run_e2e.py's
 # own query calls (kernellake-server itself will otherwise still try to
-# construct a GpuExecutionCoordinator -- see config/kernellake.yaml's own
-# comment on engine.backend).
+# construct a GpuExecutionCoordinator -- see config/kernellake-server.yaml's
+# own comment on engine.backend).
 services:
   minio:
     image: minio/minio:latest

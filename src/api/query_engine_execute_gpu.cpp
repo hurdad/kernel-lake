@@ -68,7 +68,7 @@ QueryResult QueryEngine::execute(std::string_view sql) const {
     // it doesn't need.
     result = execute_cpu(physical);
   } else {
-    RmmEnvironment rmm_environment(config_);
+    RmmEnvironment rmm_environment(config_, device_id_);
     result = execute(physical, rmm_environment);
   }
   result.metadata_inspection_seconds = metadata_inspection_seconds;
@@ -84,15 +84,15 @@ QueryResult QueryEngine::execute(std::string_view sql) const {
 QueryResult QueryEngine::execute(const PhysicalPlanPtr& physical, RmmEnvironment& rmm_environment) const {
   const auto wall_start = std::chrono::steady_clock::now();
 
-  // rmm_environment.device_id(), not config_.engine.device_id: once
-  // GpuExecutionCoordinator owns one RmmEnvironment per visible GPU (see
-  // docs/MULTI_GPU_SCALING.md's Tier 1), config_.engine.device_id is just
-  // the process's originally configured value and no longer identifies
-  // which specific device this call's rmm_environment argument is actually
-  // bound to -- the CLI's one-shot execute(sql) overload above still
-  // constructs its RmmEnvironment straight from config_, so device_id()
-  // there is config_.engine.device_id anyway and this is a no-op change for
-  // that caller.
+  // rmm_environment.device_id(): EngineConfig carries no device_id field
+  // at all (see its own comment -- which device is a runtime dispatch
+  // parameter, not a shared config concern), and GpuExecutionCoordinator
+  // owns one RmmEnvironment per configured GPU (see
+  // docs/MULTI_GPU_SCALING.md's Tier 1), so this instance's own device_id()
+  // is the only place to learn which device it's actually bound to. The
+  // CLI's one-shot execute(sql) overload above passes device_id_ (this
+  // QueryEngine's own explicit constructor argument) when it builds its
+  // RmmEnvironment, so device_id() there agrees with it too.
   const CudaDeviceGuard device_guard(rmm_environment.device_id());
   const CudaStream stream;
 

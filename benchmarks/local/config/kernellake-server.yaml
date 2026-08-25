@@ -1,10 +1,9 @@
 # kernellake-server config for the local docker-compose stack
-# (benchmarks/local/docker-compose.yml). Mirrors config/kernellake.yaml's
+# (benchmarks/local/docker-compose.yml). Mirrors config/kernellake-server.yaml's
 # own field-for-field shape -- see that file's comments for what every
 # field means; only the values that differ from its defaults are called
 # out below.
 engine:
-  device_id: 0
   batch_rows: 1000000
   result_batch_rows: 65536
   query_memory_limit_bytes: 0  # auto-detect from free VRAM
@@ -54,13 +53,6 @@ logging:
 profiling:
   nvtx: false
   operator_metrics: true
-
-benchmark:
-  default_iterations: 5
-  warmup_iterations: 1
-  output_format: json
-  verify_results: true
-  baseline: duckdb
 
 server:
   host: 0.0.0.0

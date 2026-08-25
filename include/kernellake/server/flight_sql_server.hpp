@@ -16,8 +16,9 @@ namespace kernellake {
 // A Flight SQL server wired to a real kernellake::QueryEngine: it runs
 // arriving SQL statements through the same parse/bind/plan/execute path
 // the CLI's `kernellake query` command uses, over either backend
-// (config.engine.backend, exactly as `--backend` already selects for the
-// CLI), and streams results back as Arrow RecordBatches over gRPC.
+// (config.engine_config.engine.backend, exactly as `--backend` already
+// selects for the CLI), and streams results back as Arrow RecordBatches
+// over gRPC.
 //
 // Phase 1 scope (see docs/ROADMAP.md): implements the RPCs a plain
 // `FlightSqlClient::Execute(sql)` + `DoGet(ticket)` round trip needs
@@ -56,7 +57,7 @@ namespace kernellake {
 // streaming, and not pretended to be.
 class KernelLakeFlightSqlServer : public arrow::flight::sql::FlightSqlServerBase {
  public:
-  explicit KernelLakeFlightSqlServer(const EngineConfig& config);
+  explicit KernelLakeFlightSqlServer(const ServerConfig& config);
   ~KernelLakeFlightSqlServer() override;
 
   arrow::Result<std::unique_ptr<arrow::flight::FlightInfo>> GetFlightInfoStatement(
@@ -95,9 +96,9 @@ class KernelLakeFlightSqlServer : public arrow::flight::sql::FlightSqlServerBase
       const PhysicalPlanPtr& physical, std::string_view sql,
       const arrow::flight::FlightDescriptor& descriptor);
 
-  EngineConfig config_;
+  ServerConfig config_;
   QueryEngine engine_;
-  // Only constructed for config_.engine.backend == "gpu" (see
+  // Only constructed for config_.engine_config.engine.backend == "gpu" (see
   // GpuExecutionCoordinator's own doc comment); null for "cpu".
   std::unique_ptr<GpuExecutionCoordinator> gpu_coordinator_;
 

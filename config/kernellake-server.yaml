@@ -1,0 +1,134 @@
+# Default config for kernellake-server (the Arrow Flight SQL server) --
+# loaded automatically when no --config is passed (src/server/main.cpp),
+# and contains only the top-level keys ServerConfig actually reads. See
+# include/kernellake/common/config.hpp's own comment on the
+# EngineConfig/CliConfig/ServerConfig split for why this and
+# kernellake-cli.yaml look different: `server:` and
+# `engine.max_concurrent_gpu_queries`/`engine.gpu_device_ids` below are
+# server-only and would simply be ignored if the `kernellake` CLI read
+# this same file; `engine.device_id` and `benchmark:` (CLI-only) are
+# omitted here entirely since the server never reads them.
+
+engine:
+  batch_rows: 1000000
+  result_batch_rows: 65536
+  # 0 means auto-detect from each GPU's currently free VRAM -- see
+  # EngineSection::query_memory_limit_bytes's own comment
+  # (include/kernellake/common/config.hpp). Correct out of the box on a
+  # node with identical GPUs (e.g. a p5.48xlarge's 8 H100s); set an
+  # explicit non-zero byte count here only if you want a fixed ceiling
+  # instead (applied identically to every device -- see that field's own
+  # comment on why that's only right for homogeneous nodes).
+  query_memory_limit_bytes: 0
+  # 0 means "use HashAggregateOperator::kDefaultMaxDistinctKeys".
+  max_distinct_keys: 0
+  # Caps concurrent queries *per GPU*, not process-wide (Tier 1, see
+  # docs/MULTI_GPU_SCALING.md) -- an N-GPU node allows up to N times this
+  # many queries running at once in total. 2 is a conservative default;
+  # see EngineSection::max_concurrent_gpu_queries's own comment before
+  # raising it.
+  max_concurrent_gpu_queries: 2
+  # Empty (default) = GpuExecutionCoordinator uses every GPU
+  # cudaGetDeviceCount() reports. Uncomment and list explicit ordinals to
+  # pin the server to a subset instead -- e.g. on a shared box where other
+  # workloads need some GPUs left alone. Plain CUDA ordinals, not UUIDs;
+  # if you're picking ordinals by cross-referencing `nvidia-smi -L`, set
+  # CUDA_DEVICE_ORDER=PCI_BUS_ID in this process's environment so the
+  # numbering agrees with CUDA's own (which defaults to FASTEST_FIRST, not
+  # nvidia-smi's PCI bus order).
+  gpu_device_ids: []
+  # gpu_device_ids: [0, 1, 2, 3]   # e.g. leave GPUs 4-7 for another workload
+
+memory:
+  pool_initial_bytes: 1073741824
+  pool_max_bytes: 8589934592
+  use_async_allocator: true
+
+storage:
+  local_root: /
+  s3:
+    credentials_kind: default  # anonymous | default | explicit | role | web_identity
+    region: ""
+    endpoint_override: ""
+    scheme: https
+    tls_verify_certificates: true
+    event_loop_threads: 4
+  gcs:
+    credentials_kind: default
+    endpoint_override: ""
+    scheme: https
+  azure:
+    credentials_kind: default
+    account_name: ""
+    blob_storage_authority: .blob.core.windows.net
+    dfs_storage_authority: .dfs.core.windows.net
+    blob_storage_scheme: https
+    dfs_storage_scheme: https
+  hdfs:
+    connection_config:
+      host: ""
+      port: 0
+  # Local-NVMe read-through cache -- genuinely useful for a long-lived
+  # server serving repeated queries over overlapping S3/GCS/Azure data,
+  # more so than for a one-shot CLI query. See docs/ARCHITECTURE.md's
+  # "NVMe cache tier" section.
+  cache:
+    enabled: false
+    directory: ""            # e.g. "/mnt/nvme/kernellake-cache" -- required if enabled
+    max_size_bytes: 107374182400  # 100 GiB; 0 means unbounded (no eviction)
+
+logging:
+  level: info
+  json: false
+
+profiling:
+  nvtx: true
+  operator_metrics: true
+
+server:
+  host: 0.0.0.0
+  port: 31337
+  # Inbound TLS for the Flight SQL listener. Both tls_cert_path and
+  # tls_key_path (PEM) are required when use_tls is true. Recommended for
+  # any server reachable outside localhost.
+  use_tls: false
+  tls_cert_path: ""
+  tls_key_path: ""
+  # mTLS: require clients to present a certificate signed by the CA in
+  # tls_client_ca_cert_path. Requires use_tls: true.
+  require_client_cert: false
+  tls_client_ca_cert_path: ""
+  # Static bearer-token auth: every RPC must carry an
+  # "authorization: Bearer <auth_token>" header, or it's rejected before
+  # reaching the query engine. auth_token must be set when auth_enabled is
+  # true. Combine with use_tls above -- a bearer token sent over plaintext
+  # gives an eavesdropper the token itself.
+  auth_enabled: false
+  auth_token: ""
+
+# Only takes effect when built with KERNELLAKE_ENABLE_OTEL=ON.
+observability:
+  enabled: false
+  otlp_protocol: grpc  # grpc | http
+  otlp_endpoint: localhost:4317
+  service_name: kernellake-server
+  use_tls: false
+  tls_ca_cert_path: ""
+  tls_client_cert_path: ""
+  tls_client_key_path: ""
+  tracing:
+    processor: batch  # simple | batch
+    batch:
+      max_queue_size: 2048
+      max_export_batch_size: 512
+      schedule_delay_ms: 5000
+    sampler: default  # default | always | never
+  metrics:
+    export_interval_ms: 60000
+    export_timeout_ms: 30000
+  logs:
+    processor: batch  # simple | batch
+    batch:
+      max_queue_size: 2048
+      max_export_batch_size: 512
+      schedule_delay_ms: 5000

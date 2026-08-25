@@ -76,7 +76,15 @@ struct QueryResult {
 // implementation for GPU execution without saying so explicitly.
 class QueryEngine {
  public:
-  explicit QueryEngine(EngineConfig config);
+  // `device_id` is which CUDA device the execute(sql) one-shot overload's
+  // own RmmEnvironment targets -- not part of EngineConfig (see its own
+  // comment: which device is a runtime dispatch parameter, not a shared
+  // config concern). Defaults to 0 so every existing caller that just
+  // wants "an engine" (tests, and any caller that never calls execute(sql)
+  // at all -- e.g. kernellake-server, which always goes through
+  // explain()+execute(physical, rmm_environment)/execute_cpu() instead)
+  // needs no changes. The CLI passes its own CliConfig::device_id here.
+  explicit QueryEngine(EngineConfig config, int device_id = 0);
 
   // Returns the optimized logical plan (i.e. the plan the physical planner
   // would actually receive), not the pre-optimization one -- use this to
@@ -211,6 +219,9 @@ class QueryEngine {
       const sql::AstSelectStatement& subquery_ast) const;
 
   EngineConfig config_;
+  // Which device execute(sql)'s one-shot RmmEnvironment targets -- see the
+  // constructor's own comment.
+  int device_id_ = 0;
   // Declared after config_ (member init order follows declaration order):
   // ObjectStoreRegistry keeps a reference to config_.storage, valid for
   // QueryEngine's whole lifetime since both are members of the same object.

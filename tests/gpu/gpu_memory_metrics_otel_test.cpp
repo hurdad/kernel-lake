@@ -67,7 +67,7 @@ class GpuMemoryMetricsOtelTest : public ::testing::Test {
 
 TEST_F(GpuMemoryMetricsOtelTest, ObservableGaugeAndCounterCallbacksReportRealRegistryValues) {
   EngineConfig config = default_config();
-  const int device_id = config.engine.device_id;
+  const int device_id = 0;
 
   const GpuMemoryMetricsSnapshot before = GpuMemoryMetricsRegistry::snapshot(device_id);
 

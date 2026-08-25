@@ -35,8 +35,9 @@ cmake --preset gpu-dev -DKERNELLAKE_ENABLE_OTEL=ON
 so the published images support this out of the box -- you only need the
 config below to actually turn it on.
 
-Then set `observability.enabled: true` in `config/kernellake.yaml` (or
-whatever `--config` path you pass) and point `otlp_endpoint` at a real
+Then set `observability.enabled: true` in `config/kernellake-cli.yaml`/
+`config/kernellake-server.yaml` (or whatever `--config` path you pass) and
+point `otlp_endpoint` at a real
 collector. Nothing is exported with `enabled: false` (the default) --
 `kernellake query`/`kernellake-server` run exactly as if `KERNELLAKE_ENABLE_OTEL`
 were off, no connection attempts, no `spdlog` output about it.
@@ -343,7 +344,7 @@ docker run --rm -d --name jaeger \
   jaegertracing/all-in-one:latest
 ```
 
-Point `config/kernellake.yaml` at it:
+Point `config/kernellake-cli.yaml`/`config/kernellake-server.yaml` at it:
 
 ```yaml
 observability:

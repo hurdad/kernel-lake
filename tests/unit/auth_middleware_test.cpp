@@ -51,8 +51,8 @@ class AuthMiddlewareTest : public ::testing::Test {
         parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), sink, /*chunk_size=*/3);
     ASSERT_TRUE(write_status.ok()) << write_status.ToString();
 
-    EngineConfig config = default_config();
-    config.engine.backend = "cpu";
+    ServerConfig config = default_server_config();
+    config.engine_config.engine.backend = "cpu";
     config.server.host = "127.0.0.1";
     config.server.port = 0;  // OS-assigned ephemeral port, read back after Init().
 

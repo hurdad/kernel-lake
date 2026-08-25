@@ -38,8 +38,10 @@ TEST(Logging, RejectsLevelSpdlogDoesNotRecognize) {
 // validate_config(config) with logging.level == "off" throws
 // ConfigurationError at startup, before init_logging() (which would have
 // accepted it) is ever reached via the normal
-// load_config_file()/validate_config()/init_logging() sequence in
-// main.cpp. Not fixed here (out of this test's scope), just pinned down:
+// load_cli_config_file()/validate_cli_config()/init_logging() (or the
+// server's equivalent load_server_config_file()/validate_server_config())
+// sequence in main.cpp. Not fixed here (out of this test's scope), just
+// pinned down:
 // this test demonstrates the asymmetry directly rather than asserting
 // (wrongly) that the two lists actually diverge on "off"'s acceptance --
 // they diverge on whether it's ever *reachable*.

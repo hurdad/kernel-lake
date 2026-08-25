@@ -4248,15 +4248,23 @@ log` is the authoritative chronology if that ordering ever matters.
   do anything with GPUs 2-8 rather than leave them idle. Full plan in
   `docs/MULTI_GPU_SCALING.md`, three tiers:
   - ~~*Tier 1, cheap*~~ -- done, 2026-08-24 (see
-    `docs/GPU_OPTIMIZATIONS.md`'s "Multi-GPU Tier 1 implemented"
-    section): concurrent queries across a node's GPUs, each gets its
-    own `RmmEnvironment`, `GpuExecutionCoordinator` round-robins
-    across devices per query instead of mutex-serializing onto device
-    0. Built and tested against this project's real (single) dev GPU;
-    real multi-GPU hardware to confirm queries land on genuinely
-    distinct physical devices, and to measure real per-device
-    throughput scaling, hasn't been used yet -- not a blocker for
-    calling the tier itself done, since none of this tier's logic is
+    `docs/GPU_OPTIMIZATIONS.md`'s "Multi-GPU Tier 1 implemented" and
+    its same-day follow-up section): concurrent queries across a
+    node's GPUs, each gets its own `RmmEnvironment`,
+    `GpuExecutionCoordinator` round-robins across devices per query
+    instead of mutex-serializing onto device 0, and an operator can
+    pin the server to an explicit subset of devices
+    (`ServerConfig::gpu_device_ids`) rather than always using every
+    visible one. Also prompted a real config-schema fix found along
+    the way: `EngineConfig` split into shared sections plus a
+    `CliConfig`/`ServerConfig` pair, since `device_id` had been sitting
+    on a shared struct the server silently ignored post-Tier-1 -- see
+    `include/kernellake/common/config.hpp`'s own comment. Built and
+    tested against this project's real (single) dev GPU; real
+    multi-GPU hardware to confirm queries land on genuinely distinct
+    physical devices, and to measure real per-device throughput
+    scaling, hasn't been used yet -- not a blocker for calling the
+    tier itself done, since none of this tier's logic is
     GPU-count-dependent in a way single-device testing can't exercise.
   - *Tier 2, expensive*: one query's operators (join/aggregate)
     partitioned across a node's GPUs via a new exchange operator,

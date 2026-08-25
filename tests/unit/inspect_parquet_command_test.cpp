@@ -72,18 +72,18 @@ class InspectParquetCommandTest : public ::testing::Test {
 
 TEST_F(InspectParquetCommandTest, RejectsMissingPath) {
   const std::vector<std::string_view> args = {"--format", "text"};
-  EXPECT_EQ(run_inspect_parquet(args, default_config()), 1);
+  EXPECT_EQ(run_inspect_parquet(args, default_cli_config()), 1);
 }
 
 TEST_F(InspectParquetCommandTest, RejectsInvalidFormat) {
   const std::vector<std::string_view> args = {"--path", path_, "--format", "yaml"};
-  EXPECT_EQ(run_inspect_parquet(args, default_config()), 1);
+  EXPECT_EQ(run_inspect_parquet(args, default_cli_config()), 1);
 }
 
 TEST_F(InspectParquetCommandTest, TextFormatLocksInFixedSixDecimalDoubleFormatting) {
   const std::vector<std::string_view> args = {"--path", path_, "--format", "text"};
   testing::internal::CaptureStdout();
-  const int rc = run_inspect_parquet(args, default_config());
+  const int rc = run_inspect_parquet(args, default_cli_config());
   const std::string output = testing::internal::GetCapturedStdout();
   ASSERT_EQ(rc, 0);
 
@@ -102,7 +102,7 @@ TEST_F(InspectParquetCommandTest, TextFormatLocksInFixedSixDecimalDoubleFormatti
 TEST_F(InspectParquetCommandTest, JsonFormatLocksInStringTypedMinMaxForEveryColumnType) {
   const std::vector<std::string_view> args = {"--path", path_, "--format", "json"};
   testing::internal::CaptureStdout();
-  const int rc = run_inspect_parquet(args, default_config());
+  const int rc = run_inspect_parquet(args, default_cli_config());
   const std::string output = testing::internal::GetCapturedStdout();
   ASSERT_EQ(rc, 0);
 

@@ -233,10 +233,13 @@ Three known gaps:
   externally-owned, safely-shared `RmmEnvironment` threaded into
   planning (subqueries can't just build their own GPU `RmmEnvironment`
   unconditionally -- the Flight SQL server can plan multiple concurrent
-  requests against one shared `QueryEngine`, and `RmmEnvironment`
-  installs itself as the *process-wide* current CUDA device memory
-  resource) -- see `docs/ARCHITECTURE.md`'s "`HAVING` and scalar
-  subqueries" section for the full investigation. `q15.sql`'s own header
+  requests against one shared `QueryEngine`, and each `RmmEnvironment`
+  installs itself as *its device's* current CUDA device memory resource,
+  shared across every concurrent query dispatched to that device --
+  see `docs/GPU_OPTIMIZATIONS.md`'s "Multi-GPU Tier 1 implemented"
+  section for the current one-`RmmEnvironment`-per-device model) --
+  see `docs/ARCHITECTURE.md`'s "`HAVING` and scalar subqueries" section
+  for the full investigation. `q15.sql`'s own header
   documents this; only validate/benchmark it with `--backend cpu` until
   a real fix exists.
 

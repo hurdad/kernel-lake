@@ -1,7 +1,7 @@
 #pragma once
 
 // Shared test-only fixture pieces for src/cli/ command tests that need a
-// minimal real Parquet source and a CPU-backend EngineConfig -- used by any
+// minimal real Parquet source and a CPU-backend CliConfig -- used by any
 // test file driving a run_*() command function directly (see
 // query_command_test.cpp/explain_command_test.cpp, both of which used to
 // hand-duplicate this exact setup).
@@ -16,9 +16,9 @@
 
 namespace kernellake::cli {
 
-[[nodiscard]] inline EngineConfig cpu_backend_config() {
-  EngineConfig config = default_config();
-  config.engine.backend = "cpu";
+[[nodiscard]] inline CliConfig cpu_backend_config() {
+  CliConfig config = default_cli_config();
+  config.engine_config.engine.backend = "cpu";
   return config;
 }
 

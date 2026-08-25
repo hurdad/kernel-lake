@@ -40,7 +40,7 @@ spec:
           command:
             - /opt/kernellake/bin/kernellake-server
             - --config
-            - /etc/kernellake/kernellake.yaml
+            - /etc/kernellake/kernellake-server.yaml
           ports:
             - name: flight-sql
               # See templates/configmap.yaml's comment on why numeric

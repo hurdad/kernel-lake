@@ -69,14 +69,15 @@ helm install kernellake charts/kernellake \
 | `observability.serviceName` | `kernellake-server` | OTel `service.name` resource attribute |
 | `observability.useTls` | `false` | Server-CA TLS to the collector (gRPC only) |
 
-This is a **thin** surface over `EngineConfig`
+This is a **thin** surface over `ServerConfig`
 (`include/kernellake/common/config.hpp` in the parent repo) -- any field
 not listed above keeps `kernellake-server`'s own compiled-in default. Full
 per-signal OTel processor/batch/sampler tuning and outbound mTLS to the
 OTLP collector (`observability.tls_client_cert_path`/`tls_client_key_path`)
 are not yet exposed through Helm values; edit `templates/configmap.yaml`
-directly if you need them, or use `--set-file` to replace the rendered
-`kernellake.yaml`.
+directly if you need them -- there is no raw-passthrough value (e.g. via
+`--set-file`) that reaches the rendered `kernellake-server.yaml`; every field in
+the ConfigMap is built from a specific, named value listed above.
 
 ## Connecting
 

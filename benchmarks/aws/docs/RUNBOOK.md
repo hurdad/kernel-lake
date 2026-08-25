@@ -30,9 +30,13 @@ milestone has actually run.
   limit equal to the old one, i.e. a real denial, requiring a manual
   appeal with a detailed use case reopening the Support Center case
   rather than a second API request -- `request-service-quota-increase`
-  rejects a second request outright while one is still open). Request
-  ahead of time and expect it to take a manual round-trip, not an instant
-  approval:
+  rejects a second request outright while one is still open). **In this
+  project's own account, that appeal succeeded on 2026-08-11** -- current
+  quota is 32 vCPUs (confirmed live via `aws service-quotas
+  get-service-quota`), enough for `g6.4xlarge`/`g6.8xlarge` but not
+  `g6e.16xlarge` (64). Still request ahead of time and expect a manual
+  round-trip rather than an instant approval if starting from a lower
+  quota (a new account, or this one reset):
   ```bash
   aws service-quotas request-service-quota-increase --service-code ec2 \
     --quota-code L-DB2E81BA --desired-value <needed-for-your-instance-type>
@@ -381,10 +385,12 @@ teardown if you used this workaround -- check `aws ec2 describe-subnets
 --filters "Name=vpc-id,Values=<vpc-id>"` for anything Terraform's own
 `terraform state list` doesn't know about.
 
-**Instance-size sweep**: once G/VT quota allows (see Prerequisites),
-`g6.xlarge` -> `g6.4xlarge` -> `g6e.16xlarge` is the planned next step --
-repeat this M1 sequence with `-var="kernellake_instance_type=g6.4xlarge"`
-(etc.) in place of the default, each into its own `$RUN_DIR`. `g6e.16xlarge`
+**Instance-size sweep**: `g6.xlarge` -> `g6.4xlarge` -> `g6e.16xlarge` is
+the planned next step -- repeat this M1 sequence with
+`-var="kernellake_instance_type=g6.4xlarge"` (etc.) in place of the
+default, each into its own `$RUN_DIR`. Current quota (32 vCPUs, see
+Prerequisites) already covers `g6.4xlarge` (16) and `g6.8xlarge` (32);
+only `g6e.16xlarge` (64) still needs a further increase. `g6e.16xlarge`
 carries an L40S GPU rather than the L4 the other two have, so treat that
 leg as a different-GPU-generation data point, not a same-GPU size
 comparison.

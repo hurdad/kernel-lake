@@ -65,9 +65,9 @@ affinity: {}
 
 podAnnotations: {}
 
-# A thin surface over EngineConfig (include/kernellake/common/config.hpp) --
+# A thin surface over ServerConfig (include/kernellake/common/config.hpp) --
 # every field not listed here keeps kernellake's own compiled-in default.
-# Rendered into a ConfigMap at /etc/kernellake/kernellake.yaml -- see
+# Rendered into a ConfigMap at /etc/kernellake/kernellake-server.yaml -- see
 # templates/configmap.yaml for the full mapping.
 config:
   engine:

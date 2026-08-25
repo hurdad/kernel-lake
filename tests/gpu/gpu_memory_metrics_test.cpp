@@ -166,18 +166,19 @@ TEST(GpuMemoryMetricsRegistryTest, ConcurrentAllocationsAndDeallocationsDoNotCor
 
 // --- Integration: a real RmmEnvironment/TrackingMemoryResource, real GPU
 // allocations, going through the actual production resource stack. Always
-// targets device_id 0 (EngineConfig's default), same as every other GPU
-// test in this binary -- compares before/after deltas, not absolute
-// values, since that device_id's counters are shared process-wide state.
+// targets device_id 0 (RmmEnvironment's default constructor argument),
+// same as every other GPU test in this binary -- compares before/after
+// deltas, not absolute values, since that device_id's counters are shared
+// process-wide state.
 
 TEST(GpuMemoryMetricsTrackingResourceTest, AllocatingRealDeviceBufferIncreasesCurrentBytes) {
   EngineConfig config = default_config();
   RmmEnvironment env(config);
 
-  const std::uint64_t before = GpuMemoryMetricsRegistry::snapshot(config.engine.device_id).current_bytes;
+  const std::uint64_t before = GpuMemoryMetricsRegistry::snapshot(0).current_bytes;
   constexpr std::size_t kBytes = 1024 * 1024;  // 1 MiB
   rmm::device_buffer buffer(kBytes, rmm::cuda_stream_view{});
-  const std::uint64_t during = GpuMemoryMetricsRegistry::snapshot(config.engine.device_id).current_bytes;
+  const std::uint64_t during = GpuMemoryMetricsRegistry::snapshot(0).current_bytes;
 
   EXPECT_GE(during, before + kBytes);
 }
@@ -186,11 +187,10 @@ TEST(GpuMemoryMetricsTrackingResourceTest, FreeingRealDeviceBufferDecreasesCurre
   EngineConfig config = default_config();
   RmmEnvironment env(config);
 
-  const std::uint64_t before = GpuMemoryMetricsRegistry::snapshot(config.engine.device_id).current_bytes;
-  const std::uint64_t deallocations_before =
-      GpuMemoryMetricsRegistry::snapshot(config.engine.device_id).deallocations;
+  const std::uint64_t before = GpuMemoryMetricsRegistry::snapshot(0).current_bytes;
+  const std::uint64_t deallocations_before = GpuMemoryMetricsRegistry::snapshot(0).deallocations;
   { rmm::device_buffer buffer(1024 * 1024, rmm::cuda_stream_view{}); }
-  const GpuMemoryMetricsSnapshot after = GpuMemoryMetricsRegistry::snapshot(config.engine.device_id);
+  const GpuMemoryMetricsSnapshot after = GpuMemoryMetricsRegistry::snapshot(0);
 
   EXPECT_EQ(after.current_bytes, before);
   EXPECT_GT(after.deallocations, deallocations_before);
@@ -204,9 +204,9 @@ TEST(GpuMemoryMetricsTrackingResourceTest, PeakRemainsElevatedAfterFreeingRealAl
   std::uint64_t peak_during = 0;
   {
     rmm::device_buffer buffer(kBytes, rmm::cuda_stream_view{});
-    peak_during = GpuMemoryMetricsRegistry::snapshot(config.engine.device_id).peak_bytes;
+    peak_during = GpuMemoryMetricsRegistry::snapshot(0).peak_bytes;
   }
-  const std::uint64_t peak_after = GpuMemoryMetricsRegistry::snapshot(config.engine.device_id).peak_bytes;
+  const std::uint64_t peak_after = GpuMemoryMetricsRegistry::snapshot(0).peak_bytes;
 
   EXPECT_EQ(peak_after, peak_during);
 }
@@ -218,13 +218,12 @@ TEST(GpuMemoryMetricsTrackingResourceTest, ExceedingQueryMemoryLimitIncrementsFa
                                                   // own setup (rmm_environment_test.cpp).
   RmmEnvironment env(config);
 
-  const std::uint64_t before =
-      GpuMemoryMetricsRegistry::snapshot(config.engine.device_id).allocation_failures;
+  const std::uint64_t before = GpuMemoryMetricsRegistry::snapshot(0).allocation_failures;
   EXPECT_THROW((void)({
                  rmm::device_buffer buffer(64 * 1024 * 1024, rmm::cuda_stream_view{});  // 64 MiB > limit
                }),
                std::exception);
-  const std::uint64_t after = GpuMemoryMetricsRegistry::snapshot(config.engine.device_id).allocation_failures;
+  const std::uint64_t after = GpuMemoryMetricsRegistry::snapshot(0).allocation_failures;
 
   EXPECT_EQ(after, before + 1);
 }

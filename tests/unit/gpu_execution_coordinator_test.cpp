@@ -28,14 +28,14 @@ namespace kernellake {
 namespace {
 
 TEST(GpuExecutionCoordinatorStub, ConstructorThrowsConfigurationErrorFailingFast) {
-  EngineConfig config = default_config();
-  config.engine.backend = "gpu";
+  ServerConfig config = default_server_config();
+  config.engine_config.engine.backend = "gpu";
   EXPECT_THROW((void)(GpuExecutionCoordinator(config)), ConfigurationError);
 }
 
 TEST(GpuExecutionCoordinatorStub, ConstructorErrorMessageExplainsHowToGetRealGpuSupport) {
-  EngineConfig config = default_config();
-  config.engine.backend = "gpu";
+  ServerConfig config = default_server_config();
+  config.engine_config.engine.backend = "gpu";
   try {
     (void)(GpuExecutionCoordinator(config));
     FAIL() << "expected GpuExecutionCoordinator construction to throw in a KERNELLAKE_WITH_CUDA=OFF build";
@@ -122,17 +122,17 @@ class GpuExecutionCoordinatorConcurrencyTest : public ::testing::Test {
 
 TEST_F(GpuExecutionCoordinatorConcurrencyTest,
        ConcurrentQueriesDoNotMixResultsOrMemoryAccountingAcrossThreads) {
-  EngineConfig config = default_config();
-  config.engine.backend = "gpu";
+  ServerConfig config = default_server_config();
+  config.engine_config.engine.backend = "gpu";
   // Small on purpose: with 4 threads below, this forces real queueing
   // through the semaphore (at least one thread must wait for another to
   // finish), not just "4 threads that all happened to run one at a time
   // anyway" -- exercises the actual bounded-concurrency path, not just
   // that construction doesn't throw.
-  config.engine.max_concurrent_gpu_queries = 2;
+  config.max_concurrent_gpu_queries = 2;
 
   GpuExecutionCoordinator coordinator(config);
-  QueryEngine engine(config);
+  QueryEngine engine(config.engine_config);
 
   struct ThreadResult {
     QueryResult result;
@@ -195,11 +195,11 @@ TEST_F(GpuExecutionCoordinatorConcurrencyTest,
 // plausible device count), on top of the existing concurrency test above
 // already covering the semaphore/RmmEnvironment-per-call isolation itself.
 TEST_F(GpuExecutionCoordinatorConcurrencyTest, RoundRobinDeviceSelectionStaysCorrectAcrossManyCalls) {
-  EngineConfig config = default_config();
-  config.engine.backend = "gpu";
+  ServerConfig config = default_server_config();
+  config.engine_config.engine.backend = "gpu";
 
   GpuExecutionCoordinator coordinator(config);
-  QueryEngine engine(config);
+  QueryEngine engine(config.engine_config);
 
   const std::string sql = "SELECT SUM(amount) AS total FROM read_parquet('" + path_ + "') WHERE region = 'A'";
   const PhysicalPlanPtr physical = engine.explain(sql);

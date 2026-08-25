@@ -31,7 +31,7 @@ class ExplainCommandTest : public ::testing::Test {
 
   fs::path dir_;
   std::string path_;
-  EngineConfig config_ = cpu_backend_config();
+  CliConfig config_ = cpu_backend_config();
 };
 
 TEST_F(ExplainCommandTest, RejectsMissingSql) {

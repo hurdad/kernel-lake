@@ -55,7 +55,7 @@ int main(int argc, char** argv) {
     return 0;
   }
 
-  std::string config_path = "config/kernellake.yaml";
+  std::string config_path = "config/kernellake-cli.yaml";
   bool explicit_config = false;
   std::size_t command_index = 0;
   if (args[0] == "--config") {
@@ -73,16 +73,16 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  kernellake::EngineConfig config;
+  kernellake::CliConfig config;
   try {
     if (explicit_config || std::filesystem::exists(config_path)) {
-      config = kernellake::load_config_file(config_path);
+      config = kernellake::load_cli_config_file(config_path);
     } else {
-      config = kernellake::default_config();
+      config = kernellake::default_cli_config();
     }
-    kernellake::validate_config(config);
-    kernellake::init_logging(config.logging);
-    kernellake::observability::init(config.observability);
+    kernellake::validate_cli_config(config);
+    kernellake::init_logging(config.engine_config.logging);
+    kernellake::observability::init(config.engine_config.observability);
   } catch (const kernellake::ConfigurationError& e) {
     std::fprintf(stderr, "kernellake: configuration error: %s\n", e.what());
     return 1;

@@ -90,32 +90,45 @@ void validate_batch_export_config(const std::string& prefix, const std::string& 
   }
 }
 
-}  // namespace
-
-EngineConfig default_config() {
-  return EngineConfig{};
-}
-
-EngineConfig parse_config(const std::string& yaml_text) {
-  YAML::Node root;
+// Shared by parse_config()/parse_cli_config()/parse_server_config() -- all
+// three need the same "load YAML text, wrap a malformed-document error"
+// step before reading whichever top-level keys are theirs to read.
+YAML::Node load_yaml_root(const std::string& yaml_text) {
   try {
-    root = YAML::Load(yaml_text);
+    return YAML::Load(yaml_text);
   } catch (const YAML::Exception& e) {
     throw ConfigurationError(fmt::format("failed to parse YAML configuration: {}", e.what()));
   }
+}
 
+// Reads a file's full contents, or throws ConfigurationError -- shared by
+// load_cli_config_file()/load_server_config_file().
+std::string read_config_file(const std::string& path) {
+  std::ifstream file(path);
+  if (!file) {
+    throw ConfigurationError(
+        fmt::format("cannot open configuration file '{}': check that the path exists and is readable", path));
+  }
+  std::ostringstream buffer;
+  buffer << file.rdbuf();
+  return buffer.str();
+}
+
+// The shared sections only (everything EngineConfig actually has) -- reused
+// by parse_config() directly and by parse_cli_config()/parse_server_config()
+// so a malformed engine:/storage:/etc. section is caught identically
+// regardless of which binary is parsing it, and so CLI/server YAML parsing
+// can never drift apart for the sections both share.
+EngineConfig parse_engine_config_from_root(const YAML::Node& root) {
   EngineConfig config;
 
   const YAML::Node engine = root["engine"];
-  config.engine.device_id = read_or(engine, "device_id", config.engine.device_id);
   config.engine.batch_rows = read_or(engine, "batch_rows", config.engine.batch_rows);
   config.engine.result_batch_rows = read_or(engine, "result_batch_rows", config.engine.result_batch_rows);
   config.engine.query_memory_limit_bytes =
       read_or(engine, "query_memory_limit_bytes", config.engine.query_memory_limit_bytes);
   config.engine.backend = read_or(engine, "backend", config.engine.backend);
   config.engine.max_distinct_keys = read_or(engine, "max_distinct_keys", config.engine.max_distinct_keys);
-  config.engine.max_concurrent_gpu_queries =
-      read_or(engine, "max_concurrent_gpu_queries", config.engine.max_concurrent_gpu_queries);
 
   const YAML::Node memory = root["memory"];
   config.memory.pool_initial_bytes = read_or(memory, "pool_initial_bytes", config.memory.pool_initial_bytes);
@@ -231,8 +244,14 @@ EngineConfig parse_config(const std::string& yaml_text) {
   // iceberg.catalogs is a map keyed by catalog name (read_iceberg('name.ns.table')'s
   // leading component looks it up), unlike storage.{s3,gcs,azure,hdfs}'s
   // single-section-per-scheme shape above -- each entry gets its own
-  // sub-object read the same way those do.
-  const YAML::Node iceberg_catalogs = root["iceberg"]["catalogs"];
+  // sub-object read the same way those do. Via child(), not
+  // root["iceberg"]["catalogs"] directly: `root` is now a const reference
+  // (this function used to only ever see a mutable local YAML::Node, whose
+  // non-const operator[] auto-vivifies a missing "iceberg" key -- the const
+  // overload doesn't, so a plain YAML document with no iceberg: section at
+  // all throws "invalid node" on the second index without this guard,
+  // exactly the trap child() exists to avoid elsewhere in this file.
+  const YAML::Node iceberg_catalogs = child(root["iceberg"], "catalogs");
   if (iceberg_catalogs) {
     for (const auto& entry : iceberg_catalogs) {
       std::string name;
@@ -259,7 +278,7 @@ EngineConfig parse_config(const std::string& yaml_text) {
   // unity_catalog.instances mirrors iceberg.catalogs exactly (a map keyed
   // by name, read_unity_catalog('instance.catalog.schema.table')'s leading
   // component looks it up).
-  const YAML::Node uc_instances = root["unity_catalog"]["instances"];
+  const YAML::Node uc_instances = child(root["unity_catalog"], "instances");
   if (uc_instances) {
     for (const auto& entry : uc_instances) {
       std::string name;
@@ -298,30 +317,6 @@ EngineConfig parse_config(const std::string& yaml_text) {
   config.profiling.operator_metrics =
       read_or(profiling, "operator_metrics", config.profiling.operator_metrics);
 
-  const YAML::Node benchmark = root["benchmark"];
-  config.benchmark.default_iterations =
-      read_or(benchmark, "default_iterations", config.benchmark.default_iterations);
-  config.benchmark.warmup_iterations =
-      read_or(benchmark, "warmup_iterations", config.benchmark.warmup_iterations);
-  config.benchmark.output_format = read_or(benchmark, "output_format", config.benchmark.output_format);
-  config.benchmark.verify_results = read_or(benchmark, "verify_results", config.benchmark.verify_results);
-  config.benchmark.baseline = read_or(benchmark, "baseline", config.benchmark.baseline);
-
-  const YAML::Node server = root["server"];
-  config.server.host = read_or(server, "host", config.server.host);
-  config.server.port = read_or(server, "port", config.server.port);
-  config.server.max_pending_results =
-      read_or(server, "max_pending_results", config.server.max_pending_results);
-  config.server.use_tls = read_or(server, "use_tls", config.server.use_tls);
-  config.server.tls_cert_path = read_or(server, "tls_cert_path", config.server.tls_cert_path);
-  config.server.tls_key_path = read_or(server, "tls_key_path", config.server.tls_key_path);
-  config.server.require_client_cert =
-      read_or(server, "require_client_cert", config.server.require_client_cert);
-  config.server.tls_client_ca_cert_path =
-      read_or(server, "tls_client_ca_cert_path", config.server.tls_client_ca_cert_path);
-  config.server.auth_enabled = read_or(server, "auth_enabled", config.server.auth_enabled);
-  config.server.auth_token = read_or(server, "auth_token", config.server.auth_token);
-
   const YAML::Node observability = root["observability"];
   config.observability.enabled = read_or(observability, "enabled", config.observability.enabled);
   config.observability.otlp_protocol =
@@ -357,30 +352,89 @@ EngineConfig parse_config(const std::string& yaml_text) {
   return config;
 }
 
-EngineConfig load_config_file(const std::string& path) {
-  std::ifstream file(path);
-  if (!file) {
-    throw ConfigurationError(
-        fmt::format("cannot open configuration file '{}': check that the path exists and is readable", path));
+}  // namespace
+
+EngineConfig default_config() {
+  return EngineConfig{};
+}
+
+CliConfig default_cli_config() {
+  return CliConfig{};
+}
+
+ServerConfig default_server_config() {
+  return ServerConfig{};
+}
+
+EngineConfig parse_config(const std::string& yaml_text) {
+  return parse_engine_config_from_root(load_yaml_root(yaml_text));
+}
+
+CliConfig parse_cli_config(const std::string& yaml_text) {
+  const YAML::Node root = load_yaml_root(yaml_text);
+  CliConfig config;
+  config.engine_config = parse_engine_config_from_root(root);
+
+  const YAML::Node engine = root["engine"];
+  config.device_id = read_or(engine, "device_id", config.device_id);
+
+  const YAML::Node benchmark = root["benchmark"];
+  config.benchmark.default_iterations =
+      read_or(benchmark, "default_iterations", config.benchmark.default_iterations);
+  config.benchmark.warmup_iterations =
+      read_or(benchmark, "warmup_iterations", config.benchmark.warmup_iterations);
+
+  return config;
+}
+
+ServerConfig parse_server_config(const std::string& yaml_text) {
+  const YAML::Node root = load_yaml_root(yaml_text);
+  ServerConfig config;
+  config.engine_config = parse_engine_config_from_root(root);
+
+  const YAML::Node engine = root["engine"];
+  config.max_concurrent_gpu_queries =
+      read_or(engine, "max_concurrent_gpu_queries", config.max_concurrent_gpu_queries);
+  if (engine && engine["gpu_device_ids"]) {
+    try {
+      config.gpu_device_ids = engine["gpu_device_ids"].as<std::vector<int>>();
+    } catch (const YAML::Exception& e) {
+      throw ConfigurationError(fmt::format("invalid value for 'gpu_device_ids': {}", e.what()));
+    }
   }
-  std::ostringstream buffer;
-  buffer << file.rdbuf();
-  return parse_config(buffer.str());
+
+  const YAML::Node server = root["server"];
+  config.server.host = read_or(server, "host", config.server.host);
+  config.server.port = read_or(server, "port", config.server.port);
+  config.server.max_pending_results =
+      read_or(server, "max_pending_results", config.server.max_pending_results);
+  config.server.use_tls = read_or(server, "use_tls", config.server.use_tls);
+  config.server.tls_cert_path = read_or(server, "tls_cert_path", config.server.tls_cert_path);
+  config.server.tls_key_path = read_or(server, "tls_key_path", config.server.tls_key_path);
+  config.server.require_client_cert =
+      read_or(server, "require_client_cert", config.server.require_client_cert);
+  config.server.tls_client_ca_cert_path =
+      read_or(server, "tls_client_ca_cert_path", config.server.tls_client_ca_cert_path);
+  config.server.auth_enabled = read_or(server, "auth_enabled", config.server.auth_enabled);
+  config.server.auth_token = read_or(server, "auth_token", config.server.auth_token);
+
+  return config;
+}
+
+CliConfig load_cli_config_file(const std::string& path) {
+  return parse_cli_config(read_config_file(path));
+}
+
+ServerConfig load_server_config_file(const std::string& path) {
+  return parse_server_config(read_config_file(path));
 }
 
 void validate_config(const EngineConfig& config) {
-  if (config.engine.device_id < 0) {
-    throw ConfigurationError(fmt::format("engine.device_id must be >= 0, got {}", config.engine.device_id));
-  }
   if (config.engine.batch_rows == 0) {
     throw ConfigurationError("engine.batch_rows must be > 0");
   }
   if (config.engine.result_batch_rows == 0) {
     throw ConfigurationError("engine.result_batch_rows must be > 0");
-  }
-  if (config.engine.max_concurrent_gpu_queries <= 0) {
-    throw ConfigurationError(fmt::format("engine.max_concurrent_gpu_queries must be > 0, got {}",
-                                         config.engine.max_concurrent_gpu_queries));
   }
   // 0 is a real, meaningful value here ("auto-detect from GPU VRAM" -- see
   // EngineSection::query_memory_limit_bytes's own comment), not an error;
@@ -576,43 +630,6 @@ void validate_config(const EngineConfig& config) {
                     config.logging.level));
   }
 
-  if (config.benchmark.output_format != "json" && config.benchmark.output_format != "csv") {
-    throw ConfigurationError(
-        fmt::format("benchmark.output_format '{}' is unsupported (expected 'json' or 'csv')",
-                    config.benchmark.output_format));
-  }
-  if (config.benchmark.baseline != "duckdb" && config.benchmark.baseline != "none") {
-    throw ConfigurationError(fmt::format(
-        "benchmark.baseline '{}' is unsupported (expected 'duckdb' or 'none')", config.benchmark.baseline));
-  }
-  if (config.benchmark.default_iterations <= 0) {
-    throw ConfigurationError("benchmark.default_iterations must be > 0");
-  }
-  if (config.benchmark.warmup_iterations < 0) {
-    throw ConfigurationError("benchmark.warmup_iterations must be >= 0");
-  }
-
-  if (config.server.port == 0) {
-    throw ConfigurationError("server.port must be > 0");
-  }
-  if (config.server.max_pending_results == 0) {
-    throw ConfigurationError("server.max_pending_results must be > 0");
-  }
-  if (config.server.use_tls && (config.server.tls_cert_path.empty() || config.server.tls_key_path.empty())) {
-    throw ConfigurationError(
-        "server.tls_cert_path and server.tls_key_path must both be set when server.use_tls is true");
-  }
-  if (config.server.require_client_cert && !config.server.use_tls) {
-    throw ConfigurationError("server.require_client_cert requires server.use_tls to also be true");
-  }
-  if (config.server.require_client_cert && config.server.tls_client_ca_cert_path.empty()) {
-    throw ConfigurationError(
-        "server.tls_client_ca_cert_path must be set when server.require_client_cert is true");
-  }
-  if (config.server.auth_enabled && config.server.auth_token.empty()) {
-    throw ConfigurationError("server.auth_token must not be empty when server.auth_enabled is true");
-  }
-
   if (config.observability.otlp_protocol != "grpc" && config.observability.otlp_protocol != "http") {
     throw ConfigurationError(
         fmt::format("observability.otlp_protocol '{}' is unsupported (expected 'grpc' or 'http')",
@@ -640,6 +657,62 @@ void validate_config(const EngineConfig& config) {
   }
   if (config.observability.metrics.export_timeout_ms == 0) {
     throw ConfigurationError("observability.metrics.export_timeout_ms must be > 0");
+  }
+}
+
+void validate_cli_config(const CliConfig& config) {
+  validate_config(config.engine_config);
+  if (config.device_id < 0) {
+    throw ConfigurationError(fmt::format("engine.device_id must be >= 0, got {}", config.device_id));
+  }
+  if (config.benchmark.default_iterations <= 0) {
+    throw ConfigurationError("benchmark.default_iterations must be > 0");
+  }
+  if (config.benchmark.warmup_iterations < 0) {
+    throw ConfigurationError("benchmark.warmup_iterations must be >= 0");
+  }
+}
+
+void validate_server_config(const ServerConfig& config) {
+  validate_config(config.engine_config);
+  if (config.max_concurrent_gpu_queries <= 0) {
+    throw ConfigurationError(fmt::format("engine.max_concurrent_gpu_queries must be > 0, got {}",
+                                         config.max_concurrent_gpu_queries));
+  }
+  // Only what's checkable without a CUDA context (see gpu_device_ids's own
+  // comment) -- whether each id is actually < cudaGetDeviceCount() is
+  // GpuExecutionCoordinator's job at construction time instead.
+  for (const int device_id : config.gpu_device_ids) {
+    if (device_id < 0) {
+      throw ConfigurationError(fmt::format("engine.gpu_device_ids entries must be >= 0, got {}", device_id));
+    }
+  }
+  {
+    std::vector<int> sorted_ids = config.gpu_device_ids;
+    std::sort(sorted_ids.begin(), sorted_ids.end());
+    if (std::adjacent_find(sorted_ids.begin(), sorted_ids.end()) != sorted_ids.end()) {
+      throw ConfigurationError("engine.gpu_device_ids must not contain duplicate entries");
+    }
+  }
+  if (config.server.port == 0) {
+    throw ConfigurationError("server.port must be > 0");
+  }
+  if (config.server.max_pending_results == 0) {
+    throw ConfigurationError("server.max_pending_results must be > 0");
+  }
+  if (config.server.use_tls && (config.server.tls_cert_path.empty() || config.server.tls_key_path.empty())) {
+    throw ConfigurationError(
+        "server.tls_cert_path and server.tls_key_path must both be set when server.use_tls is true");
+  }
+  if (config.server.require_client_cert && !config.server.use_tls) {
+    throw ConfigurationError("server.require_client_cert requires server.use_tls to also be true");
+  }
+  if (config.server.require_client_cert && config.server.tls_client_ca_cert_path.empty()) {
+    throw ConfigurationError(
+        "server.tls_client_ca_cert_path must be set when server.require_client_cert is true");
+  }
+  if (config.server.auth_enabled && config.server.auth_token.empty()) {
+    throw ConfigurationError("server.auth_token must not be empty when server.auth_enabled is true");
   }
 }
 

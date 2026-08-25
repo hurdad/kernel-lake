@@ -1,9 +1,11 @@
 {{/*
-Renders a real kernellake.yaml (see include/kernellake/common/config.hpp /
-config/kernellake.yaml for the full shape) from this chart's thin values
-surface. Any section/field not set here falls back to kernellake's own
-compiled-in default -- parse_config() only overrides keys actually present
-in the YAML (src/common/config.cpp's read_or() helper), so a minimal file
+Renders a real kernellake-server.yaml (see
+include/kernellake/common/config.hpp / config/kernellake-server.yaml for
+the full ServerConfig shape) from this chart's thin values surface -- this
+chart only ever deploys kernellake-server, never the CLI. Any
+section/field not set here falls back to kernellake's own compiled-in
+default -- parse_server_config() only overrides keys actually present in
+the YAML (src/common/config.cpp's read_or() helper), so a minimal file
 here is intentional, not an oversight.
 */}}
 apiVersion: v1
@@ -21,7 +23,7 @@ few digits (confirmed by an actual `helm template` run rendering
 the receiving end would either reject or misparse that.
 */}}
 data:
-  kernellake.yaml: |
+  kernellake-server.yaml: |
     engine:
       backend: {{ .Values.backend }}
       batch_rows: {{ .Values.config.engine.batchRows | int64 }}

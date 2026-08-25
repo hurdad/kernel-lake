@@ -339,9 +339,9 @@ def run_duckdb_query(
     return table, elapsed
 
 
-def write_server_config(port: int, base_config_path: str = "config/kernellake.yaml") -> str:
+def write_server_config(port: int, base_config_path: str = "config/kernellake-server.yaml") -> str:
     # A literal-string replace of the exact default ("port: 31337"), not a
-    # generic `port: \d+` regex -- config/kernellake.yaml also has an
+    # generic `port: \d+` regex -- config/kernellake-server.yaml also has an
     # unrelated `hdfs.connection_config.port: 0` earlier in the file, which
     # a generic regex's first match would hit instead. engine.backend
     # already defaults to "gpu" (include/kernellake/common/config.hpp), so

@@ -8,26 +8,11 @@
 #include <cstdint>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 namespace kernellake {
 
 struct EngineSection {
-  // The CUDA device QueryEngine::execute(sql)'s one-shot overload runs on
-  // (query_engine_execute_gpu.cpp) -- i.e. the CLI (`kernellake query`),
-  // which builds exactly one RmmEnvironment straight from this config and
-  // never goes through GpuExecutionCoordinator at all. On a multi-GPU box
-  // this is how an ad-hoc CLI query gets pinned to a specific card.
-  //
-  // NOT consulted by kernellake-server as of docs/MULTI_GPU_SCALING.md's
-  // Tier 1: GpuExecutionCoordinator ignores this field entirely, discovers
-  // every visible device via cudaGetDeviceCount(), and builds one
-  // RmmEnvironment per device from its own private config copy (each with
-  // this field overridden to that device's own index) -- the value
-  // configured here never reaches any of them. Before Tier 1 this field
-  // was "the one device the whole server uses"; that's no longer true, and
-  // there is currently no server-side equivalent (no supported way to
-  // pin kernellake-server to a subset of a node's GPUs via config).
-  int device_id = 0;
   std::uint64_t batch_rows = 1'000'000;
   std::uint64_t result_batch_rows = 65'536;
   // 0 (the default) means "auto-detect": resolve_query_memory_limit_bytes()
@@ -58,28 +43,6 @@ struct EngineSection {
   // a code change + rebuild; making it config-driven means the next scale
   // bump is a YAML edit + restart instead.
   std::uint64_t max_distinct_keys = 0;
-  // Caps how many queries GpuExecutionCoordinator (kernellake/server) lets
-  // run concurrently against *each* GPU -- deliberately bounded, not
-  // unbounded, even though the underlying RMM allocator/limiter are both
-  // already thread-safe and could technically support any number at once.
-  // Applied per device since docs/MULTI_GPU_SCALING.md's Tier 1 (one
-  // RmmEnvironment/semaphore pair per visible CUDA device): an N-GPU node
-  // allows up to N times this many queries running at once in total, not
-  // this value process-wide regardless of device count. Two real,
-  // previously-measured risks make an unbounded value unsafe to default to
-  // for any one device: (1) pass_read_limit_bytes/build_side_budget_bytes
-  // (query_engine_execute_gpu.cpp) are each sized as a fraction of the
-  // *entire* device memory ceiling for a single query -- N concurrent
-  // queries on the same device can therefore collectively demand up to N
-  // times that against one real, shared GPU budget, a genuine
-  // oversubscription risk with no guard today. (2) the opt #6
-  // parallel-decode prototype (docs/GPU_OPTIMIZATIONS.md) found concurrent
-  // decode streams on one GPU degrade past ~N=2 (up to -190% at N=16) --
-  // more concurrency is not automatically more throughput on this hardware.
-  // 2 is a conservative starting point pending a real scaling_test.py
-  // re-run to tune it per-deployment, not a value assumed to be optimal
-  // everywhere.
-  int max_concurrent_gpu_queries = 2;
 };
 
 struct MemorySection {
@@ -322,17 +285,21 @@ struct ProfilingSection {
   bool operator_metrics = true;
 };
 
+// CLI-only (`kernellake benchmark tpch`) -- see CliConfig below.
+// output_format/verify_results/baseline were removed 2026-08-24: all three
+// were read from YAML and validated (output_format in {"json","csv"},
+// baseline in {"duckdb","none"}) but never actually consumed by
+// benchmark_tpch_command.cpp, which unconditionally emits JSON and never
+// runs an in-process DuckDB comparison -- that comparison already lives in
+// the separate tools/validate_tpch.py, which this command's own output
+// tells the caller to run. Dead config from day one of this section,
+// found in a docs/config audit; removed rather than wired up, since no
+// caller ever needed the feature they implied.
 struct BenchmarkSection {
   int default_iterations = 5;
   int warmup_iterations = 1;
-  std::string output_format = "json";
-  bool verify_results = true;
-  std::string baseline = "duckdb";
 };
 
-// Only consumed by kernellake-server (KERNELLAKE_BUILD_SERVER); present
-// unconditionally here like every other section so EngineConfig has one
-// shape regardless of build options.
 struct ServerSection {
   std::string host = "0.0.0.0";
   std::uint16_t port = 31337;
@@ -469,6 +436,18 @@ struct ObservabilitySection {
   LogExportConfig logs;
 };
 
+// Every setting shared by both kernellake binaries (the CLI and
+// kernellake-server): storage/catalog/credential config, memory pool
+// tuning, logging, profiling, and observability. Neither binary-specific
+// concern lives here -- see CliConfig/ServerConfig below, added 2026-08-24
+// specifically so a field meaningful to only one binary can't sit in a
+// shared struct where the other binary silently ignores it (the bug
+// EngineSection::device_id used to be: post-Tier-1
+// (docs/MULTI_GPU_SCALING.md), it was real for the CLI's one-shot queries
+// but silently discarded by kernellake-server, which had already moved to
+// a per-device model). RmmEnvironment/QueryEngine now take "which device"
+// as an explicit constructor parameter instead of reading it from this
+// struct -- see their own headers.
 struct EngineConfig {
   EngineSection engine;
   MemorySection memory;
@@ -478,29 +457,128 @@ struct EngineConfig {
   DeltaSection delta;
   LoggingSection logging;
   ProfilingSection profiling;
-  BenchmarkSection benchmark;
-  ServerSection server;
   ObservabilitySection observability;
 };
 
-// Returns the built-in defaults, matching config/kernellake.yaml.
+// kernellake CLI's own top-level config: the shared EngineConfig plus the
+// two things only a one-shot, single-process CLI invocation needs --
+// which single GPU an ad-hoc query runs on (device_id; RmmEnvironment/
+// QueryEngine take this as an explicit constructor argument, defaulting to
+// 0 if unset -- see their own headers), and `kernellake benchmark tpch`'s
+// own tuning (benchmark). kernellake-server never constructs one of these.
+struct CliConfig {
+  EngineConfig engine_config;
+  int device_id = 0;
+  BenchmarkSection benchmark;
+};
+
+// kernellake-server's own top-level config: the shared EngineConfig plus
+// the Flight SQL listener's own settings (server) and how many queries
+// GpuExecutionCoordinator lets run concurrently against *each* GPU
+// (max_concurrent_gpu_queries -- moved here from EngineSection 2026-08-24,
+// since GpuExecutionCoordinator is the only consumer; see its own header
+// for why this cap is per-device, not process-wide, since Tier 1). The
+// CLI never constructs one of these.
+struct ServerConfig {
+  EngineConfig engine_config;
+  ServerSection server;
+  // See EngineSection::max_concurrent_gpu_queries's old comment (now
+  // moved here) for the full reasoning behind bounding this at all rather
+  // than leaving it unbounded: (1) pass_read_limit_bytes/
+  // build_side_budget_bytes (query_engine_execute_gpu.cpp) are each sized
+  // as a fraction of one device's entire memory ceiling, so N concurrent
+  // queries on the same device can collectively demand up to N times
+  // that; (2) the opt #6 parallel-decode prototype
+  // (docs/GPU_OPTIMIZATIONS.md) found concurrent decode streams on one
+  // GPU degrade past ~N=2. 2 is a conservative starting point pending a
+  // real scaling_test.py re-run to tune per-deployment.
+  int max_concurrent_gpu_queries = 2;
+  // Which CUDA device ordinals GpuExecutionCoordinator builds one
+  // RmmEnvironment per and round-robins queries across (Tier 1, see
+  // docs/MULTI_GPU_SCALING.md). Empty (the default) means "every device
+  // cudaGetDeviceCount() reports" -- Tier 1's original all-devices
+  // behavior. A non-empty list pins the server to exactly these ordinals
+  // instead, in the given order (which also becomes the round-robin
+  // order) -- for a shared box where other workloads need some GPUs left
+  // alone, or where an operator wants fewer than every visible device
+  // devoted to kernellake-server. GpuExecutionCoordinator validates each
+  // entry against the real cudaGetDeviceCount() at construction time
+  // (out-of-range or duplicate entries throw ConfigurationError) --
+  // range-checking here in validate_server_config() isn't possible
+  // without a CUDA context, matching how device availability is never
+  // checked at plain config-validation time elsewhere in this file.
+  //
+  // Ordinals, not UUIDs: every CUDA API this project calls
+  // (cudaSetDevice(), cudaMemGetInfo(), etc.) is ordinal-only regardless,
+  // so a UUID layer would still need to resolve back to an ordinal before
+  // any of it could be used -- extra machinery this project's actual
+  // target deployments (single-tenant bare-metal/VM boxes, not GPU-sliced
+  // multi-tenant Kubernetes, where a device plugin already remaps
+  // whichever physical GPUs a pod gets down to ordinals 0..N-1 before this
+  // config is ever read) don't need. The one real gotcha with plain
+  // ordinals: CUDA's own default device enumeration order
+  // (`CUDA_DEVICE_ORDER=FASTEST_FIRST`) is not guaranteed to match
+  // `nvidia-smi`'s (PCI bus ID order) -- an operator cross-referencing
+  // `nvidia-smi -L` output to decide which ordinals to reserve here should
+  // set `CUDA_DEVICE_ORDER=PCI_BUS_ID` in kernellake-server's environment
+  // first, or the numbers can silently disagree.
+  std::vector<int> gpu_device_ids;
+};
+
+// Returns the built-in defaults for the shared sections, matching the
+// sections common to config/kernellake-cli.yaml and
+// config/kernellake-server.yaml.
 [[nodiscard]] EngineConfig default_config();
 
-// Parses YAML text into an EngineConfig. Missing keys fall back to defaults.
-// Throws ConfigurationError on malformed YAML or wrong value types.
+// Returns default_config() plus the CLI's own section defaults.
+[[nodiscard]] CliConfig default_cli_config();
+
+// Returns default_config() plus the server's own section defaults.
+[[nodiscard]] ServerConfig default_server_config();
+
+// Parses YAML text into an EngineConfig -- only the shared sections; a
+// server: or benchmark: key present in `yaml_text` is silently ignored
+// here (parse_cli_config()/parse_server_config() below read those
+// themselves). Missing keys fall back to defaults. Throws
+// ConfigurationError on malformed YAML or wrong value types.
 [[nodiscard]] EngineConfig parse_config(const std::string& yaml_text);
 
-// Loads and parses a YAML config file. Throws ConfigurationError if the file
-// is missing, unreadable, or fails to parse.
-[[nodiscard]] EngineConfig load_config_file(const std::string& path);
+// parse_config() plus the CLI's own top-level keys (engine.device_id,
+// benchmark:). Both binaries can read the exact same YAML file -- this
+// simply ignores any server:/max_concurrent_gpu_queries keys present.
+[[nodiscard]] CliConfig parse_cli_config(const std::string& yaml_text);
 
-// Validates value ranges and known enumerations (log level, benchmark output
-// format, benchmark baseline) and cross-field constraints (e.g. pool_max
-// must be >= pool_initial). Does not validate GPU device availability here;
-// CUDA device-count checks happen where a CUDA context is actually created,
-// since this validation must also run in CPU-only builds.
-// Throws ConfigurationError with an actionable message on the first
-// violation found.
+// parse_config() plus the server's own top-level keys (server:,
+// engine.max_concurrent_gpu_queries). Ignores any benchmark:/
+// engine.device_id keys present.
+[[nodiscard]] ServerConfig parse_server_config(const std::string& yaml_text);
+
+// Loads and parses a YAML config file as a CliConfig. Throws
+// ConfigurationError if the file is missing, unreadable, or fails to
+// parse.
+[[nodiscard]] CliConfig load_cli_config_file(const std::string& path);
+
+// Loads and parses a YAML config file as a ServerConfig. Throws
+// ConfigurationError if the file is missing, unreadable, or fails to
+// parse.
+[[nodiscard]] ServerConfig load_server_config_file(const std::string& path);
+
+// Validates the shared sections' value ranges/known enumerations (log
+// level, etc.) and cross-field constraints (e.g. pool_max must be >=
+// pool_initial). Does not validate GPU device availability here; CUDA
+// device-count checks happen where a CUDA context is actually created,
+// since this validation must also run in CPU-only builds. Throws
+// ConfigurationError with an actionable message on the first violation
+// found. Called by both validate_cli_config()/validate_server_config()
+// below -- not usually called directly.
 void validate_config(const EngineConfig& config);
+
+// validate_config(config.engine_config) plus the CLI-only fields
+// (device_id >= 0).
+void validate_cli_config(const CliConfig& config);
+
+// validate_config(config.engine_config) plus the server-only fields
+// (server.port, TLS/auth cross-field checks, max_concurrent_gpu_queries).
+void validate_server_config(const ServerConfig& config);
 
 }  // namespace kernellake
