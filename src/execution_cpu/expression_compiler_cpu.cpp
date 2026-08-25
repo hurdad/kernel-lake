@@ -231,6 +231,17 @@ arrow::compute::Expression compile_expression_cpu(const Expression& expr) {
     return arrow::compute::call(extract_function_name(extract->part()),
                                 {compile_expression_cpu(*extract->operand())});
   }
+  if (const auto* substring = dynamic_cast<const SubstringExpression*>(&expr)) {
+    // Arrow's own utf8_slice_codeunits is 0-based [start, stop) --
+    // SubstringExpression::start_zero_based() does the one -1 conversion
+    // from SQL's 1-based convention, at this exact boundary, so both
+    // execution backends share the same already-converted value (see
+    // expression_compiler.cpp's identical GPU-side use).
+    const std::int64_t start = substring->start_zero_based();
+    return arrow::compute::call(
+        "utf8_slice_codeunits", {compile_expression_cpu(*substring->operand())},
+        arrow::compute::SliceOptions(static_cast<std::int64_t>(start), start + substring->length()));
+  }
   throw ExecutionError(
       "unrecognized expression type in CPU expression compiler (IN/DECIMAL are not yet supported "
       "by the CPU execution backend -- see docs/ARCHITECTURE.md)");

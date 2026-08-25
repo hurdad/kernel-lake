@@ -47,6 +47,7 @@ class ProjectionOperator final : public PhysicalOperator {
                                // it.
   struct CompiledLike;         // ditto.
   struct CompiledExtract;      // ditto.
+  struct CompiledSubstring;    // ditto.
 
   // A plain column index to copy, a plain literal to broadcast, a CAST to
   // DECIMAL to materialize directly, or a compiled AST expression to
@@ -76,6 +77,7 @@ class ProjectionOperator final : public PhysicalOperator {
     std::shared_ptr<CompiledDecimalCast> decimal_cast;
     std::shared_ptr<CompiledLike> like_expr;
     std::shared_ptr<CompiledExtract> extract_expr;
+    std::shared_ptr<CompiledSubstring> substring_expr;
   };
 
   struct CompiledDecimalCast {
@@ -99,6 +101,15 @@ class ProjectionOperator final : public PhysicalOperator {
   struct CompiledExtract {
     CompiledValue operand;
     DatePart part;
+  };
+
+  // `SUBSTRING(operand, start, length)`: like LIKE/EXTRACT above, cudf::ast
+  // has no substring/slice operator, so it's materialized directly via
+  // cudf::strings::slice_strings() instead of going through compute_column().
+  struct CompiledSubstring {
+    CompiledValue operand;
+    std::int64_t start;
+    std::int64_t length;
   };
 
   struct CompiledCaseBranch {
@@ -132,6 +143,9 @@ class ProjectionOperator final : public PhysicalOperator {
   [[nodiscard]] std::unique_ptr<cudf::column> materialize_extract(const CompiledExtract& extract_expr,
                                                                   const cudf::table_view& batch,
                                                                   ExecutionContext& context);
+  [[nodiscard]] std::unique_ptr<cudf::column> materialize_substring(const CompiledSubstring& substring_expr,
+                                                                    const cudf::table_view& batch,
+                                                                    ExecutionContext& context);
 
   OperatorId id_;
   std::unique_ptr<PhysicalOperator> child_;

@@ -394,6 +394,139 @@ TEST(ProjectionOperator, EvaluatesExtractForYearMonthAndDay) {
   projection.close(context);
 }
 
+// Regression coverage for FilterOperator's whole-top-level-conjunct
+// SUBSTRING-IN detection (see try_compile_substring_in()'s own doc
+// comment, added for TPC-H Q22): the IN-desugared OR-chain
+// (SUBSTRING(phone,1,2)='AB' OR SUBSTRING(phone,1,2)='ZZ') must be
+// evaluated as its own thing (cudf::ast can't represent SUBSTRING at
+// all), then LOGICAL_AND-combined with the ordinary AST-compilable
+// `id > 9` conjunct -- mirrors LikeConjunctCombinesWithPlainConjunctViaLogicalAnd
+// above exactly, just for the SUBSTRING-IN shape instead of LIKE.
+TEST(FilterOperator, SubstringInConjunctCombinesWithPlainConjunctViaLogicalAnd) {
+  RmmEnvironment env(default_config());
+  arrow::Int32Builder id_builder;
+  arrow::StringBuilder phone_builder;
+  for (const auto& [id, phone] : std::vector<std::pair<int32_t, std::string>>{
+           {10, "AB-1111"}, {20, "ZZ-2222"}, {5, "AB-3333"}, {10, "CC-4444"}}) {
+    ASSERT_TRUE(id_builder.Append(id).ok());
+    ASSERT_TRUE(phone_builder.Append(phone).ok());
+  }
+  std::shared_ptr<arrow::Array> id_array, phone_array;
+  ASSERT_TRUE(id_builder.Finish(&id_array).ok());
+  ASSERT_TRUE(phone_builder.Finish(&phone_array).ok());
+  const auto arrow_schema =
+      arrow::schema({arrow::field("id", arrow::int32(), false), arrow::field("phone", arrow::utf8(), false)});
+  const auto arrow_batch = arrow::RecordBatch::Make(arrow_schema, 4, {id_array, phone_array});
+  const auto schema = std::make_shared<const Schema>(
+      Schema({Field{"id", int32_type(false)}, Field{"phone", string_type(false)}}));
+
+  std::vector<DeviceBatch> batches;
+  batches.push_back(from_arrow_record_batch(*arrow_batch, schema));
+
+  auto id = std::make_shared<ColumnExpression>("id", 0, int32_type(false));
+  auto id_i64 = std::make_shared<CastExpression>(id, int64_type(false));
+  auto nine = std::make_shared<LiteralExpression>(LiteralExpression::make_int64(9));
+  auto id_predicate =
+      std::make_shared<BinaryExpression>(BinaryOperator::Greater, id_i64, nine, boolean_type(false));
+
+  auto phone = std::make_shared<ColumnExpression>("phone", 1, string_type(false));
+  auto cntrycode = std::make_shared<SubstringExpression>(phone, 1, 2, string_type(false));
+  auto ab = std::make_shared<LiteralExpression>(LiteralExpression::make_string("AB"));
+  auto zz = std::make_shared<LiteralExpression>(LiteralExpression::make_string("ZZ"));
+  auto eq_ab = std::make_shared<BinaryExpression>(BinaryOperator::Equal, cntrycode, ab, boolean_type(false));
+  auto eq_zz = std::make_shared<BinaryExpression>(BinaryOperator::Equal, cntrycode, zz, boolean_type(false));
+  auto substring_in =
+      std::make_shared<BinaryExpression>(BinaryOperator::Or, eq_ab, eq_zz, boolean_type(false));
+
+  auto predicate = std::make_shared<BinaryExpression>(BinaryOperator::And, id_predicate, substring_in,
+                                                      boolean_type(false));
+
+  FilterOperator filter(1, std::make_unique<VectorSourceOperator>(std::move(batches)), predicate);
+  ExecutionContext context = make_context();
+  filter.open(context);
+
+  std::optional<DeviceBatch> result = filter.next(context);
+  ASSERT_TRUE(result.has_value());
+  // id>9 AND cntrycode IN ('AB','ZZ'): row0 (10,AB) passes both; row1
+  // (20,ZZ) passes both; row2 (5,AB) fails id>9; row3 (10,CC) fails the
+  // substring-IN.
+  EXPECT_EQ(result->row_count(), 2u);
+  filter.close(context);
+}
+
+// NOT IN's own shape (UnaryExpression(Not, OR-chain), see
+// bind_node(AstIn&, bool)) -- same fixture, inverted expectation.
+TEST(FilterOperator, SubstringNotInConjunctNegatesCorrectly) {
+  RmmEnvironment env(default_config());
+  arrow::StringBuilder phone_builder;
+  for (const std::string& phone : {"AB-1111", "ZZ-2222", "CC-3333"}) {
+    ASSERT_TRUE(phone_builder.Append(phone).ok());
+  }
+  std::shared_ptr<arrow::Array> phone_array;
+  ASSERT_TRUE(phone_builder.Finish(&phone_array).ok());
+  const auto arrow_schema = arrow::schema({arrow::field("phone", arrow::utf8(), false)});
+  const auto arrow_batch = arrow::RecordBatch::Make(arrow_schema, 3, {phone_array});
+  const auto schema = std::make_shared<const Schema>(Schema({Field{"phone", string_type(false)}}));
+
+  std::vector<DeviceBatch> batches;
+  batches.push_back(from_arrow_record_batch(*arrow_batch, schema));
+
+  auto phone = std::make_shared<ColumnExpression>("phone", 0, string_type(false));
+  auto cntrycode = std::make_shared<SubstringExpression>(phone, 1, 2, string_type(false));
+  auto ab = std::make_shared<LiteralExpression>(LiteralExpression::make_string("AB"));
+  auto zz = std::make_shared<LiteralExpression>(LiteralExpression::make_string("ZZ"));
+  auto eq_ab = std::make_shared<BinaryExpression>(BinaryOperator::Equal, cntrycode, ab, boolean_type(false));
+  auto eq_zz = std::make_shared<BinaryExpression>(BinaryOperator::Equal, cntrycode, zz, boolean_type(false));
+  auto in_chain = std::make_shared<BinaryExpression>(BinaryOperator::Or, eq_ab, eq_zz, boolean_type(false));
+  auto not_in = std::make_shared<UnaryExpression>(UnaryOperator::Not, in_chain, boolean_type(false));
+
+  FilterOperator filter(1, std::make_unique<VectorSourceOperator>(std::move(batches)), not_in);
+  ExecutionContext context = make_context();
+  filter.open(context);
+
+  std::optional<DeviceBatch> result = filter.next(context);
+  ASSERT_TRUE(result.has_value());
+  EXPECT_EQ(result->row_count(), 1u);  // only "CC-3333" is NOT IN ('AB', 'ZZ')
+  filter.close(context);
+}
+
+// Regression coverage: compile_value()'s SUBSTRING branch and
+// materialize_substring() (added for TPC-H Q22) had zero coverage as a
+// plain SELECT-list item.
+TEST(ProjectionOperator, EvaluatesSubstring) {
+  RmmEnvironment env(default_config());
+  arrow::StringBuilder phone_builder;
+  for (const std::string& phone : {"17-877-453-8989", "25-809-432-8293"}) {
+    ASSERT_TRUE(phone_builder.Append(phone).ok());
+  }
+  std::shared_ptr<arrow::Array> phone_array;
+  ASSERT_TRUE(phone_builder.Finish(&phone_array).ok());
+  const auto arrow_schema = arrow::schema({arrow::field("phone", arrow::utf8(), false)});
+  const auto arrow_batch = arrow::RecordBatch::Make(arrow_schema, 2, {phone_array});
+  const auto schema = std::make_shared<const Schema>(Schema({Field{"phone", string_type(false)}}));
+
+  std::vector<DeviceBatch> batches;
+  batches.push_back(from_arrow_record_batch(*arrow_batch, schema));
+
+  auto phone = std::make_shared<ColumnExpression>("phone", 0, string_type(false));
+  auto cntrycode = std::make_shared<SubstringExpression>(phone, 1, 2, string_type(false));
+  std::vector<NamedExpression> items = {NamedExpression{cntrycode, "cc"}};
+  ProjectionOperator projection(1, std::make_unique<VectorSourceOperator>(std::move(batches)),
+                                std::move(items));
+  ExecutionContext context = make_context();
+  projection.open(context);
+
+  std::optional<DeviceBatch> result = projection.next(context);
+  ASSERT_TRUE(result.has_value());
+  ASSERT_EQ(result->row_count(), 2u);
+  const cudf::column_view cc_view = result->view().column(0);
+  const std::unique_ptr<cudf::scalar> first = cudf::get_element(cc_view, 0);
+  const std::unique_ptr<cudf::scalar> second = cudf::get_element(cc_view, 1);
+  EXPECT_EQ(static_cast<const cudf::string_scalar&>(*first).to_string(), "17");
+  EXPECT_EQ(static_cast<const cudf::string_scalar&>(*second).to_string(), "25");
+  projection.close(context);
+}
+
 // Regression coverage: compile_value()'s LIKE branch and
 // materialize_like() (including the negated/NOT LIKE path) had zero
 // coverage through ProjectionOperator -- LIKE was previously only ever

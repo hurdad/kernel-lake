@@ -181,6 +181,16 @@ void ScalarAggregateOperator::open(ExecutionContext& context) {
       throw ExecutionError(
           fmt::format("ScalarAggregateOperator item '{}' is not an AggregateExpression", item.name));
     }
+    if (aggregate->function() == AggregateFunction::CountDistinct) {
+      // No TPC-H query needs a GROUP BY-less COUNT(DISTINCT ...) on the GPU
+      // backend today (Q16, the one query that needs CountDistinct at all,
+      // always has a GROUP BY -- see HashAggregateOperator's own support),
+      // so this is a real, narrow scope limit, not an oversight -- reject
+      // clearly rather than silently mishandling it. The CPU (Acero)
+      // backend has no such limitation (count_distinct is an ordinary
+      // scalar aggregate there too).
+      throw ExecutionError("COUNT(DISTINCT ...) without a GROUP BY is not yet supported on the GPU backend");
+    }
     Accumulator state;
     state.function = aggregate->function();
     state.result_type = aggregate->result_type();
@@ -218,6 +228,8 @@ std::unique_ptr<cudf::column> ScalarAggregateOperator::materialize_count_ones(co
 void ScalarAggregateOperator::process_batch(Accumulator& state, const DeviceBatch& batch,
                                             ExecutionContext& context) {
   switch (state.function) {
+    case AggregateFunction::CountDistinct:
+      break;  // rejected in open(), before a state with this function ever reaches here.
     case AggregateFunction::CountStar:
       state.running_count += static_cast<std::int64_t>(batch.row_count());
       return;
@@ -322,6 +334,8 @@ std::unique_ptr<cudf::column> ScalarAggregateOperator::finalize(Accumulator& sta
   const cudf::data_type output_type = to_cudf_type(state.result_type);
 
   switch (state.function) {
+    case AggregateFunction::CountDistinct:
+      break;  // rejected in open(), before a state with this function ever reaches here.
     case AggregateFunction::CountStar: {
       cudf::numeric_scalar<std::int64_t> scalar(state.running_count, true, context.stream,
                                                 context.memory_resource);

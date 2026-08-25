@@ -10,11 +10,14 @@
 #include <cudf/null_mask.hpp>
 #include <cudf/replace.hpp>
 #include <cudf/scalar/scalar_factories.hpp>
+#include <cudf/stream_compaction.hpp>
 #include <cudf/strings/contains.hpp>
 #include <cudf/strings/strings_column_view.hpp>
 #include <cudf/transform.hpp>
 #include <cudf/unary.hpp>
 #include <fmt/format.h>
+
+#include <numeric>
 
 #include "kernellake/common/errors.hpp"
 #include "kernellake/execution_gpu/cudf_adapter.hpp"
@@ -256,7 +259,21 @@ void HashAggregateOperator::open(ExecutionContext& context) {
           fmt::format("HashAggregateOperator item '{}' is not an AggregateExpression", item.name));
     }
 
+    if (aggregate->function() == AggregateFunction::CountDistinct) {
+      if (aggregates_.size() != 1) {
+        throw ExecutionError(
+            "COUNT(DISTINCT ...) cannot be combined with another aggregate in the same GROUP BY on the "
+            "GPU backend (see HashAggregateOperator's own class comment for why; the CPU backend has no "
+            "such restriction)");
+      }
+      is_count_distinct_ = true;
+      compiled_count_distinct_arg_ = compile_expr(*aggregate->argument(), context);
+      continue;
+    }
+
     switch (aggregate->function()) {
+      case AggregateFunction::CountDistinct:
+        break;  // handled above, before this switch is ever reached
       case AggregateFunction::Sum:
       case AggregateFunction::Min:
       case AggregateFunction::Max:
@@ -349,6 +366,34 @@ std::unique_ptr<cudf::table> HashAggregateOperator::run_groupby_and_assemble(
 
 void HashAggregateOperator::process_batch(const DeviceBatch& batch, ExecutionContext& context) {
   any_batch_seen_ = true;
+
+  if (is_count_distinct_) {
+    // See this class's own CountDistinct comment: pending_partials_/
+    // accumulated_ hold deduplicated (group-by keys, distinct argument)
+    // rows in this mode, not a groupby+SUM partial -- cudf::distinct()
+    // over every column (keys and argument together) is what "one batch's
+    // partial result" means here.
+    std::vector<std::unique_ptr<cudf::column>> columns;
+    columns.reserve(group_by_.size() + 1);
+    for (const CompiledExpr& compiled : compiled_group_by_) {
+      columns.push_back(materialize(compiled, batch, context));
+    }
+    columns.push_back(materialize(compiled_count_distinct_arg_, batch, context));
+    const std::unique_ptr<cudf::table> combined = std::make_unique<cudf::table>(std::move(columns));
+    std::vector<cudf::size_type> all_columns(static_cast<std::size_t>(combined->num_columns()));
+    std::iota(all_columns.begin(), all_columns.end(), 0);
+    std::unique_ptr<cudf::table> partial = cudf::distinct(
+        combined->view(), all_columns, cudf::duplicate_keep_option::KEEP_ANY, cudf::null_equality::EQUAL,
+        cudf::nan_equality::ALL_EQUAL, context.stream, context.memory_resource);
+
+    pending_rows_ += partial->num_rows();
+    pending_partials_.push_back(std::move(partial));
+    if (accumulated_ == nullptr || pending_rows_ >= accumulated_->num_rows()) {
+      flush_pending(context);
+    }
+    return;
+  }
+
   const std::unique_ptr<cudf::table> combined = build_combined_columns(batch, context);
   const cudf::table_view combined_view = combined->view();
   const auto group_by_count = static_cast<cudf::size_type>(group_by_.size());
@@ -398,9 +443,28 @@ void HashAggregateOperator::flush_pending(ExecutionContext& context) {
 
   if (accumulated_ == nullptr && pending_partials_.size() == 1) {
     // First flush of a single partial: no accumulated_ to merge against and
-    // nothing else pending, so the partial's own groupby result already is
+    // nothing else pending, so the partial's own groupby result (or, in
+    // CountDistinct mode, its own already-deduplicated rows) already is
     // the correct accumulated_ -- no redundant re-aggregation needed.
     accumulated_ = std::move(pending_partials_.front());
+  } else if (is_count_distinct_) {
+    // Merge via row-level dedup (cudf::distinct()), not groupby+SUM -- see
+    // this class's own CountDistinct comment.
+    std::vector<cudf::table_view> views;
+    views.reserve(pending_partials_.size() + 1);
+    if (accumulated_ != nullptr) {
+      views.push_back(accumulated_->view());
+    }
+    for (const std::unique_ptr<cudf::table>& partial : pending_partials_) {
+      views.push_back(partial->view());
+    }
+    const std::unique_ptr<cudf::table> concatenated =
+        cudf::concatenate(views, context.stream, context.memory_resource);
+    std::vector<cudf::size_type> all_columns(static_cast<std::size_t>(concatenated->num_columns()));
+    std::iota(all_columns.begin(), all_columns.end(), 0);
+    accumulated_ = cudf::distinct(concatenated->view(), all_columns, cudf::duplicate_keep_option::KEEP_ANY,
+                                  cudf::null_equality::EQUAL, cudf::nan_equality::ALL_EQUAL, context.stream,
+                                  context.memory_resource);
   } else {
     std::vector<cudf::table_view> views;
     views.reserve(pending_partials_.size() + 1);
@@ -422,9 +486,11 @@ void HashAggregateOperator::flush_pending(ExecutionContext& context) {
   pending_rows_ = 0;
 
   if (accumulated_->num_rows() > max_distinct_keys_) {
-    throw ExecutionError(
-        fmt::format("HashAggregateOperator: distinct key count {} exceeds max_distinct_keys ({})",
-                    accumulated_->num_rows(), max_distinct_keys_));
+    throw ExecutionError(fmt::format("HashAggregateOperator: {} {} exceeds max_distinct_keys ({})",
+                                     is_count_distinct_
+                                         ? "distinct (group-key, COUNT(DISTINCT) argument) row count"
+                                         : "distinct key count",
+                                     accumulated_->num_rows(), max_distinct_keys_));
   }
 }
 
@@ -444,6 +510,38 @@ std::optional<DeviceBatch> HashAggregateOperator::next(ExecutionContext& context
       columns.push_back(cudf::make_empty_column(to_cudf_type(field.type)));
     }
     return DeviceBatch(std::make_unique<cudf::table>(std::move(columns)), output_schema_);
+  }
+
+  if (is_count_distinct_) {
+    // accumulated_ holds every distinct (group-by keys, argument) row seen
+    // across the whole input by now -- the one and only real groupby this
+    // mode ever runs is here, computing each group's true distinct count
+    // directly from that already-deduplicated table (a plain COUNT over
+    // it is correct precisely because duplicates are already gone).
+    const auto group_by_count = static_cast<cudf::size_type>(group_by_.size());
+    const cudf::table_view accumulated_view = accumulated_->view();
+    const cudf::table_view key_view = column_range(accumulated_view, 0, group_by_count);
+    const cudf::table_view arg_view =
+        column_range(accumulated_view, group_by_count, accumulated_view.num_columns());
+
+    cudf::groupby::groupby grouper(key_view);
+    std::vector<cudf::groupby::aggregation_request> requests(1);
+    requests[0].values = arg_view.column(0);
+    requests[0].aggregations.push_back(
+        cudf::make_count_aggregation<cudf::groupby_aggregation>(cudf::null_policy::EXCLUDE));
+    auto [keys_table, results] = grouper.aggregate(requests, context.stream, context.memory_resource);
+
+    std::vector<std::unique_ptr<cudf::column>> final_columns = keys_table->release();
+    // cudf's groupby COUNT accumulates in INT32 -- cast to INT64 to match
+    // binder.cpp's declared int64_type(false) result type for
+    // AggregateFunction::CountDistinct (a per-group distinct-supplier-style
+    // count is nowhere near 2^31 at any TPC-H scale, so this is just a
+    // type-match cast, not the SUM-of-ones overflow workaround the other
+    // COUNT/AVG paths need -- see AggregateOutputKind's own comment).
+    final_columns.push_back(cudf::cast(results.front().results.front()->view(),
+                                       cudf::data_type{cudf::type_id::INT64}, context.stream,
+                                       context.memory_resource));
+    return DeviceBatch(std::make_unique<cudf::table>(std::move(final_columns)), output_schema_);
   }
 
   std::vector<std::unique_ptr<cudf::column>> accumulated_columns = accumulated_->release();

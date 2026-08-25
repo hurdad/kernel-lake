@@ -150,12 +150,14 @@ class LogicalScan final : public LogicalPlanNode {
 class LogicalJoin final : public LogicalPlanNode {
  public:
   LogicalJoin(LogicalPlanPtr left, LogicalPlanPtr right, std::size_t left_key_index,
-              std::size_t right_key_index, JoinType join_type = JoinType::Inner)
+              std::size_t right_key_index, JoinType join_type = JoinType::Inner,
+              ExpressionPtr residual_predicate = nullptr)
       : left_(std::move(left)),
         right_(std::move(right)),
         left_key_index_(left_key_index),
         right_key_index_(right_key_index),
         join_type_(join_type),
+        residual_predicate_(std::move(residual_predicate)),
         schema_(build_schema(left_->output_schema(), right_->output_schema(), join_type_)) {}
 
   [[nodiscard]] const LogicalPlanPtr& left() const noexcept { return left_; }
@@ -163,6 +165,12 @@ class LogicalJoin final : public LogicalPlanNode {
   [[nodiscard]] std::size_t left_key_index() const noexcept { return left_key_index_; }
   [[nodiscard]] std::size_t right_key_index() const noexcept { return right_key_index_; }
   [[nodiscard]] JoinType join_type() const noexcept { return join_type_; }
+  // Non-null only for LeftSemi/LeftAnti -- see BoundJoinStep's own doc
+  // comment (binder.hpp) for the full scope (TPC-H Q21's shape). Column
+  // indices are unrebased combined-schema indices, exactly like
+  // `left_key_index_`/`right_key_index_` above -- see this class's own
+  // doc comment on why no remapping is needed at this stage.
+  [[nodiscard]] const ExpressionPtr& residual_predicate() const noexcept { return residual_predicate_; }
   [[nodiscard]] const Schema& output_schema() const override { return schema_; }
   [[nodiscard]] std::string_view node_name() const noexcept override { return "LogicalJoin"; }
   [[nodiscard]] std::vector<LogicalPlanPtr> children() const override { return {left_, right_}; }
@@ -197,6 +205,7 @@ class LogicalJoin final : public LogicalPlanNode {
   std::size_t left_key_index_;
   std::size_t right_key_index_;
   JoinType join_type_;
+  ExpressionPtr residual_predicate_;
   Schema schema_;
 };
 

@@ -249,6 +249,42 @@ TEST(Binder, InListWithNullLiteralBindsAgainstNonNumericColumn) {
   EXPECT_EQ(null_literal->result_type().id, TypeId::String);
 }
 
+TEST(Binder, BindsCountDistinctToInt64Result) {
+  const auto stmt = sql::parse_sql(
+      "SELECT COUNT(DISTINCT region) AS region_cnt FROM read_parquet('/x.parquet') GROUP BY event_date");
+  const BoundQuery bound = bind_query(stmt, sales_schema());
+  ASSERT_EQ(bound.select_list.size(), 1u);
+  const auto* aggregate = dynamic_cast<const AggregateExpression*>(bound.select_list[0].expr.get());
+  ASSERT_NE(aggregate, nullptr);
+  EXPECT_EQ(aggregate->function(), AggregateFunction::CountDistinct);
+  EXPECT_EQ(aggregate->result_type().id, TypeId::Int64);
+  EXPECT_FALSE(aggregate->result_type().nullable);
+  ASSERT_NE(aggregate->argument(), nullptr);
+  EXPECT_EQ(aggregate->argument()->result_type().id, TypeId::String);
+}
+
+TEST(Binder, BindsSubstringToStringResult) {
+  const auto stmt = sql::parse_sql("SELECT SUBSTRING(region, 1, 2) AS cc FROM read_parquet('/x.parquet')");
+  const BoundQuery bound = bind_query(stmt, sales_schema());
+  ASSERT_EQ(bound.select_list.size(), 1u);
+  const auto* substring = dynamic_cast<const SubstringExpression*>(bound.select_list[0].expr.get());
+  ASSERT_NE(substring, nullptr);
+  EXPECT_EQ(substring->start(), 1);
+  EXPECT_EQ(substring->length(), 2);
+  EXPECT_EQ(substring->start_zero_based(), 0);
+  EXPECT_EQ(substring->result_type().id, TypeId::String);
+}
+
+TEST(Binder, RejectsSubstringOverNonStringOperand) {
+  const auto stmt = sql::parse_sql("SELECT SUBSTRING(amount, 1, 2) FROM read_parquet('/x.parquet')");
+  EXPECT_THROW((void)(bind_query(stmt, sales_schema())), BindingError);
+}
+
+TEST(Binder, RejectsSubstringWithStartLessThanOne) {
+  const auto stmt = sql::parse_sql("SELECT SUBSTRING(region, 0, 2) FROM read_parquet('/x.parquet')");
+  EXPECT_THROW((void)(bind_query(stmt, sales_schema())), BindingError);
+}
+
 TEST(Binder, CaseRequiresBooleanConditionsAndUnifiesResultTypes) {
   const auto stmt = sql::parse_sql(
       "SELECT CASE WHEN amount > 500 THEN 1 WHEN amount > 100 THEN 2 ELSE 0 END AS bucket "

@@ -81,7 +81,70 @@ Q15's shared `revenue0` view, inlined twice since KernelLake has no
 fixed) a real GPU-backend limitation this query's own exact `=`
 comparison exposes -- see `docs/ARCHITECTURE.md`'s "`HAVING` and scalar
 subqueries" section for both. **CPU-backend only** -- see `q15.sql`'s
-own header and the "GPU backend caveat" note below).
+own header and the "GPU backend caveat" note below), and **Q16** (a
+two-table `partsupp`/`part` `INNER JOIN`, `NOT LIKE`, a literal `IN (...)`
+list, and a non-correlated `NOT IN (SELECT ...)` subquery in `WHERE` --
+the mirror image of Q18's own `IN (SELECT ...)`, same underlying
+machinery just negated -- plus the first query in this project needing
+`COUNT(DISTINCT ...)`, genuinely supported on both backends (with one
+real GPU-backend-only restriction: it cannot be combined with another
+aggregate in the same `GROUP BY` -- see `docs/ARCHITECTURE.md`'s
+"`COUNT(DISTINCT ...)`" section for the full scope and why), and **Q22**
+(a derived table -- `FROM (SELECT SUBSTRING(c_phone,1,2) AS cntrycode,
+c_acctbal FROM customer WHERE ...) AS custsale GROUP BY cntrycode` --
+whose own inner `WHERE` combines a `SUBSTRING(...) IN (...)` literal-list
+filter, a non-correlated scalar subquery as a bare comparison operand
+(`c_acctbal > (SELECT AVG(c_acctbal) FROM customer WHERE ...)`, not
+`HAVING` or `IN`), and a correlated `NOT EXISTS (SELECT * FROM orders
+WHERE o_custkey = c_custkey)` -- the first query needing `SUBSTRING` at
+all, and the first needing a scalar subquery as a bare `WHERE` operand
+rather than `HAVING`'s threshold; see `docs/ARCHITECTURE.md`'s own
+`SUBSTRING` and "Non-correlated scalar subquery in WHERE" sections for
+the full scope), and **Q21** (a four-table `supplier`/`lineitem`/
+`orders`/`nation` `INNER JOIN` chain whose `WHERE` clause combines an
+`EXISTS` *and* a `NOT EXISTS`, both correlated to the same outer
+`lineitem` alias -- the first query needing two chained semi/anti steps
+in one query (rewritten into a `LEFT SEMI` immediately followed by a
+`LEFT ANTI`), and the first needing a residual (cross-side) correlation
+predicate inside `EXISTS`/`NOT EXISTS` itself (`l2.l_suppkey <>
+l1.l_suppkey`), not just a right-side-only auxiliary one. Found and
+fixed two real, previously-latent bugs along the way: `bind_query()`'s
+own running combined-schema-width counter (and `Binder`'s own per-alias
+offset bookkeeping) over-counted a semi/anti step's field width for
+whatever came after it -- harmless with a single semi/anti step (Q4's,
+Q13's, Q22's own shape), but corrupted the second of two *chained* steps'
+own column classification; and the physical planner's own
+`HashJoinNode::original_column_map()` inflated a semi/anti join's exposed
+original-index domain size by appending (nulled-out) entries for its own
+right side, similarly only surfacing once a second join sat directly
+above it. See `docs/ARCHITECTURE.md`'s "Correlated subqueries" section
+for the full scope and both fixes), **Q17** (a two-table `part`/
+`lineitem` `INNER JOIN` whose `WHERE` clause compares against a
+*correlated scalar* subquery -- `l_quantity < (SELECT 0.2 * AVG(l_quantity)
+FROM lineitem WHERE l_partkey = p_partkey)` -- the first query needing
+one at all, decorrelated by `sql::rewrite_correlated_scalar_subqueries()`
+into a `JOIN` against a synthesized, `GROUP BY`-aggregated derived table;
+see docs/ARCHITECTURE.md's new "Correlated scalar subqueries" section for
+the full rewrite and the two real bugs it surfaced (a single-source
+subquery's own qualified column references needing stripping, and a new
+`find_scan_boundary()` case for a derived-table join step's own root)),
+**Q2** (the same correlated-scalar-subquery machinery as Q17, but the
+subquery's own `FROM` is itself a 4-way `partsupp`/`supplier`/`nation`/
+`region` `JOIN` chain, not a single source -- confirms the rewrite moves
+an arbitrary inner join chain onto the derived table unmodified, and
+correctly keeps the subquery's own non-correlation `r_name = 'EUROPE'`
+filter on that derived table's own `WHERE` clause), and **Q20** (a
+`supplier`/`nation` `INNER JOIN` whose `WHERE` clause has an `IN
+(SELECT ...)` subquery nested *inside* another `IN (SELECT ...)`
+subquery, with a correlated scalar subquery -- itself needing a
+*two-column* correlation key, `l_partkey = ps_partkey AND l_suppkey =
+ps_suppkey` -- nested inside that. The first query confirming the
+decorrelation rewrite composes with no extra wiring wherever
+`QueryEngine::plan_logical_unoptimized()` itself recurses (an
+`IN`-subquery's own independently-planned body included), and the first
+needing a multi-column correlation key, split the same "one key in
+`ON`, the rest as a post-join `WHERE` filter" way TPC-H Q9's own
+two-column join condition already is).
 KernelLake supports a chain of two
 or more tables via `INNER` or `LEFT OUTER JOIN ... ON`, each step a single
 equality key (`LEFT OUTER` additionally allows an `ON`-clause predicate
@@ -157,9 +220,10 @@ also a single file.
 ## 2. Query
 
 The queries live in version-controlled files, `benchmarks/tpch/queries/
-q01.sql`, `q03.sql`, `q04.sql`, `q05.sql`, `q06.sql`, `q07.sql`, `q08.sql`,
+q01.sql`, `q02.sql`, `q03.sql`, `q04.sql`, `q05.sql`, `q06.sql`, `q07.sql`, `q08.sql`,
 `q09.sql`, `q10.sql`, `q11.sql`, `q12.sql`, `q13.sql`, `q14.sql`,
-`q15.sql`, `q18.sql`, `q19.sql`, each with a header comment documenting
+`q15.sql`, `q16.sql`, `q17.sql`, `q18.sql`, `q19.sql`, `q20.sql`, `q21.sql`, `q22.sql` --
+all 22 of TPC-H's standard queries -- each with a header comment documenting
 its specific deviations from canonical TPC-H syntax (`FROM lineitem` ->
 `FROM read_parquet('{data}')`, no `INTERVAL` arithmetic). Q1/Q6 need only
 `{data}` substituted with your `lineitem` glob; Q19/Q14 also need
@@ -204,7 +268,37 @@ required by this project's own tooling but never actually substituted
 into Q13's query text. Q15 needs `{data}` and `{supplier_data}`
 substituted with your `lineitem` and `supplier` globs (each appears
 *twice* -- once in the outer `JOIN`, once again in the `HAVING`
-subquery's own re-`JOIN` -- both get the same substitution).
+subquery's own re-`JOIN` -- both get the same substitution). Q16 needs
+`{partsupp_data}`, `{part_data}`, and `{supplier_data}` substituted with
+your `partsupp`, `part`, and `supplier` globs -- like Q11/Q13, it doesn't
+reference `lineitem` at all, so `{data}`/`--data` is still required by
+this project's own tooling but never actually substituted into Q16's
+query text. Q22 needs `{customer_data}` and `{orders_data}` substituted
+with your `customer` and `orders` globs (`{customer_data}` appears
+*twice* -- once in the derived table's own outer filter, once again in
+the correlated-average subquery's identical re-filter -- both get the
+same substitution) -- like Q11/Q13/Q16, it doesn't reference `lineitem`
+at all, so `{data}`/`--data` is still required by this project's own
+tooling but never actually substituted into Q22's query text. Q21 needs
+`{data}`, `{supplier_data}`, `{orders_data}`, and `{nation_data}`
+substituted with your `lineitem`, `supplier`, `orders`, and `nation`
+globs (`{data}` appears *three* times -- once in the outer join as `l1`,
+once each in the `EXISTS`/`NOT EXISTS` subqueries as `l2`/`l3` -- all
+three get the same substitution). Q17 needs `{data}` and `{part_data}`
+substituted with your `lineitem` and `part` globs (`{data}` appears
+*twice* -- once in the outer join, once in the correlated subquery --
+both get the same substitution). Q2 needs `{part_data}`,
+`{partsupp_data}`, `{supplier_data}`, `{nation_data}`, and
+`{region_data}` substituted with your `part`, `partsupp`, `supplier`,
+`nation`, and `region` globs (`{partsupp_data}`/`{supplier_data}`/
+`{nation_data}`/`{region_data}` each appear *twice* -- once in the outer
+join, once again in the correlated subquery's own re-join -- both get
+the same substitution) -- like Q11/Q13/Q16/Q22, it doesn't reference
+`lineitem` at all, so `{data}`/`--data` is still required but never
+actually substituted into Q2's query text. Q20 needs `{data}`,
+`{supplier_data}`, `{nation_data}`, `{partsupp_data}`, and `{part_data}`
+substituted with your `lineitem`, `supplier`, `nation`, `partsupp`, and
+`part` globs.
 `{data}` must always be a `lineitem`-specific
 glob (e.g. `lineitem-*.parquet`), not a bare `*.parquet` --
 `generate_tpch.py` writes every table into the same output directory, so
@@ -347,9 +441,18 @@ python3 tools/validate_tpch.py \
 # required but unused by Q11's own query text), Q13 needs
 # --customer-data and --orders-data (--data likewise required but
 # unused), Q15 needs --supplier-data (CPU-backend only -- pass
-# --backend cpu, see q15.sql's own header), Q18 needs --customer-data
+# --backend cpu, see q15.sql's own header), Q16 needs --part-data,
+# --partsupp-data, and --supplier-data (--data is still required but
+# unused by Q16's own query text), Q18 needs --customer-data
 # and --orders-data (none covered by --query all, which only passes
-# --data):
+# --data), Q22 needs --customer-data and --orders-data (--data is still
+# required but unused by Q22's own query text), Q21 needs
+# --supplier-data, --orders-data, and --nation-data (--data is reused
+# three times -- l1/l2/l3 -- and substituted the same way as --query all's
+# own single --data flag), Q17 needs --part-data, Q2 needs --partsupp-data,
+# --supplier-data, --nation-data, and --region-data (--data is still
+# required but unused by Q2's own query text), Q20 needs --supplier-data,
+# --nation-data, --partsupp-data, and --part-data:
 python3 tools/validate_tpch.py \
   --kernellake build/gpu-dev/src/cli/kernellake \
   --data '/tmp/kernellake-tpch-sf1/lineitem-*.parquet' \
@@ -441,17 +544,30 @@ python3 tools/validate_tpch.py \
 python3 tools/validate_tpch.py \
   --kernellake build/gpu-dev/src/cli/kernellake \
   --data '/tmp/kernellake-tpch-sf1/lineitem-*.parquet' \
+  --part-data '/tmp/kernellake-tpch-sf1/part-*.parquet' \
+  --partsupp-data '/tmp/kernellake-tpch-sf1/partsupp-*.parquet' \
+  --supplier-data '/tmp/kernellake-tpch-sf1/supplier-*.parquet' \
+  --scale-factor 1 --query 16
+python3 tools/validate_tpch.py \
+  --kernellake build/gpu-dev/src/cli/kernellake \
+  --data '/tmp/kernellake-tpch-sf1/lineitem-*.parquet' \
   --customer-data '/tmp/kernellake-tpch-sf1/customer-*.parquet' \
   --orders-data '/tmp/kernellake-tpch-sf1/orders-*.parquet' \
   --scale-factor 1 --query 18
+python3 tools/validate_tpch.py \
+  --kernellake build/gpu-dev/src/cli/kernellake \
+  --data '/tmp/kernellake-tpch-sf1/lineitem-*.parquet' \
+  --customer-data '/tmp/kernellake-tpch-sf1/customer-*.parquet' \
+  --orders-data '/tmp/kernellake-tpch-sf1/orders-*.parquet' \
+  --scale-factor 1 --query 22
 ```
 
 This has been run at SF0.01, SF0.1, and SF1 (60,000, 600,000, and
 6,000,000 generated rows) -- Q1 and Q6 matched DuckDB exactly at every
 scale, including the full SF1 run (~105 MiB single Parquet file, zstd
 compression, 1,000,000-row row groups). Q19, Q12, Q14, Q3, Q10, Q5, Q7,
-Q8, Q9, Q11, and Q18 have each been verified at SF0.01 on both the CPU and
-GPU backends, exact match against DuckDB (Q3 including its 3-way join,
+Q8, Q9, Q11, Q16, Q22, and Q18 have each been verified at SF0.01 on both the
+CPU and GPU backends, exact match against DuckDB (Q3 including its 3-way join,
 Q4 including its correlated `EXISTS` subquery -- verified not just at
 SF0.01 but stress-tested at SF10 (a ~60M-row `lineitem` build side,
 orders split across 4 files), 20/20 clean runs and an exact DuckDB match
@@ -473,10 +589,48 @@ the `ps_suppkey = l_suppkey` `WHERE`-clause half of `partsupp`'s
 otherwise-inexpressible two-column join condition -- 175 real matching
 rows at SF0.01, not an empty/trivial result; Q11 including its 3-way join,
 `GROUP BY` + `HAVING`, and a real non-correlated scalar subquery computing
-`HAVING`'s own threshold; Q18 including its 3-way join and a real
+`HAVING`'s own threshold; Q16 including its real `COUNT(DISTINCT
+ps_suppkey)` (218 result rows at SF0.01, not an empty/trivial result) and
+its `NOT IN (SELECT ...)` subquery, on both backends -- confirming both
+that COUNT(DISTINCT) genuinely dedupes and that DuckDB needs no code
+changes for it either, it already supports it natively; Q18 including
+its 3-way join and a real
 non-correlated `IN (SELECT ...)` subquery in `WHERE` -- DuckDB needs no
 code changes for `HAVING`/`IN`-subqueries, it already supports both
-natively). Q15 has been verified at SF0.01 on the **CPU backend only**
+natively; Q22 including its `SUBSTRING`, its non-correlated scalar
+subquery as a bare `WHERE` comparison operand, and its correlated
+`NOT EXISTS` -- 7 result rows at SF0.01 (one per matched `cntrycode`),
+row counts exact on both backends, `totacctbal` differing only in
+DOUBLE-summation-order noise past the ~7th significant digit, the same
+as every other DOUBLE-accumulated aggregate in this suite); Q21 including
+its 4-way join and its two chained, same-outer-alias-correlated
+`EXISTS`/`NOT EXISTS` subqueries, each carrying a residual (cross-side)
+predicate -- 27 result rows at SF0.01, exact row-for-row match on both
+backends (`kernellake query --backend cpu`/`--backend gpu` byte-identical
+output, both matching DuckDB), confirming both the chained-semi/anti-
+steps bind-time fix and the physical planner's `original_column_map()`
+domain-size fix); Q17 including its correlated scalar subquery
+decorrelated into a JOIN against a synthesized `GROUP BY`-aggregated
+derived table -- 1 result row at SF0.01, matching DuckDB (`avg_yearly`
+differing only in the same DOUBLE-summation-order noise as every other
+aggregate in this suite); Q2 including the same decorrelation machinery
+over a subquery whose own `FROM` is itself a 4-way JOIN chain -- 4
+result rows at SF0.01, exact match on both backends, confirming both the
+inner-join-chain-moved-onto-the-derived-table-unmodified path and the
+`find_scan_boundary()` identity-boundary fix (row-for-row byte-identical
+`s_name`/`n_name`/`p_partkey`/etc. -- not just an aggregate scalar, so
+this also confirms the derived-table join's own row-for-row correctness,
+not just its aggregate arithmetic); Q20 including its two-level nested
+`IN (SELECT ...)` subqueries with a two-column-correlated scalar
+subquery nested inside the innermost one -- 2 result rows at SF0.01,
+exact match on both backends, confirming the decorrelation rewrite
+composes with no extra wiring through `run_subquery()`'s own independent
+`plan_logical_unoptimized()` re-entry, and that a second correlation
+column (`l_suppkey = ps_suppkey`) genuinely changes the result versus
+grouping by the first column (`l_partkey`) alone -- see
+`tests/gpu/correlated_scalar_subquery_test.cpp`'s own discriminating
+fixture data for a case verified to differ between the two). Q15 has
+been verified at SF0.01 on the **CPU backend only**
 (exact DuckDB match, 0/20 repeated runs mismatched) -- its own `HAVING`
 comparison against a subquery whose `FROM` is itself a derived table
 (`HAVING total_revenue = (SELECT MAX(total_revenue) FROM (SELECT ...

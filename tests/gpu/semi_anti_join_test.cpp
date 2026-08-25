@@ -211,6 +211,120 @@ TEST_F(ExistsQueryTest, ExistsCombinesWithGroupedAggregate) {
   EXPECT_EQ(count_column->Value(0), 4);
 }
 
+// A residual predicate (TPC-H Q21's shape: a non-equality conjunct
+// referencing *both* sides, not just the newly-joined one) -- self-joins
+// orders against itself to ask "does this customer have another order
+// besides this one". customer_id=10 has two orders (1, 2), each an
+// "other order" for the other; customers 20/30/99 each have exactly one
+// order, so no "other" order exists. Exercises SemiAntiJoinOperator's
+// cudf::mixed_left_semi_join() path (compile_two_table()'s LEFT/RIGHT
+// table_reference split) instead of the plain hash_join()+distinct()
+// path the auxiliary-predicate tests above use (that predicate only ever
+// touches the *newly-joined* side, never the outer one).
+TEST_F(ExistsQueryTest, ExistsWithResidualPredicateAcrossBothSidesKeepsOnlyCustomersWithAnotherOrder) {
+  const QueryResult result = engine_.execute(
+      "SELECT o.order_id FROM read_parquet('" + orders_path_ +
+      "') AS o WHERE EXISTS (SELECT * FROM read_parquet('" + orders_path_ +
+      "') AS o2 WHERE o2.customer_id = o.customer_id AND o2.order_id <> o.order_id) ORDER BY o.order_id");
+  ASSERT_EQ(result.batches.size(), 1u);
+  const std::shared_ptr<arrow::RecordBatch>& batch = result.batches.front();
+  ASSERT_EQ(batch->num_rows(), 2);
+  const auto order_id_column =
+      std::static_pointer_cast<arrow::Int64Array>(batch->GetColumnByName("order_id"));
+  ASSERT_NE(order_id_column, nullptr);
+  EXPECT_EQ(order_id_column->Value(0), 1);
+  EXPECT_EQ(order_id_column->Value(1), 2);
+}
+
+// The NOT EXISTS/LeftAnti side of the same residual-predicate machinery:
+// only customers with no *other* order (20, 30, 99) survive.
+TEST_F(ExistsQueryTest, NotExistsWithResidualPredicateAcrossBothSidesKeepsOnlySoleOrders) {
+  const QueryResult result = engine_.execute(
+      "SELECT o.order_id FROM read_parquet('" + orders_path_ +
+      "') AS o WHERE NOT EXISTS (SELECT * FROM read_parquet('" + orders_path_ +
+      "') AS o2 WHERE o2.customer_id = o.customer_id AND o2.order_id <> o.order_id) ORDER BY o.order_id");
+  ASSERT_EQ(result.batches.size(), 1u);
+  const std::shared_ptr<arrow::RecordBatch>& batch = result.batches.front();
+  ASSERT_EQ(batch->num_rows(), 3);
+  const auto order_id_column =
+      std::static_pointer_cast<arrow::Int64Array>(batch->GetColumnByName("order_id"));
+  ASSERT_NE(order_id_column, nullptr);
+  EXPECT_EQ(order_id_column->Value(0), 3);
+  EXPECT_EQ(order_id_column->Value(1), 4);
+  EXPECT_EQ(order_id_column->Value(2), 5);
+}
+
+// TPC-H Q21's exact shape: an EXISTS *and* a NOT EXISTS, both correlated
+// to the same outer alias and both carrying their own residual predicate,
+// chained back-to-back (rewritten into a LeftSemi step immediately
+// followed by a LeftAnti step). Regression test for two real,
+// previously-latent bugs this combination exposed, both now fixed:
+//   1. bind_query(join_schemas)'s own `combined_field_count`/join_sources_
+//      offset bookkeeping (binder.cpp) used to grow by a semi/anti step's
+//      full source width even though that step contributes zero fields to
+//      the real combined row -- harmless with a single semi/anti step
+//      (never followed by another), but corrupted the *second* step's own
+//      column-index classification once two were chained.
+//   2. The physical planner's HashJoinNode::original_column_map() for a
+//      LeftSemi/LeftAnti join used to still append (nulled-out) entries
+//      for its own right side, inflating the *domain size* a join sitting
+//      directly above it would see -- silently misclassifying the outer
+//      step's own residual-predicate columns as belonging to the inner
+//      step's defunct right side instead.
+// Only order_id=1 survives: customer 10's other order (order_id=2) fails
+// the EXISTS check trivially (order 1 exists as its own "other order"),
+// but order 2 itself is excluded by the NOT EXISTS clause below (order 1,
+// with a *smaller* order_id, is its own disqualifying "earlier sibling").
+TEST_F(ExistsQueryTest, ChainedExistsAndNotExistsBothCorrelatedToSameOuterAliasWithResidualPredicates) {
+  const QueryResult result = engine_.execute(
+      "SELECT o.order_id FROM read_parquet('" + orders_path_ +
+      "') AS o WHERE EXISTS (SELECT * FROM read_parquet('" + orders_path_ +
+      "') AS o2 WHERE o2.customer_id = o.customer_id AND o2.order_id <> o.order_id) "
+      "AND NOT EXISTS (SELECT * FROM read_parquet('" +
+      orders_path_ +
+      "') AS o3 WHERE o3.customer_id = o.customer_id AND o3.order_id <> o.order_id AND o3.order_id < "
+      "o.order_id) ORDER BY o.order_id");
+  ASSERT_EQ(result.batches.size(), 1u);
+  const std::shared_ptr<arrow::RecordBatch>& batch = result.batches.front();
+  ASSERT_EQ(batch->num_rows(), 1);
+  const auto order_id_column =
+      std::static_pointer_cast<arrow::Int64Array>(batch->GetColumnByName("order_id"));
+  ASSERT_NE(order_id_column, nullptr);
+  EXPECT_EQ(order_id_column->Value(0), 1);
+}
+
+TEST_F(ExistsQueryTest, ResidualPredicateCpuBackendMatchesGpuBackend) {
+  const std::string sql =
+      "SELECT o.order_id FROM read_parquet('" + orders_path_ +
+      "') AS o WHERE EXISTS (SELECT * FROM read_parquet('" + orders_path_ +
+      "') AS o2 WHERE o2.customer_id = o.customer_id AND o2.order_id <> o.order_id) "
+      "AND NOT EXISTS (SELECT * FROM read_parquet('" +
+      orders_path_ +
+      "') AS o3 WHERE o3.customer_id = o.customer_id AND o3.order_id <> o.order_id AND o3.order_id < "
+      "o.order_id) ORDER BY o.order_id";
+  const QueryResult gpu_result = engine_.execute(sql);
+
+  EngineConfig cpu_config = default_config();
+  cpu_config.engine.backend = "cpu";
+  const QueryEngine cpu_engine(cpu_config);
+  const QueryResult cpu_result = cpu_engine.execute(sql);
+
+  ASSERT_EQ(gpu_result.batches.size(), 1u);
+  ASSERT_EQ(cpu_result.batches.size(), 1u);
+  const arrow::RecordBatch& gpu_batch = *gpu_result.batches.front();
+  const arrow::RecordBatch& cpu_batch = *cpu_result.batches.front();
+  ASSERT_EQ(gpu_batch.num_rows(), cpu_batch.num_rows());
+  const auto gpu_order_id =
+      std::static_pointer_cast<arrow::Int64Array>(gpu_batch.GetColumnByName("order_id"));
+  const auto cpu_order_id =
+      std::static_pointer_cast<arrow::Int64Array>(cpu_batch.GetColumnByName("order_id"));
+  ASSERT_NE(gpu_order_id, nullptr);
+  ASSERT_NE(cpu_order_id, nullptr);
+  for (std::int64_t i = 0; i < gpu_batch.num_rows(); ++i) {
+    EXPECT_EQ(gpu_order_id->Value(i), cpu_order_id->Value(i)) << "row " << i;
+  }
+}
+
 TEST_F(ExistsQueryTest, ExistsCpuBackendMatchesGpuBackend) {
   const std::string sql =
       "SELECT o.order_id " + exists_clause(" AND c.name <> 'Bob'") + " ORDER BY o.order_id";

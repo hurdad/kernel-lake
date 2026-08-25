@@ -97,6 +97,7 @@ enum class AstAggregateFunc : std::uint8_t {
   Sum,
   Count,
   CountStar,
+  CountDistinct,
   Min,
   Max,
   Avg,
@@ -175,6 +176,22 @@ struct AstExtract {
   AstExprPtr operand;
 };
 
+// `SUBSTRING(operand, start, length)` -- SQL-92's own `SUBSTRING(x FROM
+// start FOR length)` isn't in this project's grammar (hsql has no
+// dedicated FROM/FOR substring rule; TPC-H Q22's own use is rewritten to
+// this function-call form, the same kind of syntactic deviation every
+// other query's own header comment already documents). `start` is
+// 1-based (SQL's own convention -- the binder/expression layer converts
+// to 0-based when actually slicing); both `start` and `length` must be
+// integer literals in the source SQL (parser.cpp rejects anything else),
+// matching AstCast's own decimal_precision/decimal_scale fields being
+// plain literal-only integers rather than general expressions.
+struct AstSubstring {
+  AstExprPtr operand;
+  std::int64_t start;
+  std::int64_t length;
+};
+
 // `(SELECT ...)` used as a value expression -- only ever legal today as an
 // operand inside a `HAVING` clause's boolean expression (see
 // kernellake::sql::resolve_subqueries()/QueryEngine::evaluate_scalar_subquery(),
@@ -223,7 +240,7 @@ struct AstExists {
 
 struct AstExpr {
   std::variant<AstColumnRef, AstStar, AstLiteral, AstBinary, AstUnary, AstBetween, AstAggregate, AstLike,
-               AstIn, AstCase, AstCast, AstExtract, AstSubquery, AstExists>
+               AstIn, AstCase, AstCast, AstExtract, AstSubstring, AstSubquery, AstExists>
       node;
   std::optional<std::string> alias;
 };
@@ -254,6 +271,22 @@ struct AstJoinStep {
   AstParquetSource source;
   AstExprPtr condition;
   kernellake::JoinType join_type = kernellake::JoinType::Inner;
+  // Non-null only when this step was synthesized internally by
+  // sql::rewrite_correlated_scalar_subqueries() (TPC-H Q17/Q2/Q20's
+  // shape: `WHERE l_quantity < (SELECT 0.2 * AVG(l_quantity) FROM
+  // lineitem WHERE l_partkey = p_partkey)`, decorrelated into a JOIN
+  // against a `GROUP BY`-aggregated derived table) -- a derived table
+  // (its own SELECT/FROM/WHERE/GROUP BY) used as this step's join source
+  // instead of a real `read_parquet(...)` scan. `source.paths` is empty
+  // and unused in this case; `source.alias` still holds the step's own
+  // alias, the same as a real source. Never produced by parsing real SQL
+  // syntax -- there is no `JOIN (SELECT ...) AS x ON ...` grammar; this
+  // is purely an internal decorrelation-rewrite output.
+  // QueryEngine::plan_logical_unoptimized() recursively plans it (the
+  // same way `AstSelectStatement::from_subquery` already does for a
+  // whole-FROM derived table) instead of resolving `source.paths` via
+  // inspect_source().
+  std::shared_ptr<AstSelectStatement> derived_source;
 };
 
 // `FROM read_parquet(...) AS a JOIN read_parquet(...) AS b ON <c1> [JOIN

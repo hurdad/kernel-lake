@@ -157,6 +157,12 @@ ExpressionPtr rewrite_aggregate_refs(const ExpressionPtr& expr, std::vector<Name
                                group_by_positions, group_by_count),
         extract->result_type());
   }
+  if (const auto* substring = dynamic_cast<const SubstringExpression*>(expr.get())) {
+    return std::make_shared<SubstringExpression>(
+        rewrite_aggregate_refs(substring->operand(), aggregates, aggregate_positions, group_by,
+                               group_by_positions, group_by_count),
+        substring->start(), substring->length(), substring->result_type());
+  }
   return expr;
 }
 
@@ -295,7 +301,8 @@ LogicalPlanPtr build_logical_plan(const BoundQuery& query, const Schema& source_
 }
 
 LogicalPlanPtr build_logical_plan(const BoundQuery& query, const std::vector<Schema>& join_schemas,
-                                  std::vector<std::vector<PartitionColumn>> partition_columns_per_source) {
+                                  std::vector<std::vector<PartitionColumn>> partition_columns_per_source,
+                                  const std::vector<LogicalPlanPtr>& join_subplans) {
   if (!query.join.has_value()) {
     throw PlanningError("unreachable: build_logical_plan(join_schemas) called without a JOIN clause");
   }
@@ -309,6 +316,10 @@ LogicalPlanPtr build_logical_plan(const BoundQuery& query, const std::vector<Sch
         "unreachable: build_logical_plan(join_schemas) called with a mismatched partition_columns_per_source "
         "count");
   }
+  if (!join_subplans.empty() && join_subplans.size() != join_schemas.size()) {
+    throw PlanningError(
+        "unreachable: build_logical_plan(join_schemas) called with a mismatched join_subplans count");
+  }
   // Builds a left-deep chain of LogicalJoin nodes, one per step, e.g.
   // LogicalJoin(LogicalJoin(Scan(0), Scan(1)), Scan(2)) for 3 sources --
   // exactly matching BoundJoin's own left-to-right chain structure (see
@@ -321,12 +332,23 @@ LogicalPlanPtr build_logical_plan(const BoundQuery& query, const std::vector<Sch
     return partition_columns_per_source.empty() ? std::vector<PartitionColumn>{}
                                                 : partition_columns_per_source[index];
   };
+  auto subplan_for = [&](std::size_t index) -> LogicalPlanPtr {
+    return join_subplans.empty() ? nullptr : join_subplans[index];
+  };
   LogicalPlanPtr plan = std::make_shared<LogicalScan>(query.join->first_source_paths, join_schemas[0],
                                                       partition_columns_for(0));
   for (std::size_t i = 0; i < query.join->steps.size(); ++i) {
     const BoundJoinStep& step = query.join->steps[i];
-    LogicalPlanPtr right_scan =
-        std::make_shared<LogicalScan>(step.source_paths, join_schemas[i + 1], partition_columns_for(i + 1));
+    // A decorrelated correlated-scalar-subquery step (TPC-H Q17/Q2/Q20's
+    // shape, see sql::rewrite_correlated_scalar_subqueries()'s own doc
+    // comment) already has its own fully-built logical plan -- reuse it
+    // directly instead of constructing a LogicalScan, mirroring the
+    // derived-table-as-whole-FROM overload below.
+    LogicalPlanPtr right_scan = subplan_for(i + 1);
+    if (right_scan == nullptr) {
+      right_scan =
+          std::make_shared<LogicalScan>(step.source_paths, join_schemas[i + 1], partition_columns_for(i + 1));
+    }
     // An auxiliary ON-clause conjunct referencing only this source's own
     // columns (e.g. TPC-H Q13's `o_comment NOT LIKE '%special%requests%'`)
     // -- see BoundJoinStep::right_prefilter's own comment for why this is
@@ -335,7 +357,7 @@ LogicalPlanPtr build_logical_plan(const BoundQuery& query, const std::vector<Sch
       right_scan = std::make_shared<LogicalFilter>(std::move(right_scan), step.right_prefilter);
     }
     plan = std::make_shared<LogicalJoin>(std::move(plan), std::move(right_scan), step.combined_key_index,
-                                         step.source_key_index, step.join_type);
+                                         step.source_key_index, step.join_type, step.residual_predicate);
   }
   return finish_logical_plan(std::move(plan), query);
 }

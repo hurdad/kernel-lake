@@ -245,6 +245,42 @@ class ExtractExpression final : public Expression {
 };
 
 // ---------------------------------------------------------------------------
+// SUBSTRING
+// ---------------------------------------------------------------------------
+
+// `SUBSTRING(operand, start, length)` -- `start` is 1-based (SQL's own
+// convention, as parsed by sql::AstSubstring); `start_zero_based()` below
+// converts once, at the boundary, so every execution backend works in
+// plain 0-based [start, start+length) character offsets without each
+// needing to repeat the same -1. Always evaluates to STRING -- the binder
+// requires `operand` to be STRING.
+class SubstringExpression final : public Expression {
+ public:
+  SubstringExpression(ExpressionPtr operand, std::int64_t start, std::int64_t length, DataType result_type)
+      : operand_(std::move(operand)), start_(start), length_(length), type_(result_type) {}
+
+  [[nodiscard]] const ExpressionPtr& operand() const noexcept { return operand_; }
+  [[nodiscard]] std::int64_t start() const noexcept { return start_; }
+  [[nodiscard]] std::int64_t length() const noexcept { return length_; }
+  [[nodiscard]] std::int64_t start_zero_based() const noexcept { return start_ - 1; }
+  [[nodiscard]] const DataType& result_type() const override { return type_; }
+  [[nodiscard]] std::string to_string() const override {
+    return "SUBSTRING(" + operand_->to_string() + ", " + std::to_string(start_) + ", " +
+           std::to_string(length_) + ")";
+  }
+  [[nodiscard]] std::string structural_key() const override {
+    return "SUBSTRING(" + operand_->structural_key() + ", " + std::to_string(start_) + ", " +
+           std::to_string(length_) + ")";
+  }
+
+ private:
+  ExpressionPtr operand_;
+  std::int64_t start_;
+  std::int64_t length_;
+  DataType type_;
+};
+
+// ---------------------------------------------------------------------------
 // BETWEEN
 // ---------------------------------------------------------------------------
 
@@ -365,6 +401,7 @@ enum class AggregateFunction : std::uint8_t {
   Sum,
   Count,
   CountStar,
+  CountDistinct,
   Min,
   Max,
   Avg,

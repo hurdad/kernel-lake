@@ -108,6 +108,91 @@ TEST(HashAggregateOperator, MergesPartialGroupsAcrossBatches) {
   op.close(context);
 }
 
+// Regression coverage for COUNT(DISTINCT ...) (added for TPC-H Q16): the
+// GPU backend can't merge a per-batch "distinct count" across batches via
+// the same SUM-of-partials trick every other aggregate here uses (see
+// HashAggregateOperator's own CountDistinct comment) -- deliberately
+// repeats supplier 200 for region 1 and supplier 300 for region 2 *across*
+// two separate batches (not just within one), so a naive
+// sum-of-per-batch-distinct-counts implementation would double-count them
+// (region 1 -> 3, region 2 -> 3) instead of the true cross-batch distinct
+// count (region 1 -> 2 {100, 200}, region 2 -> 2 {300, 400}).
+TEST(HashAggregateOperator, CountDistinctMergesAcrossBatchesWithoutDoubleCountingRepeatedValues) {
+  RmmEnvironment env(default_config());
+
+  Schema region_supplier_schema({Field{"region", int32_type(false)}, Field{"supplier", int32_type(false)}});
+  auto make_region_supplier_batch = [&](const std::vector<int32_t>& regions,
+                                        const std::vector<int32_t>& suppliers) {
+    std::vector<std::unique_ptr<cudf::column>> columns;
+    columns.push_back(column_from_host(regions, cudf::type_id::INT32));
+    columns.push_back(column_from_host(suppliers, cudf::type_id::INT32));
+    return DeviceBatch(std::make_unique<cudf::table>(std::move(columns)),
+                       std::make_shared<const Schema>(region_supplier_schema));
+  };
+
+  std::vector<DeviceBatch> batches;
+  batches.push_back(make_region_supplier_batch({1, 1, 1, 2}, {100, 100, 200, 300}));
+  batches.push_back(make_region_supplier_batch({1, 2, 2}, {200, 300, 400}));
+  batches.push_back(make_region_supplier_batch({3}, {500}));
+
+  auto region = std::make_shared<ColumnExpression>("region", 0, int32_type(false));
+  std::vector<NamedExpression> group_by = {NamedExpression{region, "region"}};
+
+  auto supplier = std::make_shared<ColumnExpression>("supplier", 1, int32_type(false));
+  auto count_distinct_expr =
+      std::make_shared<AggregateExpression>(AggregateFunction::CountDistinct, supplier, int64_type(false));
+  std::vector<NamedExpression> aggregates = {NamedExpression{count_distinct_expr, "supplier_cnt"}};
+
+  HashAggregateOperator op(1, std::make_unique<VectorSourceOperator>(std::move(batches)), std::move(group_by),
+                           std::move(aggregates));
+  ExecutionContext context = make_context();
+  op.open(context);
+
+  std::optional<DeviceBatch> result = op.next(context);
+  ASSERT_TRUE(result.has_value());
+  EXPECT_EQ(result->row_count(), 3u);
+  EXPECT_FALSE(op.next(context).has_value());
+
+  const std::vector<int32_t> region_values = copy_to_host<int32_t>(result->view().column(0));
+  const std::vector<std::int64_t> count_values = copy_to_host<std::int64_t>(result->view().column(1));
+  std::map<int32_t, std::int64_t> by_region;
+  for (std::size_t i = 0; i < region_values.size(); ++i) {
+    by_region[region_values[i]] = count_values[i];
+  }
+
+  ASSERT_EQ(by_region.size(), 3u);
+  EXPECT_EQ(by_region[1], 2);  // {100, 200}
+  EXPECT_EQ(by_region[2], 2);  // {300, 400}
+  EXPECT_EQ(by_region[3], 1);  // {500}
+
+  op.close(context);
+}
+
+// The GPU backend's own restriction (see HashAggregateOperator's class
+// comment): unlike the CPU/Acero backend, COUNT(DISTINCT ...) can't share
+// a GROUP BY with another aggregate here.
+TEST(HashAggregateOperator, OpenThrowsWhenCountDistinctIsCombinedWithAnotherAggregate) {
+  RmmEnvironment env(default_config());
+
+  std::vector<DeviceBatch> batches;
+  batches.push_back(make_batch({1, 2}, {10.0, 20.0}));
+
+  auto region = std::make_shared<ColumnExpression>("region", 0, int32_type(false));
+  std::vector<NamedExpression> group_by = {NamedExpression{region, "region"}};
+
+  auto amount = std::make_shared<ColumnExpression>("amount", 1, float64_type(false));
+  auto count_distinct_expr =
+      std::make_shared<AggregateExpression>(AggregateFunction::CountDistinct, amount, int64_type(false));
+  auto sum_expr = std::make_shared<AggregateExpression>(AggregateFunction::Sum, amount, float64_type(true));
+  std::vector<NamedExpression> aggregates = {NamedExpression{count_distinct_expr, "distinct_cnt"},
+                                             NamedExpression{sum_expr, "total"}};
+
+  HashAggregateOperator op(1, std::make_unique<VectorSourceOperator>(std::move(batches)), std::move(group_by),
+                           std::move(aggregates));
+  ExecutionContext context = make_context();
+  EXPECT_THROW(op.open(context), ExecutionError);
+}
+
 // Regression test: cudf::groupby::streaming_groupby::aggregate() requires a
 // single call's row count to not exceed max_distinct_keys (an
 // implementation encoding-scheme constraint, unrelated to actual GROUP BY

@@ -4,6 +4,7 @@
 #include <cudf/scalar/scalar.hpp>
 
 #include <memory>
+#include <optional>
 #include <vector>
 
 #include "kernellake/execution_gpu/execution_context.hpp"
@@ -40,6 +41,26 @@ class ExpressionCompiler {
   // here.
   [[nodiscard]] const cudf::ast::expression& compile(const Expression& expr, ExecutionContext& context);
 
+  // Compiles a two-sided predicate (currently only
+  // SemiAntiJoinOperator's own residual_predicate_, TPC-H Q21's `l2.l_
+  // suppkey <> l1.l_suppkey` shape) for cudf::mixed_left_semi_join()/
+  // mixed_left_anti_join(), which evaluate an ast::expression against a
+  // *pair* of tables rather than one. `left_field_count` is the same
+  // threshold HashJoinNode::residual_predicate()'s own column-index
+  // convention already uses: a ColumnExpression index below it compiles
+  // to `cudf::ast::table_reference::LEFT` at that index; at or above it,
+  // to `table_reference::RIGHT` at `index - left_field_count`. Every
+  // other Expression node type compiles identically to the plain
+  // single-table compile() above (BinaryExpression/UnaryExpression/etc.
+  // don't care which table a nested ColumnExpression's reference resolves
+  // against, only compile_column() does) -- implemented by setting
+  // `two_table_left_field_count_` for the duration of this call and
+  // delegating straight to compile(), rather than a separate parallel
+  // recursive dispatcher.
+  [[nodiscard]] const cudf::ast::expression& compile_two_table(const Expression& expr,
+                                                               std::size_t left_field_count,
+                                                               ExecutionContext& context);
+
  private:
   const cudf::ast::expression& compile_column(const ColumnExpression& expr);
   const cudf::ast::expression& compile_literal(const LiteralExpression& expr, ExecutionContext& context);
@@ -53,6 +74,10 @@ class ExpressionCompiler {
 
   cudf::ast::tree tree_;
   std::vector<std::unique_ptr<cudf::scalar>> scalars_;
+  // Set only for the duration of a compile_two_table() call -- nullopt
+  // (the default, normal single-table mode) for every other caller, so
+  // compile_column() below behaves exactly as it always has for them.
+  std::optional<std::size_t> two_table_left_field_count_;
 };
 
 }  // namespace kernellake

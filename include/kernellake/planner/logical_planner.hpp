@@ -27,9 +27,18 @@ namespace kernellake {
 // of LogicalJoin(..., LogicalScan(...)) nodes, one join per step.
 // `partition_columns_per_source`, if non-empty, must have the same length
 // as `join_schemas` and is threaded onto each corresponding LogicalScan.
+// `join_subplans`, if non-empty, must have the same length as
+// `join_schemas` too: a non-null entry at index i (only ever i >= 1 in
+// practice -- see sql::rewrite_correlated_scalar_subqueries()'s own doc
+// comment) is used *directly* as that source's own already-built logical
+// plan instead of constructing a LogicalScan -- TPC-H Q17/Q2/Q20's
+// decorrelated-subquery-as-join-source shape, mirroring the derived-table
+// overload below (`source_plan`) but for one join step instead of a
+// query's *entire* FROM.
 [[nodiscard]] LogicalPlanPtr build_logical_plan(
     const BoundQuery& query, const std::vector<Schema>& join_schemas,
-    std::vector<std::vector<PartitionColumn>> partition_columns_per_source = {});
+    std::vector<std::vector<PartitionColumn>> partition_columns_per_source = {},
+    const std::vector<LogicalPlanPtr>& join_subplans = {});
 
 // The derived-table overload; only valid when `query` was bound (via the
 // single-table bind_query() overload) against `source_plan->output_schema()`

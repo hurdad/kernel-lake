@@ -200,18 +200,50 @@ LogicalPlanPtr QueryEngine::plan_logical_unoptimized(sql::AstSelectStatement ast
   // (neither touches AstExists nodes), this is just the more natural
   // "structural rewrite before inline resolution" sequence.
   ast = sql::rewrite_exists_subqueries(std::move(ast));
+  // Must run before the WHERE-clause resolve_subqueries() call below: a
+  // correlated scalar subquery (TPC-H Q17/Q2/Q20's shape) left in place
+  // would otherwise be handed to evaluate_scalar_subquery(), which binds
+  // it in total isolation -- any reference to this (outer) query's own
+  // columns would fail to resolve there, well before this decorrelation
+  // pass ever got a chance to run. Structural, like rewrite_exists_subqueries()
+  // above: it only ever *replaces* a matched WHERE conjunct's own
+  // AstSubquery node with a plain column reference into a new join step,
+  // so by the time resolve_subqueries()/resolve_in_subqueries() run, a
+  // decorrelated conjunct's subquery is already gone -- nothing left for
+  // either of those passes to (mis)handle. See
+  // sql::rewrite_correlated_scalar_subqueries()'s own doc comment for the
+  // full scope.
+  ast = sql::rewrite_correlated_scalar_subqueries(std::move(ast));
 
   if (ast.having != nullptr) {
     // Resolved before binding: the binder has no I/O capability of its
     // own (by design, see ast.hpp's own header comment) and can't run a
     // nested query itself -- see resolve_subqueries()'s own doc comment
     // for why this lives here instead. Any AstSubquery surviving this
-    // (i.e. one that wasn't inside HAVING) reaches Binder::bind_node(const
-    // AstSubquery&, bool) instead, which rejects it with a clear error.
+    // (i.e. one that wasn't inside HAVING or WHERE) reaches
+    // Binder::bind_node(const AstSubquery&, bool) instead, which rejects
+    // it with a clear error.
     ast.having = sql::resolve_subqueries(
         ast.having, [this](const sql::AstSelectStatement& sub) { return evaluate_scalar_subquery(sub); });
   }
   if (ast.where != nullptr) {
+    // Same resolve_subqueries() pass as HAVING above, also run over WHERE
+    // (TPC-H Q22's `c_acctbal > (SELECT AVG(c_acctbal) FROM customer WHERE
+    // ...)` shape -- a non-correlated scalar subquery as a bare WHERE
+    // comparison operand, not inside IN). resolve_subqueries() is generic,
+    // clause-agnostic AST-tree-walking code (it doesn't care which clause
+    // called it) and already deliberately leaves AstIn's own `subquery`
+    // field untouched (see its own doc comment) -- resolve_in_subqueries()
+    // just below is what resolves that one, so running both over the same
+    // ast.where is safe: each only ever touches its own distinct node
+    // shape (bare AstSubquery vs. AstIn::subquery). A *correlated* scalar
+    // subquery here would still fail -- run_subquery() binds/plans/
+    // executes it in total isolation, so any reference to the outer
+    // query's own columns fails to resolve inside that nested bind, the
+    // same "fails cleanly, not silently wrong" outcome as any other
+    // unsupported shape.
+    ast.where = sql::resolve_subqueries(
+        ast.where, [this](const sql::AstSelectStatement& sub) { return evaluate_scalar_subquery(sub); });
     // Same rationale as the HAVING resolution above, run separately since
     // an IN-subquery can legitimately return many rows (unlike HAVING's
     // exactly-one-row/one-column contract) -- see
@@ -226,20 +258,38 @@ LogicalPlanPtr QueryEngine::plan_logical_unoptimized(sql::AstSelectStatement ast
   if (ast.join.has_value()) {
     std::vector<Schema> join_schemas;
     std::vector<std::vector<PartitionColumn>> partition_columns_per_source;
+    std::vector<LogicalPlanPtr> join_subplans;
     join_schemas.reserve(ast.join->steps.size() + 1);
     partition_columns_per_source.reserve(ast.join->steps.size() + 1);
+    join_subplans.reserve(ast.join->steps.size() + 1);
     const ResolvedTable first =
         inspect_source(store_, ast.join->first.paths, &resolver, metadata_inspection_seconds_out);
     join_schemas.push_back(first.schema);
     partition_columns_per_source.push_back(first.partition_columns);
+    join_subplans.push_back(nullptr);
     for (const sql::AstJoinStep& step : ast.join->steps) {
+      // A decorrelated correlated-scalar-subquery step (TPC-H Q17/Q2/Q20's
+      // shape, see sql::rewrite_correlated_scalar_subqueries()'s own doc
+      // comment) -- plan its own derived table recursively, exactly like
+      // ast.from_subquery below does for a whole-FROM derived table, and
+      // use its output schema/logical plan instead of inspecting a real
+      // Parquet source.
+      if (step.derived_source != nullptr) {
+        LogicalPlanPtr inner =
+            plan_logical_unoptimized(*step.derived_source, resolver, metadata_inspection_seconds_out);
+        join_schemas.push_back(inner->output_schema());
+        partition_columns_per_source.emplace_back();
+        join_subplans.push_back(std::move(inner));
+        continue;
+      }
       const ResolvedTable resolved =
           inspect_source(store_, step.source.paths, &resolver, metadata_inspection_seconds_out);
       join_schemas.push_back(resolved.schema);
       partition_columns_per_source.push_back(resolved.partition_columns);
+      join_subplans.push_back(nullptr);
     }
     const BoundQuery bound = bind_query(ast, join_schemas);
-    return build_logical_plan(bound, join_schemas, std::move(partition_columns_per_source));
+    return build_logical_plan(bound, join_schemas, std::move(partition_columns_per_source), join_subplans);
   }
 
   if (ast.from_subquery != nullptr) {

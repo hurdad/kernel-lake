@@ -171,7 +171,7 @@ std::unique_ptr<PhysicalOperator> build(const PhysicalPlanPtr& node, ObjectStore
       return instrument(std::make_unique<SemiAntiJoinOperator>(
           next_id++, std::move(semi_anti_left), std::move(semi_anti_right), join->left_key_index(),
           join->right_key_index(), std::make_shared<const Schema>(join->output_schema()),
-          semi_anti_partition_count, spill_directory, join->join_type()));
+          semi_anti_partition_count, spill_directory, join->join_type(), join->residual_predicate()));
     }
     // Computed *before* recursing into children (unlike every other case
     // here): choose_partition_count() only needs the plan node itself

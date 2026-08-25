@@ -294,6 +294,26 @@ class HashAggregateOperator final : public PhysicalOperator {
   cudf::size_type pending_rows_ = 0;
   bool any_batch_seen_ = false;
   bool produced_ = false;
+
+  // COUNT(DISTINCT x): open() rejects any query that combines it with
+  // another aggregate in the same GROUP BY (see open()'s own check) --
+  // this operator's partial-then-merge design (see the class comment)
+  // relies on every physical value column being re-aggregatable via the
+  // *same* associative SUM/MIN/MAX across batch/merge boundaries, and a
+  // per-batch "distinct count" can't be summed into a correct global
+  // distinct count the same way (the same value appearing in two
+  // different batches would be double-counted). Instead, when this is
+  // the query's one and only aggregate, pending_partials_/accumulated_
+  // above are reused for a *different* purpose in this mode: each holds
+  // deduplicated (group-by-key columns, distinct argument) rows -- merged
+  // via cudf::distinct() (row-level dedup), not groupby+SUM -- with the
+  // true per-group distinct count computed only once, right before
+  // producing output in next(), via one real COUNT(argument) groupby over
+  // that fully-deduplicated table. The CPU (Acero) backend has no
+  // equivalent restriction -- see acero_query_executor.cpp's
+  // translate_aggregate().
+  bool is_count_distinct_ = false;
+  CompiledExpr compiled_count_distinct_arg_;
 };
 
 }  // namespace kernellake

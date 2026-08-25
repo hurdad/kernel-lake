@@ -30,6 +30,50 @@ TEST(SqlParser, ParsesGeneralMvpQuery) {
   EXPECT_EQ(*stmt.limit, 100);
 }
 
+TEST(SqlParser, ParsesCountDistinct) {
+  const auto stmt = parse_sql(
+      "SELECT p_brand, COUNT(DISTINCT ps_suppkey) AS supplier_cnt "
+      "FROM read_parquet('/partsupp.parquet') GROUP BY p_brand");
+  ASSERT_EQ(stmt.select_list.size(), 2u);
+  ASSERT_TRUE(std::holds_alternative<AstAggregate>(stmt.select_list[1]->node));
+  const auto& aggregate = std::get<AstAggregate>(stmt.select_list[1]->node);
+  EXPECT_EQ(aggregate.function, AstAggregateFunc::CountDistinct);
+  ASSERT_NE(aggregate.argument, nullptr);
+}
+
+// COUNT(DISTINCT *) isn't real SQL (DISTINCT only makes sense with a real
+// argument column, and COUNT(*) already means "every row" with no
+// argument to be distinct over) -- rejected rather than silently treated
+// as plain COUNT(*).
+TEST(SqlParser, RejectsCountDistinctStar) {
+  EXPECT_THROW((void)(parse_sql("SELECT COUNT(DISTINCT *) FROM read_parquet('/x.parquet')")), SqlError);
+}
+
+// Only COUNT(DISTINCT ...) is supported -- SUM/MIN/MAX/AVG with DISTINCT
+// isn't needed by any TPC-H query and isn't implemented.
+TEST(SqlParser, RejectsSumDistinct) {
+  EXPECT_THROW((void)(parse_sql("SELECT SUM(DISTINCT amount) FROM read_parquet('/x.parquet')")), SqlError);
+}
+
+TEST(SqlParser, ParsesSubstring) {
+  const auto stmt = parse_sql("SELECT SUBSTRING(c_phone, 1, 2) AS cc FROM read_parquet('/customer.parquet')");
+  ASSERT_EQ(stmt.select_list.size(), 1u);
+  ASSERT_TRUE(std::holds_alternative<AstSubstring>(stmt.select_list[0]->node));
+  const auto& substring = std::get<AstSubstring>(stmt.select_list[0]->node);
+  EXPECT_EQ(substring.start, 1);
+  EXPECT_EQ(substring.length, 2);
+  ASSERT_NE(substring.operand, nullptr);
+}
+
+TEST(SqlParser, RejectsSubstringWithNonLiteralStartOrLength) {
+  EXPECT_THROW((void)(parse_sql("SELECT SUBSTRING(c_phone, c_custkey, 2) FROM read_parquet('/x.parquet')")),
+               SqlError);
+}
+
+TEST(SqlParser, RejectsSubstringWithWrongArgumentCount) {
+  EXPECT_THROW((void)(parse_sql("SELECT SUBSTRING(c_phone, 1) FROM read_parquet('/x.parquet')")), SqlError);
+}
+
 TEST(SqlParser, ParsesTpchQ6Shape) {
   const auto stmt = parse_sql(
       "SELECT SUM(l_extendedprice * l_discount) AS revenue "

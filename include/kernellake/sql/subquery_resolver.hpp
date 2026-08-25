@@ -98,4 +98,61 @@ namespace kernellake::sql {
 // is unsupported.
 [[nodiscard]] AstSelectStatement rewrite_exists_subqueries(AstSelectStatement stmt);
 
+// Extracts every top-level `WHERE`-clause `AND`-conjunct of shape
+// `<expr> <comparison> (SELECT <agg-expr> FROM ... WHERE <correlation>)`
+// or `(SELECT ...) <comparison> <expr>` (TPC-H Q17's `l_quantity < (SELECT
+// 0.2 * AVG(l_quantity) FROM lineitem WHERE l_partkey = p_partkey)`) and
+// decorrelates it into a JOIN against a synthesized, `GROUP BY`-
+// aggregated derived table, appended as a new step onto `stmt`'s own join
+// chain (creating one, from `stmt.from`, if `stmt` had none yet, mirroring
+// `rewrite_exists_subqueries()`'s identical promotion) -- the matched
+// conjunct itself is rewritten in place to compare against the derived
+// table's own output column instead of the subquery.
+//
+// The subquery's own `WHERE` clause is scanned for top-level `AND`-
+// conjuncts that are a plain equality between a column qualified by one
+// of `stmt`'s own (outer) aliases and a column qualified by one of the
+// subquery's own (inner) aliases -- each such conjunct is a correlation
+// key, removed from the subquery's own `WHERE` and instead becomes: the
+// first one, the new join step's `ON`-clause equality key; any further
+// ones (TPC-H Q20's two-column `l_partkey = ps_partkey AND l_suppkey =
+// ps_suppkey` correlation), additional top-level conjuncts appended to
+// the *outer* query's own `WHERE` after the join (the exact same
+// "one key in `ON`, the rest as a post-join `WHERE` filter" idiom this
+// project's Q9 already uses for `partsupp`'s own two-column join
+// condition, and correct for the same reason: the derived table's
+// composite `GROUP BY` still groups by every correlation column
+// together, so a many-to-one join on the first key alone, filtered by
+// the rest afterward, produces the same result set as a true multi-key
+// join would). The subquery's own remaining (non-correlation) `WHERE`
+// conjuncts, if any (TPC-H Q2's own `r_name = '[REGION]'`), stay on the
+// synthesized derived table's `WHERE` clause unchanged; its own `FROM`
+// (a single source or a full multi-way `JOIN` chain, TPC-H Q2's own
+// 4-way `partsupp`/`supplier`/`nation`/`region` shape) is moved onto the
+// derived table as-is, uninspected -- this function has no opinion on
+// what's inside it, only on the subquery's own top-level shape (exactly
+// one `SELECT`-list item, no `GROUP BY`/`HAVING`/`ORDER BY`/`LIMIT`/
+// derived-table `FROM` of its own, at least one correlation conjunct
+// found).
+//
+// Like `rewrite_exists_subqueries()`, a purely structural AST-to-AST
+// transform with no I/O/execution dependency: the decorrelated subquery
+// becomes part of the *outer* query's own join chain and `GROUP BY`
+// binding, reusing the exact same, already-tested machinery any real
+// multi-way `JOIN`-plus-aggregate query goes through -- never run
+// separately beforehand the way a HAVING/IN subquery is. Runs generically
+// on whatever `AstSelectStatement` it's given, so it applies equally
+// however deeply this statement is nested (a top-level query, an `IN
+// (SELECT ...)`'s own body, a derived table's own inner query, ...) as
+// long as the caller runs it wherever `QueryEngine::plan_logical_unoptimized()`
+// itself recurses -- see that function's own call site.
+//
+// A conjunct that isn't rewritable (any restriction above unmet, or no
+// correlation conjunct found in the subquery's own `WHERE` at all -- a
+// non-correlated scalar subquery, `resolve_subqueries()`'s own job, run
+// separately) is left exactly where it is, to be resolved by that other
+// pass or, failing that, rejected at bind time with a clear, specific
+// error the same way any other unsupported subquery shape already is.
+[[nodiscard]] AstSelectStatement rewrite_correlated_scalar_subqueries(AstSelectStatement stmt);
+
 }  // namespace kernellake::sql

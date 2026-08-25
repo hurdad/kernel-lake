@@ -3886,6 +3886,74 @@ log` is the authoritative chronology if that ordering ever matters.
   full existing TPC-H suite and unit/GPU test suites. 16 of TPC-H's 22
   queries now, up from 15.
 
+- **All 22 of TPC-H's standard queries now implemented** (`q01.sql`
+  through `q22.sql`), up from 16 -- six added this session: **Q16**
+  (`COUNT(DISTINCT ...)`, genuinely supported on both backends via a
+  parallel dedup-based merge path in `HashAggregateOperator` alongside
+  its existing associative-SUM one; one real GPU-only restriction, can't
+  combine with another aggregate in the same `GROUP BY`); **Q22**
+  (`SUBSTRING`, plus a non-correlated scalar subquery as a bare `WHERE`
+  comparison operand rather than `HAVING`'s own threshold -- found and
+  fixed a real projection-pruning gap along the way, `SubstringExpression`
+  was missing from five separate tree-walking functions across
+  `physical_planner.cpp`/`optimizer.cpp`/`logical_planner.cpp`/
+  `subquery_resolver.cpp`); **Q21** (`EXISTS` *and* `NOT EXISTS` chained
+  in one `WHERE` clause, both correlated to the same outer alias, each
+  carrying a residual (cross-side, not just right-side-only) correlation
+  predicate -- found and fixed two real, previously-latent bugs: `Binder`'s
+  own running combined-schema-width bookkeeping over-counted a semi/anti
+  step's field width for whatever came after it, corrupting a *second*
+  chained step's own column classification; and the physical planner's
+  `HashJoinNode::original_column_map()` similarly inflated a semi/anti
+  join's exposed original-index domain size. Evaluated via
+  `cudf::mixed_left_semi_join()`/`mixed_left_anti_join()` on GPU and
+  Arrow Acero's own `HashJoinNodeOptions::filter` on CPU -- both
+  purpose-built two-sided join primitives that needed no hand-rolled
+  dedup/sentinel-filtering logic); **Q17**, **Q2**, and **Q20** (the
+  first queries needing a *correlated scalar* subquery in `WHERE`, as
+  opposed to `EXISTS`/`NOT EXISTS` or a non-correlated one -- a new
+  `sql::rewrite_correlated_scalar_subqueries()` AST rewrite decorrelates
+  the matched conjunct into a `JOIN` against a synthesized, `GROUP BY`-
+  aggregated derived table, reusing the existing bind/plan/optimize/
+  execute pipeline with no new operator, expression type, or physical-
+  plan node of its own -- Q17 exercises the minimal single-source-
+  subquery shape (needing a new `strip_table_qualifier()` fix: the
+  derived table's own reused expressions keep their subquery-scope
+  qualifier, invalid once that single source is left unjoined), Q2
+  exercises a subquery whose own `FROM` is itself a 4-way `JOIN` chain
+  (moved onto the derived table unmodified), and Q20 exercises both a
+  *two-column* correlation key (split the same "one key in `ON`, the
+  rest as a post-join `WHERE` filter" way Q9's own two-column join
+  condition already is) and nesting *inside* an `IN (SELECT ...)`
+  subquery's own independently-planned body, confirming the rewrite
+  composes for free wherever `QueryEngine::plan_logical_unoptimized()`
+  itself recurses. Found and fixed one more real bug along the way:
+  `physical_planner.cpp`'s `find_scan_boundary()` had no case for a JOIN
+  child whose own root is an independently-planned query's final
+  `Projection`/`Aggregate` node (a derived-table join step, never
+  possible before this feature) -- it would recurse *through* that node
+  looking for a scan/join boundary, finding an unrelated one buried
+  inside and silently misindexing against it; fixed by giving these
+  three node types their own identity `ScanBoundary`, switching
+  `ScanBoundary::original_to_narrowed` from a raw pointer to a
+  `shared_ptr` in the process (an owned, freshly-synthesized identity
+  map needed somewhere to live). See `docs/ARCHITECTURE.md`'s
+  "Correlated subqueries"/"Correlated scalar subqueries"/
+  "`COUNT(DISTINCT ...)`"/"`SUBSTRING`" sections and `docs/TPCH.md`'s own
+  per-query scope paragraphs for the full detail on each. Verified: all
+  22 queries pass `tools/validate_tpch.py --query all` against DuckDB at
+  SF0.01 on the CPU backend (22/22) and the GPU backend (21/22 -- Q15
+  remains the sole, pre-existing, documented GPU-backend exception, a
+  cross-backend floating-point comparison limitation unrelated to this
+  session's work), plus zero regressions across the full existing unit
+  (834/835, one pre-existing unrelated OTel-logging test-isolation flake)
+  and GPU (250/250) test suites, each backed by new permanent regression
+  tests (`hash_aggregate_operator_test.cpp`,
+  `filter_projection_operator_test.cpp`, `semi_anti_join_test.cpp`,
+  `correlated_scalar_subquery_test.cpp`, plus binder/parser-level unit
+  tests) and, for both bind-time bugs and the multi-column-correlation
+  mechanism, a real revert-confirm-fail/restore-confirm-pass cycle.
+
 ## Not yet started
 
 - **Unity Catalog support: remaining gaps** -- the core read path (Phase 5

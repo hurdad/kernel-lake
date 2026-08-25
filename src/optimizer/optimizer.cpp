@@ -272,6 +272,14 @@ ExpressionPtr simplify_expression(const ExpressionPtr& expr) {
     }
     return std::make_shared<ExtractExpression>(extract->part(), std::move(operand), extract->result_type());
   }
+  if (const auto* substring = dynamic_cast<const SubstringExpression*>(expr.get())) {
+    ExpressionPtr operand = simplify_expression(substring->operand());
+    if (operand.get() == substring->operand().get()) {
+      return expr;
+    }
+    return std::make_shared<SubstringExpression>(std::move(operand), substring->start(), substring->length(),
+                                                 substring->result_type());
+  }
   return expr;  // ColumnExpression, LiteralExpression: nothing to simplify.
 }
 
@@ -313,6 +321,8 @@ void collect_columns(const ExpressionPtr& expr, std::unordered_set<std::size_t>&
     collect_columns(case_expr->else_branch(), out);
   } else if (const auto* extract = dynamic_cast<const ExtractExpression*>(expr.get())) {
     collect_columns(extract->operand(), out);
+  } else if (const auto* substring = dynamic_cast<const SubstringExpression*>(expr.get())) {
+    collect_columns(substring->operand(), out);
   }
   // LiteralExpression: nothing to collect. AstIn desugars into
   // BinaryExpression at bind time (see binder.cpp), so it needs no case
@@ -452,6 +462,11 @@ ExpressionPtr shift_columns(const ExpressionPtr& expr, std::int64_t delta) {
     return std::make_shared<ExtractExpression>(extract->part(), shift_columns(extract->operand(), delta),
                                                extract->result_type());
   }
+  if (const auto* substring = dynamic_cast<const SubstringExpression*>(expr.get())) {
+    return std::make_shared<SubstringExpression>(shift_columns(substring->operand(), delta),
+                                                 substring->start(), substring->length(),
+                                                 substring->result_type());
+  }
   return expr;  // LiteralExpression: no column indices to shift.
 }
 
@@ -538,7 +553,7 @@ LogicalPlanPtr push_predicate_through_join(const LogicalJoin& join, const Expres
   }
   LogicalPlanPtr new_join =
       std::make_shared<LogicalJoin>(std::move(new_left), std::move(new_right), join.left_key_index(),
-                                    join.right_key_index(), join.join_type());
+                                    join.right_key_index(), join.join_type(), join.residual_predicate());
   if (remaining_conjuncts.empty()) {
     return new_join;
   }
@@ -574,7 +589,8 @@ LogicalPlanPtr rewrite_plan(const LogicalPlanPtr& node) {
     LogicalPlanPtr left = rewrite_plan(join->left());
     LogicalPlanPtr right = rewrite_plan(join->right());
     return std::make_shared<LogicalJoin>(std::move(left), std::move(right), join->left_key_index(),
-                                         join->right_key_index(), join->join_type());
+                                         join->right_key_index(), join->join_type(),
+                                         join->residual_predicate());
   }
 
   if (const auto* filter = dynamic_cast<const LogicalFilter*>(node.get())) {
@@ -747,6 +763,24 @@ void annotate_scan(const LogicalPlanPtr& node, std::unordered_set<std::size_t>& 
     }
     left_required.insert(join->left_key_index());
     right_required.insert(join->right_key_index());
+    // A residual_predicate (LeftSemi/LeftAnti only, TPC-H Q21's shape --
+    // see LogicalJoin's own doc comment) references columns on *both*
+    // sides directly, not through a separate Filter node the way every
+    // other cross-referencing predicate in this codebase does -- so its
+    // own required columns need collecting here explicitly, split by the
+    // same left_count threshold, or pruning could drop a column it still
+    // needs.
+    if (join->residual_predicate() != nullptr) {
+      std::unordered_set<std::size_t> residual_columns;
+      collect_columns(join->residual_predicate(), residual_columns);
+      for (const std::size_t index : residual_columns) {
+        if (index < left_count) {
+          left_required.insert(index);
+        } else {
+          right_required.insert(index - left_count);
+        }
+      }
+    }
 
     std::vector<PushablePredicate> no_left_pushdown;
     annotate_scan(join->left(), left_required, no_left_pushdown);

@@ -403,6 +403,13 @@ arrow::compute::Aggregate translate_aggregate(AggregateInputPlan& plan, const Ag
     case AggregateFunction::Count:
       return arrow::compute::Aggregate{grouped ? "hash_count" : "count", count_options(), target,
                                        output_name};
+    case AggregateFunction::CountDistinct:
+      // Unlike the GPU backend (see HashAggregateOperator's own comment),
+      // Acero's hash_count_distinct/count_distinct are ordinary grouped
+      // aggregate functions with no restriction against being mixed with
+      // other aggregates in the same GROUP BY.
+      return arrow::compute::Aggregate{grouped ? "hash_count_distinct" : "count_distinct", count_options(),
+                                       target, output_name};
     case AggregateFunction::CountStar:
       // "count"/"hash_count" require a real value column (arity 1/2); Acero
       // has dedicated arity-0/1 "count_all"/"hash_count_all" functions
@@ -469,12 +476,26 @@ arrow::acero::Declaration translate(const PhysicalPlanPtr& node, ObjectStore& st
         acero_join_type = arrow::acero::JoinType::INNER;
         break;
     }
+    // A residual_predicate (LeftSemi/LeftAnti only, TPC-H Q21's shape --
+    // see HashJoinNode's own doc comment) compiles through the *ordinary*
+    // single-table compile_expression_cpu() path with no special-casing
+    // at all: its column indices are already remapped by
+    // physical_planner.cpp's remap_join_residual_predicate() into one
+    // combined (left-then-right) narrowed index space, exactly what
+    // HashJoinNodeOptions's own `filter` expects (Acero evaluates it
+    // against the full combined post-key-match row, unlike cudf's own
+    // mixed_join API, which needs two separate table_views -- see
+    // SemiAntiJoinOperator's own GPU-side handling for the contrast).
+    const arrow::compute::Expression filter = hash_join->residual_predicate() != nullptr
+                                                  ? compile_expression_cpu(*hash_join->residual_predicate())
+                                                  : arrow::compute::literal(true);
     return arrow::acero::Declaration{
         "hashjoin",
         {translate(hash_join->left(), store), translate(hash_join->right(), store)},
         arrow::acero::HashJoinNodeOptions{acero_join_type,
                                           {arrow::FieldRef(static_cast<int>(hash_join->left_key_index()))},
-                                          {arrow::FieldRef(static_cast<int>(hash_join->right_key_index()))}}};
+                                          {arrow::FieldRef(static_cast<int>(hash_join->right_key_index()))},
+                                          filter}};
   }
   if (const auto* filter = dynamic_cast<const FilterNode*>(node.get())) {
     return arrow::acero::Declaration{

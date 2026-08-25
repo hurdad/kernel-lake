@@ -154,6 +154,7 @@ std::string_view to_string(AggregateFunction function) noexcept {
       return "SUM";
     case AggregateFunction::Count:
     case AggregateFunction::CountStar:
+    case AggregateFunction::CountDistinct:
       return "COUNT";
     case AggregateFunction::Min:
       return "MIN";
@@ -171,6 +172,15 @@ std::string AggregateExpression::to_string() const {
   if (function_ == AggregateFunction::CountStar) {
     out << "*";
   } else {
+    // CountDistinct's own "DISTINCT " prefix is the only textual difference
+    // from a plain Count over the same argument -- both to_string() and
+    // structural_key() below need it, so a query with COUNT(x) and
+    // COUNT(DISTINCT x) in the same SELECT list (structurally different
+    // aggregates) isn't mistaken for a duplicate/shared subexpression by
+    // any structural_key()-based comparison elsewhere in the planner.
+    if (function_ == AggregateFunction::CountDistinct) {
+      out << "DISTINCT ";
+    }
     out << argument_->to_string();
   }
   out << ")";
@@ -183,6 +193,9 @@ std::string AggregateExpression::structural_key() const {
   if (function_ == AggregateFunction::CountStar) {
     out << "*";
   } else {
+    if (function_ == AggregateFunction::CountDistinct) {
+      out << "DISTINCT ";
+    }
     out << argument_->structural_key();
   }
   out << ")";

@@ -10,7 +10,9 @@
 #include <string>
 #include <vector>
 
+#include "kernellake/execution_gpu/expression_compiler.hpp"
 #include "kernellake/execution_gpu/operator.hpp"
+#include "kernellake/expression/expression.hpp"
 #include "kernellake/types/join_type.hpp"
 
 namespace kernellake {
@@ -71,6 +73,19 @@ namespace kernellake {
 // match" and must pass through to the output unchanged, mirroring the
 // existing right_is_empty_ (whole-build-side) case in the non-partitioned
 // path below.
+//
+// A non-null `residual_predicate_` (TPC-H Q21's shape -- see this
+// constructor's own doc comment) takes an entirely different code path
+// through probe_one_batch(): cudf::mixed_left_semi_join()/
+// mixed_left_anti_join() instead of hash_join_->inner_join()/left_join(),
+// since the plain equi-join primitive has no way to also require a
+// residual, cross-side, non-equality condition on each candidate pair --
+// build_hash_join() is skipped entirely in this mode (the mixed-join
+// functions take raw table_views directly, no prebuilt cudf::hash_join
+// object at all), and the mixed functions' own semantics already do
+// exactly what LEFT SEMI/LEFT ANTI want with no extra dedup/sentinel-
+// filter step needed (unlike the plain-hash_join path's own
+// distinct()/JoinNoMatch handling above).
 class SemiAntiJoinOperator final : public PhysicalOperator {
  public:
   // `join_type` must be LeftSemi or LeftAnti -- open() throws otherwise
@@ -79,10 +94,19 @@ class SemiAntiJoinOperator final : public PhysicalOperator {
   // those two join types). `spill_directory` (only consulted when
   // partition_count > 1) mirrors HashJoinOperator's own constructor
   // parameter exactly -- see that class's own doc comment.
+  // `residual_predicate` (only ever non-null for LeftSemi/LeftAnti, see
+  // HashJoinNode::residual_predicate()'s own doc comment -- TPC-H Q21's
+  // `l2.l_suppkey <> l1.l_suppkey` shape) is evaluated per candidate
+  // (probe-row, build-row) pair via cudf::mixed_left_semi_join()/
+  // mixed_left_anti_join() instead of this operator's own plain
+  // cudf::hash_join path -- see open()'s own comment for why a residual
+  // predicate needs a structurally different cudf join primitive, not
+  // just an extra post-filter step.
   SemiAntiJoinOperator(OperatorId id, std::unique_ptr<PhysicalOperator> left,
                        std::unique_ptr<PhysicalOperator> right, std::size_t left_key_index,
                        std::size_t right_key_index, std::shared_ptr<const Schema> output_schema,
-                       std::size_t partition_count, std::string spill_directory, JoinType join_type);
+                       std::size_t partition_count, std::string spill_directory, JoinType join_type,
+                       ExpressionPtr residual_predicate = nullptr);
   ~SemiAntiJoinOperator() override;
 
   void open(ExecutionContext& context) override;
@@ -129,6 +153,13 @@ class SemiAntiJoinOperator final : public PhysicalOperator {
   std::size_t partition_count_;
   std::string spill_directory_;
   JoinType join_type_;
+  ExpressionPtr residual_predicate_;
+  ExpressionCompiler compiler_;
+  // Compiled once, in open() -- valid only while compiler_'s own
+  // underlying cudf::ast::tree arena stays alive (this operator's whole
+  // lifetime), same convention as FilterOperator's own
+  // compiled_ast_conjuncts_. Null whenever residual_predicate_ is.
+  const cudf::ast::expression* compiled_residual_ = nullptr;
 
   // Populated for whichever build side is currently active: the *whole*
   // build side when partition_count_ == 1, or just the current bucket's

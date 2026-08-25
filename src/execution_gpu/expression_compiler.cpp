@@ -48,7 +48,26 @@ const cudf::ast::expression& ExpressionCompiler::compile(const Expression& expr,
 }
 
 const cudf::ast::expression& ExpressionCompiler::compile_column(const ColumnExpression& expr) {
-  return tree_.emplace<cudf::ast::column_reference>(static_cast<cudf::size_type>(expr.column_index()));
+  if (!two_table_left_field_count_.has_value()) {
+    return tree_.emplace<cudf::ast::column_reference>(static_cast<cudf::size_type>(expr.column_index()));
+  }
+  // compile_two_table() mode -- see its own doc comment for the index
+  // convention.
+  const std::size_t left_field_count = *two_table_left_field_count_;
+  if (expr.column_index() < left_field_count) {
+    return tree_.emplace<cudf::ast::column_reference>(static_cast<cudf::size_type>(expr.column_index()),
+                                                      cudf::ast::table_reference::LEFT);
+  }
+  return tree_.emplace<cudf::ast::column_reference>(
+      static_cast<cudf::size_type>(expr.column_index() - left_field_count),
+      cudf::ast::table_reference::RIGHT);
+}
+
+const cudf::ast::expression& ExpressionCompiler::compile_two_table(const Expression& expr,
+                                                                   std::size_t left_field_count,
+                                                                   ExecutionContext& context) {
+  two_table_left_field_count_ = left_field_count;
+  return compile(expr, context);
 }
 
 const cudf::ast::expression& ExpressionCompiler::make_literal(const DataType& type,

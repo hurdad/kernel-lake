@@ -3,6 +3,7 @@
 #include <cudf/binaryop.hpp>
 #include <cudf/concatenate.hpp>
 #include <cudf/copying.hpp>
+#include <cudf/join/mixed_join.hpp>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/stream_compaction.hpp>
 #include <cudf/table/table_view.hpp>
@@ -37,7 +38,7 @@ SemiAntiJoinOperator::SemiAntiJoinOperator(OperatorId id, std::unique_ptr<Physic
                                            std::size_t left_key_index, std::size_t right_key_index,
                                            std::shared_ptr<const Schema> output_schema,
                                            std::size_t partition_count, std::string spill_directory,
-                                           JoinType join_type)
+                                           JoinType join_type, ExpressionPtr residual_predicate)
     : id_(id),
       left_(std::move(left)),
       right_(std::move(right)),
@@ -46,7 +47,8 @@ SemiAntiJoinOperator::SemiAntiJoinOperator(OperatorId id, std::unique_ptr<Physic
       output_schema_(std::move(output_schema)),
       partition_count_(partition_count == 0 ? 1 : partition_count),
       spill_directory_(std::move(spill_directory)),
-      join_type_(join_type) {
+      join_type_(join_type),
+      residual_predicate_(std::move(residual_predicate)) {
   if (join_type_ != JoinType::LeftSemi && join_type_ != JoinType::LeftAnti) {
     throw ExecutionError(fmt::format(
         "internal error: SemiAntiJoinOperator constructed with join_type={} (must be LEFT SEMI or LEFT ANTI)",
@@ -75,6 +77,13 @@ void SemiAntiJoinOperator::build_hash_join(ExecutionContext& context) {
     return;
   }
   right_is_empty_ = false;
+  // A residual predicate uses cudf::mixed_left_semi_join()/
+  // mixed_left_anti_join() instead (see probe_one_batch()), which take
+  // right_table_'s own table_view directly, on every call -- no prebuilt
+  // cudf::hash_join object needed or used in this mode.
+  if (residual_predicate_ != nullptr) {
+    return;
+  }
   const cudf::table_view right_key_view({right_table_->view().column(right_key_index_)});
   hash_join_ = std::make_unique<cudf::hash_join>(right_key_view, cudf::null_equality::EQUAL, context.stream);
 }
@@ -102,6 +111,14 @@ void SemiAntiJoinOperator::ensure_partition_built(ExecutionContext& context) {
 void SemiAntiJoinOperator::open(ExecutionContext& context) {
   left_->open(context);
   right_->open(context);
+
+  if (residual_predicate_ != nullptr) {
+    // output_schema_ *is* left's own schema unchanged (see this class's
+    // own doc comment), so its field count is exactly the threshold
+    // residual_predicate_'s own column indices already split on.
+    compiled_residual_ =
+        &compiler_.compile_two_table(*residual_predicate_, output_schema_->field_count(), context);
+  }
 
   if (partition_count_ <= 1) {
     std::vector<DeviceBatch> right_batches;
@@ -134,6 +151,31 @@ std::optional<DeviceBatch> SemiAntiJoinOperator::probe_one_batch(const DeviceBat
                                                                  ExecutionContext& context) {
   const cudf::table_view left_view = left_batch.view();
   const cudf::table_view left_key_view({left_view.column(left_key_index_)});
+
+  if (residual_predicate_ != nullptr) {
+    // cudf::mixed_left_semi_join()/mixed_left_anti_join() already return
+    // each qualifying left row exactly once (semi) or every left row with
+    // zero qualifying matches (anti) -- no dedup/sentinel-filter step
+    // needed the way the plain-hash_join path below still requires, since
+    // the equality-plus-conditional matching happens in one call. See
+    // this class's own header comment.
+    const cudf::table_view right_key_view({right_table_->view().column(right_key_index_)});
+    const std::unique_ptr<rmm::device_uvector<cudf::size_type>> left_indices =
+        join_type_ == JoinType::LeftSemi
+            ? cudf::mixed_left_semi_join(left_key_view, right_key_view, left_view, right_table_->view(),
+                                         *compiled_residual_, cudf::null_equality::EQUAL, context.stream,
+                                         context.memory_resource)
+            : cudf::mixed_left_anti_join(left_key_view, right_key_view, left_view, right_table_->view(),
+                                         *compiled_residual_, cudf::null_equality::EQUAL, context.stream,
+                                         context.memory_resource);
+    if (left_indices->is_empty()) {
+      return std::nullopt;
+    }
+    std::unique_ptr<cudf::table> gathered =
+        cudf::gather(left_view, as_gather_map(*left_indices), cudf::out_of_bounds_policy::DONT_CHECK,
+                     context.stream, context.memory_resource);
+    return DeviceBatch(std::move(gathered), output_schema_);
+  }
 
   if (join_type_ == JoinType::LeftSemi) {
     auto [left_indices, right_indices] = hash_join_->inner_join(left_key_view, std::nullopt, context.stream);

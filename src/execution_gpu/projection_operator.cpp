@@ -6,6 +6,7 @@
 #include <cudf/datetime.hpp>
 #include <cudf/scalar/scalar_factories.hpp>
 #include <cudf/strings/contains.hpp>
+#include <cudf/strings/slice.hpp>
 #include <cudf/strings/strings_column_view.hpp>
 #include <cudf/transform.hpp>
 #include <cudf/unary.hpp>
@@ -68,7 +69,17 @@ ProjectionOperator::CompiledValue ProjectionOperator::compile_value(const Expres
     value.extract_expr = std::move(compiled_extract);
     return value;
   }
-  return CompiledValue{std::nullopt, nullptr, &compiler_.compile(expr, context), nullptr, nullptr, nullptr};
+  if (const auto* substring_expr = dynamic_cast<const SubstringExpression*>(&expr)) {
+    auto compiled_substring = std::make_shared<CompiledSubstring>();
+    compiled_substring->operand = compile_value(*substring_expr->operand(), context);
+    compiled_substring->start = substring_expr->start_zero_based();
+    compiled_substring->length = substring_expr->length();
+    CompiledValue value;
+    value.substring_expr = std::move(compiled_substring);
+    return value;
+  }
+  return CompiledValue{std::nullopt, nullptr, &compiler_.compile(expr, context), nullptr, nullptr,
+                       nullptr,      nullptr};
 }
 
 ProjectionOperator::CompiledItem ProjectionOperator::compile_item(const Expression& expr,
@@ -100,6 +111,7 @@ std::unique_ptr<cudf::column> ProjectionOperator::materialize_value(const Compil
                                                                     ExecutionContext& context) {
   if (value.like_expr != nullptr) return materialize_like(*value.like_expr, batch, context);
   if (value.extract_expr != nullptr) return materialize_extract(*value.extract_expr, batch, context);
+  if (value.substring_expr != nullptr) return materialize_substring(*value.substring_expr, batch, context);
   if (value.decimal_cast != nullptr) {
     const std::unique_ptr<cudf::column> operand =
         materialize_value(value.decimal_cast->operand, batch, context);
@@ -168,6 +180,20 @@ std::unique_ptr<cudf::column> ProjectionOperator::materialize_extract(const Comp
       context.memory_resource);
   return cudf::cast(extracted->view(), cudf::data_type{cudf::type_id::INT64}, context.stream,
                     context.memory_resource);
+}
+
+std::unique_ptr<cudf::column> ProjectionOperator::materialize_substring(
+    const CompiledSubstring& substring_expr, const cudf::table_view& batch, ExecutionContext& context) {
+  const std::unique_ptr<cudf::column> operand = materialize_value(substring_expr.operand, batch, context);
+  const cudf::numeric_scalar<cudf::size_type> start(static_cast<cudf::size_type>(substring_expr.start), true,
+                                                    context.stream, context.memory_resource);
+  const cudf::numeric_scalar<cudf::size_type> stop(
+      static_cast<cudf::size_type>(substring_expr.start + substring_expr.length), true, context.stream,
+      context.memory_resource);
+  return cudf::strings::slice_strings(
+      cudf::strings_column_view(operand->view()), start, stop,
+      cudf::numeric_scalar<cudf::size_type>(1, true, context.stream, context.memory_resource), context.stream,
+      context.memory_resource);
 }
 
 std::optional<DeviceBatch> ProjectionOperator::next(ExecutionContext& context) {

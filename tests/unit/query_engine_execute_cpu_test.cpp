@@ -946,6 +946,76 @@ TEST_F(QueryEngineExecuteCpuTest, HavingWithScalarSubqueryThresholdFiltersGroups
   EXPECT_DOUBLE_EQ(total_column->Value(0), 110.0);
 }
 
+// Regression coverage for resolve_subqueries() now also running over
+// WHERE, not just HAVING (added for TPC-H Q22's `c_acctbal > (SELECT
+// AVG(c_acctbal) FROM customer WHERE ...)` shape) -- same threshold math
+// as HavingWithScalarSubqueryThresholdFiltersGroups above (145.0 grand
+// total * 0.3 = 43.5), just as a bare WHERE comparison operand instead of
+// HAVING: only the amount=100.0 row (region B) exceeds 43.5.
+TEST_F(QueryEngineExecuteCpuTest, WhereWithScalarSubqueryThresholdFiltersRows) {
+  const QueryResult result = engine_.execute("SELECT region, amount FROM read_parquet('" + path_ +
+                                             "') WHERE amount > (SELECT SUM(amount) * 0.3 "
+                                             "FROM read_parquet('" +
+                                             path_ + "'))");
+
+  ASSERT_EQ(result.rows_returned, 1);
+  const std::shared_ptr<arrow::RecordBatch>& batch = result.batches.front();
+  const auto region_column = std::static_pointer_cast<arrow::StringArray>(batch->GetColumnByName("region"));
+  const auto amount_column = std::static_pointer_cast<arrow::DoubleArray>(batch->GetColumnByName("amount"));
+  ASSERT_NE(region_column, nullptr);
+  ASSERT_NE(amount_column, nullptr);
+  EXPECT_EQ(region_column->GetString(0), "B");
+  EXPECT_DOUBLE_EQ(amount_column->Value(0), 100.0);
+}
+
+// A *correlated* scalar subquery in WHERE is still not supported --
+// run_subquery() binds/plans/executes the subquery in total isolation
+// (see query_engine.cpp's own comment on this exact limitation), so a
+// reference to the outer query's own alias fails to resolve inside that
+// nested, independent bind rather than silently producing a wrong
+// (uncorrelated) result.
+// A correlated scalar subquery in WHERE (TPC-H Q17's shape) --
+// sql::rewrite_correlated_scalar_subqueries() decorrelates this into a
+// JOIN against a synthesized `GROUP BY region`-aggregated derived table
+// before binding, so this is no longer rejected (see the test below for
+// what genuinely still is). Region 'A''s amounts are {10, 20, 5} (avg
+// 11.667): only 20 exceeds it. Region 'B''s are {100, 7, 3} (avg 36.667):
+// only 100 exceeds it.
+TEST_F(QueryEngineExecuteCpuTest, WhereWithCorrelatedScalarSubqueryFiltersToAboveGroupAverage) {
+  const QueryResult result =
+      engine_.execute("SELECT o.region, o.amount FROM read_parquet('" + path_ +
+                      "') AS o WHERE o.amount > (SELECT AVG(amount) FROM read_parquet('" + path_ +
+                      "') AS i WHERE i.region = o.region) ORDER BY o.amount");
+
+  ASSERT_EQ(result.rows_returned, 2);
+  ASSERT_EQ(result.batches.size(), 1u);
+  const std::shared_ptr<arrow::RecordBatch>& batch = result.batches.front();
+  const auto region_column = std::static_pointer_cast<arrow::StringArray>(batch->GetColumnByName("region"));
+  const auto amount_column = std::static_pointer_cast<arrow::DoubleArray>(batch->GetColumnByName("amount"));
+  ASSERT_NE(region_column, nullptr);
+  ASSERT_NE(amount_column, nullptr);
+  EXPECT_EQ(region_column->GetString(0), "A");
+  EXPECT_DOUBLE_EQ(amount_column->Value(0), 20.0);
+  EXPECT_EQ(region_column->GetString(1), "B");
+  EXPECT_DOUBLE_EQ(amount_column->Value(1), 100.0);
+}
+
+// A correlated scalar subquery combined via OR (not a top-level WHERE
+// AND-conjunct) is outside sql::rewrite_correlated_scalar_subqueries()'s
+// scope -- same "top-level AND-conjunct only" restriction
+// rewrite_exists_subqueries() already has for EXISTS/NOT EXISTS. Left
+// unresolved, it reaches resolve_subqueries(), which binds/plans/
+// executes it in total isolation -- the correlated reference to `o`
+// fails to resolve there, the same clean-rejection outcome as any other
+// unsupported subquery shape.
+TEST_F(QueryEngineExecuteCpuTest, WhereRejectsCorrelatedScalarSubqueryInsideOrWithCleanError) {
+  EXPECT_THROW((void)(engine_.execute(
+                   "SELECT region FROM read_parquet('" + path_ +
+                   "') AS o WHERE o.amount > 99999 OR o.amount > (SELECT AVG(amount) FROM read_parquet('" +
+                   path_ + "') AS i WHERE i.region = o.region)")),
+               KernelLakeError);
+}
+
 // sql::resolve_subqueries() recurses through an AstBetween's lower/upper
 // bounds -- a subquery sitting directly as HAVING's own comparison operand
 // (the test above) never exercises that recursion. Same threshold/split as

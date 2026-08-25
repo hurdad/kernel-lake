@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <functional>
 
 #include "kernellake/common/errors.hpp"
 #include "kernellake/io/parquet_metadata.hpp"
@@ -21,7 +22,15 @@ namespace {
 // `original_to_narrowed` exists instead of relying on Schema::find_field().
 struct ScanBoundary {
   const Schema* schema;
-  const std::vector<std::optional<std::size_t>>* original_to_narrowed;
+  // A shared_ptr (not a raw pointer) so this can point at either an
+  // existing node's own member (ParquetScanNode::original_column_map(),
+  // HashJoinNode::original_column_map() -- wrapped with a no-op deleter,
+  // since the node itself, not this pointer, owns that lifetime) or a
+  // freshly-synthesized identity map (a derived-table join step's own
+  // root -- see find_scan_boundary()'s own comment on why one is needed
+  // there and why it can't simply be a class member the way the other
+  // two cases already are).
+  std::shared_ptr<const std::vector<std::optional<std::size_t>>> original_to_narrowed;
 };
 
 // LogicalScan's own output_schema() always keeps every original column (the
@@ -43,9 +52,73 @@ struct ScanBoundary {
 // from different sides into one combined schema, silently resolving a
 // reference to the wrong side's column (see ParquetScanNode's and
 // HashJoinNode's own original_column_map() comments in physical_plan.hpp).
-ExpressionPtr remap_columns(const ExpressionPtr& expr, const ScanBoundary& boundary) {
+// Shared tree-walk behind both remap_columns() (a single ScanBoundary) and
+// remap_join_residual_predicate() (two independent sides, see that
+// function's own comment) -- `resolve` is the only part that differs
+// between the two: given one original ColumnExpression, it returns that
+// column's new index (throwing PlanningError itself if the column is
+// missing from wherever it needs to end up), and this walk handles
+// recursing through every other Expression node type identically either
+// way.
+ExpressionPtr remap_columns_via(const ExpressionPtr& expr,
+                                const std::function<std::size_t(const ColumnExpression&)>& resolve) {
   if (const auto* column = dynamic_cast<const ColumnExpression*>(expr.get())) {
-    const std::size_t original_index = column->column_index();
+    return std::make_shared<ColumnExpression>(column->name(), resolve(*column), column->result_type());
+  }
+  if (const auto* binary = dynamic_cast<const BinaryExpression*>(expr.get())) {
+    return std::make_shared<BinaryExpression>(binary->op(), remap_columns_via(binary->left(), resolve),
+                                              remap_columns_via(binary->right(), resolve),
+                                              binary->result_type());
+  }
+  if (const auto* unary = dynamic_cast<const UnaryExpression*>(expr.get())) {
+    return std::make_shared<UnaryExpression>(unary->op(), remap_columns_via(unary->operand(), resolve),
+                                             unary->result_type());
+  }
+  if (const auto* cast = dynamic_cast<const CastExpression*>(expr.get())) {
+    return std::make_shared<CastExpression>(remap_columns_via(cast->operand(), resolve), cast->result_type());
+  }
+  if (const auto* between = dynamic_cast<const BetweenExpression*>(expr.get())) {
+    return std::make_shared<BetweenExpression>(remap_columns_via(between->value(), resolve),
+                                               remap_columns_via(between->lower(), resolve),
+                                               remap_columns_via(between->upper(), resolve));
+  }
+  if (const auto* aggregate = dynamic_cast<const AggregateExpression*>(expr.get())) {
+    ExpressionPtr argument =
+        aggregate->argument() ? remap_columns_via(aggregate->argument(), resolve) : nullptr;
+    return std::make_shared<AggregateExpression>(aggregate->function(), std::move(argument),
+                                                 aggregate->result_type());
+  }
+  if (const auto* like = dynamic_cast<const LikeExpression*>(expr.get())) {
+    return std::make_shared<LikeExpression>(remap_columns_via(like->value(), resolve), like->pattern(),
+                                            like->negated());
+  }
+  if (const auto* case_expr = dynamic_cast<const CaseExpression*>(expr.get())) {
+    std::vector<CaseExpression::WhenThen> branches;
+    branches.reserve(case_expr->when_then().size());
+    for (const CaseExpression::WhenThen& branch : case_expr->when_then()) {
+      branches.push_back(CaseExpression::WhenThen{remap_columns_via(branch.condition, resolve),
+                                                  remap_columns_via(branch.result, resolve)});
+    }
+    ExpressionPtr else_branch =
+        case_expr->else_branch() ? remap_columns_via(case_expr->else_branch(), resolve) : nullptr;
+    return std::make_shared<CaseExpression>(std::move(branches), std::move(else_branch),
+                                            case_expr->result_type());
+  }
+  if (const auto* extract = dynamic_cast<const ExtractExpression*>(expr.get())) {
+    return std::make_shared<ExtractExpression>(
+        extract->part(), remap_columns_via(extract->operand(), resolve), extract->result_type());
+  }
+  if (const auto* substring = dynamic_cast<const SubstringExpression*>(expr.get())) {
+    return std::make_shared<SubstringExpression>(remap_columns_via(substring->operand(), resolve),
+                                                 substring->start(), substring->length(),
+                                                 substring->result_type());
+  }
+  return expr;  // LiteralExpression: no column reference to remap.
+}
+
+ExpressionPtr remap_columns(const ExpressionPtr& expr, const ScanBoundary& boundary) {
+  return remap_columns_via(expr, [&boundary](const ColumnExpression& column) -> std::size_t {
+    const std::size_t original_index = column.column_index();
     const std::optional<std::size_t> narrowed_index = original_index < boundary.original_to_narrowed->size()
                                                           ? (*boundary.original_to_narrowed)[original_index]
                                                           : std::nullopt;
@@ -53,53 +126,58 @@ ExpressionPtr remap_columns(const ExpressionPtr& expr, const ScanBoundary& bound
       throw PlanningError(fmt::format(
           "physical planner: column '{}' referenced above the scan but missing from its pruned column list "
           "(internal error)",
-          column->name()));
+          column.name()));
     }
-    return std::make_shared<ColumnExpression>(column->name(), *narrowed_index, column->result_type());
-  }
-  if (const auto* binary = dynamic_cast<const BinaryExpression*>(expr.get())) {
-    return std::make_shared<BinaryExpression>(binary->op(), remap_columns(binary->left(), boundary),
-                                              remap_columns(binary->right(), boundary),
-                                              binary->result_type());
-  }
-  if (const auto* unary = dynamic_cast<const UnaryExpression*>(expr.get())) {
-    return std::make_shared<UnaryExpression>(unary->op(), remap_columns(unary->operand(), boundary),
-                                             unary->result_type());
-  }
-  if (const auto* cast = dynamic_cast<const CastExpression*>(expr.get())) {
-    return std::make_shared<CastExpression>(remap_columns(cast->operand(), boundary), cast->result_type());
-  }
-  if (const auto* between = dynamic_cast<const BetweenExpression*>(expr.get())) {
-    return std::make_shared<BetweenExpression>(remap_columns(between->value(), boundary),
-                                               remap_columns(between->lower(), boundary),
-                                               remap_columns(between->upper(), boundary));
-  }
-  if (const auto* aggregate = dynamic_cast<const AggregateExpression*>(expr.get())) {
-    ExpressionPtr argument = aggregate->argument() ? remap_columns(aggregate->argument(), boundary) : nullptr;
-    return std::make_shared<AggregateExpression>(aggregate->function(), std::move(argument),
-                                                 aggregate->result_type());
-  }
-  if (const auto* like = dynamic_cast<const LikeExpression*>(expr.get())) {
-    return std::make_shared<LikeExpression>(remap_columns(like->value(), boundary), like->pattern(),
-                                            like->negated());
-  }
-  if (const auto* case_expr = dynamic_cast<const CaseExpression*>(expr.get())) {
-    std::vector<CaseExpression::WhenThen> branches;
-    branches.reserve(case_expr->when_then().size());
-    for (const CaseExpression::WhenThen& branch : case_expr->when_then()) {
-      branches.push_back(CaseExpression::WhenThen{remap_columns(branch.condition, boundary),
-                                                  remap_columns(branch.result, boundary)});
+    return *narrowed_index;
+  });
+}
+
+// A JOIN's own residual_predicate (LEFT SEMI/LEFT ANTI only -- see
+// LogicalJoin's own doc comment) is the one Expression in this codebase
+// that references *two* independent sides at once, each with its own
+// original_column_map(), rather than a single ScanBoundary -- so it needs
+// its own resolver instead of remap_columns()'s single-boundary one.
+// `left_original_count` is the threshold this project's own bind-time
+// convention already uses for a residual predicate's raw column indices
+// (see extract_join_step_keys()'s own comment): indices below it are the
+// already-joined (left) side's own original schema position, at or above
+// it are `left_original_count` + the newly-joined (right) side's own
+// original schema position. Remapped into a single combined index space
+// too, just a *narrowed* one this time: [0, left_narrowed_count) for the
+// left side, [left_narrowed_count, ...) for the right -- exactly the
+// convention operator_builder.cpp's own SemiAntiJoinOperator construction
+// expects, splitting back apart at that same `left_narrowed_count`
+// threshold to build a two-table cudf::ast tree (LEFT/RIGHT table
+// references) at the operator layer.
+ExpressionPtr remap_join_residual_predicate(const ExpressionPtr& expr,
+                                            const std::vector<std::optional<std::size_t>>& left_original_map,
+                                            const std::vector<std::optional<std::size_t>>& right_original_map,
+                                            std::size_t left_original_count,
+                                            std::size_t left_narrowed_count) {
+  return remap_columns_via(expr, [&](const ColumnExpression& column) -> std::size_t {
+    const std::size_t original_index = column.column_index();
+    if (original_index < left_original_count) {
+      const std::optional<std::size_t> narrowed =
+          original_index < left_original_map.size() ? left_original_map[original_index] : std::nullopt;
+      if (!narrowed) {
+        throw PlanningError(fmt::format(
+            "physical planner: column '{}' referenced by a JOIN's residual predicate but missing from the "
+            "left side's pruned column list (internal error)",
+            column.name()));
+      }
+      return *narrowed;
     }
-    ExpressionPtr else_branch =
-        case_expr->else_branch() ? remap_columns(case_expr->else_branch(), boundary) : nullptr;
-    return std::make_shared<CaseExpression>(std::move(branches), std::move(else_branch),
-                                            case_expr->result_type());
-  }
-  if (const auto* extract = dynamic_cast<const ExtractExpression*>(expr.get())) {
-    return std::make_shared<ExtractExpression>(extract->part(), remap_columns(extract->operand(), boundary),
-                                               extract->result_type());
-  }
-  return expr;  // LiteralExpression: no column reference to remap.
+    const std::size_t local_index = original_index - left_original_count;
+    const std::optional<std::size_t> narrowed =
+        local_index < right_original_map.size() ? right_original_map[local_index] : std::nullopt;
+    if (!narrowed) {
+      throw PlanningError(fmt::format(
+          "physical planner: column '{}' referenced by a JOIN's residual predicate but missing from the "
+          "right side's pruned column list (internal error)",
+          column.name()));
+    }
+    return left_narrowed_count + *narrowed;
+  });
 }
 
 std::vector<NamedExpression> remap_named(const std::vector<NamedExpression>& items,
@@ -312,12 +390,50 @@ std::optional<std::int64_t> estimate_row_count(const PhysicalPlanPtr& node) {
 // Filter/Projection/Aggregate/Sort sitting on top of a join needs, so the
 // search stops there rather than continuing into the join's two children
 // (which have two separate, incompatible narrowed schemas).
+// Wraps a raw pointer to a node's own member (its lifetime already
+// guaranteed by that node's own, so no real ownership to transfer) in a
+// shared_ptr with a no-op deleter -- lets ScanBoundary's own type stay
+// uniform between this case and identity_boundary()'s freshly-owned
+// vector below.
+std::shared_ptr<const std::vector<std::optional<std::size_t>>> alias_column_map(
+    const std::vector<std::optional<std::size_t>>& map) {
+  return std::shared_ptr<const std::vector<std::optional<std::size_t>>>(&map, [](const void*) {});
+}
+
+// A ProjectionNode/HashAggregateNode/ScalarAggregateNode reached as a
+// JOIN child's own root (TPC-H Q17/Q2/Q20's decorrelated-subquery-as-
+// join-source shape, see sql::rewrite_correlated_scalar_subqueries()'s
+// own doc comment) is the *entire* output of an independently-planned
+// query -- its own SELECT list, already exactly [0, field_count), with
+// no pruning of its own top-level output columns ever applied (unlike a
+// raw scan's columns, which projection pruning does narrow) -- so unlike
+// ParquetScanNode/HashJoinNode's own real (possibly-narrowing) maps, this
+// one is always the identity: index i needs no translation at all.
+ScanBoundary identity_boundary(const PhysicalPlanNode& node) {
+  auto identity = std::make_shared<std::vector<std::optional<std::size_t>>>();
+  identity->reserve(node.output_schema().field_count());
+  for (std::size_t i = 0; i < node.output_schema().field_count(); ++i) {
+    identity->emplace_back(i);
+  }
+  return ScanBoundary{&node.output_schema(), std::move(identity)};
+}
+
 std::optional<ScanBoundary> find_scan_boundary(const PhysicalPlanNode& node) {
   if (const auto* scan = dynamic_cast<const ParquetScanNode*>(&node)) {
-    return ScanBoundary{&scan->output_schema(), &scan->original_column_map()};
+    return ScanBoundary{&scan->output_schema(), alias_column_map(scan->original_column_map())};
   }
   if (const auto* join = dynamic_cast<const HashJoinNode*>(&node)) {
-    return ScanBoundary{&join->output_schema(), &join->original_column_map()};
+    return ScanBoundary{&join->output_schema(), alias_column_map(join->original_column_map())};
+  }
+  // Only ever reached for a JOIN child that is a decorrelated subquery's
+  // own root (see identity_boundary()'s own comment) -- every *other*
+  // existing call site that reaches find_scan_boundary() already gates
+  // on references_scan_schema() first (false for a Projection/Aggregate
+  // child), so this never fires for any pre-existing query shape.
+  if (dynamic_cast<const ProjectionNode*>(&node) != nullptr ||
+      dynamic_cast<const HashAggregateNode*>(&node) != nullptr ||
+      dynamic_cast<const ScalarAggregateNode*>(&node) != nullptr) {
+    return identity_boundary(node);
   }
   for (const PhysicalPlanPtr& child : node.children()) {
     if (const std::optional<ScanBoundary> found = find_scan_boundary(*child)) {
@@ -546,25 +662,34 @@ PhysicalPlanPtr convert(const LogicalPlanPtr& node, ObjectStore& store, TableSou
     const std::size_t right_narrowed_count = right_child->output_schema().field_count();
     const std::size_t original_left_physical_offset = swap_for_build_side ? right_narrowed_count : 0;
     const std::size_t original_right_physical_offset = swap_for_build_side ? 0 : left_narrowed_count;
+    // LeftSemi/LeftAnti: the right side contributes no columns to this
+    // join's own output *domain*, not just its narrowed range -- matching
+    // bind_query(join_schemas)'s own `combined_field_count` convention
+    // (binder.cpp), which likewise never reserves any index space for a
+    // semi/anti step's source once that step is behind it. combined_column_map's
+    // own *length* (not just its entries' values) is itself the "original
+    // index domain size" a JOIN sitting immediately above this one uses (via
+    // `left_original_map.size()` below, and via remap_join_residual_predicate's
+    // own `left_original_count` parameter) to decide which side one of *its*
+    // raw column indices belongs to -- appending (even all-nullopt) entries
+    // for the right side here would inflate that domain past what the
+    // binder assumed when it assigned those raw indices, silently
+    // misclassifying a later step's own newly-joined-source columns as
+    // belonging to this (semi/anti) step's now-defunct right side instead.
+    const bool right_side_never_in_output =
+        join->join_type() == JoinType::LeftSemi || join->join_type() == JoinType::LeftAnti;
     std::vector<std::optional<std::size_t>> combined_column_map;
-    combined_column_map.reserve(left_original_map.size() + right_original_map.size());
+    combined_column_map.reserve(left_original_map.size() +
+                                (right_side_never_in_output ? 0 : right_original_map.size()));
     for (const std::optional<std::size_t>& index : left_original_map) {
       combined_column_map.push_back(index ? std::optional<std::size_t>(original_left_physical_offset + *index)
                                           : std::nullopt);
     }
-    // LeftSemi/LeftAnti: every right-side original index maps to nullopt
-    // unconditionally, regardless of what right_original_map itself says
-    // about pruning within the right subtree -- HashJoinNode::output_schema()
-    // (see its own build_schema()) never includes any right-side column at
-    // all for these join types, not just the ones projection pruning
-    // happened to prune.
-    const bool right_side_never_in_output =
-        join->join_type() == JoinType::LeftSemi || join->join_type() == JoinType::LeftAnti;
-    for (const std::optional<std::size_t>& index : right_original_map) {
-      combined_column_map.push_back(
-          right_side_never_in_output || !index
-              ? std::nullopt
-              : std::optional<std::size_t>(original_right_physical_offset + *index));
+    if (!right_side_never_in_output) {
+      for (const std::optional<std::size_t>& index : right_original_map) {
+        combined_column_map.push_back(
+            index ? std::optional<std::size_t>(original_right_physical_offset + *index) : std::nullopt);
+      }
     }
 
     // HashJoinOperator always builds its hash table on the *right* child
@@ -578,9 +703,22 @@ PhysicalPlanPtr convert(const LogicalPlanPtr& node, ObjectStore& store, TableSou
       std::swap(left_child, right_child);
       std::swap(left_key_narrowed, right_key_narrowed);
     }
+    // LeftSemi/LeftAnti only (TPC-H Q21's shape, see LogicalJoin's own
+    // doc comment) -- swap_for_build_side is unconditionally false for
+    // these two join types (see its own definition above), so left_child/
+    // right_child are still in their original (unswapped) order here,
+    // matching residual_predicate()'s own left-then-right column-index
+    // convention exactly.
+    ExpressionPtr residual_predicate;
+    if (join->residual_predicate() != nullptr) {
+      residual_predicate =
+          remap_join_residual_predicate(join->residual_predicate(), left_original_map, right_original_map,
+                                        left_original_map.size(), left_narrowed_count);
+    }
     return std::make_shared<HashJoinNode>(std::move(left_child), std::move(right_child), *left_key_narrowed,
                                           *right_key_narrowed, std::move(combined_column_map),
-                                          estimated_build_rows, join->join_type());
+                                          estimated_build_rows, join->join_type(),
+                                          std::move(residual_predicate));
   }
   if (const auto* filter = dynamic_cast<const LogicalFilter*>(node.get())) {
     PhysicalPlanPtr child = convert(filter->child(), store, extra_resolver);

@@ -32,6 +32,7 @@ using sql::AstLiteral;
 using sql::AstLiteralKind;
 using sql::AstStar;
 using sql::AstSubquery;
+using sql::AstSubstring;
 using sql::AstUnary;
 using sql::AstUnaryOp;
 
@@ -234,7 +235,7 @@ bool contains_aggregate(const AstExprPtr& expr) {
         } else if constexpr (std::is_same_v<T, AstBinary>) {
           return contains_aggregate(node.left) || contains_aggregate(node.right);
         } else if constexpr (std::is_same_v<T, AstUnary> || std::is_same_v<T, AstCast> ||
-                             std::is_same_v<T, AstExtract>) {
+                             std::is_same_v<T, AstExtract> || std::is_same_v<T, AstSubstring>) {
           return contains_aggregate(node.operand);
         } else if constexpr (std::is_same_v<T, AstBetween>) {
           return contains_aggregate(node.value) || contains_aggregate(node.lower) ||
@@ -314,6 +315,9 @@ bool references_ungrouped_column(const ExpressionPtr& expr,
   if (const auto* extract = dynamic_cast<const ExtractExpression*>(expr.get())) {
     return references_ungrouped_column(extract->operand(), group_by_keys, inside_aggregate);
   }
+  if (const auto* substring = dynamic_cast<const SubstringExpression*>(expr.get())) {
+    return references_ungrouped_column(substring->operand(), group_by_keys, inside_aggregate);
+  }
   return false;  // LiteralExpression: no column reference. AstIn is already
                  // expanded into Binary/Unary nodes by bind time (see
                  // bind_node(const AstIn&, ...)), so it needs no case here.
@@ -334,8 +338,18 @@ class Binder {
   // `join_sources` is in FROM-clause left-to-right order (source 0's
   // fields occupy the combined row's lowest indices, then source 1's,
   // ...) -- every alias must be non-empty (parser.cpp rejects an
-  // unaliased JOIN side before an AstJoinClause is ever constructed).
-  explicit Binder(std::vector<std::pair<std::string, const Schema*>> join_sources)
+  // unaliased JOIN side before an AstJoinClause is ever constructed). Each
+  // entry's JoinType is the type of the step that introduced that source
+  // (source 0, the base FROM table, always passes JoinType::Inner here --
+  // its own type is never consulted, only whether *later* sources should
+  // skip its width, and it has no "later" side of itself). A LeftSemi/
+  // LeftAnti source contributes zero width to every offset computed for
+  // sources placed *after* it (see the offset-accumulation loops below) --
+  // mirrors bind_query(join_schemas)'s identical `combined_field_count`
+  // skip, and must stay in sync with it: both express the same fact, that
+  // LogicalJoin::build_schema() gives a semi/anti step zero fields in the
+  // real combined row.
+  explicit Binder(std::vector<std::tuple<std::string, const Schema*, JoinType>> join_sources)
       : join_sources_(std::move(join_sources)) {}
 
   // `allow_aggregates` is true only while binding SELECT-list / ORDER BY
@@ -362,11 +376,13 @@ class Binder {
       return fields;
     }
     std::size_t offset = 0;
-    for (const auto& [alias, schema] : join_sources_) {
+    for (const auto& [alias, schema, join_type] : join_sources_) {
       for (std::size_t i = 0; i < schema->field_count(); ++i) {
         fields.emplace_back(schema->field(i), offset + i);
       }
-      offset += schema->field_count();
+      if (join_type != JoinType::LeftSemi && join_type != JoinType::LeftAnti) {
+        offset += schema->field_count();
+      }
     }
     return fields;
   }
@@ -382,7 +398,7 @@ class Binder {
     std::optional<std::size_t> found_index;
     std::string found_alias;
     std::size_t offset = 0;
-    for (const auto& [alias, schema] : join_sources_) {
+    for (const auto& [alias, schema, join_type] : join_sources_) {
       if (const std::optional<std::size_t> index = schema->find_field(name); index.has_value()) {
         if (found_index.has_value()) {
           throw BindingError(fmt::format(
@@ -392,7 +408,9 @@ class Binder {
         found_index = offset + *index;
         found_alias = alias;
       }
-      offset += schema->field_count();
+      if (join_type != JoinType::LeftSemi && join_type != JoinType::LeftAnti) {
+        offset += schema->field_count();
+      }
     }
     return found_index;
   }
@@ -417,14 +435,16 @@ class Binder {
     }
     if (node.table.has_value()) {
       std::size_t offset = 0;
-      for (const auto& [alias, schema] : join_sources_) {
+      for (const auto& [alias, schema, join_type] : join_sources_) {
         if (alias == *node.table) {
           return resolve_column(*schema, offset, node.name);
         }
-        offset += schema->field_count();
+        if (join_type != JoinType::LeftSemi && join_type != JoinType::LeftAnti) {
+          offset += schema->field_count();
+        }
       }
       std::string known_aliases;
-      for (const auto& [alias, schema] : join_sources_) {
+      for (const auto& [alias, schema, join_type] : join_sources_) {
         if (!known_aliases.empty()) {
           known_aliases += ", ";
         }
@@ -438,11 +458,13 @@ class Binder {
       throw BindingError(fmt::format("unknown column '{}'", node.name));
     }
     std::size_t offset = 0;
-    for (const auto& [alias, schema] : join_sources_) {
+    for (const auto& [alias, schema, join_type] : join_sources_) {
       if (*combined_index < offset + schema->field_count()) {
         return resolve_column(*schema, offset, node.name);
       }
-      offset += schema->field_count();
+      if (join_type != JoinType::LeftSemi && join_type != JoinType::LeftAnti) {
+        offset += schema->field_count();
+      }
     }
     throw BindingError("unreachable: combined_index did not fall within any JOIN source's field range");
   }
@@ -656,6 +678,9 @@ class Binder {
       case AstAggregateFunc::Count:
         return std::make_shared<AggregateExpression>(AggregateFunction::Count, std::move(argument),
                                                      int64_type(false));
+      case AstAggregateFunc::CountDistinct:
+        return std::make_shared<AggregateExpression>(AggregateFunction::CountDistinct, std::move(argument),
+                                                     int64_type(false));
       case AstAggregateFunc::Sum: {
         if (!is_numeric(arg_type.id)) {
           throw BindingError(fmt::format("SUM requires a numeric argument, got {}", arg_type.to_string()));
@@ -826,18 +851,39 @@ class Binder {
     return std::make_shared<ExtractExpression>(part, std::move(operand), int64_type(nullable));
   }
 
+  ExpressionPtr bind_node(const AstSubstring& node, bool allow_aggregates) {
+    ExpressionPtr operand = bind(node.operand, allow_aggregates);
+    if (operand->result_type().id != TypeId::String) {
+      throw BindingError(
+          fmt::format("SUBSTRING requires a STRING operand, got {}", operand->result_type().to_string()));
+    }
+    if (node.start < 1) {
+      throw BindingError("SUBSTRING's start argument must be >= 1 (SQL's own 1-based convention)");
+    }
+    if (node.length < 0) {
+      throw BindingError("SUBSTRING's length argument must be >= 0");
+    }
+    const bool nullable = operand->result_type().nullable;
+    return std::make_shared<SubstringExpression>(std::move(operand), node.start, node.length,
+                                                 string_type(nullable));
+  }
+
   // Reached only if an `AstSubquery` survives all the way to binding --
   // i.e. it appeared somewhere QueryEngine::plan_logical()'s
-  // sql::resolve_subqueries() pass never looks (that pass only ever
-  // walks AstSelectStatement::having), or that pass's own walk somehow
-  // missed one. Either way, the only place a subquery is actually
-  // supported is inside HAVING (see docs/ARCHITECTURE.md), so this is
-  // always a real error, never reached for a query that binds
+  // sql::resolve_subqueries() pass never looks (that pass walks both
+  // AstSelectStatement::having and ::where), or that pass's own walk
+  // somehow missed one -- most likely because the subquery was
+  // *correlated* (referenced the outer query's own columns), which
+  // resolve_subqueries()'s isolated run_subquery() call can't resolve at
+  // all (see query_engine.cpp's own comment on that call site). Either
+  // way, a non-correlated scalar subquery is only supported inside HAVING
+  // or as a bare WHERE comparison operand (see docs/ARCHITECTURE.md), so
+  // this is always a real error, never reached for a query that binds
   // successfully.
   [[noreturn]] ExpressionPtr bind_node(const AstSubquery&, bool) {
     throw BindingError(
-        "subqueries are only supported as an operand inside a HAVING clause (e.g. "
-        "'HAVING SUM(x) > (SELECT ...)'), not here");
+        "subqueries are only supported as a non-correlated scalar operand inside HAVING or WHERE (e.g. "
+        "'HAVING SUM(x) > (SELECT ...)' or 'WHERE x > (SELECT ...)'), not here");
   }
 
   // Reached only if an `AstExists` survives all the way to binding -- i.e.
@@ -861,7 +907,7 @@ class Binder {
   // JOIN mode: one (alias, schema) pair per FROM-clause source, in
   // left-to-right order -- empty (and input_schema_ non-null) in
   // single-table mode.
-  std::vector<std::pair<std::string, const Schema*>> join_sources_;
+  std::vector<std::tuple<std::string, const Schema*, JoinType>> join_sources_;
 };
 
 }  // namespace
@@ -1089,6 +1135,8 @@ void collect_column_indices(const ExpressionPtr& expr, std::vector<std::size_t>&
     collect_column_indices(cast->operand(), out);
   } else if (const auto* extract = dynamic_cast<const ExtractExpression*>(expr.get())) {
     collect_column_indices(extract->operand(), out);
+  } else if (const auto* substring = dynamic_cast<const SubstringExpression*>(expr.get())) {
+    collect_column_indices(substring->operand(), out);
   } else if (const auto* between = dynamic_cast<const BetweenExpression*>(expr.get())) {
     collect_column_indices(between->value(), out);
     collect_column_indices(between->lower(), out);
@@ -1142,6 +1190,11 @@ ExpressionPtr rebase_to_source_schema(const ExpressionPtr& expr, std::size_t com
         extract->part(), rebase_to_source_schema(extract->operand(), combined_field_count),
         extract->result_type());
   }
+  if (const auto* substring = dynamic_cast<const SubstringExpression*>(expr.get())) {
+    return std::make_shared<SubstringExpression>(
+        rebase_to_source_schema(substring->operand(), combined_field_count), substring->start(),
+        substring->length(), substring->result_type());
+  }
   if (const auto* between = dynamic_cast<const BetweenExpression*>(expr.get())) {
     return std::make_shared<BetweenExpression>(
         rebase_to_source_schema(between->value(), combined_field_count),
@@ -1179,6 +1232,10 @@ struct JoinStepKeys {
   // logical_planner.cpp as a LogicalFilter directly on that source's scan,
   // before it becomes this step's join child.
   ExpressionPtr right_prefilter;
+  // Non-null only for LeftSemi/LeftAnti -- see BoundJoinStep's own
+  // identical field for the full scope. Left unrebased (combined-schema
+  // indices, same convention as combined_key_index above).
+  ExpressionPtr residual_predicate;
 };
 
 // Splits `condition` (already bound, allow_aggregates=false) into: exactly
@@ -1202,19 +1259,26 @@ struct JoinStepKeys {
 // shrinking the pool of rows it can match against.
 //
 // A conjunct that references the already-joined (left) side at all --
-// alone, or mixed with the new source's columns -- is rejected outright,
-// unconditionally (even for INNER JOIN, where a left-side pre-filter would
-// actually be safe too): unlike the right-side-only case, a LEFT OUTER
-// JOIN's own left-side ON conjunct has a genuinely different semantics (a
-// left row failing it must still appear exactly once, null-extended -- it
-// is *not* equivalent to pre-filtering the left side, which would drop the
-// row entirely instead) that this project does not implement yet. Keeping
-// the restriction unconditional keeps this one function's contract simple
-// regardless of join_type, and avoids a footgun if a step's join_type is
-// ever changed from Inner to LeftOuter later without this function being
-// revisited.
+// alone, or mixed with the new source's columns -- is rejected outright
+// for INNER/LEFT OUTER JOIN: unlike the right-side-only case, a LEFT
+// OUTER JOIN's own left-side ON conjunct has a genuinely different
+// semantics (a left row failing it must still appear exactly once,
+// null-extended -- it is *not* equivalent to pre-filtering the left
+// side, which would drop the row entirely instead) that this project
+// does not implement yet.
+//
+// For LeftSemi/LeftAnti specifically (`join_type` below), a cross-side
+// conjunct is accepted instead, as `residual_predicate` (TPC-H Q21's
+// `l2.l_suppkey <> l1.l_suppkey`, correlated to the outer lineitem alias
+// beyond the required `l_orderkey` equality) -- there is no left-row-
+// preservation guarantee to violate for these two join types (a semi/
+// anti join never null-extends anything), and the operator layer
+// (SemiAntiJoinOperator, cudf::mixed_left_semi_join/mixed_left_anti_join)
+// evaluates it directly per candidate pair instead of needing it pushed
+// down as a single-sided prefilter. INNER/LEFT OUTER keep the
+// unconditional rejection.
 JoinStepKeys extract_join_step_keys(const ExpressionPtr& condition, std::size_t combined_field_count,
-                                    std::size_t source_field_count) {
+                                    std::size_t source_field_count, JoinType join_type) {
   std::vector<ExpressionPtr> conjuncts;
   collect_join_condition_conjuncts(condition, conjuncts);
   const std::size_t combined_end = combined_field_count + source_field_count;
@@ -1271,7 +1335,9 @@ JoinStepKeys extract_join_step_keys(const ExpressionPtr& condition, std::size_t 
         "a.key = b.key");
   }
 
+  const bool allow_residual = join_type == JoinType::LeftSemi || join_type == JoinType::LeftAnti;
   ExpressionPtr right_prefilter;
+  ExpressionPtr residual_predicate;
   for (std::size_t i = 0; i < conjuncts.size(); ++i) {
     if (i == *key_conjunct_index) {
       continue;
@@ -1281,20 +1347,30 @@ JoinStepKeys extract_join_step_keys(const ExpressionPtr& condition, std::size_t 
     const bool right_only = std::all_of(referenced.begin(), referenced.end(), [&](std::size_t idx) {
       return idx >= combined_field_count && idx < combined_end;
     });
-    if (!right_only) {
+    if (right_only) {
+      ExpressionPtr rebased = rebase_to_source_schema(conjuncts[i], combined_field_count);
+      right_prefilter = right_prefilter == nullptr
+                            ? rebased
+                            : std::make_shared<BinaryExpression>(BinaryOperator::And, right_prefilter,
+                                                                 rebased, boolean_type(false));
+      continue;
+    }
+    if (!allow_residual) {
       throw BindingError(
           "JOIN ON condition may only combine the required equality key with additional predicates that "
           "reference just the newly-joined source's own columns (e.g. TPC-H Q13's `o_comment NOT LIKE "
           "'%special%requests%'`) -- a predicate referencing the already-joined side is not supported");
     }
-    ExpressionPtr rebased = rebase_to_source_schema(conjuncts[i], combined_field_count);
-    right_prefilter = right_prefilter == nullptr
-                          ? rebased
-                          : std::make_shared<BinaryExpression>(BinaryOperator::And, right_prefilter, rebased,
-                                                               boolean_type(false));
+    // LeftSemi/LeftAnti only (TPC-H Q21's shape) -- kept unrebased (see
+    // JoinStepKeys::residual_predicate's own comment), evaluated by the
+    // join operator itself rather than pushed down as a prefilter.
+    residual_predicate = residual_predicate == nullptr
+                             ? conjuncts[i]
+                             : std::make_shared<BinaryExpression>(BinaryOperator::And, residual_predicate,
+                                                                  conjuncts[i], boolean_type(false));
   }
 
-  return JoinStepKeys{combined_key_index, source_key_index, right_prefilter};
+  return JoinStepKeys{combined_key_index, source_key_index, right_prefilter, residual_predicate};
 }
 
 }  // namespace
@@ -1324,14 +1400,14 @@ BoundQuery bind_query(const sql::AstSelectStatement& stmt, const std::vector<Sch
   // parser.cpp rejects a JOIN whose sides aren't all aliased (see its
   // "both sides of a JOIN must be aliased" check) before an AstJoinClause
   // is ever constructed, so every source's alias is always set here.
-  std::vector<std::pair<std::string, const Schema*>> join_sources;
+  std::vector<std::tuple<std::string, const Schema*, JoinType>> join_sources;
   join_sources.reserve(join_schemas.size());
   join_sources.emplace_back(*stmt.join->first.alias,  // NOLINT(bugprone-unchecked-optional-access)
-                            &join_schemas[0]);
+                            &join_schemas[0], JoinType::Inner);
   for (std::size_t i = 0; i < stmt.join->steps.size(); ++i) {
     join_sources.emplace_back(
         *stmt.join->steps[i].source.alias,  // NOLINT(bugprone-unchecked-optional-access)
-        &join_schemas[i + 1]);
+        &join_schemas[i + 1], stmt.join->steps[i].join_type);
   }
   Binder binder(join_sources);
 
@@ -1342,38 +1418,24 @@ BoundQuery bind_query(const sql::AstSelectStatement& stmt, const std::vector<Sch
   for (std::size_t i = 0; i < stmt.join->steps.size(); ++i) {
     const sql::AstJoinStep& step = stmt.join->steps[i];
     const ExpressionPtr condition = binder.bind(step.condition, /*allow_aggregates=*/false);
-    const JoinStepKeys keys =
-        extract_join_step_keys(condition, combined_field_count, join_schemas[i + 1].field_count());
+    const JoinStepKeys keys = extract_join_step_keys(condition, combined_field_count,
+                                                     join_schemas[i + 1].field_count(), step.join_type);
     join.steps.push_back(BoundJoinStep{step.source.paths, keys.combined_key_index, keys.source_key_index,
-                                       step.join_type, keys.right_prefilter});
-    // Unconditional, even for LeftSemi/LeftAnti (whose actual combined
-    // *output* schema -- see LogicalJoin::build_schema() -- contributes
-    // zero of this step's fields, not source_field_count of them): safe
-    // because a semi/anti step, by construction, is never followed by
-    // another step. sql::rewrite_exists_subqueries() only ever *appends*
-    // LeftSemi/LeftAnti steps (from a WHERE-clause EXISTS/NOT EXISTS),
-    // and SQL syntax itself guarantees WHERE is parsed after every real
-    // JOIN clause, so there is no `join_schemas[i + 2]` whose own
-    // classification this now-too-large `combined_field_count` could ever
-    // incorrectly feed into. `Binder::join_sources_`'s own offset
-    // accounting (used for every *other* column reference in this query --
-    // SELECT list, WHERE, GROUP BY, a later step's condition) has the
-    // identical property for the identical reason: a source's own offset
-    // there is fixed by its position *before* this step is ever reached,
-    // so a semi/anti step's own (over-counted) width never corrupts
-    // anything computed earlier in that same left-to-right accumulation.
-    // Known, deliberately unguarded gap (matches this codebase's existing
-    // "documented narrow gap" convention, e.g. ARCHITECTURE.md's same-
-    // named-columns-after-JOIN note): a query that references a semi/
-    // anti-joined source's own alias *outside* its own step's condition
-    // (e.g. in the outer SELECT list) is not rejected here with a clean
-    // error -- it resolves to an index that doesn't correspond to any
-    // real column in LogicalJoin's actual (left-only) output schema.
-    // TPC-H's own real EXISTS/NOT EXISTS usage never does this (a
-    // semi/anti-joined table's columns are never referenced anywhere but
-    // inside its own correlation predicate), so this has not been worth
-    // the real complexity of restructuring Binder to reject it cleanly.
-    combined_field_count += join_schemas[i + 1].field_count();
+                                       step.join_type, keys.right_prefilter, keys.residual_predicate});
+    // A LeftSemi/LeftAnti step's actual combined *output* schema -- see
+    // LogicalJoin::build_schema() -- contributes zero of this step's
+    // fields, not source_field_count of them. This matters as soon as a
+    // query has more than one such step chained back-to-back (TPC-H Q21:
+    // an EXISTS followed by a NOT EXISTS in the same WHERE clause,
+    // rewritten by sql::rewrite_exists_subqueries() into two appended
+    // steps) -- the second step's own condition must be classified
+    // against the width the row actually has at that point, not one
+    // inflated by the first (dropped) step's source width. `source.paths`
+    // (the actual FROM-source columns) are unaffected: those are read
+    // fresh from `join_schemas[i + 1]` regardless of `combined_field_count`.
+    if (step.join_type != JoinType::LeftSemi && step.join_type != JoinType::LeftAnti) {
+      combined_field_count += join_schemas[i + 1].field_count();
+    }
   }
 
   BoundQuery result = bind_query_common(stmt, binder, is_aggregate_query);

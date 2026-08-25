@@ -324,10 +324,11 @@ Preprocessed preprocess_from_read_parquet(const std::string& sql) {
   throw SqlError(fmt::format("unsupported SQL construct: {}", what));
 }
 
-AstExprPtr wrap(std::variant<AstColumnRef, AstStar, AstLiteral, AstBinary, AstUnary, AstBetween, AstAggregate,
-                             AstLike, AstIn, AstCase, AstCast, AstExtract, AstSubquery, AstExists>
-                    node,
-                std::optional<std::string> alias = std::nullopt) {
+AstExprPtr wrap(
+    std::variant<AstColumnRef, AstStar, AstLiteral, AstBinary, AstUnary, AstBetween, AstAggregate, AstLike,
+                 AstIn, AstCase, AstCast, AstExtract, AstSubstring, AstSubquery, AstExists>
+        node,
+    std::optional<std::string> alias = std::nullopt) {
   auto expr = std::make_shared<AstExpr>();
   expr->node = std::move(node);
   expr->alias = std::move(alias);
@@ -498,9 +499,6 @@ AstExprPtr convert_operator(const hsql::Expr* e, ConversionState& state) {
 }
 
 AstExprPtr convert_function(const hsql::Expr* e, ConversionState& state) {
-  if (e->distinct) {
-    unsupported("DISTINCT inside an aggregate function");
-  }
   if (e->windowDescription != nullptr) {
     unsupported("window functions");
   }
@@ -515,12 +513,19 @@ AstExprPtr convert_function(const hsql::Expr* e, ConversionState& state) {
 
   if (name == "COUNT") {
     if (e->exprList != nullptr && e->exprList->size() == 1 && (*e->exprList)[0]->type == hsql::kExprStar) {
+      if (e->distinct) {
+        unsupported("DISTINCT inside COUNT(*)");
+      }
       return wrap(AstAggregate{AstAggregateFunc::CountStar, nullptr}, alias_of(*e));
     }
     if (e->exprList == nullptr || e->exprList->size() != 1) {
       unsupported("COUNT with != 1 argument");
     }
-    return wrap(AstAggregate{AstAggregateFunc::Count, convert_expr((*e->exprList)[0], state)}, alias_of(*e));
+    const AstAggregateFunc function = e->distinct ? AstAggregateFunc::CountDistinct : AstAggregateFunc::Count;
+    return wrap(AstAggregate{function, convert_expr((*e->exprList)[0], state)}, alias_of(*e));
+  }
+  if (e->distinct) {
+    unsupported("DISTINCT inside an aggregate function (only COUNT(DISTINCT ...) is supported)");
   }
 
   static const std::vector<std::pair<std::string, AstAggregateFunc>> kAggregates = {
@@ -539,7 +544,23 @@ AstExprPtr convert_function(const hsql::Expr* e, ConversionState& state) {
     return wrap(AstAggregate{fn, convert_expr((*e->exprList)[0], state)}, alias_of(*e));
   }
 
-  unsupported("function '" + name + "' (only SUM/COUNT/MIN/MAX/AVG are supported)");
+  if (name == "SUBSTRING" || name == "SUBSTR") {
+    if (e->exprList == nullptr || e->exprList->size() != 3) {
+      unsupported(name +
+                  " requires exactly 3 arguments (string, start, length) -- SQL-92's own "
+                  "SUBSTRING(x FROM start FOR length) syntax isn't supported, use the function-call "
+                  "form instead");
+    }
+    const hsql::Expr* start_arg = (*e->exprList)[1];
+    const hsql::Expr* length_arg = (*e->exprList)[2];
+    if (start_arg->type != hsql::kExprLiteralInt || length_arg->type != hsql::kExprLiteralInt) {
+      unsupported(name + "'s start/length arguments must be integer literals");
+    }
+    return wrap(AstSubstring{convert_expr((*e->exprList)[0], state), start_arg->ival, length_arg->ival},
+                alias_of(*e));
+  }
+
+  unsupported("function '" + name + "' (only SUM/COUNT/MIN/MAX/AVG/SUBSTRING are supported)");
 }
 
 // Names deliberately match SQL keywords, not KernelLake's own TypeId names

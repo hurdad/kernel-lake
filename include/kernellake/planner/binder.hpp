@@ -49,6 +49,23 @@ struct BoundJoinStep {
   // why a left-side-referencing conjunct is rejected at bind time instead
   // of ever reaching here.
   ExpressionPtr right_prefilter;
+  // Non-null only for `join_type == LeftSemi/LeftAnti` (TPC-H Q21's
+  // shape: `EXISTS (SELECT * FROM lineitem l2 WHERE l2.l_orderkey =
+  // l1.l_orderkey AND l2.l_suppkey <> l1.l_suppkey)`) -- an ON-clause
+  // conjunct beyond the required equality key that references *both*
+  // sides at once (not just the newly-joined source's own columns, the
+  // only case `right_prefilter` above handles), so it can't be pushed
+  // down as a single-sided prefilter at all; it must be evaluated per
+  // candidate (already-joined-row, newly-joined-row) pair, at the join
+  // itself. Column indices are unrebased -- exactly the same combined-
+  // schema convention `combined_key_index` above already uses (indices
+  // `< combined_field_count` are the already-joined side's own original
+  // position, `>= combined_field_count` are `combined_field_count` +
+  // the newly-joined source's own original position) -- see
+  // extract_join_step_keys() (binder.cpp) for why real `JOIN ... ON`
+  // (INNER/LEFT OUTER) still rejects this shape outright rather than
+  // accepting it here too.
+  ExpressionPtr residual_predicate;
 };
 
 // The bound form of a `JOIN ... ON` chain (see sql::AstJoinClause):

@@ -129,12 +129,13 @@ class HashJoinNode final : public PhysicalPlanNode {
   HashJoinNode(PhysicalPlanPtr left, PhysicalPlanPtr right, std::size_t left_key_index,
                std::size_t right_key_index, std::vector<std::optional<std::size_t>> original_column_map = {},
                std::optional<std::int64_t> estimated_build_rows = std::nullopt,
-               JoinType join_type = JoinType::Inner)
+               JoinType join_type = JoinType::Inner, ExpressionPtr residual_predicate = nullptr)
       : left_(std::move(left)),
         right_(std::move(right)),
         left_key_index_(left_key_index),
         right_key_index_(right_key_index),
         join_type_(join_type),
+        residual_predicate_(std::move(residual_predicate)),
         schema_(build_schema(left_->output_schema(), right_->output_schema(), join_type_)),
         original_column_map_(std::move(original_column_map)),
         estimated_build_rows_(estimated_build_rows) {}
@@ -144,6 +145,14 @@ class HashJoinNode final : public PhysicalPlanNode {
   [[nodiscard]] std::size_t left_key_index() const noexcept { return left_key_index_; }
   [[nodiscard]] std::size_t right_key_index() const noexcept { return right_key_index_; }
   [[nodiscard]] JoinType join_type() const noexcept { return join_type_; }
+  // Non-null only for LeftSemi/LeftAnti (TPC-H Q21's shape) -- see
+  // LogicalJoin::residual_predicate()'s own doc comment. Unlike that
+  // logical-layer version, this one's column indices are already remapped
+  // into *narrowed* combined-schema space ([0, left's own narrowed field
+  // count) for the left side, that count onward for the right) by
+  // physical_planner.cpp's own JOIN conversion -- see
+  // remap_join_residual_predicate() there.
+  [[nodiscard]] const ExpressionPtr& residual_predicate() const noexcept { return residual_predicate_; }
   // Rough, pre-filter row-count estimate of the *build* (right) side --
   // exactly the value physical_planner.cpp's own estimate_row_count()
   // already computes to decide which side to build on (see that
@@ -200,6 +209,7 @@ class HashJoinNode final : public PhysicalPlanNode {
   std::size_t left_key_index_;
   std::size_t right_key_index_;
   JoinType join_type_;
+  ExpressionPtr residual_predicate_;
   Schema schema_;
   std::vector<std::optional<std::size_t>> original_column_map_;
   std::optional<std::int64_t> estimated_build_rows_;
