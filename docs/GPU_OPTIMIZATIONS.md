@@ -2171,3 +2171,76 @@ actual GDS behavior. Given the cost/complexity, this line of
 investigation is being closed out here rather than continued further
 without an explicit decision to spend at that level. Instance and FSx
 torn down after this test.
+
+## Multi-GPU Tier 1 implemented: one `RmmEnvironment` per visible device (2026-08-24)
+
+Both `p5.48xlarge` and `p6-b200.48xlarge` above are fixed 8-GPU boxes,
+which is what prompted `docs/MULTI_GPU_SCALING.md`'s three-tier plan --
+this closes out Tier 1 ("concurrent queries, one GPU each, single
+node"), the only tier recommended without a separate scope decision
+first.
+
+**What changed**, all four of that doc's "concrete pieces":
+
+1. `GpuExecutionCoordinator` (`gpu_execution_coordinator_gpu.cpp`) no
+   longer holds one process-wide `RmmEnvironment` pinned to
+   `config.engine.device_id`. Its constructor now calls
+   `cudaGetDeviceCount()` and builds one `RmmEnvironment` per visible
+   device, each from its own `EngineConfig` copy (`device_id`
+   overridden to that device's index) constructed while a
+   `CudaDeviceGuard` for that index is active --
+   `set_current_device_resource()` really is one slot per device, so
+   this is mechanical, exactly as the planning doc expected.
+2. `execute()` round-robins across devices via an ever-growing atomic
+   counter modulo device count, rather than always targeting device 0.
+   Each device gets its own `std::counting_semaphore<>` sized to
+   `EngineSection::max_concurrent_gpu_queries` -- that field is now a
+   **per-device** cap, not process-wide (see its own updated doc
+   comment in `config.hpp`): an N-GPU node gets up to N times the
+   total concurrent-query throughput a single-GPU node does, at the
+   same per-device concurrency risk profile opt #2 already validated.
+3. `ExecutionContext::cuda_device_id` is now threaded through for
+   real. `RmmEnvironment` gained a `device_id()` accessor (the value
+   it was actually constructed with); `query_engine_execute_gpu.cpp`'s
+   `execute(physical, rmm_environment)` reads the target device from
+   `rmm_environment.device_id()` instead of `config_.engine.device_id`
+   for both its `CudaDeviceGuard` and the `ExecutionContext` it builds.
+   This turned out to need no operator-level changes at all: a grep
+   audit found no operator in `execution_gpu/` calls `cudaSetDevice()`
+   or reads an implicit current-device resource -- every allocation
+   already goes through `ExecutionContext::memory_resource` explicitly,
+   and the query's one `CudaStream` is created immediately after the
+   (now-correct) device guard, so it's already bound to the right
+   device. The planning doc flagged this as "most likely to surface
+   latent assume-device-0 bugs" -- it didn't, because opt #2's own
+   `mr`/`stream` explicitness audit had already closed that gap.
+4. Per-device metrics needed no new work: `TrackingMemoryResource`
+   (`gpu_memory_tracking_resource.hpp`) already took a `device_id` and
+   fed it to `GpuMemoryMetricsRegistry`, which was already keyed by
+   device -- once each `RmmEnvironment` is actually constructed with
+   its own real `device_id`, the existing `kernellake.gpu.memory.*`
+   OTel metrics report correctly per device with no changes needed.
+
+**What didn't change**: no new operator types, no cross-GPU data
+movement, `config.engine.device_id`'s meaning for the CLI's one-shot
+`QueryEngine::execute(sql)` overload (still the single device that
+call uses, unaffected -- it never goes through
+`GpuExecutionCoordinator`). A single query still runs entirely on
+whichever one device the coordinator dispatched it to; spanning one
+query across multiple GPUs is Tier 2, not attempted here.
+
+**Verified**: built and run against this project's real dev GPU
+(`gpu-dev-wsl` preset) -- one visible device, so this can't confirm
+two *different* physical GPUs each ran a query for real, but it does
+confirm the round-robin/semaphore-per-device machinery works
+end-to-end and degrades to exactly the old single-device behavior when
+`cudaGetDeviceCount() == 1`. Added
+`GpuExecutionCoordinatorConcurrencyTest.RoundRobinDeviceSelectionStaysCorrectAcrossManyCalls`
+(`tests/unit/gpu_execution_coordinator_test.cpp`) to exercise the
+round-robin index arithmetic well past a full wrap of the counter, and
+`RmmEnvironment.DeviceIdAccessorReflectsConstructionConfig`
+(`tests/gpu/rmm_environment_test.cpp`) for the new accessor. Real
+8-GPU verification (confirming queries actually land on distinct
+physical devices, and a real per-device-throughput measurement) still
+needs actual `p5.48xlarge`/`p6-b200.48xlarge` hardware -- not done this
+session, no such instance was provisioned.

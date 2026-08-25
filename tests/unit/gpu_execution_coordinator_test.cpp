@@ -180,6 +180,46 @@ TEST_F(GpuExecutionCoordinatorConcurrencyTest,
   }
 }
 
+// Regression coverage for the Tier 1 multi-device rewrite
+// (docs/MULTI_GPU_SCALING.md): GpuExecutionCoordinator now owns one
+// RmmEnvironment/semaphore pair per visible CUDA device
+// (cudaGetDeviceCount()) and round-robins execute() calls across them via
+// an ever-growing atomic counter modulo device count, rather than every
+// call always targeting the single process-wide instance this used to be.
+// Real hardware for this project's CI/dev boxes has exactly one visible
+// GPU, so this can't directly confirm two *different* physical devices
+// each ran a query -- what it does confirm, and what a single-device box
+// can't get right by accident, is that the round-robin index arithmetic
+// stays in bounds and every call still gets a correct, independent result
+// well past a full wrap-around of the counter (more calls than any
+// plausible device count), on top of the existing concurrency test above
+// already covering the semaphore/RmmEnvironment-per-call isolation itself.
+TEST_F(GpuExecutionCoordinatorConcurrencyTest, RoundRobinDeviceSelectionStaysCorrectAcrossManyCalls) {
+  EngineConfig config = default_config();
+  config.engine.backend = "gpu";
+
+  GpuExecutionCoordinator coordinator(config);
+  QueryEngine engine(config);
+
+  const std::string sql = "SELECT SUM(amount) AS total FROM read_parquet('" + path_ + "') WHERE region = 'A'";
+  const PhysicalPlanPtr physical = engine.explain(sql);
+
+  // Comfortably more than any real single-node GPU count (see
+  // kMaxTrackedGpuDevices's own comment, kernellake/memory/gpu_memory_metrics.hpp)
+  // so this exercises at least one full wrap of the round-robin counter
+  // even on an 8- or 16-GPU box, not just a 1-GPU dev machine.
+  constexpr int kCalls = 20;
+  for (int i = 0; i < kCalls; ++i) {
+    const QueryResult result = coordinator.execute(engine, physical);
+    ASSERT_EQ(result.rows_returned, 1) << "call " << i;
+    ASSERT_EQ(result.batches.size(), 1u) << "call " << i;
+    const auto total_column =
+        std::static_pointer_cast<arrow::DoubleArray>(result.batches.front()->GetColumnByName("total"));
+    ASSERT_NE(total_column, nullptr) << "call " << i;
+    EXPECT_DOUBLE_EQ(total_column->Value(0), 35.0) << "call " << i;
+  }
+}
+
 }  // namespace
 }  // namespace kernellake
 

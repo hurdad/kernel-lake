@@ -32,7 +32,16 @@ arbitrary limit that's easy to lift:
 Three tiers below, roughly in the order they'd need to be built (each
 depends on the previous one's infrastructure):
 
-## Tier 1 (cheap): concurrent queries, one GPU each, single node
+## Tier 1 (cheap): concurrent queries, one GPU each, single node -- IMPLEMENTED (2026-08-24)
+
+See docs/GPU_OPTIMIZATIONS.md's "Multi-GPU Tier 1 implemented" section
+for the full account of what changed and how it was verified. Built and
+tested against this project's real (single) dev GPU; real multi-GPU
+hardware (`p5.48xlarge`/`p6-b200.48xlarge`) has not yet been used to
+confirm queries land on genuinely distinct physical devices or to
+measure real per-device throughput scaling -- everything below is kept
+as the original planning record, now with each piece's actual
+disposition noted inline.
 
 **What it is**: turn 8 idle GPUs into 8x concurrent-query throughput.
 Each GPU gets its own `RmmEnvironment` instance; `GpuExecutionCoordinator`
@@ -51,31 +60,33 @@ execution safe in the first place. What's left for this tier is now just
 the device dimension bolted on top (items 1-4 below), not that whole
 prerequisite plus the device dimension.
 
-**Concrete pieces**:
+**Concrete pieces** (all four now DONE, see
+docs/GPU_OPTIMIZATIONS.md's "Multi-GPU Tier 1 implemented" section):
 
-1. `RmmEnvironment` becomes one-per-device instead of one-per-process:
-   either `GpuExecutionCoordinator` owns a `std::vector<std::unique_ptr<RmmEnvironment>>`
-   sized to `cudaGetDeviceCount()`, or a `RmmEnvironmentPool` wraps that.
-   Each construction call needs `cudaSetDevice(i)` first --
-   `set_current_device_resource()` really is one slot per device (confirmed
-   from RMM source during the 2026-08-17 mutex investigation), so this
-   part is mechanical, not risky.
-2. `GpuExecutionCoordinator::execute()` picks a device instead of
-   assuming device 0 -- simplest correct policy is round-robin or
-   least-recently-used; anything fancier (memory-aware placement) is a
-   tier-1.5 refinement, not a blocker.
-3. `ExecutionContext::cuda_device_id` gets threaded through for real --
-   every `cudaSetDevice()`/stream-creation call in the operator tree
-   needs to target the assigned device, not assume "whatever's
-   current." This is the part most likely to surface latent
-   assume-device-0 bugs; needs the same kind of grep-every-call-site
-   audit opt #2 already did for `mr`/`stream`.
-4. Per-device metrics: `GpuMemoryMetricsRegistry`
-   (`kernellake/memory/gpu_memory_metrics.hpp`) currently reports
-   process-wide counters with no device dimension -- needs a device-id
-   label added so the existing `kernellake.gpu.memory.*` OTel metrics
-   (see the memory-metrics project note) stay meaningful once there's
-   more than one device to report on.
+1. ~~`RmmEnvironment` becomes one-per-device instead of
+   one-per-process~~ -- done. `GpuExecutionCoordinator` owns a
+   `std::vector<std::unique_ptr<RmmEnvironment>>` sized to
+   `cudaGetDeviceCount()`, each constructed under a `CudaDeviceGuard`
+   for its own index from its own `EngineConfig` copy. Turned out to be
+   exactly as mechanical as expected -- `set_current_device_resource()`
+   really is one slot per device.
+2. ~~`GpuExecutionCoordinator::execute()` picks a device instead of
+   assuming device 0~~ -- done, via round-robin (an ever-growing atomic
+   counter modulo device count). Memory-aware placement remains an
+   unstarted tier-1.5 refinement, not needed yet.
+3. ~~`ExecutionContext::cuda_device_id` gets threaded through for
+   real~~ -- done. Turned out *not* to need the feared
+   grep-every-call-site operator audit: no operator in `execution_gpu/`
+   calls `cudaSetDevice()` or touches an implicit current-device
+   resource, since opt #2's own `mr`/`stream` explicitness audit had
+   already made every allocation and the query's one `CudaStream`
+   explicit. Fixing `RmmEnvironment::device_id()` (a new accessor) to
+   flow into `query_engine_execute_gpu.cpp`'s `CudaDeviceGuard`/
+   `ExecutionContext` construction was the whole fix.
+4. ~~Per-device metrics~~ -- done, and needed no code changes at all:
+   `TrackingMemoryResource`/`GpuMemoryMetricsRegistry` were already
+   device-keyed; they just weren't being fed a real per-device
+   `device_id` until piece 1 above existed.
 
 **What doesn't change**: no new operator types, no network protocol,
 no cross-GPU data movement at all. `HashJoinOperator`,
@@ -206,11 +217,13 @@ scoping, not a natural next step after tier 2.
 
 ## Recommendation
 
-Build tier 1 regardless of which instance type (or whether either) is
-ever provisioned -- it's cheap, mostly already-scoped work, and pays
-off even on hardware already owned (any multi-GPU box, not just the
-two GDS-validated ones). Tier 2 only pays for itself if a real
-single-query workload too big for one GPU's memory actually shows up
+Tier 1 is now implemented (2026-08-24, see above) regardless of which
+instance type (or whether either) is ever provisioned -- it was cheap,
+mostly already-scoped work, and pays off even on hardware already
+owned (any multi-GPU box, not just the two GDS-validated ones); real
+multi-GPU hardware to confirm it end to end is still an open item, not
+a reason to have waited to build it. Tier 2 only pays for itself if a
+real single-query workload too big for one GPU's memory actually shows up
 (nothing measured in this project so far has hit that ceiling -- SF1000
 Q3 fits in 9.9 GiB post-fix, well under even the smaller GPUs already
 tested). Tier 3 is a separate, much larger decision -- don't scope it

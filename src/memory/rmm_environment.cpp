@@ -57,6 +57,7 @@ std::uint64_t resolve_query_memory_limit_bytes(const EngineConfig& config) {
 }
 
 struct RmmEnvironment::Impl {
+  int device_id;
   std::uint64_t query_memory_limit_bytes;
   cuda::mr::any_resource<cuda::mr::device_accessible> base_resource;
   // SHARED across every concurrently in-flight query -- deliberately not
@@ -79,7 +80,8 @@ struct RmmEnvironment::Impl {
 
   Impl(const EngineConfig& config, cuda::mr::any_resource<cuda::mr::device_accessible> base,
        cuda::mr::any_resource<cuda::mr::device_accessible> previous)
-      : query_memory_limit_bytes(resolve_query_memory_limit_bytes(config)),
+      : device_id(config.engine.device_id),
+        query_memory_limit_bytes(resolve_query_memory_limit_bytes(config)),
         base_resource(std::move(base)),
         limiter(base_resource, query_memory_limit_bytes),
         tracking(cuda::mr::any_resource<cuda::mr::device_accessible>{limiter}, config.engine.device_id),
@@ -163,6 +165,10 @@ QueryMemoryTracker RmmEnvironment::make_query_tracker() {
 
 std::uint64_t RmmEnvironment::query_memory_limit_bytes() const {
   return impl_->query_memory_limit_bytes;
+}
+
+int RmmEnvironment::device_id() const {
+  return impl_->device_id;
 }
 
 }  // namespace kernellake

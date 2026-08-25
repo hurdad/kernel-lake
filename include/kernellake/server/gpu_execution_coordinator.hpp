@@ -8,7 +8,8 @@
 
 namespace kernellake {
 
-// Owns the single long-lived RmmEnvironment a Flight SQL server needs to
+// Owns one long-lived RmmEnvironment per visible CUDA device (see
+// docs/MULTI_GPU_SCALING.md's Tier 1) that a Flight SQL server needs to
 // safely call QueryEngine::execute(physical, RmmEnvironment&) across
 // concurrent gRPC handler threads for the "gpu" backend, instead of the
 // one-shot QueryEngine::execute(sql) convenience overload's per-call
@@ -37,13 +38,18 @@ class GpuExecutionCoordinator {
   GpuExecutionCoordinator(const GpuExecutionCoordinator&) = delete;
   GpuExecutionCoordinator& operator=(const GpuExecutionCoordinator&) = delete;
 
-  // Runs concurrent calls against the one shared RmmEnvironment, bounded
-  // to at most EngineSection::max_concurrent_gpu_queries at a time (a
-  // semaphore, not the single-flight mutex this used to be -- see that
+  // Round-robins each call across one RmmEnvironment per visible CUDA
+  // device (docs/MULTI_GPU_SCALING.md's Tier 1) -- not the single
+  // process-wide RmmEnvironment pinned to config.engine.device_id this used
+  // to be. Each device's own share of concurrent queries is bounded to at
+  // most EngineSection::max_concurrent_gpu_queries at a time (a semaphore,
+  // not the single-flight mutex this used to be before opt #2 -- see that
   // config field's own comment for why bounded rather than unbounded, and
   // RmmEnvironment::make_query_tracker() for how per-query GPU memory
   // reporting stays correctly isolated once more than one call can be
-  // in-flight here at once).
+  // in-flight against the same device at once). A single query still runs
+  // entirely on whichever one device it's dispatched to -- this does not
+  // split one query's work across multiple GPUs.
   [[nodiscard]] QueryResult execute(const QueryEngine& engine, const PhysicalPlanPtr& physical);
 
  private:

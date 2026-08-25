@@ -89,6 +89,20 @@ class RmmEnvironment {
   // silently drift from the ceiling this instance actually enforces.
   [[nodiscard]] std::uint64_t query_memory_limit_bytes() const;
 
+  // The CUDA device ordinal this instance's resource stack was constructed
+  // against (config.engine.device_id at construction time -- fixed for this
+  // instance's whole lifetime, since a fresh RmmEnvironment is what
+  // multi-device support constructs one-per-device from, see
+  // GpuExecutionCoordinator). Callers that need to target the *right*
+  // device for a given call -- CudaDeviceGuard construction and
+  // ExecutionContext::cuda_device_id in query_engine_execute_gpu.cpp -- must
+  // read it from here rather than from config_.engine.device_id directly:
+  // once GpuExecutionCoordinator owns more than one RmmEnvironment (one per
+  // visible GPU), config_.engine.device_id is just the process's original
+  // configured value and no longer identifies which specific instance a
+  // caller is holding.
+  [[nodiscard]] int device_id() const;
+
  private:
   struct Impl;
   std::unique_ptr<Impl> impl_;

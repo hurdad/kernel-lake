@@ -4245,15 +4245,19 @@ log` is the authoritative chronology if that ordering ever matters.
   (`docs/GPU_OPTIMIZATIONS.md`) landing on two real GDS-validated
   instance types (`p5.48xlarge`, `p6-b200.48xlarge`) that are both
   fixed 8-GPU boxes, raising the question of whether KernelLake should
-  do anything with GPUs 2-8 rather than leave them idle. Full plan
-  (not started, no code changes) in `docs/MULTI_GPU_SCALING.md`, three
-  tiers:
-  - *Tier 1, cheap*: concurrent queries across a node's GPUs (each
-    gets its own `RmmEnvironment`, `GpuExecutionCoordinator` picks a
-    free device per query instead of mutex-serializing onto device 0).
-    Mostly the already-scoped opt #2 mutex-removal work
-    (`GPU_OPTIMIZATIONS.md`) plus a device dimension -- a natural MVP
-    scope extension, not a reversal of anything declared below.
+  do anything with GPUs 2-8 rather than leave them idle. Full plan in
+  `docs/MULTI_GPU_SCALING.md`, three tiers:
+  - ~~*Tier 1, cheap*~~ -- done, 2026-08-24 (see
+    `docs/GPU_OPTIMIZATIONS.md`'s "Multi-GPU Tier 1 implemented"
+    section): concurrent queries across a node's GPUs, each gets its
+    own `RmmEnvironment`, `GpuExecutionCoordinator` round-robins
+    across devices per query instead of mutex-serializing onto device
+    0. Built and tested against this project's real (single) dev GPU;
+    real multi-GPU hardware to confirm queries land on genuinely
+    distinct physical devices, and to measure real per-device
+    throughput scaling, hasn't been used yet -- not a blocker for
+    calling the tier itself done, since none of this tier's logic is
+    GPU-count-dependent in a way single-device testing can't exercise.
   - *Tier 2, expensive*: one query's operators (join/aggregate)
     partitioned across a node's GPUs via a new exchange operator,
     building on `HashJoinOperator`'s existing hash-partition-and-spill
@@ -4267,10 +4271,10 @@ log` is the authoritative chronology if that ordering ever matters.
   multi-node/multi-GPU scheduling" in the non-goals section just below
   already excludes from the MVP -- this plan exists as pre-work for if
   that's ever revisited on its own merits, not a commitment to build
-  it now. Tier 1 doesn't carry that same exclusion (it's
-  single-node, single-query-per-GPU, no distributed anything) and is
-  the only one of the three worth prioritizing without a separate
-  scope decision first.
+  it now. Tier 1 didn't carry that same exclusion (it's single-node,
+  single-query-per-GPU, no distributed anything), which is why it was
+  the one built without waiting on a separate scope decision for the
+  other two.
 
 ## Explicit non-goals for the MVP
 

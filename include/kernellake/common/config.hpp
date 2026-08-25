@@ -12,6 +12,21 @@
 namespace kernellake {
 
 struct EngineSection {
+  // The CUDA device QueryEngine::execute(sql)'s one-shot overload runs on
+  // (query_engine_execute_gpu.cpp) -- i.e. the CLI (`kernellake query`),
+  // which builds exactly one RmmEnvironment straight from this config and
+  // never goes through GpuExecutionCoordinator at all. On a multi-GPU box
+  // this is how an ad-hoc CLI query gets pinned to a specific card.
+  //
+  // NOT consulted by kernellake-server as of docs/MULTI_GPU_SCALING.md's
+  // Tier 1: GpuExecutionCoordinator ignores this field entirely, discovers
+  // every visible device via cudaGetDeviceCount(), and builds one
+  // RmmEnvironment per device from its own private config copy (each with
+  // this field overridden to that device's own index) -- the value
+  // configured here never reaches any of them. Before Tier 1 this field
+  // was "the one device the whole server uses"; that's no longer true, and
+  // there is currently no server-side equivalent (no supported way to
+  // pin kernellake-server to a subset of a node's GPUs via config).
   int device_id = 0;
   std::uint64_t batch_rows = 1'000'000;
   std::uint64_t result_batch_rows = 65'536;
@@ -44,21 +59,26 @@ struct EngineSection {
   // bump is a YAML edit + restart instead.
   std::uint64_t max_distinct_keys = 0;
   // Caps how many queries GpuExecutionCoordinator (kernellake/server) lets
-  // run concurrently against the shared GPU -- deliberately bounded, not
+  // run concurrently against *each* GPU -- deliberately bounded, not
   // unbounded, even though the underlying RMM allocator/limiter are both
   // already thread-safe and could technically support any number at once.
-  // Two real, previously-measured risks make an unbounded value unsafe to
-  // default to: (1) pass_read_limit_bytes/build_side_budget_bytes
+  // Applied per device since docs/MULTI_GPU_SCALING.md's Tier 1 (one
+  // RmmEnvironment/semaphore pair per visible CUDA device): an N-GPU node
+  // allows up to N times this many queries running at once in total, not
+  // this value process-wide regardless of device count. Two real,
+  // previously-measured risks make an unbounded value unsafe to default to
+  // for any one device: (1) pass_read_limit_bytes/build_side_budget_bytes
   // (query_engine_execute_gpu.cpp) are each sized as a fraction of the
   // *entire* device memory ceiling for a single query -- N concurrent
-  // queries can therefore collectively demand up to N times that against
-  // one real, shared GPU budget, a genuine oversubscription risk with no
-  // guard today. (2) the opt #6 parallel-decode prototype
-  // (docs/GPU_OPTIMIZATIONS.md) found concurrent decode streams on one GPU
-  // degrade past ~N=2 (up to -190% at N=16) -- more concurrency is not
-  // automatically more throughput on this hardware. 2 is a conservative
-  // starting point pending a real scaling_test.py re-run to tune it
-  // per-deployment, not a value assumed to be optimal everywhere.
+  // queries on the same device can therefore collectively demand up to N
+  // times that against one real, shared GPU budget, a genuine
+  // oversubscription risk with no guard today. (2) the opt #6
+  // parallel-decode prototype (docs/GPU_OPTIMIZATIONS.md) found concurrent
+  // decode streams on one GPU degrade past ~N=2 (up to -190% at N=16) --
+  // more concurrency is not automatically more throughput on this hardware.
+  // 2 is a conservative starting point pending a real scaling_test.py
+  // re-run to tune it per-deployment, not a value assumed to be optimal
+  // everywhere.
   int max_concurrent_gpu_queries = 2;
 };
 

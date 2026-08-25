@@ -84,7 +84,16 @@ QueryResult QueryEngine::execute(std::string_view sql) const {
 QueryResult QueryEngine::execute(const PhysicalPlanPtr& physical, RmmEnvironment& rmm_environment) const {
   const auto wall_start = std::chrono::steady_clock::now();
 
-  const CudaDeviceGuard device_guard(config_.engine.device_id);
+  // rmm_environment.device_id(), not config_.engine.device_id: once
+  // GpuExecutionCoordinator owns one RmmEnvironment per visible GPU (see
+  // docs/MULTI_GPU_SCALING.md's Tier 1), config_.engine.device_id is just
+  // the process's originally configured value and no longer identifies
+  // which specific device this call's rmm_environment argument is actually
+  // bound to -- the CLI's one-shot execute(sql) overload above still
+  // constructs its RmmEnvironment straight from config_, so device_id()
+  // there is config_.engine.device_id anyway and this is a no-op change for
+  // that caller.
+  const CudaDeviceGuard device_guard(rmm_environment.device_id());
   const CudaStream stream;
 
   // Per-query, not the process-wide ambient default -- see
@@ -99,9 +108,10 @@ QueryResult QueryEngine::execute(const PhysicalPlanPtr& physical, RmmEnvironment
   QueryMemoryTracker memory_tracker = rmm_environment.make_query_tracker();
 
   MetricsRegistry metrics;
-  ExecutionContext context{
-      make_query_id(), config_.engine.device_id, stream.get(), memory_tracker.resource_ref(), nullptr,
-      &metrics,        &memory_tracker};
+  ExecutionContext context{make_query_id(), rmm_environment.device_id(),
+                           stream.get(),    memory_tracker.resource_ref(),
+                           nullptr,         &metrics,
+                           &memory_tracker};
 
   // A quarter of the *actually enforced* memory ceiling --
   // rmm_environment.query_memory_limit_bytes() (the exact value this
