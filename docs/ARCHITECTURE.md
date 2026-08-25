@@ -1325,10 +1325,16 @@ would fail on an implementation detail unrelated to correctness.
 *entire* FROM clause (TPC-H Q13's own outer-query shape), not itself
 joined or joinable, and not correlated (the inner query cannot reference
 the outer query's columns -- there's no outer query yet when the inner one
-binds). A derived table nested inside a JOIN, or a JOIN inside a derived
-table's own FROM, is out of scope; both fail clearly (the parser only
+binds). A derived table used *as a JOIN source* (`FROM a JOIN (SELECT
+...) AS b ON ...`) is out of scope and fails clearly (the parser only
 recognizes `kTableSelect` at a statement's own top-level FROM position,
 and `flatten_join_chain()`/`convert_join_source()` never look for one).
+The derived table's *own inner query*, by contrast, may contain a real
+JOIN of its own -- TPC-H Q13's inner query is itself a `customer LEFT
+JOIN orders`, and TPC-H Q8's is an 8-way `INNER JOIN` chain; there is
+nothing derived-table-specific stopping this (see the recursive
+resolution below, which just builds the inner query's own logical plan
+exactly as if it had been a whole standalone query, JOIN and all).
 
 `QueryEngine::plan_logical_unoptimized()` is where this is actually
 resolved: a genuinely recursive private helper (the same shape
@@ -1360,6 +1366,27 @@ child is a `LogicalAggregate` whose child is a `LogicalJoin`) for a
 plain single-statement query with `WHERE` + `JOIN` + `GROUP BY` all
 together; a derived table just means that whole subtree was built by a
 separate, earlier recursive call instead of inline.
+
+**Real bug found and fixed while adding TPC-H Q8** (`physical_planner.cpp`'s
+`LogicalAggregate` case): an outer `GROUP BY` over a derived table whose
+*own inner query has no `GROUP BY` of its own* (a plain JOIN projection,
+Q8's own shape -- unlike Q13's, whose inner query is itself aggregated)
+crashed at execution time. The `LogicalAggregate` case was the one node
+type of the four (`Filter`/`Projection`/`Aggregate`/`Sort`) in `convert()`
+that unconditionally called `find_scan_boundary()` on its own child,
+without first checking `references_scan_schema()` the way the other
+three already do. When the aggregate's child is a `LogicalProjection`
+(the derived table's own finished SELECT list) rather than a raw
+`Scan`/`Filter`/`Join`, its `group_by()`/`aggregates()` already correctly
+reference *that* projection's narrow output one-for-one and need no
+remap at all -- but `find_scan_boundary()` searches through any node type
+looking for a scan/join boundary, so it happily found the *join's* wider
+boundary sitting underneath the already-converted physical projection and
+wrongly remapped already-correct indices against it. Fixed by adding the
+same `references_scan_schema(aggregate->child().get())` guard the other
+three cases already have. See
+`GroupByOverDerivedTableWhoseInnerQueryIsAPlainJoinMatchesExpectedCounts`
+in `tests/unit/query_engine_execute_cpu_test.cpp` for the regression test.
 
 ### GPU dependency vendoring (no conda)
 

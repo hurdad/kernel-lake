@@ -8,7 +8,7 @@ subqueries, `IN (SELECT ...)` subqueries, Hash joins, DECIMAL support,
 LIKE/IN/CASE/CAST implementation notes, Derived tables). For which TPC-H
 queries this adds up to, see `docs/TPCH.md` and `docs/ROADMAP.md`'s
 "Done"/"Not yet started" sections. Everything below reflects the
-codebase as of the TPC-H Q4 addition (14 of 22 TPC-H queries supported).
+codebase as of the TPC-H Q8 addition (15 of 22 TPC-H queries supported).
 
 KernelLake vendors `hyrise/sql-parser` (hsql) for grammar parsing, then
 applies its own, much narrower binder/logical-planner scope on top --
@@ -229,10 +229,12 @@ error rather than being silently reinterpreted.
 
 ## TPC-H query coverage
 
-14 of 22 TPC-H queries: **Q1, Q3, Q4, Q5, Q6, Q7, Q9, Q10, Q11, Q12, Q13,
-Q14, Q18, Q19**. See `docs/TPCH.md` for the generate/query/validate/benchmark
-workflow and `docs/ROADMAP.md`'s "Done" section for what each addition
-needed. Every remaining query is blocked on a feature in the "Not
-supported" list above (most commonly `DISTINCT`, set operations,
-`WITH`/CTEs, window functions, or a correlated scalar subquery) --
-none of the "cheap," no-new-SQL-feature queries remain.
+15 of 22 TPC-H queries: **Q1, Q3, Q4, Q5, Q6, Q7, Q8, Q9, Q10, Q11, Q12,
+Q13, Q14, Q18, Q19**. See `docs/TPCH.md` for the generate/query/validate/
+benchmark workflow and `docs/ROADMAP.md`'s "Done" section for what each
+addition needed. Every remaining query is blocked on a feature in the
+"Not supported" list above (most commonly `DISTINCT`, set operations,
+`WITH`/CTEs, window functions, or a correlated scalar subquery) -- Q8
+needed no new SQL feature (just a real execution-layer bug fix, see
+`docs/ARCHITECTURE.md`'s "Derived tables" section), but every other
+remaining query is genuinely feature-blocked.

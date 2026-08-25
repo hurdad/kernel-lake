@@ -60,7 +60,17 @@ AND l_commitdate < l_receiptdate)` -- the first query in this project
 needing a correlated subquery, rewritten internally into a `LEFT SEMI
 JOIN` reusing the same ON-clause-auxiliary-predicate machinery Q13's
 `LEFT OUTER JOIN` already exercises; see `docs/ARCHITECTURE.md`'s
-"Correlated subqueries" section for the exact `EXISTS`/`NOT EXISTS` scope).
+"Correlated subqueries" section for the exact `EXISTS`/`NOT EXISTS` scope),
+and **Q8** (an 8-way `part`/`lineitem`/`supplier`/`orders`/`customer`/
+`nation`/`region`/`nation` `INNER JOIN` chain -- `nation` joined twice,
+Q7's own pattern -- wrapped in a derived table kept exactly as canonical
+TPC-H writes it (unlike Q7's own flattened deviation), the first query
+combining a derived table with a real `JOIN` *inside* that derived
+table's own `FROM`. Found and fixed a real bug along the way: an outer
+`GROUP BY` over a derived table whose own inner query has no `GROUP BY`
+of its own (a plain JOIN projection, Q8's shape -- unlike Q13's, whose
+inner query is itself aggregated) crashed at execution time; see
+`docs/ARCHITECTURE.md`'s "Derived tables" section for the fix).
 KernelLake supports a chain of two
 or more tables via `INNER` or `LEFT OUTER JOIN ... ON`, each step a single
 equality key (`LEFT OUTER` additionally allows an `ON`-clause predicate
@@ -136,8 +146,8 @@ also a single file.
 ## 2. Query
 
 The queries live in version-controlled files, `benchmarks/tpch/queries/
-q01.sql`, `q03.sql`, `q04.sql`, `q05.sql`, `q06.sql`, `q07.sql`, `q09.sql`,
-`q10.sql`, `q11.sql`, `q12.sql`, `q13.sql`, `q14.sql`, `q18.sql`,
+q01.sql`, `q03.sql`, `q04.sql`, `q05.sql`, `q06.sql`, `q07.sql`, `q08.sql`,
+`q09.sql`, `q10.sql`, `q11.sql`, `q12.sql`, `q13.sql`, `q14.sql`, `q18.sql`,
 `q19.sql`, each with a header comment documenting
 its specific deviations from canonical TPC-H syntax (`FROM lineitem` ->
 `FROM read_parquet('{data}')`, no `INTERVAL` arithmetic). Q1/Q6 need only
@@ -156,7 +166,12 @@ globs; Q5 needs `{orders_data}`, `{customer_data}`, `{supplier_data}`,
 `{orders_data}`, `{customer_data}`, `{supplier_data}`, and `{nation_data}`
 substituted with your `orders`, `customer`, `supplier`, and `nation` globs
 (`{nation_data}` appears *twice* in Q7's own text -- once per alias --
-and both get the same substitution); Q9 needs `{part_data}`,
+and both get the same substitution); Q8 needs `{part_data}`, `{data}`,
+`{supplier_data}`, `{orders_data}`, `{customer_data}`, `{nation_data}`,
+and `{region_data}` substituted with your `part`, `lineitem`, `supplier`,
+`orders`, `customer`, `nation`, and `region` globs (`{nation_data}`
+appears *twice*, same as Q7, both get the same substitution); Q9 needs
+`{part_data}`,
 `{supplier_data}`, `{partsupp_data}`, `{orders_data}`, and
 `{nation_data}` substituted with your `part`, `supplier`, `partsupp`,
 `orders`, and `nation` globs; Q11 needs `{partsupp_data}`,
@@ -236,6 +251,17 @@ sql=$(grep -v '^--' benchmarks/tpch/queries/q07.sql | tr '\n' ' ' | \
        s|{nation_data}|/tmp/kernellake-tpch-sf1/nation-*.parquet|")
 ./build/gpu-dev/src/cli/kernellake query --sql "$sql" --stats
 
+# Q8's own {nation_data} appears twice -- once per alias, same as Q7's.
+sql=$(grep -v '^--' benchmarks/tpch/queries/q08.sql | tr '\n' ' ' | \
+  sed "s|{data}|/tmp/kernellake-tpch-sf1/lineitem-*.parquet|; \
+       s|{part_data}|/tmp/kernellake-tpch-sf1/part-*.parquet|; \
+       s|{supplier_data}|/tmp/kernellake-tpch-sf1/supplier-*.parquet|; \
+       s|{orders_data}|/tmp/kernellake-tpch-sf1/orders-*.parquet|; \
+       s|{customer_data}|/tmp/kernellake-tpch-sf1/customer-*.parquet|; \
+       s|{nation_data}|/tmp/kernellake-tpch-sf1/nation-*.parquet|g; \
+       s|{region_data}|/tmp/kernellake-tpch-sf1/region-*.parquet|")
+./build/gpu-dev/src/cli/kernellake query --sql "$sql" --stats
+
 sql=$(grep -v '^--' benchmarks/tpch/queries/q09.sql | tr '\n' ' ' | \
   sed "s|{data}|/tmp/kernellake-tpch-sf1/lineitem-*.parquet|; \
        s|{part_data}|/tmp/kernellake-tpch-sf1/part-*.parquet|; \
@@ -291,8 +317,10 @@ python3 tools/validate_tpch.py \
 # --customer-data, and --nation-data, Q5 needs --orders-data,
 # --customer-data, --supplier-data, --nation-data, and --region-data,
 # Q7 needs --orders-data, --customer-data, --supplier-data, and
-# --nation-data, Q9 needs --part-data, --supplier-data,
-# --partsupp-data, --orders-data, and --nation-data, Q11 needs
+# --nation-data, Q8 needs --part-data, --supplier-data, --orders-data,
+# --customer-data, --nation-data, and --region-data, Q9 needs
+# --part-data, --supplier-data, --partsupp-data, --orders-data, and
+# --nation-data, Q11 needs
 # --partsupp-data, --supplier-data, and --nation-data (--data is still
 # required but unused by Q11's own query text), Q13 needs
 # --customer-data and --orders-data (--data likewise required but
@@ -353,6 +381,16 @@ python3 tools/validate_tpch.py \
   --data '/tmp/kernellake-tpch-sf1/lineitem-*.parquet' \
   --part-data '/tmp/kernellake-tpch-sf1/part-*.parquet' \
   --supplier-data '/tmp/kernellake-tpch-sf1/supplier-*.parquet' \
+  --orders-data '/tmp/kernellake-tpch-sf1/orders-*.parquet' \
+  --customer-data '/tmp/kernellake-tpch-sf1/customer-*.parquet' \
+  --nation-data '/tmp/kernellake-tpch-sf1/nation-*.parquet' \
+  --region-data '/tmp/kernellake-tpch-sf1/region-*.parquet' \
+  --scale-factor 1 --query 8
+python3 tools/validate_tpch.py \
+  --kernellake build/gpu-dev/src/cli/kernellake \
+  --data '/tmp/kernellake-tpch-sf1/lineitem-*.parquet' \
+  --part-data '/tmp/kernellake-tpch-sf1/part-*.parquet' \
+  --supplier-data '/tmp/kernellake-tpch-sf1/supplier-*.parquet' \
   --partsupp-data '/tmp/kernellake-tpch-sf1/partsupp-*.parquet' \
   --orders-data '/tmp/kernellake-tpch-sf1/orders-*.parquet' \
   --nation-data '/tmp/kernellake-tpch-sf1/nation-*.parquet' \
@@ -382,7 +420,7 @@ This has been run at SF0.01, SF0.1, and SF1 (60,000, 600,000, and
 6,000,000 generated rows) -- Q1 and Q6 matched DuckDB exactly at every
 scale, including the full SF1 run (~105 MiB single Parquet file, zstd
 compression, 1,000,000-row row groups). Q19, Q12, Q14, Q3, Q10, Q5, Q7,
-Q9, Q11, and Q18 have each been verified at SF0.01 on both the CPU and
+Q8, Q9, Q11, and Q18 have each been verified at SF0.01 on both the CPU and
 GPU backends, exact match against DuckDB (Q3 including its 3-way join,
 Q4 including its correlated `EXISTS` subquery -- verified not just at
 SF0.01 but stress-tested at SF10 (a ~60M-row `lineitem` build side,
@@ -396,7 +434,11 @@ including its 4-way join, 7-column `GROUP BY` spanning two non-adjacent
 join sources, and `LIMIT 20`; Q5 including its 6-way join and the
 `c_nationkey = s_nationkey` `WHERE`-clause predicate spanning two
 non-adjacent join sources; Q7 including its 6-way join with `nation`
-joined twice under different aliases; Q9 including its 6-way join and
+joined twice under different aliases; Q8 including its 8-way join (also
+`nation` joined twice) wrapped in a real derived table with a JOIN
+inside its own `FROM` -- the shape that surfaced the `LogicalAggregate`
+column-remap bug fixed alongside this query, see `docs/ARCHITECTURE.md`'s
+"Derived tables" section; Q9 including its 6-way join and
 the `ps_suppkey = l_suppkey` `WHERE`-clause half of `partsupp`'s
 otherwise-inexpressible two-column join condition -- 175 real matching
 rows at SF0.01, not an empty/trivial result; Q11 including its 3-way join,
@@ -409,7 +451,7 @@ DuckDB via `tools/benchmark_three_way.py` (KernelLake via a persistent
 `kernellake-server` over Arrow Flight SQL, PySpark, and DuckDB all agree
 on every query, real GPU hardware, SF0.01/SF1/SF10 -- see
 `docs/ROADMAP.md` for the full crossover numbers and a
-`--cost-per-hour`-based cost-per-TB comparison); Q10/Q5/Q7/Q9/Q11/Q18
+`--cost-per-hour`-based cost-per-TB comparison); Q10/Q5/Q7/Q8/Q9/Q11/Q18
 have not been wired into `benchmark_three_way.py` yet (see
 `docs/ROADMAP.md`'s "Not yet started").
 
@@ -423,6 +465,8 @@ for Q12, `--orders-data` and `--customer-data` for Q3, `--orders-data`,
 `--customer-data`, `--supplier-data`, `--nation-data`, and `--region-data`
 for Q5, `--orders-data`, `--customer-data`, `--supplier-data`, and
 `--nation-data` for Q7, `--part-data`, `--supplier-data`,
+`--orders-data`, `--customer-data`, `--nation-data`, and `--region-data`
+for Q8, `--part-data`, `--supplier-data`,
 `--partsupp-data`, `--orders-data`, and `--nation-data` for Q9,
 `--partsupp-data`, `--supplier-data`, and `--nation-data` for Q11
 (`--data` is still required but unused by Q11's own query text),

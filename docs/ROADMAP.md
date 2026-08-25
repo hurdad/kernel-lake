@@ -3760,6 +3760,55 @@ log` is the authoritative chronology if that ordering ever matters.
   cross-validated against DuckDB via `tools/validate_tpch.py --query 4`.
   14 of TPC-H's 22 queries now, up from 13.
 
+- **TPC-H Q8** (`a3deaeb`, 2026-08-24): picked as
+  the next query since, unlike every other remaining one, it needed no
+  new SQL feature at all -- canonical Q8 is just an 8-way `INNER JOIN`
+  chain (`nation` joined twice, Q7's own pattern) wrapped in a derived
+  table, and every one of those pieces was already independently
+  supported. Written using the derived table exactly as canonical TPC-H
+  writes it (`FROM (SELECT ...) AS all_nations`), unlike Q7's own
+  deviation which had flattened an equivalent derived table away back
+  when derived tables weren't supported yet.
+
+  **Real bug found and fixed, not just a query-wiring exercise.** Testing
+  the real query (not just a synthetic unit-test shape) surfaced a
+  genuine execution-layer bug: `SELECT o_year, SUM(volume) ... FROM
+  (SELECT ... FROM <8-way join>) AS t GROUP BY o_year` crashed --
+  `vector::_M_range_check` on the GPU backend, an Arrow "No match for
+  FieldRef.FieldPath" error on CPU. Root-caused via a binary search on
+  the query shape (the crash reproduced down to a minimal 2-way-join
+  derived table with an outer `GROUP BY` and no inner one) plus reading
+  `kernellake explain`'s own plan tree (which built fine -- confirming
+  the bug was execution-only, not a planning/binding bug) alongside a
+  targeted grep for every `Schema::field()` call site in the codebase
+  (the only `std::vector::at()` in play, per the GPU crash message).
+  Found in `physical_planner.cpp`'s `LogicalAggregate` case: the one node
+  type of the four (`Filter`/`Projection`/`Aggregate`/`Sort`) that
+  unconditionally called `find_scan_boundary()` on its own child, missing
+  the same `references_scan_schema()` guard the other three already
+  have. When an aggregate's child is a `LogicalProjection` (a derived
+  table's own finished SELECT list, Q8's shape) rather than a raw
+  `Scan`/`Filter`/`Join`, its `group_by()`/`aggregates()` already
+  correctly reference *that* projection's narrow output one-for-one --
+  but `find_scan_boundary()` searches through any node type for a scan/
+  join boundary, so it found the *join's* wider boundary sitting
+  underneath the already-converted physical projection and wrongly
+  remapped already-correct indices against it. Never caught before since
+  TPC-H Q13 (the only prior query combining a derived table with a real
+  JOIN inside it) has its own inner `GROUP BY`, which sidesteps this
+  exact shape entirely. Fixed by adding the missing guard; also fixed a
+  stale, directly-contradicted claim in `docs/ARCHITECTURE.md`'s "Derived
+  tables" section ("a JOIN inside a derived table's own FROM is out of
+  scope" -- both Q13 and Q8 do exactly this).
+
+  Verified: exact match against DuckDB on both backends
+  (`tools/validate_tpch.py --query 8`), a new permanent regression test
+  in `query_engine_execute_cpu_test.cpp`
+  (`GroupByOverDerivedTableWhoseInnerQueryIsAPlainJoinMatchesExpectedCounts`),
+  and zero regressions across the full existing TPC-H suite (`--query
+  all`, both backends) and the unit/GPU test suites. 15 of TPC-H's 22
+  queries now, up from 14.
+
 ## Not yet started
 
 - **Unity Catalog support: remaining gaps** -- the core read path (Phase 5
@@ -3998,11 +4047,19 @@ log` is the authoritative chronology if that ordering ever matters.
 - ~~Correlated subqueries (`EXISTS`/`NOT EXISTS`) / Q4~~ -- done, see
   "Correlated subqueries (`EXISTS`/`NOT EXISTS`) and TPC-H Q4" in "Done"
   above. Scoped to `EXISTS`/`NOT EXISTS`, single equality key; correlated
-  *scalar* subqueries remain unsupported. Every *other* still-missing
-  query needs `DISTINCT`, set operations, `WITH`/CTEs, window functions,
-  a correlated scalar subquery, or a derived table nested inside a JOIN
-  -- see `docs/ARCHITECTURE.md`'s "Supported SQL grammar" section for the
-  current scope -- 14 of TPC-H's 22 queries now, up from 13.
+  *scalar* subqueries remain unsupported -- 14 of TPC-H's 22 queries at
+  this point, up from 13.
+- ~~TPC-H Q8~~ -- done, see "TPC-H Q8" in "Done" above. Needed no new SQL
+  feature (an 8-way `INNER JOIN` chain wrapped in a derived table, every
+  piece already independently supported); found and fixed a real
+  execution-layer bug along the way (`GROUP BY` over a derived table
+  whose own inner query isn't itself grouped). Every *other*
+  still-missing query needs `DISTINCT`, set operations, `WITH`/CTEs,
+  window functions, a correlated scalar subquery, or a derived table
+  used *as a JOIN source* (not to be confused with a JOIN *inside* a
+  derived table's own `FROM`, which Q8 itself now proves works) -- see
+  `docs/ARCHITECTURE.md`'s "Supported SQL grammar" section for the
+  current scope -- 15 of TPC-H's 22 queries now, up from 14.
 - `CASE`/`EXTRACT` inside `WHERE` on the GPU backend (`FilterOperator`'s
   own gap, separate from the aggregate-argument fix above; the CPU backend
   already supports both via its one shared expression compiler) -- not
