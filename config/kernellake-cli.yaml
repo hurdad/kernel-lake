@@ -81,8 +81,8 @@ benchmark:
   default_iterations: 5
   warmup_iterations: 1
 
-# Same schema as config/kernellake.yaml's own observability: section --
-# only takes effect when built with KERNELLAKE_ENABLE_OTEL=ON.
+# Same schema as config/kernellake-server.yaml's own observability:
+# section -- only takes effect when built with KERNELLAKE_ENABLE_OTEL=ON.
 observability:
   enabled: false
   otlp_protocol: grpc  # grpc | http

@@ -2207,11 +2207,14 @@ first.
 2. `execute()` round-robins across devices via an ever-growing atomic
    counter modulo device count, rather than always targeting device 0.
    Each device gets its own `std::counting_semaphore<>` sized to
-   `EngineSection::max_concurrent_gpu_queries` -- that field is now a
-   **per-device** cap, not process-wide (see its own updated doc
-   comment in `config.hpp`): an N-GPU node gets up to N times the
-   total concurrent-query throughput a single-GPU node does, at the
-   same per-device concurrency risk profile opt #2 already validated.
+   `max_concurrent_gpu_queries` -- that field is now a **per-device**
+   cap, not process-wide (see its own updated doc comment in
+   `config.hpp`): an N-GPU node gets up to N times the total
+   concurrent-query throughput a single-GPU node does, at the same
+   per-device concurrency risk profile opt #2 already validated. (This
+   field itself later moved from `EngineSection` to
+   `ServerConfig::max_concurrent_gpu_queries` -- see the "Follow-up"
+   section below.)
 3. `ExecutionContext::cuda_device_id` is now threaded through for
    real. `RmmEnvironment` gained a `device_id()` accessor (the value
    it was actually constructed with); `query_engine_execute_gpu.cpp`'s

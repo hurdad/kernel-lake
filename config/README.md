@@ -9,7 +9,8 @@ run with no `--config` flag:
   top-level keys `CliConfig` reads: `engine.device_id` (which GPU an
   ad-hoc query runs on) and `benchmark:` (default iteration counts),
   plus every section shared with the server (`memory`, `storage`,
-  `logging`, `profiling`, `observability`, and the rest of `engine`).
+  `iceberg`, `unity_catalog`, `delta`, `logging`, `profiling`,
+  `observability`, and the rest of `engine`).
 - **`kernellake-server.yaml`** -- loaded by `kernellake-server` (the
   Arrow Flight SQL server). Contains only the top-level keys
   `ServerConfig` reads: `server:` (host/port/TLS/auth),

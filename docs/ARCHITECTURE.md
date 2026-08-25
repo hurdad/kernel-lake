@@ -624,6 +624,10 @@ flowchart BT
 Every operator is also wrapped in `InstrumentedOperator` (not shown above),
 which records per-`next()` wall-clock time into `MetricsRegistry` and emits
 an NVTX range, so the same tree shape shows up directly in a trace tool.
+Also not shown: `BatchSizeLimitOperator` wraps each `ParquetScanOperator`
+(capping `engine.batch_rows`) and wraps the operator feeding
+`ArrowResultOperator` (capping `engine.result_batch_rows`) -- see its own
+row in the table below.
 Most operators are **streaming** (bounded memory, one batch of `child` in
 flight at a time); `SortOperator` and a non-partitioned `HashJoinOperator`
 build side are **blocking** (consume `child` to exhaustion first) -- see
@@ -642,6 +646,7 @@ either `config/kernellake-cli.yaml` or `config/kernellake-server.yaml`) throws. 
 | `SortOperator` | `ORDER BY`: **blocking**, unlike every operator above -- consumes `child` to exhaustion, concatenates every batch (`cudf::concatenate`) into one table, then `cudf::stable_sorted_order` + `cudf::gather`. Memory footprint is the whole result set, not bounded like the streaming operators. |
 | `HashJoinOperator` | Two-table `INNER JOIN`: when `choose_partition_count()` decides the build side is small enough, its *build* (right) side is **blocking** like `SortOperator` (consumed to exhaustion, concatenated into one table, then wraps a single `cudf::hash_join`); otherwise both sides are grace-hash partitioned and spilled to disk, bounding device memory to one partition/batch at a time (`b915063`, 2026-08-13). Its *probe* (left) side streams normally, one `inner_join()` + double-`cudf::gather` per batch (unpartitioned case). See "Hash joins" above. |
 | `SemiAntiJoinOperator` | `LEFT SEMI`/`LEFT ANTI`, produced only by the `EXISTS`/`NOT EXISTS` rewrite: its *build* (right) side is **blocking**, same shape as `HashJoinOperator`'s unpartitioned build (no partitioned mode yet). Its *probe* (left) side streams normally, wrapping the same `cudf::hash_join` -- `LEFT SEMI` via `inner_join()` + `cudf::distinct()` dedup, `LEFT ANTI` via `left_join()` filtered to the `JoinNoMatch` sentinel -- gathering only *its own* columns, never the build side's. See "Correlated subqueries" above. |
+| `BatchSizeLimitOperator` | Caps every batch it yields at `max_rows`: an oversized batch is split via `cudf::slice` (`table_view`) + the `cudf::table` copy constructor into consecutive chunks (a real device-to-device copy per split); an already-small batch passes through unchanged. `operator_builder.cpp` wraps each `ParquetScanOperator` with one (`engine.batch_rows`) and wraps the operator feeding `ArrowResultOperator` with another (`engine.result_batch_rows`), not the whole tree from outside |
 | `ArrowResultOperator` | Trivial passthrough; the actual `DeviceBatch` -> `arrow::RecordBatch` conversion happens in `QueryEngine::execute()` via `to_arrow_record_batch()`, since `PhysicalOperator::next()` must return a `DeviceBatch` |
 
 Two correctness details worth knowing if you touch these operators:
