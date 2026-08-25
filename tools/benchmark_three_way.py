@@ -45,6 +45,18 @@ Usage:
         --part-data '/tmp/kernellake-tpch/part-*.parquet' \
         --query 19 --iterations 5
 
+    # Q2 needs five extra tables (part/partsupp/supplier/nation/region) --
+    # same --*-data flags tools/validate_tpch.py already uses:
+    python3 tools/benchmark_three_way.py \
+        --kernellake-server build/gpu-dev/src/server/kernellake-server \
+        --data '/tmp/kernellake-tpch/lineitem-*.parquet' \
+        --part-data '/tmp/kernellake-tpch/part-*.parquet' \
+        --partsupp-data '/tmp/kernellake-tpch/partsupp-*.parquet' \
+        --supplier-data '/tmp/kernellake-tpch/supplier-*.parquet' \
+        --nation-data '/tmp/kernellake-tpch/nation-*.parquet' \
+        --region-data '/tmp/kernellake-tpch/region-*.parquet' \
+        --query 2 --iterations 5
+
 Requires: pyspark (+ a JVM on PATH), pyarrow, duckdb, adbc-driver-flightsql.
 Not part of this project's own CPU-only dev environment's dependency set --
 see docker/Dockerfile's `benchmark-gpu` stage, which adds all of them to a
@@ -111,15 +123,20 @@ def bytes_processed_for_query(
     part_data_glob: str | None,
     orders_data_glob: str | None,
     customer_data_glob: str | None,
+    nation_data_glob: str | None = None,
+    supplier_data_glob: str | None = None,
+    region_data_glob: str | None = None,
+    partsupp_data_glob: str | None = None,
 ) -> int:
     # Real on-disk (compressed Parquet) bytes for whichever tables this
     # specific query's SQL actually references -- not every --data/
-    # --part-data/--orders-data/--customer-data glob passed on the command
-    # line, since e.g. Q1/Q6 only ever touch {data} regardless of what
-    # else was supplied for other queries in the same --query all run.
-    # This is what "cost per TB processed" (see --cost-per-hour) divides
-    # against: a real, measured input size, not a query's row count or
-    # output size.
+    # --part-data/--orders-data/--customer-data/--nation-data/
+    # --supplier-data/--region-data/--partsupp-data glob passed on the
+    # command line, since e.g. Q1/Q6 only ever touch {data} regardless of
+    # what else was supplied for other queries in the same --query all
+    # run. This is what "cost per TB processed" (see --cost-per-hour)
+    # divides against: a real, measured input size, not a query's row
+    # count or output size.
     text = load_query_text(query_number)
     total = bytes_for_glob(data_glob)
     if part_data_glob and "{part_data}" in text:
@@ -128,6 +145,14 @@ def bytes_processed_for_query(
         total += bytes_for_glob(orders_data_glob)
     if customer_data_glob and "{customer_data}" in text:
         total += bytes_for_glob(customer_data_glob)
+    if nation_data_glob and "{nation_data}" in text:
+        total += bytes_for_glob(nation_data_glob)
+    if supplier_data_glob and "{supplier_data}" in text:
+        total += bytes_for_glob(supplier_data_glob)
+    if region_data_glob and "{region_data}" in text:
+        total += bytes_for_glob(region_data_glob)
+    if partsupp_data_glob and "{partsupp_data}" in text:
+        total += bytes_for_glob(partsupp_data_glob)
     return total
 
 
@@ -286,6 +311,10 @@ def run_pyspark_query(
     part_data_glob: str | None = None,
     orders_data_glob: str | None = None,
     customer_data_glob: str | None = None,
+    nation_data_glob: str | None = None,
+    supplier_data_glob: str | None = None,
+    region_data_glob: str | None = None,
+    partsupp_data_glob: str | None = None,
     cold: bool = False,
 ):
     import pyarrow as pa
@@ -298,6 +327,14 @@ def run_pyspark_query(
             evict_data_files(orders_data_glob)
         if customer_data_glob:
             evict_data_files(customer_data_glob)
+        if nation_data_glob:
+            evict_data_files(nation_data_glob)
+        if supplier_data_glob:
+            evict_data_files(supplier_data_glob)
+        if region_data_glob:
+            evict_data_files(region_data_glob)
+        if partsupp_data_glob:
+            evict_data_files(partsupp_data_glob)
     sql = spark_sql(query_number)
     start = time.perf_counter()
     # Spark SQL is lazy -- toPandas() is what actually triggers execution
@@ -317,6 +354,10 @@ def run_duckdb_query(
     part_data_glob: str | None = None,
     orders_data_glob: str | None = None,
     customer_data_glob: str | None = None,
+    nation_data_glob: str | None = None,
+    supplier_data_glob: str | None = None,
+    region_data_glob: str | None = None,
+    partsupp_data_glob: str | None = None,
     cold: bool = False,
 ):
     # Unlike Spark, DuckDB accepts read_parquet('path') AS alias JOIN ...
@@ -332,7 +373,25 @@ def run_duckdb_query(
             evict_data_files(orders_data_glob)
         if customer_data_glob:
             evict_data_files(customer_data_glob)
-    sql = kernellake_sql(query_number, data_glob, part_data_glob, orders_data_glob, customer_data_glob)
+        if nation_data_glob:
+            evict_data_files(nation_data_glob)
+        if supplier_data_glob:
+            evict_data_files(supplier_data_glob)
+        if region_data_glob:
+            evict_data_files(region_data_glob)
+        if partsupp_data_glob:
+            evict_data_files(partsupp_data_glob)
+    sql = kernellake_sql(
+        query_number,
+        data_glob,
+        part_data_glob,
+        orders_data_glob,
+        customer_data_glob,
+        nation_data_glob,
+        supplier_data_glob,
+        region_data_glob,
+        partsupp_data_glob,
+    )
     start = time.perf_counter()
     table = run_duckdb(sql)
     elapsed = time.perf_counter() - start
@@ -388,6 +447,10 @@ def run_kernellake_server_query(
     part_data_glob: str | None = None,
     orders_data_glob: str | None = None,
     customer_data_glob: str | None = None,
+    nation_data_glob: str | None = None,
+    supplier_data_glob: str | None = None,
+    region_data_glob: str | None = None,
+    partsupp_data_glob: str | None = None,
     cold: bool = False,
 ):
     # Same substituted SQL as the CLI-subprocess and DuckDB paths -- the
@@ -404,7 +467,25 @@ def run_kernellake_server_query(
             evict_data_files(orders_data_glob)
         if customer_data_glob:
             evict_data_files(customer_data_glob)
-    sql = kernellake_sql(query_number, data_glob, part_data_glob, orders_data_glob, customer_data_glob)
+        if nation_data_glob:
+            evict_data_files(nation_data_glob)
+        if supplier_data_glob:
+            evict_data_files(supplier_data_glob)
+        if region_data_glob:
+            evict_data_files(region_data_glob)
+        if partsupp_data_glob:
+            evict_data_files(partsupp_data_glob)
+    sql = kernellake_sql(
+        query_number,
+        data_glob,
+        part_data_glob,
+        orders_data_glob,
+        customer_data_glob,
+        nation_data_glob,
+        supplier_data_glob,
+        region_data_glob,
+        partsupp_data_glob,
+    )
     start = time.perf_counter()
     cursor.execute(sql)
     table = cursor.fetch_arrow_table()
@@ -441,8 +522,19 @@ def benchmark_one_query(
     modes: tuple,
     backends: tuple,
     cost_per_hour: dict | None = None,
+    nation_data_glob: str | None = None,
+    supplier_data_glob: str | None = None,
+    region_data_glob: str | None = None,
+    partsupp_data_glob: str | None = None,
 ) -> dict:
     print(f"=== Q{query_number} ===")
+
+    extra_globs = dict(
+        nation_data_glob=nation_data_glob,
+        supplier_data_glob=supplier_data_glob,
+        region_data_glob=region_data_glob,
+        partsupp_data_glob=partsupp_data_glob,
+    )
 
     # Correctness first: one untimed, warm run per *enabled* engine (see
     # --backends -- a real reason to skip one exists, e.g. at a large
@@ -453,15 +545,21 @@ def benchmark_one_query(
         tables = {}
         if "kernellake-gpu-server" in backends:
             tables["kernellake-gpu-server"], _ = run_kernellake_server_query(
-                server_cursor, query_number, data_glob, part_data_glob, orders_data_glob, customer_data_glob
+                server_cursor,
+                query_number,
+                data_glob,
+                part_data_glob,
+                orders_data_glob,
+                customer_data_glob,
+                **extra_globs,
             )
         if "pyspark" in backends:
             tables["pyspark"], _ = run_pyspark_query(
-                spark, query_number, data_glob, part_data_glob, orders_data_glob, customer_data_glob
+                spark, query_number, data_glob, part_data_glob, orders_data_glob, customer_data_glob, **extra_globs
             )
         if "duckdb" in backends:
             tables["duckdb"], _ = run_duckdb_query(
-                query_number, data_glob, part_data_glob, orders_data_glob, customer_data_glob
+                query_number, data_glob, part_data_glob, orders_data_glob, customer_data_glob, **extra_globs
             )
     except Exception as exc:  # noqa: BLE001 -- reported as a validation failure, not a crash
         print(f"    ERROR during correctness check: {exc}")
@@ -486,7 +584,7 @@ def benchmark_one_query(
     print(f"    PASS: {', '.join(backends)} agree ({row_count} rows)")
 
     bytes_processed = bytes_processed_for_query(
-        query_number, data_glob, part_data_glob, orders_data_glob, customer_data_glob
+        query_number, data_glob, part_data_glob, orders_data_glob, customer_data_glob, **extra_globs
     )
     result = {
         "query": query_number,
@@ -512,16 +610,30 @@ def benchmark_one_query(
                     orders_data_glob,
                     customer_data_glob,
                     cold=cold,
+                    **extra_globs,
                 )
                 timings["kernellake-gpu-server"].append(t)
             if "pyspark" in backends:
                 _, t = run_pyspark_query(
-                    spark, query_number, data_glob, part_data_glob, orders_data_glob, customer_data_glob, cold=cold
+                    spark,
+                    query_number,
+                    data_glob,
+                    part_data_glob,
+                    orders_data_glob,
+                    customer_data_glob,
+                    cold=cold,
+                    **extra_globs,
                 )
                 timings["pyspark"].append(t)
             if "duckdb" in backends:
                 _, t = run_duckdb_query(
-                    query_number, data_glob, part_data_glob, orders_data_glob, customer_data_glob, cold=cold
+                    query_number,
+                    data_glob,
+                    part_data_glob,
+                    orders_data_glob,
+                    customer_data_glob,
+                    cold=cold,
+                    **extra_globs,
                 )
                 timings["duckdb"].append(t)
             print(f"    [{mode}] iteration {i + 1}/{iterations} done")
@@ -593,19 +705,49 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--data", required=True, help="Glob pattern over generate_tpch.py's lineitem Parquet output")
     parser.add_argument(
-        "--part-data", default=None, help="Glob pattern over generate_tpch.py's part Parquet output (Q19 needs this)"
+        "--part-data",
+        default=None,
+        help="Glob pattern over generate_tpch.py's part Parquet output (Q19/Q17/Q16/Q20/Q2/Q8/Q9/Q14 need this)",
     )
     parser.add_argument(
         "--orders-data",
         default=None,
-        help="Glob pattern over generate_tpch.py's orders Parquet output (Q12 needs this)",
+        help="Glob pattern over generate_tpch.py's orders Parquet output "
+        "(Q12/Q21/Q22/Q5/Q7/Q8/Q9/Q10/Q18/Q4/Q13 need this)",
     )
     parser.add_argument(
         "--customer-data",
         default=None,
-        help="Glob pattern over generate_tpch.py's customer Parquet output (Q3 needs this)",
+        help="Glob pattern over generate_tpch.py's customer Parquet output "
+        "(Q3/Q22/Q5/Q7/Q8/Q10/Q18/Q13 need this)",
     )
-    parser.add_argument("--query", required=True, help="Query number (1, 3, 6, 12, 19) or 'all'")
+    parser.add_argument(
+        "--nation-data",
+        default=None,
+        help="Glob pattern over generate_tpch.py's nation Parquet output "
+        "(Q21/Q2/Q20/Q5/Q7/Q8/Q9/Q10/Q11 need this)",
+    )
+    parser.add_argument(
+        "--supplier-data",
+        default=None,
+        help="Glob pattern over generate_tpch.py's supplier Parquet output "
+        "(Q16/Q21/Q2/Q20/Q5/Q7/Q8/Q9/Q11/Q15 need this)",
+    )
+    parser.add_argument(
+        "--region-data",
+        default=None,
+        help="Glob pattern over generate_tpch.py's region Parquet output (Q2/Q5/Q8 need this)",
+    )
+    parser.add_argument(
+        "--partsupp-data",
+        default=None,
+        help="Glob pattern over generate_tpch.py's partsupp Parquet output (Q16/Q2/Q20/Q9/Q11 need this)",
+    )
+    parser.add_argument(
+        "--query",
+        required=True,
+        help="Query number (1-22) or 'all'",
+    )
     parser.add_argument("--iterations", type=int, default=5, help="Timed iterations per engine per query per mode")
     parser.add_argument(
         "--mode",
@@ -701,16 +843,48 @@ def main() -> int:
         parser.error("--backends gpu-server requires --kernellake-server <path>")
 
     if args.query == "all":
-        # Q19 needs --part-data, Q12 needs --orders-data, Q3 needs both
-        # --orders-data and --customer-data; each is silently omitted from
-        # "all" without its flag(s) (not attempted-and-failed, since that's
-        # a missing argument, not a cross-engine disagreement) -- pass
-        # --query 19/12/3 explicitly to see that error.
-        query_numbers = (
-            [1, 6]
-            + ([19] if args.part_data else [])
-            + ([12] if args.orders_data else [])
-            + ([3] if (args.orders_data and args.customer_data) else [])
+        # Q1/Q6 need only --data. Every other supported query needs --data
+        # plus some subset of the extra tables below -- each is silently
+        # omitted from "all" without its required flag(s) (not attempted-
+        # and-failed, since that's a missing argument, not a cross-engine
+        # disagreement) -- pass --query <N> explicitly to see that error.
+        # Table requirements mirror tools/validate_tpch.py's own per-query
+        # --*-data documentation exactly (see that script's own module
+        # docstring). Q15 is included despite its own documented
+        # GPU-backend unreliability (`kernellake-gpu-server` always runs
+        # the outer query on GPU; Q15's own HAVING subquery always runs on
+        # CPU regardless -- see docs/ARCHITECTURE.md's "HAVING and scalar
+        # subqueries" section) -- this benchmark's whole point is
+        # validating cross-engine agreement before trusting a timing, so
+        # an occasional Q15 validation failure here is real signal about a
+        # real, already-documented gap, not a bug to paper over by
+        # excluding it.
+        required_extra_globs = {
+            2: ("part_data", "partsupp_data", "supplier_data", "nation_data", "region_data"),
+            3: ("orders_data", "customer_data"),
+            4: ("orders_data",),
+            5: ("orders_data", "customer_data", "supplier_data", "nation_data", "region_data"),
+            7: ("orders_data", "customer_data", "supplier_data", "nation_data"),
+            8: ("part_data", "supplier_data", "orders_data", "customer_data", "nation_data", "region_data"),
+            9: ("part_data", "supplier_data", "partsupp_data", "orders_data", "nation_data"),
+            10: ("orders_data", "customer_data", "nation_data"),
+            11: ("partsupp_data", "supplier_data", "nation_data"),
+            12: ("orders_data",),
+            13: ("customer_data", "orders_data"),
+            14: ("part_data",),
+            15: ("supplier_data",),
+            16: ("partsupp_data", "part_data", "supplier_data"),
+            17: ("part_data",),
+            18: ("customer_data", "orders_data"),
+            19: ("part_data",),
+            20: ("supplier_data", "nation_data", "partsupp_data", "part_data"),
+            21: ("supplier_data", "orders_data", "nation_data"),
+            22: ("customer_data", "orders_data"),
+        }
+        query_numbers = [1, 6] + sorted(
+            query_number
+            for query_number, needed_globs in required_extra_globs.items()
+            if all(getattr(args, glob_name) for glob_name in needed_globs)
         )
     else:
         query_numbers = [int(args.query)]
@@ -766,6 +940,14 @@ def main() -> int:
                 spark.read.parquet(args.orders_data).createOrReplaceTempView("orders")
             if args.customer_data:
                 spark.read.parquet(args.customer_data).createOrReplaceTempView("customer")
+            if args.nation_data:
+                spark.read.parquet(args.nation_data).createOrReplaceTempView("nation")
+            if args.supplier_data:
+                spark.read.parquet(args.supplier_data).createOrReplaceTempView("supplier")
+            if args.region_data:
+                spark.read.parquet(args.region_data).createOrReplaceTempView("region")
+            if args.partsupp_data:
+                spark.read.parquet(args.partsupp_data).createOrReplaceTempView("partsupp")
 
         if "duckdb" in backends and args.cpu_cores:
             # run_duckdb() (tools/duckdb_compare.py) runs every query
@@ -800,6 +982,10 @@ def main() -> int:
                     modes,
                     backends,
                     cost_per_hour,
+                    nation_data_glob=args.nation_data,
+                    supplier_data_glob=args.supplier_data,
+                    region_data_glob=args.region_data,
+                    partsupp_data_glob=args.partsupp_data,
                 )
             )
     finally:
@@ -824,6 +1010,10 @@ def main() -> int:
             "part_data": args.part_data,
             "orders_data": args.orders_data,
             "customer_data": args.customer_data,
+            "nation_data": args.nation_data,
+            "supplier_data": args.supplier_data,
+            "region_data": args.region_data,
+            "partsupp_data": args.partsupp_data,
             "kernellake_server": args.kernellake_server,
             "cost_per_hour": cost_per_hour,
             "modes": list(modes),

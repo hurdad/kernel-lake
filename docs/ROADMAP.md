@@ -3954,6 +3954,82 @@ log` is the authoritative chronology if that ordering ever matters.
   tests) and, for both bind-time bugs and the multi-column-correlation
   mechanism, a real revert-confirm-fail/restore-confirm-pass cycle.
 
+- **`tools/benchmark_three_way.py` wired up for Q16/Q17/Q2/Q20/Q21/Q22**
+  (2026-08-25). The script's own `kernellake_sql()` already accepted
+  `nation_data_glob`/`supplier_data_glob`/`region_data_glob`/
+  `partsupp_data_glob` keyword args (and `spark_sql()` already rewrote
+  those same placeholders into temp-view names), but nothing upstream of
+  `kernellake_sql()` actually threaded them through: `run_duckdb_query()`/
+  `run_kernellake_server_query()`/`run_pyspark_query()`/
+  `benchmark_one_query()`/`bytes_processed_for_query()` only ever
+  accepted `part_data_glob`/`orders_data_glob`/`customer_data_glob`, and
+  `main()` never registered `nation`/`supplier`/`region`/`partsupp` as
+  Spark temp views or exposed CLI flags for them at all -- so every one
+  of these 6 new queries (and, previously, every older not-yet-wired one
+  needing those same tables) was unreachable from this script regardless
+  of `kernellake_sql()`'s own readiness. Added `--nation-data`/
+  `--supplier-data`/`--region-data`/`--partsupp-data` CLI flags, threaded
+  the corresponding globs through every function in the call chain (an
+  `extra_globs` dict in `benchmark_one_query()` keeps the now-7-glob
+  parameter list manageable at each call site), registered the matching
+  Spark temp views, and added each new query to `--query all`'s own
+  gated auto-list (each still silently omitted without its required
+  flag(s), matching the existing Q19/Q12/Q3 convention). Verified for
+  real (not just code review): a standalone script exercising
+  `kernellake_sql()`/`spark_sql()`/`bytes_processed_for_query()`/
+  `run_duckdb_query()` directly for all 6 queries confirmed no
+  unsubstituted `{...}` placeholders survive either engine's rewrite and
+  every row count matches `tools/validate_tpch.py`'s own already-verified
+  numbers (218/1/4/2/27/7) exactly; a second script against a real,
+  freshly-rebuilt `kernellake-server` (the first attempt hit a stale
+  binary left over from earlier in the same session, caught immediately
+  by the exact same error `strip_table_qualifier()` was built to fix --
+  a build-freshness mistake, not a regression) confirmed the same row
+  counts over real Arrow Flight SQL. PySpark itself (needs a JVM) isn't
+  part of this dev box's own dependency set, so the `spark_sql()`/temp-
+  view leg was verified structurally (valid, fully-substituted SQL text)
+  rather than by an actual PySpark run -- `docker/Dockerfile`'s
+  `benchmark-gpu` stage is where that would run for real.
+
+- **Q10/Q5/Q7/Q8/Q9/Q11/Q15/Q18 also wired into
+  `tools/benchmark_three_way.py`** (2026-08-25, immediate follow-up to
+  the above) -- exactly the "would now need only a few more `--query
+  all` gate lines" case predicted above, confirmed for real. The
+  `--query all` gating logic itself was refactored from a chain of `+
+  ([N] if ... else [])` clauses (17 entries deep after Q16/Q17/Q2/Q20/
+  Q21/Q22, about to become 25) into a single `required_extra_globs: dict[int,
+  tuple[str, ...]]` table plus one generator expression -- easier to
+  extend than another chained clause, not a speculative abstraction (the
+  chain was already unwieldy at 17 entries before this session even
+  started adding to it). Q15 is included in `--query all` *despite* its
+  own documented GPU-backend cross-engine-comparison unreliability (see
+  its own "Done" entry and docs/ARCHITECTURE.md's "HAVING and scalar
+  subqueries" section) -- deliberately, not an oversight: this script's
+  whole purpose is validating cross-engine agreement before trusting a
+  timing, so an occasional Q15 validation failure here is exactly the
+  real signal the script exists to surface, not a bug to paper over by
+  excluding it. Verified the same way as the six queries above: a
+  standalone script exercising `kernellake_sql()`/`spark_sql()`/
+  `bytes_processed_for_query()`/`run_duckdb_query()` directly confirmed
+  no unsubstituted placeholders and every row count matching already-
+  known-good values (Q5=5, Q7=4, Q8=2, Q9=175, Q10=20, Q11=266, Q15=1,
+  Q18=1); a second standalone check exercised the refactored
+  `required_extra_globs` gating logic itself directly (no globs given ->
+  only Q1/Q6; every glob given -> all 19 of the 22 queries then wired,
+  correctly still excluding the not-yet-wired Q4/Q13/Q14; only
+  `--part-data` given -> exactly Q17/Q19, the only two needing *just*
+  that table).
+
+- **Q4/Q13/Q14 wired into `tools/benchmark_three_way.py` too**
+  (2026-08-25, immediate follow-up) -- exactly the three
+  `required_extra_globs` entries predicted above, no new plumbing
+  needed (`Q4: ("orders_data",)`, `Q13: ("customer_data", "orders_data")`,
+  `Q14: ("part_data",)`). `--query all` now covers **all 22** of TPC-H's
+  standard queries, confirmed both by direct SQL-substitution/row-count
+  checks (Q4=5, Q13=4, Q14=1 rows, matching already-known-good values)
+  and by re-running the gating-logic check with every glob supplied,
+  asserting the resulting query list is exactly `1..22`.
+
 ## Not yet started
 
 - **Unity Catalog support: remaining gaps** -- the core read path (Phase 5
