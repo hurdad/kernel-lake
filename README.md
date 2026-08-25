@@ -272,13 +272,17 @@ grouped aggregates (including a ~40,000-group `GROUP BY customer_id`), and
 ## TPC-H-derived benchmarking (unofficial)
 
 **Unofficial TPC-H-derived benchmark. Not a certified TPC result.** Q1,
-Q3, Q4, Q5, Q6, Q7, Q8, Q9, Q10, Q11, Q12, Q13, Q14, Q18, and Q19 are
-supported (15 of 22) -- both single-table scans (Q1/Q6) and multi-table
-`INNER`/`LEFT OUTER JOIN` chains (Q3's/Q11's/Q18's 3-way joins, Q10's
-4-way join, Q5's/Q7's/Q9's 6-way joins and Q8's 8-way join -- Q7/Q8
-self-join `nation` under two aliases, Q9 splits `partsupp`'s two-column
-join key across a `JOIN` condition and a `WHERE` filter, Q12/Q13/Q14/
-Q19's 2-way joins), on both the CPU and GPU execution backends. Q11 was
+Q3, Q4, Q5, Q6, Q7, Q8, Q9, Q10, Q11, Q12, Q13, Q14, Q15, Q18, and Q19
+are supported (16 of 22) -- both single-table scans (Q1/Q6) and
+multi-table `INNER`/`LEFT OUTER JOIN` chains (Q3's/Q11's/Q18's 3-way
+joins, Q10's 4-way join, Q5's/Q7's/Q9's 6-way joins and Q8's 8-way join
+-- Q7/Q8 self-join `nation` under two aliases, Q9 splits `partsupp`'s
+two-column join key across a `JOIN` condition and a `WHERE` filter,
+Q12/Q13/Q14/Q15/Q19's 2-way joins), on both the CPU and GPU execution
+backends -- Q15 is the one exception, CPU-backend only for now (a real,
+investigated GPU-vs-CPU floating-point limitation for exact-equality
+`HAVING`/`IN` subquery comparisons, not yet fixed; see
+[docs/SQL_COMPATIBILITY.md](docs/SQL_COMPATIBILITY.md)). Q11 was
 also the first query needing `GROUP BY`'s `HAVING` clause or a subquery
 (a non-correlated scalar one computing `HAVING`'s own threshold); Q18
 generalizes that same subquery machinery to `WHERE ... IN (SELECT ...)`
@@ -288,8 +292,9 @@ extra predicate scoped to just the newly-joined side, or a derived table
 (`FROM (SELECT ...) AS alias`); Q4 is the first needing a correlated
 subquery -- `EXISTS`/`NOT EXISTS`, rewritten internally into a `LEFT
 SEMI`/`LEFT ANTI` join; Q8 is the first combining a derived table with a
-real JOIN *inside* that derived table's own `FROM` -- see
-[docs/SQL_COMPATIBILITY.md](docs/SQL_COMPATIBILITY.md) for the full
+real JOIN *inside* that derived table's own `FROM`; Q15 is the first
+needing a scalar subquery whose own `FROM` is itself a derived table --
+see [docs/SQL_COMPATIBILITY.md](docs/SQL_COMPATIBILITY.md) for the full
 scope of all of these. See [docs/TPCH.md](docs/TPCH.md) for the full generate ->
 query -> validate -> benchmark workflow, including `tools/generate_tpch.py`
 (a synthetic generator, not the official `dbgen`) and `kernellake

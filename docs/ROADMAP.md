@@ -3809,6 +3809,83 @@ log` is the authoritative chronology if that ordering ever matters.
   all`, both backends) and the unit/GPU test suites. 15 of TPC-H's 22
   queries now, up from 14.
 
+- **TPC-H Q15** (`77ea774`, 2026-08-24): picked as
+  the next-cheapest option after Q8 -- needed only a small widening of
+  Q11's own existing scalar-subquery machinery (a `HAVING` comparison
+  against a non-correlated scalar subquery), not a wholly new feature.
+  Canonical Q15 factors its per-supplier revenue into a shared `CREATE
+  VIEW revenue0 (...) AS SELECT ... GROUP BY l_suppkey`, referenced
+  twice; KernelLake has no `CREATE VIEW`/`WITH` support, so `revenue0`'s
+  definition is inlined at both call sites in `q15.sql` instead -- once
+  as a real `supplier JOIN lineitem`, once more (identically shaped) as
+  a derived table inside the `HAVING` subquery.
+
+  **Two real things found while adding this query, not just a query-
+  wiring exercise.** First, a genuine architecture gap:
+  `QueryEngine::run_subquery()` (shared by every `HAVING`/`IN (SELECT
+  ...)` subquery) had no case at all for a subquery whose own `FROM` is
+  a derived table -- it silently fell through to its single-table
+  branch with an empty path list ("no data source given" at execution
+  time). Root cause: `run_subquery()` hand-rolled its own narrower
+  join-or-single-table planning instead of delegating to
+  `plan_logical_unoptimized()`, the same recursive planner a real
+  top-level query already goes through. Fixed by delegating to it
+  directly -- a net simplification too, since that function already does
+  its own recursive `HAVING`/`WHERE`-`IN`/`EXISTS` resolution, making
+  `run_subquery()`'s own manual pre-resolution dead code, deleted
+  alongside the fix.
+
+  Second, a real numerical-precision discovery while getting Q15's exact
+  `=` comparison to actually match DuckDB: this project's monetary
+  columns are `DOUBLE`, not `DECIMAL` (a documented, pre-existing
+  generator deviation), and floating-point `SUM` isn't associative --
+  summing the same rows via a `supplier JOIN lineitem` visits them in a
+  different physical order than a bare `lineitem`-only scan-and-group
+  does, rounding the last one or two significant digits differently.
+  Canonical Q15's own shared `revenue0` view never hits this (it
+  computes each supplier's revenue *once* and reuses that exact value
+  both places); the inlined workaround has no such view to share, so
+  `q15.sql` keeps both inlined copies *physically identical* (same
+  `JOIN`, same `GROUP BY` columns) specifically to keep the comparison
+  exact rather than spuriously returning zero rows.
+
+  That fix made CPU-backend Q15 fully reliable (0/20 repeated runs
+  mismatched), but real investigation found a **deeper, GPU-specific
+  limitation that survives it, not yet fixed**: `HAVING`/`IN` subqueries
+  always execute on the CPU backend regardless of the outer query's own
+  `--backend` (a deliberate, pre-existing design choice -- see
+  `docs/ARCHITECTURE.md`'s "`HAVING` and scalar subqueries" section), so
+  Q15's own `=` comparison, when the outer query runs on GPU, ends up
+  checking a GPU-computed `SUM` against a CPU-computed one -- and GPU
+  vs. CPU floating-point summation essentially never rounds to the exact
+  same last bit, confirmed empirically (14/20 GPU-backend runs
+  mismatched, sometimes returning zero rows instead of the one true
+  match; GPU hash-based multi-group aggregation also has its own
+  run-to-run non-determinism on top of the cross-backend gap). A real
+  fix was investigated, not assumed away: `QueryEngine::execute(sql)`
+  plans (triggering subquery resolution) *before* constructing its own
+  `RmmEnvironment`, so a subquery *could* safely build a temporary GPU
+  environment sequentially for that single-query-per-process caller --
+  but `run_subquery()` is shared code also reached via `explain()`,
+  which the Flight SQL server's `GpuExecutionCoordinator` can call
+  concurrently for multiple in-flight requests against one shared
+  `QueryEngine`; since `RmmEnvironment` installs itself as the
+  *process-wide* current CUDA device memory resource, letting subqueries
+  build their own unconditionally would reintroduce the exact
+  racing-`RmmEnvironment`s hazard this design already avoids elsewhere.
+  A real fix needs an externally-owned, safely-shared `RmmEnvironment`
+  threaded into planning -- a genuine architecture change, not a quick
+  fix. Q15 ships **CPU-backend only** until that exists (documented in
+  `q15.sql`'s own header, `docs/ARCHITECTURE.md`, and
+  `docs/SQL_COMPATIBILITY.md`).
+
+  Verified: exact DuckDB match on CPU (`tools/validate_tpch.py --query
+  15 --backend cpu`, 0/20 repeated runs mismatched), a new permanent
+  regression test (`HavingSubqueryContainingADerivedTableSucceeds`,
+  `query_engine_execute_cpu_test.cpp`), and zero regressions across the
+  full existing TPC-H suite and unit/GPU test suites. 16 of TPC-H's 22
+  queries now, up from 15.
+
 ## Not yet started
 
 - **Unity Catalog support: remaining gaps** -- the core read path (Phase 5
@@ -4053,13 +4130,26 @@ log` is the authoritative chronology if that ordering ever matters.
   feature (an 8-way `INNER JOIN` chain wrapped in a derived table, every
   piece already independently supported); found and fixed a real
   execution-layer bug along the way (`GROUP BY` over a derived table
-  whose own inner query isn't itself grouped). Every *other*
-  still-missing query needs `DISTINCT`, set operations, `WITH`/CTEs,
-  window functions, a correlated scalar subquery, or a derived table
-  used *as a JOIN source* (not to be confused with a JOIN *inside* a
-  derived table's own `FROM`, which Q8 itself now proves works) -- see
-  `docs/ARCHITECTURE.md`'s "Supported SQL grammar" section for the
-  current scope -- 15 of TPC-H's 22 queries now, up from 14.
+  whose own inner query isn't itself grouped) -- 15 of TPC-H's 22
+  queries at this point, up from 14.
+- ~~TPC-H Q15~~ -- done, see "TPC-H Q15" in "Done" above. Needed only a
+  small widening of Q11's existing scalar-subquery machinery (a
+  `HAVING` comparison against a subquery whose own `FROM` may now be a
+  derived table); found and fixed a real `run_subquery()` architecture
+  gap along the way, and found (documented, not yet fixed) a real
+  GPU-backend floating-point limitation for exact-equality `HAVING`/`IN`
+  subquery comparisons -- Q15 itself ships CPU-backend only. Every
+  *other* still-missing query needs `DISTINCT`, set operations,
+  `WITH`/CTEs, window functions, a correlated scalar subquery, or a
+  derived table used *as a JOIN source* (not to be confused with a JOIN
+  *inside* a derived table's own `FROM`, which Q8 already proves works)
+  -- see `docs/ARCHITECTURE.md`'s "Supported SQL grammar" section for
+  the current scope -- 16 of TPC-H's 22 queries now, up from 15. A real
+  fix for the GPU-backend subquery-comparison limitation above (an
+  externally-owned, safely-shared `RmmEnvironment` threaded into
+  planning) is a genuine follow-up, not yet started -- see
+  `docs/ARCHITECTURE.md`'s "`HAVING` and scalar subqueries" section for
+  the full investigation.
 - `CASE`/`EXTRACT` inside `WHERE` on the GPU backend (`FilterOperator`'s
   own gap, separate from the aggregate-argument fix above; the CPU backend
   already supports both via its one shared expression compiler) -- not

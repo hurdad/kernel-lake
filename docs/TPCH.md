@@ -70,7 +70,18 @@ table's own `FROM`. Found and fixed a real bug along the way: an outer
 `GROUP BY` over a derived table whose own inner query has no `GROUP BY`
 of its own (a plain JOIN projection, Q8's shape -- unlike Q13's, whose
 inner query is itself aggregated) crashed at execution time; see
-`docs/ARCHITECTURE.md`'s "Derived tables" section for the fix).
+`docs/ARCHITECTURE.md`'s "Derived tables" section for the fix), and
+**Q15** (a `supplier`/`lineitem` `INNER JOIN` with a `HAVING` comparison
+against a non-correlated scalar subquery whose own `FROM` is a derived
+table with its own `GROUP BY` feeding an outer `MAX(...)` -- canonical
+Q15's shared `revenue0` view, inlined twice since KernelLake has no
+`CREATE VIEW`/`WITH` support. Found and fixed a real bug along the way:
+`QueryEngine::run_subquery()` had no case for a subquery whose own
+`FROM` is a derived table at all; also found and documented (not yet
+fixed) a real GPU-backend limitation this query's own exact `=`
+comparison exposes -- see `docs/ARCHITECTURE.md`'s "`HAVING` and scalar
+subqueries" section for both. **CPU-backend only** -- see `q15.sql`'s
+own header and the "GPU backend caveat" note below).
 KernelLake supports a chain of two
 or more tables via `INNER` or `LEFT OUTER JOIN ... ON`, each step a single
 equality key (`LEFT OUTER` additionally allows an `ON`-clause predicate
@@ -147,8 +158,8 @@ also a single file.
 
 The queries live in version-controlled files, `benchmarks/tpch/queries/
 q01.sql`, `q03.sql`, `q04.sql`, `q05.sql`, `q06.sql`, `q07.sql`, `q08.sql`,
-`q09.sql`, `q10.sql`, `q11.sql`, `q12.sql`, `q13.sql`, `q14.sql`, `q18.sql`,
-`q19.sql`, each with a header comment documenting
+`q09.sql`, `q10.sql`, `q11.sql`, `q12.sql`, `q13.sql`, `q14.sql`,
+`q15.sql`, `q18.sql`, `q19.sql`, each with a header comment documenting
 its specific deviations from canonical TPC-H syntax (`FROM lineitem` ->
 `FROM read_parquet('{data}')`, no `INTERVAL` arithmetic). Q1/Q6 need only
 `{data}` substituted with your `lineitem` glob; Q19/Q14 also need
@@ -190,7 +201,11 @@ substitution). Q13 needs `{customer_data}` and `{orders_data}`
 substituted with your `customer` and `orders` globs -- like Q11, it
 doesn't reference `lineitem` at all, so `{data}`/`--data` is still
 required by this project's own tooling but never actually substituted
-into Q13's query text. `{data}` must always be a `lineitem`-specific
+into Q13's query text. Q15 needs `{data}` and `{supplier_data}`
+substituted with your `lineitem` and `supplier` globs (each appears
+*twice* -- once in the outer `JOIN`, once again in the `HAVING`
+subquery's own re-`JOIN` -- both get the same substitution).
+`{data}` must always be a `lineitem`-specific
 glob (e.g. `lineitem-*.parquet`), not a bare `*.parquet` --
 `generate_tpch.py` writes every table into the same output directory, so
 a bare glob would pull in all of them at once and fail with a schema
@@ -293,6 +308,13 @@ sql=$(grep -v '^--' benchmarks/tpch/queries/q13.sql | tr '\n' ' ' | \
   sed "s|{customer_data}|/tmp/kernellake-tpch-sf1/customer-*.parquet|; \
        s|{orders_data}|/tmp/kernellake-tpch-sf1/orders-*.parquet|")
 ./build/gpu-dev/src/cli/kernellake query --sql "$sql" --stats
+
+# Q15's own {data}/{supplier_data} each appear twice; CPU-backend only
+# (see q15.sql's own header) -- use --backend cpu here, not --backend gpu.
+sql=$(grep -v '^--' benchmarks/tpch/queries/q15.sql | tr '\n' ' ' | \
+  sed "s|{data}|/tmp/kernellake-tpch-sf1/lineitem-*.parquet|g; \
+       s|{supplier_data}|/tmp/kernellake-tpch-sf1/supplier-*.parquet|g")
+./build/gpu-dev/src/cli/kernellake query --sql "$sql" --backend cpu --stats
 ```
 
 ## 3. Validate against DuckDB
@@ -324,8 +346,10 @@ python3 tools/validate_tpch.py \
 # --partsupp-data, --supplier-data, and --nation-data (--data is still
 # required but unused by Q11's own query text), Q13 needs
 # --customer-data and --orders-data (--data likewise required but
-# unused), Q18 needs --customer-data and --orders-data (none covered by
-# --query all, which only passes --data):
+# unused), Q15 needs --supplier-data (CPU-backend only -- pass
+# --backend cpu, see q15.sql's own header), Q18 needs --customer-data
+# and --orders-data (none covered by --query all, which only passes
+# --data):
 python3 tools/validate_tpch.py \
   --kernellake build/gpu-dev/src/cli/kernellake \
   --data '/tmp/kernellake-tpch-sf1/lineitem-*.parquet' \
@@ -408,6 +432,12 @@ python3 tools/validate_tpch.py \
   --customer-data '/tmp/kernellake-tpch-sf1/customer-*.parquet' \
   --orders-data '/tmp/kernellake-tpch-sf1/orders-*.parquet' \
   --scale-factor 1 --query 13
+# CPU-backend only -- see q15.sql's own header for why.
+python3 tools/validate_tpch.py \
+  --kernellake build/gpu-dev/src/cli/kernellake \
+  --data '/tmp/kernellake-tpch-sf1/lineitem-*.parquet' \
+  --supplier-data '/tmp/kernellake-tpch-sf1/supplier-*.parquet' \
+  --scale-factor 1 --query 15 --backend cpu
 python3 tools/validate_tpch.py \
   --kernellake build/gpu-dev/src/cli/kernellake \
   --data '/tmp/kernellake-tpch-sf1/lineitem-*.parquet' \
@@ -446,14 +476,22 @@ rows at SF0.01, not an empty/trivial result; Q11 including its 3-way join,
 `HAVING`'s own threshold; Q18 including its 3-way join and a real
 non-correlated `IN (SELECT ...)` subquery in `WHERE` -- DuckDB needs no
 code changes for `HAVING`/`IN`-subqueries, it already supports both
-natively) -- Q19/Q12/Q14/Q3 also cross-validated against PySpark and
+natively). Q15 has been verified at SF0.01 on the **CPU backend only**
+(exact DuckDB match, 0/20 repeated runs mismatched) -- its own `HAVING`
+comparison against a subquery whose `FROM` is itself a derived table
+(`HAVING total_revenue = (SELECT MAX(total_revenue) FROM (SELECT ...
+GROUP BY ...) AS r2)`) is unreliable on the GPU backend specifically (a
+real, investigated, not-yet-fixed cross-backend floating-point
+limitation -- confirmed 14/20 GPU-backend runs mismatched -- see
+`docs/ARCHITECTURE.md`'s "`HAVING` and scalar subqueries" section) --
+Q19/Q12/Q14/Q3 also cross-validated against PySpark and
 DuckDB via `tools/benchmark_three_way.py` (KernelLake via a persistent
 `kernellake-server` over Arrow Flight SQL, PySpark, and DuckDB all agree
 on every query, real GPU hardware, SF0.01/SF1/SF10 -- see
 `docs/ROADMAP.md` for the full crossover numbers and a
-`--cost-per-hour`-based cost-per-TB comparison); Q10/Q5/Q7/Q8/Q9/Q11/Q18
-have not been wired into `benchmark_three_way.py` yet (see
-`docs/ROADMAP.md`'s "Not yet started").
+`--cost-per-hour`-based cost-per-TB comparison);
+Q10/Q5/Q7/Q8/Q9/Q11/Q15/Q18 have not been wired into
+`benchmark_three_way.py` yet (see `docs/ROADMAP.md`'s "Not yet started").
 
 ## 4. Benchmark
 
@@ -471,8 +509,10 @@ for Q8, `--part-data`, `--supplier-data`,
 `--partsupp-data`, `--supplier-data`, and `--nation-data` for Q11
 (`--data` is still required but unused by Q11's own query text),
 `--customer-data` and `--orders-data` for Q13 (`--data` likewise
-required but unused), or `--customer-data` and `--orders-data` for Q18
-(or any combination for a future query needing those extra tables).
+required but unused), `--supplier-data` for Q15 (CPU-backend only --
+see `q15.sql`'s own header), or `--customer-data` and `--orders-data`
+for Q18 (or any combination for a future query needing those extra
+tables).
 
 ```bash
 ./build/gpu-dev/src/cli/kernellake benchmark tpch \

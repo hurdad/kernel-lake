@@ -268,6 +268,63 @@ its own (by design -- see `ast.hpp`'s own header comment), this
 resolution step could not live in the binder itself; it needed a layer
 with real query-execution access, which only `QueryEngine` has.
 
+`QueryEngine::run_subquery()` (shared by `evaluate_scalar_subquery()` and
+`evaluate_list_subquery()` below) delegates the subquery's own planning
+straight to `plan_logical_unoptimized()` -- the same recursive planner a
+real top-level query already goes through -- rather than reimplementing
+a narrower version of it. **Fixed 2026-08-24**: it previously hand-rolled
+its own join-or-single-table-only planning, with no case at all for a
+subquery whose own `FROM` is a derived table -- silently falling through
+to the single-table branch with an *empty* path list, "no data source
+given" at execution time. This mattered for real: TPC-H Q15's own
+`HAVING total_revenue = (SELECT MAX(total_revenue) FROM (SELECT ...
+GROUP BY l_suppkey) AS r2)` needs exactly this shape (a "max of grouped
+sums" can't be expressed without an inner `GROUP BY` feeding an outer
+`MAX(...)`, i.e. a derived table). Delegating to
+`plan_logical_unoptimized()` fixed it in one place for every subquery
+kind at once, and is also a net simplification -- that function already
+does its own recursive `HAVING`/`WHERE`-`IN`/`EXISTS` resolution, so
+`run_subquery()`'s own manual pre-resolution of those became dead code
+and was deleted alongside the fix.
+
+**Real, investigated limitation this surfaced (not yet fixed): an exact
+`=`/`<>` comparison between a `HAVING`/`IN` subquery's own result and an
+outer aggregate is unreliable when the outer query runs on the GPU
+backend.** Since the subquery always executes on CPU (the design
+decision explained above) while the outer query's own aggregate executes
+on whichever backend `--backend` selects, a `HAVING x = (SELECT
+MAX(x) FROM ...)`-shaped comparison ends up checking a GPU-computed
+floating-point sum against a CPU-computed one -- and this project's
+monetary columns are `DOUBLE`, not `DECIMAL` (see `generate_tpch.py`'s
+own docstring), so GPU and CPU floating-point summation essentially
+never round to the exact same last bit. TPC-H Q15 is the first query to
+combine an exact-equality `HAVING` comparison with its own aggregate this
+way, and empirically confirms it: CPU backend is reliable (0/20 repeated
+runs mismatched); GPU backend is not (14/20 mismatched, sometimes
+returning zero rows instead of the one true match -- GPU hash-based
+multi-group aggregation also has its own run-to-run non-determinism on
+top of the cross-backend gap, confirmed by isolating a single-group
+aggregate, which *was* stable run-to-run on each backend individually).
+Investigated a real fix rather than assuming one away: `QueryEngine::
+execute(sql)`'s own convenience wrapper calls `plan_logical()` (which is
+where subquery resolution happens) *before* constructing its own
+`RmmEnvironment`, so a subquery *could* safely build a temporary GPU
+`RmmEnvironment` sequentially, with no lifetime overlap, for that single-
+query-per-process caller specifically. But `run_subquery()` is shared
+code, also reached via `explain()` -- and the Flight SQL server's
+`GpuExecutionCoordinator` can plan *multiple concurrent requests* against
+one shared `QueryEngine` instance (see "Concurrency" below), each
+potentially triggering subquery resolution at the same time. Since
+`RmmEnvironment`'s constructor installs itself as the *process-wide*
+current CUDA device memory resource, letting subqueries build their own
+GPU `RmmEnvironment` unconditionally would reintroduce exactly the
+racing-`RmmEnvironment`s hazard this design already avoids elsewhere --
+a real fix needs an externally-owned, safely-shared `RmmEnvironment`
+threaded all the way into planning, not a quick change to
+`run_subquery()` alone. Until that exists, TPC-H Q15 is documented as
+CPU-backend-only (see its own query file's header comment) rather than
+shipped with a silently-unreliable GPU result.
+
 ### `IN (SELECT ...)` subqueries
 
 `value IN (SELECT ...)` (and `NOT IN`) is accepted in `WHERE`, with the

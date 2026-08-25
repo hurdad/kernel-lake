@@ -8,7 +8,7 @@ subqueries, `IN (SELECT ...)` subqueries, Hash joins, DECIMAL support,
 LIKE/IN/CASE/CAST implementation notes, Derived tables). For which TPC-H
 queries this adds up to, see `docs/TPCH.md` and `docs/ROADMAP.md`'s
 "Done"/"Not yet started" sections. Everything below reflects the
-codebase as of the TPC-H Q8 addition (15 of 22 TPC-H queries supported).
+codebase as of the TPC-H Q15 addition (16 of 22 TPC-H queries supported).
 
 KernelLake vendors `hyrise/sql-parser` (hsql) for grammar parsing, then
 applies its own, much narrower binder/logical-planner scope on top --
@@ -125,6 +125,15 @@ side effect of planning (including inside `explain`):
 1. **A scalar subquery as an operand inside `HAVING`'s own boolean
    expression** (`HAVING SUM(x) > (SELECT ...)`, TPC-H Q11's shape).
    Must return exactly one row, one column (`DOUBLE`/`INT64`/`STRING`).
+   The subquery's own `FROM` may be a single source, a JOIN chain, or a
+   derived table -- including a derived table containing its own `GROUP
+   BY` feeding an outer `MAX(...)`/`MIN(...)` (TPC-H Q15's shape,
+   `HAVING total_revenue = (SELECT MAX(total_revenue) FROM (SELECT ...
+   GROUP BY ...) AS r2)`), needed for any "aggregate of a grouped
+   aggregate" the subquery itself can't express in one level. An exact
+   `=`/`<>` comparison against a `HAVING`/`IN` subquery's own result is
+   unreliable on the GPU backend specifically -- see "CPU vs. GPU
+   backend differences" below.
 2. **`value IN (SELECT ...)` / `NOT IN (SELECT ...)` in `WHERE`**
    (`o_orderkey IN (SELECT l_orderkey FROM ... HAVING SUM(...) > 300)`,
    TPC-H Q18's shape). May return any number of rows, one column
@@ -206,19 +215,37 @@ five aggregates and `EXTRACT` is recognized.
 
 Both backends accept the same SQL and are validated to produce identical
 results (`tools/validate_tpch.py`) wherever both support a query shape.
-The only two known gaps, both GPU-only:
+Three known gaps:
 
-- `CASE`/`EXTRACT` in `WHERE` (`FilterOperator`'s own gap; not needed by
-  any TPC-H query added so far).
+- `CASE`/`EXTRACT` in `WHERE` (`FilterOperator`'s own gap, GPU-only; not
+  needed by any TPC-H query added so far).
 - Subquery execution (`HAVING` or `IN`) always uses the CPU backend
   regardless of `--backend` (a deliberate design choice, not a
   capability gap -- see "Subqueries" above).
+- A direct consequence of the point above: an exact `=`/`<>` comparison
+  between a `HAVING`/`IN` subquery's own result and an outer aggregate
+  (TPC-H Q15's own shape) is unreliable specifically when the *outer*
+  query runs on the GPU backend -- it ends up comparing a GPU-computed
+  floating-point sum against a CPU-computed one, and this project's
+  monetary columns are `DOUBLE`, not `DECIMAL`, so the two essentially
+  never round to the exact same last bit (empirically: 0/20 CPU-backend
+  runs mismatched, 14/20 GPU-backend runs did). A real fix needs an
+  externally-owned, safely-shared `RmmEnvironment` threaded into
+  planning (subqueries can't just build their own GPU `RmmEnvironment`
+  unconditionally -- the Flight SQL server can plan multiple concurrent
+  requests against one shared `QueryEngine`, and `RmmEnvironment`
+  installs itself as the *process-wide* current CUDA device memory
+  resource) -- see `docs/ARCHITECTURE.md`'s "`HAVING` and scalar
+  subqueries" section for the full investigation. `q15.sql`'s own header
+  documents this; only validate/benchmark it with `--backend cpu` until
+  a real fix exists.
 
 ## Not supported
 
 `DISTINCT`, set operations (`UNION`/`INTERSECT`/`EXCEPT`), `WITH`/CTEs,
-`OFFSET`, window functions, a derived table nested inside a JOIN or a
-JOIN inside a derived table's own `FROM`, correlated *scalar*
+`OFFSET`, window functions, a derived table used *as a JOIN source*
+(not to be confused with a JOIN *inside* a derived table's own `FROM`,
+which TPC-H Q8 already proves works), correlated *scalar*
 subqueries or `EXISTS` outside its narrow correlated scope (see
 "Subqueries" above), `RIGHT`/`FULL`/`CROSS` JOIN, comma-style joins,
 multi-key or non-equality join conditions, a JOIN `ON`-clause predicate
@@ -229,12 +256,13 @@ error rather than being silently reinterpreted.
 
 ## TPC-H query coverage
 
-15 of 22 TPC-H queries: **Q1, Q3, Q4, Q5, Q6, Q7, Q8, Q9, Q10, Q11, Q12,
-Q13, Q14, Q18, Q19**. See `docs/TPCH.md` for the generate/query/validate/
-benchmark workflow and `docs/ROADMAP.md`'s "Done" section for what each
-addition needed. Every remaining query is blocked on a feature in the
-"Not supported" list above (most commonly `DISTINCT`, set operations,
-`WITH`/CTEs, window functions, or a correlated scalar subquery) -- Q8
-needed no new SQL feature (just a real execution-layer bug fix, see
-`docs/ARCHITECTURE.md`'s "Derived tables" section), but every other
-remaining query is genuinely feature-blocked.
+16 of 22 TPC-H queries: **Q1, Q3, Q4, Q5, Q6, Q7, Q8, Q9, Q10, Q11, Q12,
+Q13, Q14, Q15, Q18, Q19** (Q15 is CPU-backend-only for now -- see "CPU
+vs. GPU backend differences" above). See `docs/TPCH.md` for the
+generate/query/validate/benchmark workflow and `docs/ROADMAP.md`'s
+"Done" section for what each addition needed. Every remaining query is
+blocked on a feature in the "Not supported" list above (most commonly
+`DISTINCT`, set operations, `WITH`/CTEs, window functions, or a
+correlated scalar subquery) -- Q8 needed no new SQL feature (just a real
+execution-layer bug fix, see `docs/ARCHITECTURE.md`'s "Derived tables"
+section), but every other remaining query is genuinely feature-blocked.
