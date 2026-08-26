@@ -204,10 +204,15 @@ def gpu_info() -> dict | None:
     return {"name": name, "memory_total": memory_total, "driver_version": driver_version}
 
 
-def collect_system_stats() -> dict:
-    import pyspark
-
-    return {
+def collect_system_stats(backends: tuple = ENGINES) -> dict:
+    # pyspark itself is only importable/installed when that engine is
+    # actually part of this run's dependency set (it's not part of this
+    # project's own CPU-only dev environment -- see this module's own
+    # docstring); reporting its version unconditionally would make this
+    # function (and therefore this whole script) fail before ever
+    # reaching --backends' own "pyspark disabled" handling, even for a
+    # gpu-server/duckdb-only run that never touches pyspark at all.
+    stats = {
         "cpu_model": cpu_model(),
         "cpu_logical_cores": os.cpu_count(),
         "total_ram_gib": total_ram_gib(),
@@ -215,8 +220,12 @@ def collect_system_stats() -> dict:
         "os": platform.platform(),
         "kernel_release": platform.release(),
         "python_version": platform.python_version(),
-        "pyspark_version": pyspark.__version__,
     }
+    if "pyspark" in backends:
+        import pyspark
+
+        stats["pyspark_version"] = pyspark.__version__
+    return stats
 
 
 def load_query_text(query_number: int) -> str:
@@ -891,7 +900,7 @@ def main() -> int:
 
     modes = MODES if args.mode == "both" else (args.mode,)
 
-    system_stats = collect_system_stats()
+    system_stats = collect_system_stats(backends)
     print("=== System ===")
     for key, value in system_stats.items():
         print(f"    {key}: {value}")
