@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+#include <unistd.h>
 
 #include <filesystem>
 #include <fstream>
@@ -11,6 +12,28 @@ namespace kernellake {
 namespace {
 
 namespace fs = std::filesystem;
+
+// root (euid 0) has CAP_DAC_OVERRIDE -- every POSIX permission check,
+// including the directory-traversal ones ListThrowsStorageErrorOnUnreadableDirectory/
+// ListRecursiveThrowsStorageErrorOnUnreadableSubdirectory below rely on,
+// is bypassed entirely. A directory with its execute bit stripped is
+// still fully traversable by root, so the fs::filesystem_error these
+// tests exist to trigger never happens there -- not a bug in the
+// production code (StorageError conversion is still correct), just an
+// environment this specific test shape can't exercise. This is exactly
+// how `docker build`'s own RUN steps execute (no USER directive is set
+// until after the cpu-release/gpu-release stage that runs ctest -- see
+// docker/Dockerfile), which is where this first surfaced: CI's own
+// `docker-publish-cpu` job reported exactly these two tests FAILED (no
+// exception thrown) starting the run this pair was added, while every
+// other CI job building/testing the identical commit outside Docker
+// (running as a non-root user) passed. Skipped, not rewritten to avoid
+// permissions entirely, since there is no portable way to force
+// fs::directory_iterator to fail without relying on real DAC permission
+// bits.
+bool running_as_root() {
+  return geteuid() == 0;
+}
 
 class LocalObjectStoreTest : public ::testing::Test {
  protected:
@@ -103,6 +126,10 @@ TEST_F(LocalObjectStoreTest, FileDiscoveryRejectsEmptySourceList) {
 // of converting it to this file's own StorageError like every other
 // failure path here.
 TEST_F(LocalObjectStoreTest, ListThrowsStorageErrorOnUnreadableDirectory) {
+  if (running_as_root()) {
+    GTEST_SKIP()
+        << "root bypasses directory-execute permission checks -- see running_as_root()'s own comment";
+  }
   const fs::path unreadable = dir_ / "unreadable";
   fs::create_directories(unreadable);
   write_file(unreadable / "hidden.parquet", "x");
@@ -116,6 +143,10 @@ TEST_F(LocalObjectStoreTest, ListThrowsStorageErrorOnUnreadableDirectory) {
 }
 
 TEST_F(LocalObjectStoreTest, ListRecursiveThrowsStorageErrorOnUnreadableSubdirectory) {
+  if (running_as_root()) {
+    GTEST_SKIP()
+        << "root bypasses directory-execute permission checks -- see running_as_root()'s own comment";
+  }
   const fs::path unreadable = dir_ / "unreadable_recursive";
   fs::create_directories(unreadable);
   write_file(unreadable / "hidden.parquet", "x");
