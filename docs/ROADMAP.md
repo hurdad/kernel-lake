@@ -4238,15 +4238,15 @@ log` is the authoritative chronology if that ordering ever matters.
   SF10 on the Q1/Q6-only sweep already run) looks different for a
   join-shaped query; not yet done at any scale factor beyond the SF0.01
   spot-checks above
-- Wiring TPC-H Q14 into `tools/benchmark_three_way.py`'s three-way
-  performance comparison, the same way Q19 already is (it needs the same
-  `--part-data` mechanism Q19 uses, so this should be a small, mostly
-  mechanical follow-up, not a new fix) -- not yet done
-- Wiring TPC-H Q10 into `tools/benchmark_three_way.py` (needs a new
-  `--nation-data` mechanism, mirroring `--orders-data`/`--customer-data`'s
-  existing pattern: `kernellake_sql()` substitution, a fourth Spark temp
-  view, cold-mode cache eviction) -- not yet done; also not yet run at any
-  scale factor beyond the SF0.01 validation in "Done" above
+- ~~Wiring TPC-H Q14/Q10 into `tools/benchmark_three_way.py`~~ -- done
+  (2026-08-25), see the `tools/benchmark_three_way.py`-wiring entries in
+  "Done" above. Landed alongside every other not-yet-wired query
+  (Q5/Q7/Q8/Q9/Q11/Q15/Q18, then Q4/Q13/Q14) once the generic
+  `--nation-data`/`--supplier-data`/`--region-data`/`--partsupp-data`
+  plumbing this entry anticipated was built (while wiring in Q16/Q17/Q2/
+  Q20/Q21/Q22 first) -- every subsequent query was then just a
+  `required_extra_globs` table entry, not a new per-query mechanism.
+  `--query all` now covers all 22 queries.
 - ~~Q7/Q9~~ -- done, see "TPC-H Q7 and Q9" in "Done" above.
 - ~~Q11~~ -- done, see "TPC-H Q11" in "Done" above. `HAVING` and a
   narrow non-correlated scalar subquery are now supported (see

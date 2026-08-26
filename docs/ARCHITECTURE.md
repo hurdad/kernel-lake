@@ -188,9 +188,16 @@ Catalog server and a real MinIO, not just reasoned about: see
   see "LIKE/IN/CASE/CAST implementation notes" below for the
   truncate-vs-round caveat on numeric-to-integer casts, and "DECIMAL
   support" below for `DECIMAL`'s own scope)
+- `SUBSTRING(expr, start, length)` (function-call form only -- SQL-92's
+  `SUBSTRING(x FROM start FOR length)` syntax isn't accepted); materialized
+  outside `cudf::ast` the same way `EXTRACT`/`LIKE` are, since it has no
+  native AST node either -- see "`SUBSTRING`" below
 - `DECIMAL(p, s)` columns and literals -- see "DECIMAL support" below
-- Aggregates: `SUM`, `COUNT`, `COUNT(*)`, `MIN`, `MAX`, `AVG` (`AVG` does
-  not support a `DECIMAL` argument; see "DECIMAL support")
+- Aggregates: `SUM`, `COUNT`, `COUNT(DISTINCT ...)`, `COUNT(*)`, `MIN`,
+  `MAX`, `AVG` (`AVG` does not support a `DECIMAL` argument; see "DECIMAL
+  support". `COUNT(DISTINCT ...)` cannot be combined with another
+  aggregate in the same `GROUP BY` on the GPU backend specifically -- see
+  "`COUNT(DISTINCT ...)`" below)
 - A chain of two or more tables via `INNER` or `LEFT [OUTER] JOIN ... ON`,
   each step a single equality key plus, optionally, an extra predicate
   scoped to just the newly-joined side (see "Hash joins" below for the
@@ -213,18 +220,24 @@ Catalog server and a real MinIO, not just reasoned about: see
   `BIGINT`, unlike cudf's `INT16`, needing no extra cast on that side).
 
 Not yet supported (fails clearly rather than being silently reinterpreted):
-`DISTINCT`, set operations (`UNION`/etc.), `WITH`/CTEs, `OFFSET`, window
-functions, `CASE`/`EXTRACT` in `WHERE` (GPU only -- see above), any
-function other than the five aggregates and `EXTRACT` above, `EXTRACT`
-fields other than `YEAR`/`MONTH`/`DAY`, comma-style joins,
-`RIGHT`/`FULL`/`CROSS` JOIN, a subquery used as a JOIN source (a derived
-table is only accepted as a query's entire `FROM` clause -- see "Derived
-tables" below), correlated *scalar* subqueries, and multi-key or
-non-equality join conditions. `LEFT [OUTER] JOIN`, a single top-level
-derived table, `HAVING`, and three narrow subquery forms are now
-supported -- see "Hash joins", "Derived tables", "`HAVING` and scalar
-subqueries", "`IN (SELECT ...)` subqueries", and "Correlated subqueries"
-(`EXISTS`/`NOT EXISTS`) below.
+bare `SELECT DISTINCT` (`COUNT(DISTINCT ...)` specifically *is* supported,
+narrowly -- see above and "`COUNT(DISTINCT ...)`" below), set operations
+(`UNION`/etc.), `WITH`/CTEs, `OFFSET`, window functions, `CASE`/`EXTRACT`
+in `WHERE` (GPU only -- see above), any function other than the five
+aggregates/`EXTRACT`/`SUBSTRING` above, `EXTRACT` fields other than
+`YEAR`/`MONTH`/`DAY`, comma-style joins, `RIGHT`/`FULL`/`CROSS` JOIN, a
+derived table used as one *JOIN source* in real SQL syntax (accepted only
+as a query's entire `FROM` clause -- see "Derived tables" below; an
+internal decorrelation rewrite can synthesize one, but there is no
+`JOIN (SELECT ...) AS x ON ...` grammar), and multi-key or non-equality
+join conditions (except a JOIN's own residual, cross-side predicate,
+`LEFT SEMI`/`LEFT ANTI` only -- see "Correlated subqueries" below).
+`LEFT [OUTER] JOIN`, a single top-level derived table, `HAVING`, and five
+narrow subquery forms (including correlated *scalar* subqueries in
+`WHERE`) are now supported -- see "Hash joins", "Derived tables", "`HAVING`
+and scalar subqueries", "`IN (SELECT ...)` subqueries", "Correlated
+subqueries" (`EXISTS`/`NOT EXISTS`), and "Correlated scalar subqueries"
+below.
 
 ### `HAVING` and scalar subqueries
 

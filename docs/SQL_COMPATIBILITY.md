@@ -4,11 +4,14 @@ A single, scannable reference for what SQL KernelLake accepts today. This
 is a compatibility matrix, not an implementation guide -- for *why* a
 given scope boundary exists, see `docs/ARCHITECTURE.md`'s "Supported SQL
 grammar (current)" section and its sub-sections (`HAVING`/scalar
-subqueries, `IN (SELECT ...)` subqueries, Hash joins, DECIMAL support,
-LIKE/IN/CASE/CAST implementation notes, Derived tables). For which TPC-H
-queries this adds up to, see `docs/TPCH.md` and `docs/ROADMAP.md`'s
-"Done"/"Not yet started" sections. Everything below reflects the
-codebase as of the TPC-H Q15 addition (16 of 22 TPC-H queries supported).
+subqueries, non-correlated scalar subquery in `WHERE`, `IN (SELECT ...)`
+subqueries, correlated subqueries (`EXISTS`/`NOT EXISTS`), correlated
+scalar subqueries, Hash joins, DECIMAL support, `COUNT(DISTINCT ...)`,
+`SUBSTRING`, LIKE/IN/CASE/CAST implementation notes, Derived tables). For
+which TPC-H queries this adds up to, see
+`docs/TPCH.md` and `docs/ROADMAP.md`'s "Done"/"Not yet started" sections.
+Everything below reflects the codebase as of the TPC-H Q20 addition
+(**all 22 of TPC-H's standard queries supported**).
 
 KernelLake vendors `hyrise/sql-parser` (hsql) for grammar parsing, then
 applies its own, much narrower binder/logical-planner scope on top --
@@ -48,14 +51,14 @@ join list.
 | --- | --- | --- |
 | `SELECT` list | Yes | Columns, aliases, `*`, expressions, aggregates |
 | `FROM` | Single source, JOIN chain, or single derived table | `read_parquet`/`read_iceberg`/`read_delta`/`read_unity_catalog`, or `(SELECT ...) AS alias` |
-| `JOIN ... ON` | Yes, N-way | `INNER` or `LEFT [OUTER]`, one equality key per step plus an optional right-side-only predicate -- see "Joins" below |
-| `WHERE` | Yes | See "Expressions" below; also accepts one subquery form, `IN (SELECT ...)` -- see "Subqueries" |
+| `JOIN ... ON` | Yes, N-way | `INNER` or `LEFT [OUTER]`, one equality key per step plus an optional right-side-only predicate; `LEFT SEMI`/`LEFT ANTI` (produced only by the internal `EXISTS`/`NOT EXISTS` rewrite, not real SQL grammar) additionally accept a residual, cross-side predicate -- see "Joins" below |
+| `WHERE` | Yes | See "Expressions" below; also accepts three subquery forms, `IN (SELECT ...)`, `EXISTS`/`NOT EXISTS`, and a correlated scalar subquery -- see "Subqueries" |
 | `GROUP BY` | Yes | By base column, computed expression, or `SELECT`-list alias |
 | `HAVING` | Yes, narrow | Aggregates/`GROUP BY` keys only, plus one scalar subquery form -- see "Subqueries" |
 | `ORDER BY` | Yes | Multiple keys, `ASC`/`DESC` |
 | `LIMIT` | Yes | |
 | `OFFSET` | No | |
-| `DISTINCT` | No | |
+| `DISTINCT` | No (bare `SELECT DISTINCT`) | `COUNT(DISTINCT ...)` specifically *is* supported -- see "Aggregates" below |
 | `UNION`/`INTERSECT`/`EXCEPT` | No | |
 | `WITH` (CTEs) | No | Rejected unconditionally at parse time |
 | Window functions | No | |
@@ -74,16 +77,21 @@ join list.
   columns (TPC-H Q13's own `o_comment NOT LIKE '%special%requests%'`) --
   these are pushed down as a pre-filter on `b` before the join runs,
   exact for both `INNER` and `LEFT OUTER`. A conjunct referencing `a` at
-  all (alone, or mixed with `b`'s columns) is rejected: unlike the
-  right-side-only case, a `LEFT OUTER JOIN`'s own left-side `ON`
-  conjunct has different semantics (a left row failing it must still
-  appear once, null-extended, not be dropped like a pre-filter would)
-  that isn't implemented. Any other multi-key or non-equality condition
-  is rejected at bind time -- a composite key must be split, with one
-  key as the `JOIN ... ON` condition and the rest moved into `WHERE`
-  (valid for `INNER JOIN` only; see TPC-H Q5/Q9 for real examples).
+  all (alone, or mixed with `b`'s columns) is rejected for `INNER`/`LEFT
+  OUTER`: unlike the right-side-only case, a `LEFT OUTER JOIN`'s own
+  left-side `ON` conjunct has different semantics (a left row failing it
+  must still appear once, null-extended, not be dropped like a pre-filter
+  would) that isn't implemented -- **except** for `LEFT SEMI`/`LEFT ANTI`
+  (produced only by the internal `EXISTS`/`NOT EXISTS` rewrite below, not
+  reachable from real `JOIN` syntax), where a both-sides conjunct *is*
+  accepted, as a residual predicate evaluated per candidate pair (TPC-H
+  Q21's `l2.l_suppkey <> l1.l_suppkey`) -- see "Correlated subqueries"
+  below. Any other multi-key or non-equality condition on a real `JOIN`
+  is rejected at bind time -- a composite key must be split, with one key
+  as the `JOIN ... ON` condition and the rest moved into `WHERE` (valid
+  for `INNER JOIN` only; see TPC-H Q5/Q9 for real examples).
 - **Chain length**: up to 12 sources (`kMaxJoinSources`), each explicitly
-  aliased. Verified in production shape up to 6-way (TPC-H Q5/Q7/Q9).
+  aliased. Verified in production shape up to 8-way (TPC-H Q8).
 - Same-named columns from different join sides resolve correctly by
   qualified name (`a.x`/`b.x`), including a table joined to itself under
   two aliases (TPC-H Q7's `nation AS n1`/`AS n2`).
@@ -107,18 +115,19 @@ join list.
 | `LIKE` / `NOT LIKE` | Yes | Both, everywhere (`WHERE`, `SELECT`, `CASE` branch, aggregate argument) |
 | `IN (literal, ...)` / `NOT IN (...)` | Yes | Desugared at bind time into an OR/AND chain of equalities; no dedicated execution support needed |
 | `IN (SELECT ...)` / `NOT IN (SELECT ...)` | Yes, narrow | Non-correlated, any row count, one column -- resolved to a literal list (same OR/AND desugar) before binding; see "Subqueries" |
-| `EXISTS` / `NOT EXISTS` | Yes, narrow | Correlated, single equality key -- rewritten into a `LEFT SEMI`/`LEFT ANTI` join step before binding; see "Subqueries" |
-| Correlated *scalar* subqueries | No | |
+| `EXISTS` / `NOT EXISTS` | Yes, narrow | Correlated, one or more equality keys (a second or later key becomes a residual, cross-side predicate on the resulting `LEFT SEMI`/`LEFT ANTI` join step, TPC-H Q21's shape), rewritten before binding; two chained `EXISTS`/`NOT EXISTS` steps in one `WHERE` clause is supported (Q21) -- see "Subqueries" |
+| Correlated *scalar* subqueries | Yes, narrow | Decorrelated into a `JOIN` against a synthesized, `GROUP BY`-aggregated derived table before binding -- both backends, since it becomes a real join/aggregate in the same physical plan; see "Subqueries" |
 | `CASE WHEN ... THEN ... [ELSE ...] END` | Yes, backend-scoped | CPU: everywhere. GPU: `SELECT` list, `GROUP BY` keys, aggregate arguments -- **not yet in `WHERE`** |
 | `CAST(expr AS type)` | Yes | `INT`/`BIGINT`/`DOUBLE`/`VARCHAR(n)`/`DECIMAL(p, s)`; numeric-to-integer casts truncate (not round -- differs from DuckDB) |
+| `SUBSTRING(expr, start, length)` | Yes | Both -- function-call form only, not SQL-92's `SUBSTRING(x FROM ... FOR ...)`; materialized outside `cudf::ast` on GPU, same mechanism as `EXTRACT`/`LIKE` |
 | `EXTRACT(field FROM expr)` | Yes, backend-scoped | `field` is `YEAR`/`MONTH`/`DAY` only; `expr` must be `DATE`/`TIMESTAMP`. Both backends everywhere `CASE` can appear except `WHERE` |
 | Aggregate-combining `SELECT` items (e.g. `100.0 * SUM(a) / SUM(b)`) | Yes | Both -- resolved in shared logical-plan construction |
 
 ## Subqueries
 
-Three forms are supported. The first two are **non-correlated** (bound
+Five forms are supported. The first three are **non-correlated** (bound
 independently against their own `FROM`/`JOIN` schema, with no access to
-the outer query's tables or aliases) and both executed always on the CPU
+the outer query's tables or aliases) and all executed always on the CPU
 (Acero) backend regardless of the outer query's own `--backend`, as a
 side effect of planning (including inside `explain`):
 
@@ -134,7 +143,12 @@ side effect of planning (including inside `explain`):
    `=`/`<>` comparison against a `HAVING`/`IN` subquery's own result is
    unreliable on the GPU backend specifically -- see "CPU vs. GPU
    backend differences" below.
-2. **`value IN (SELECT ...)` / `NOT IN (SELECT ...)` in `WHERE`**
+2. **A scalar subquery as a bare `WHERE` comparison operand**
+   (`WHERE c_acctbal > (SELECT AVG(c_acctbal) FROM customer WHERE ...)`,
+   TPC-H Q22's shape) -- same non-correlated, one-row/one-column contract
+   as the `HAVING` form above, just reachable directly from `WHERE`
+   without needing `HAVING` or `IN`.
+3. **`value IN (SELECT ...)` / `NOT IN (SELECT ...)` in `WHERE`**
    (`o_orderkey IN (SELECT l_orderkey FROM ... HAVING SUM(...) > 300)`,
    TPC-H Q18's shape). May return any number of rows, one column
    (`DOUBLE`/`INT64`/`STRING`); resolved into a literal list -- the same
@@ -143,32 +157,63 @@ side effect of planning (including inside `explain`):
    `IN ()` is always false, `NOT IN ()` is always true. No size cap on
    the returned row count -- a narrow mechanism for a subquery expected
    to return a modest number of rows (e.g. a tight `HAVING` filter), not
-   a general-purpose semi-join.
-3. **`EXISTS (SELECT ...)` / `NOT EXISTS (SELECT ...)` as a top-level
+   a general-purpose semi-join. A correlated scalar subquery (form 5
+   below) can appear nested inside this one's own body (TPC-H Q20's
+   shape) and is decorrelated there too -- the rewrite runs wherever
+   query planning itself recurses, including a non-correlated
+   `IN`-subquery's own independently-planned body.
+
+The remaining two are **correlated** (the subquery references a column
+from the outer query) and, unlike the three above, become part of the
+outer query's own join chain/logical plan -- both run on whichever
+backend the outer query does, not always CPU:
+
+4. **`EXISTS (SELECT ...)` / `NOT EXISTS (SELECT ...)` as a top-level
    `WHERE` `AND`-conjunct** (`WHERE ... AND EXISTS (SELECT * FROM l
-   WHERE l.k = o.k AND <predicate over l only>)`, TPC-H Q4's shape) --
-   the one **correlated** form supported. Exactly one equality key
-   correlating the subquery to a column already in scope, plus
-   optionally one `AND`-conjunct referencing only the subquery's own
-   source; no `JOIN`/derived-table `FROM`, `GROUP BY`, `HAVING`, `ORDER
-   BY`, or `LIMIT` inside the subquery, and the outer `FROM` must
-   already be aliased or joined. Rewritten into a `LEFT SEMI`
-   (`EXISTS`)/`LEFT ANTI` (`NOT EXISTS`) join step *before* binding --
-   runs on whichever backend the outer query does, unlike the two
-   non-correlated forms above, since it becomes a real join step in the
-   same physical plan rather than a separate planning-time execution.
-   See `docs/ARCHITECTURE.md`'s "Correlated subqueries" section for the
-   full scope and rewrite mechanics.
+   WHERE l.k = o.k AND <predicate over l only>)`, TPC-H Q4's shape).
+   One or more equality keys correlating the subquery to a column
+   already in scope -- a second (or later) key becomes a residual,
+   cross-side predicate on the resulting join step instead of a plain
+   equality (`l2.l_suppkey <> l1.l_suppkey`, TPC-H Q21's shape), evaluated
+   per candidate pair via `cudf::mixed_left_semi_join()`/
+   `mixed_left_anti_join()` (GPU) or Arrow Acero's own
+   `HashJoinNodeOptions::filter` (CPU). No `JOIN`/derived-table `FROM`,
+   `GROUP BY`, `HAVING`, `ORDER BY`, or `LIMIT` inside the subquery, and
+   the outer `FROM` must already be aliased or joined. Two `EXISTS`/`NOT
+   EXISTS` conjuncts in the same `WHERE` clause, both correlated to the
+   same outer alias, chain into two back-to-back join steps (TPC-H Q21's
+   shape) and are supported together. Rewritten into a `LEFT SEMI`
+   (`EXISTS`)/`LEFT ANTI` (`NOT EXISTS`) join step *before* binding. See
+   `docs/ARCHITECTURE.md`'s "Correlated subqueries" section for the full
+   scope and rewrite mechanics.
+5. **A correlated scalar subquery in `WHERE`** (`WHERE l_quantity <
+   (SELECT 0.2 * AVG(l_quantity) FROM lineitem WHERE l_partkey =
+   p_partkey)`, TPC-H Q17's shape). Decorrelated *before* binding into a
+   `JOIN` against a synthesized, `GROUP BY`-aggregated derived table --
+   the matched comparison is rewritten to compare against that derived
+   table's own output column instead of the subquery, reusing the
+   ordinary bind/plan/optimize/execute pipeline with no new operator,
+   expression type, or physical-plan node. The subquery's own `FROM` may
+   be a single source or a full multi-way `JOIN` chain (TPC-H Q2's
+   shape); one or more equality keys correlate it to the outer query,
+   split the same "first key in the derived table's own `JOIN`, the rest
+   as a post-join `WHERE` filter" way a real multi-key join condition
+   already is (TPC-H Q20's two-column `l_partkey = ps_partkey AND
+   l_suppkey = ps_suppkey` correlation); any other conjunct in the
+   subquery's own `WHERE` stays there unchanged. No `GROUP BY`/`HAVING`/
+   `ORDER BY`/`LIMIT`/derived-table `FROM` inside the subquery, and
+   exactly one `SELECT`-list item. See `docs/ARCHITECTURE.md`'s
+   "Correlated scalar subqueries" section for the full scope.
 
 A subquery-as-value-expression anywhere else -- bare in `WHERE` outside
-an `EXISTS`/`IN` wrapper, `SELECT`, `GROUP BY`, join `ON` -- is rejected
-with a clear `BindingError`. Correlated *scalar* subqueries, `EXISTS`
-outside the scope above (e.g. mixed with `OR` rather than `AND`, or
-wrapping a subquery with its own `JOIN`), and a `HAVING` subquery
-returning more than one row or more than one column are all unsupported.
-A derived table in `FROM` (`FROM (SELECT ...) AS alias`, see "Joins"
-above) is a different mechanism -- a *relation*, not a scalar/list
-value -- and is supported, narrowly, as described there.
+one of the forms above, `SELECT`, `GROUP BY`, join `ON` -- is rejected
+with a clear `BindingError`. `EXISTS` outside the scope above (e.g. mixed
+with `OR` rather than `AND`, or wrapping a subquery with its own `JOIN`),
+a correlated scalar subquery outside its own scope above, and a `HAVING`
+subquery returning more than one row or more than one column are all
+unsupported. A derived table in `FROM` (`FROM (SELECT ...) AS alias`, see
+"Joins" above) is a different mechanism -- a *relation*, not a
+scalar/list value -- and is supported, narrowly, as described there.
 
 ## Data types
 
@@ -207,9 +252,14 @@ REQUIRED/OPTIONAL, or explicit for partition columns), not assumed --
 
 ## Aggregates
 
-`SUM`, `COUNT`, `COUNT(*)`, `MIN`, `MAX`, `AVG` -- both backends. `AVG`
-does not support a `DECIMAL` argument. No other function beyond these
-five aggregates and `EXTRACT` is recognized.
+`SUM`, `COUNT`, `COUNT(DISTINCT ...)`, `COUNT(*)`, `MIN`, `MAX`, `AVG` --
+both backends. `AVG` does not support a `DECIMAL` argument.
+`COUNT(DISTINCT ...)` cannot be combined with another aggregate in the
+same `GROUP BY` on the GPU backend specifically (no such restriction on
+CPU; DuckDB needs no change either, it supports the combination
+natively) -- see `docs/ARCHITECTURE.md`'s "`COUNT(DISTINCT ...)`"
+section. No other function beyond these six aggregates, `EXTRACT`, and
+`SUBSTRING` is recognized.
 
 ## CPU vs. GPU backend differences
 
@@ -219,9 +269,13 @@ Three known gaps:
 
 - `CASE`/`EXTRACT` in `WHERE` (`FilterOperator`'s own gap, GPU-only; not
   needed by any TPC-H query added so far).
-- Subquery execution (`HAVING` or `IN`) always uses the CPU backend
-  regardless of `--backend` (a deliberate design choice, not a
-  capability gap -- see "Subqueries" above).
+- The three **non-correlated** subquery forms (`HAVING`, bare-`WHERE`-
+  operand, `IN`) always execute on the CPU backend regardless of
+  `--backend` (a deliberate design choice, not a capability gap -- see
+  "Subqueries" above). The two **correlated** forms (`EXISTS`/`NOT
+  EXISTS`, correlated scalar subqueries) do *not* have this restriction --
+  both become part of the outer query's own join chain/logical plan, so
+  they run on whichever backend the outer query does.
 - A direct consequence of the point above: an exact `=`/`<>` comparison
   between a `HAVING`/`IN` subquery's own result and an outer aggregate
   (TPC-H Q15's own shape) is unreliable specifically when the *outer*
@@ -245,27 +299,33 @@ Three known gaps:
 
 ## Not supported
 
-`DISTINCT`, set operations (`UNION`/`INTERSECT`/`EXCEPT`), `WITH`/CTEs,
-`OFFSET`, window functions, a derived table used *as a JOIN source*
-(not to be confused with a JOIN *inside* a derived table's own `FROM`,
-which TPC-H Q8 already proves works), correlated *scalar*
-subqueries or `EXISTS` outside its narrow correlated scope (see
+Bare `SELECT DISTINCT` (`COUNT(DISTINCT ...)` specifically *is*
+supported, narrowly -- see "Aggregates" above), set operations
+(`UNION`/`INTERSECT`/`EXCEPT`), `WITH`/CTEs, `OFFSET`, window functions, a
+derived table used as one *JOIN source* in real SQL syntax (not to be
+confused with a JOIN *inside* a derived table's own `FROM`, which TPC-H
+Q8 already proves works; an internal decorrelation rewrite can
+synthesize one for a correlated scalar subquery, but there is no
+`JOIN (SELECT ...) AS x ON ...` grammar), `EXISTS`/correlated-scalar-
+subquery shapes outside their own narrow correlated scope (see
 "Subqueries" above), `RIGHT`/`FULL`/`CROSS` JOIN, comma-style joins,
-multi-key or non-equality join conditions, a JOIN `ON`-clause predicate
-referencing the already-joined (left) side, `CASE`/`EXTRACT` in `WHERE`
-on the GPU backend, and any function beyond the five aggregates and
-`EXTRACT`. Each fails clearly at parse or bind time with a specific
-error rather than being silently reinterpreted.
+multi-key or non-equality join conditions on a real `JOIN` (except a
+`LEFT SEMI`/`LEFT ANTI` step's own residual predicate -- see "Joins"
+above), a JOIN `ON`-clause predicate referencing the already-joined
+(left) side (same `LEFT SEMI`/`LEFT ANTI` exception), `CASE`/`EXTRACT` in
+`WHERE` on the GPU backend, and any function beyond the six aggregates,
+`EXTRACT`, and `SUBSTRING`. Each fails clearly at parse or bind time with
+a specific error rather than being silently reinterpreted.
 
 ## TPC-H query coverage
 
-16 of 22 TPC-H queries: **Q1, Q3, Q4, Q5, Q6, Q7, Q8, Q9, Q10, Q11, Q12,
-Q13, Q14, Q15, Q18, Q19** (Q15 is CPU-backend-only for now -- see "CPU
-vs. GPU backend differences" above). See `docs/TPCH.md` for the
+**All 22 of TPC-H's standard queries are supported: Q1 through Q22.**
+Q15 is CPU-backend-only (see "CPU vs. GPU backend differences" above);
+every other query works on both backends. See `docs/TPCH.md` for the
 generate/query/validate/benchmark workflow and `docs/ROADMAP.md`'s
-"Done" section for what each addition needed. Every remaining query is
-blocked on a feature in the "Not supported" list above (most commonly
-`DISTINCT`, set operations, `WITH`/CTEs, window functions, or a
-correlated scalar subquery) -- Q8 needed no new SQL feature (just a real
-execution-layer bug fix, see `docs/ARCHITECTURE.md`'s "Derived tables"
-section), but every other remaining query is genuinely feature-blocked.
+"Done" section for what each addition needed -- Q16 added
+`COUNT(DISTINCT ...)`, Q22 added `SUBSTRING` plus the bare-`WHERE`-
+operand scalar subquery form, Q21 added the residual-predicate/chained-
+`EXISTS` shape, and Q17/Q2/Q20 added correlated scalar subqueries (the
+last real SQL-feature gap TPC-H's own 22-query suite needed -- see
+"Subqueries" above for all of these).
